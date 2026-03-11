@@ -1,0 +1,31 @@
+{
+  "name": "@wystack/client",
+  "version": "0.0.1",
+  "description": "React hooks, TanStack DB integration, and sync engine for WyStack",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@wystack/server": "workspace:*",
+    "@tanstack/react-query": "^5.90.0"
+  },
+  "peerDependencies": {
+    "react": ">=19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.8.3"
+  }
+}

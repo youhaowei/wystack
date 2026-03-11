@@ -1,0 +1,27 @@
+{
+  "name": "@wystack/server",
+  "version": "0.0.1",
+  "description": "Reactive data engine with function registry, subscription management, and multi-transport support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@wystack/db": "workspace:*",
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}

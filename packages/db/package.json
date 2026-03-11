@@ -1,0 +1,34 @@
+{
+  "name": "@wystack/db",
+  "version": "0.0.1",
+  "description": "SQL-agnostic database layer with schema definition, dual-driver support, and change tracking",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.3.0",
+    "postgres": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@electric-sql/pglite": { "optional": true },
+    "postgres": { "optional": true }
+  }
+}
