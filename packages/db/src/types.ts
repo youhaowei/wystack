@@ -10,4 +10,4 @@ export interface DbConfig {
   url?: string
 }
 
-export type Db = any // Will be narrowed to Drizzle instance type
+export type Db = any
