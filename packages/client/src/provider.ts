@@ -1,21 +1,14 @@
-import type { WyStackClientConfig } from './types'
+import { createContext, useContext, createElement } from 'react'
+import type { WyStackClient } from './client'
 
-/**
- * Create a WyStack client instance that manages the connection
- * to the server and local TanStack DB cache.
- */
-export function createWyStackClient(config: WyStackClientConfig) {
-  return {
-    url: config.url,
-    mode: config.mode ?? 'local-first',
-  }
+const WyStackContext = createContext<WyStackClient | null>(null)
+
+export function WyStackProvider(props: { client: WyStackClient; children: React.ReactNode }) {
+  return createElement(WyStackContext.Provider, { value: props.client }, props.children)
 }
 
-/**
- * React context provider. Wrap your app to enable useQuery/useMutation.
- * TODO: Implement as React context with TanStack QueryClientProvider
- */
-export function WyStackProvider(_props: { client: ReturnType<typeof createWyStackClient>; children: any }) {
-  // TODO: React context + QueryClientProvider
-  throw new Error('Not yet implemented')
+export function useWyStackClient(): WyStackClient {
+  const client = useContext(WyStackContext)
+  if (!client) throw new Error('useWyStackClient must be used within <WyStackProvider>')
+  return client
 }

@@ -1,7 +1,7 @@
 {
   "name": "@wystack/client",
   "version": "0.0.1",
-  "description": "React hooks, TanStack DB integration, and sync engine for WyStack",
+  "description": "React hooks and sync engine for WyStack",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,15 +17,17 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {
-    "@wystack/server": "workspace:*",
-    "@tanstack/react-query": "^5.90.0"
-  },
+  "dependencies": {},
   "peerDependencies": {
     "react": ">=19.0.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": ">=0.3.0",
     "@types/react": "^19.0.0",
+    "@wystack/db": "workspace:*",
+    "@wystack/server": "workspace:*",
+    "drizzle-orm": "^0.45.1",
+    "react": "^19.0.0",
     "typescript": "^5.8.3"
   }
 }

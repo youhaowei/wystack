@@ -1,7 +1,11 @@
 // @wystack/client
-// React hooks, TanStack DB integration, and sync engine
+// React hooks and sync engine for WyStack
 
-export { useQuery, useMutation } from './hooks'
-export { WyStackProvider, createWyStackClient } from './provider'
+export { createClient } from './client'
+export { WyStackProvider, useWyStackClient } from './provider'
+export { useWyQuery, useWyMutation } from './hooks'
+export { createWsManager } from './ws'
 
-export type { WyStackClientConfig, UseQueryResult } from './types'
+export type { WyStackClient } from './client'
+export type { WsManager } from './ws'
+export type { WyStackClientConfig, UseQueryResult, UseMutationResult } from './types'
