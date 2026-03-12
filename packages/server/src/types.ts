@@ -1,25 +1,28 @@
-import type { Db, DbConfig } from '@wystack/db'
+import type { TrackedDb, ColumnDef } from '@wystack/db'
 
 export interface FunctionContext {
-  db: Db
+  db: TrackedDb
+}
+
+/** Maps DSL ColumnDef types to TypeScript types for arg validation */
+export type InferArg<C> = C extends ColumnDef<infer T, any> ? T : never
+
+export type InferArgs<T extends Record<string, ColumnDef<any, any>>> = {
+  [K in keyof T]: InferArg<T[K]>
 }
 
 export interface QueryDef<TArgs = any, TReturn = any> {
   type: 'query'
   path: string
-  args: TArgs
+  args: Record<string, ColumnDef<any, any>>
   handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>
-  tablesRead: Set<string>
 }
 
 export interface MutationDef<TArgs = any, TReturn = any> {
   type: 'mutation'
   path: string
-  args: TArgs
+  args: Record<string, ColumnDef<any, any>>
   handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>
-  tablesWritten: Set<string>
 }
 
-export interface WyStackConfig {
-  db: DbConfig
-}
+export type FunctionDef = QueryDef | MutationDef

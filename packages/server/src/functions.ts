@@ -1,39 +1,30 @@
-import type { FunctionContext, QueryDef, MutationDef } from './types'
+import type { ColumnDef } from '@wystack/db'
+import type { FunctionContext, QueryDef, MutationDef, InferArgs } from './types'
 
-interface ArgSchema {
-  args: Record<string, string>
-}
-
-/**
- * Define a reactive query. The server tracks which tables this reads
- * and re-runs it when relevant mutations fire.
- */
-export function query<TArgs, TReturn>(
-  schema: { args: Record<string, string> },
-  handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>,
-): QueryDef<TArgs, TReturn> {
+export function query<TArgSchema extends Record<string, ColumnDef<any, any>>, TReturn>(
+  opts: {
+    args: TArgSchema
+    handler: (ctx: FunctionContext, args: InferArgs<TArgSchema>) => Promise<TReturn>
+  },
+): QueryDef<InferArgs<TArgSchema>, TReturn> {
   return {
     type: 'query',
-    path: '', // set by registry
-    args: {} as TArgs,
-    handler,
-    tablesRead: new Set(),
+    path: '',
+    args: opts.args,
+    handler: opts.handler,
   }
 }
 
-/**
- * Define a mutation. The server tracks which tables this writes to
- * and invalidates subscribed queries.
- */
-export function mutation<TArgs, TReturn>(
-  schema: { args: Record<string, string> },
-  handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>,
-): MutationDef<TArgs, TReturn> {
+export function mutation<TArgSchema extends Record<string, ColumnDef<any, any>>, TReturn>(
+  opts: {
+    args: TArgSchema
+    handler: (ctx: FunctionContext, args: InferArgs<TArgSchema>) => Promise<TReturn>
+  },
+): MutationDef<InferArgs<TArgSchema>, TReturn> {
   return {
     type: 'mutation',
-    path: '', // set by registry
-    args: {} as TArgs,
-    handler,
-    tablesWritten: new Set(),
+    path: '',
+    args: opts.args,
+    handler: opts.handler,
   }
 }

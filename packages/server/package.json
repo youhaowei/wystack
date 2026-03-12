@@ -18,10 +18,11 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@wystack/db": "workspace:*",
-    "hono": "^4.0.0"
+    "@wystack/db": "workspace:*"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.3.16",
+    "drizzle-orm": "^0.45.1",
     "typescript": "^5.8.3"
   }
 }
