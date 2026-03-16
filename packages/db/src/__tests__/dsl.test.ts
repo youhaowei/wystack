@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { text, int, boolean, timestamp, jsonb, ColumnDef } from '../dsl'
+import { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from '../dsl'
 
 describe('DSL column builders', () => {
   test('text creates a text column def', () => {
@@ -64,5 +64,45 @@ describe('DSL column builders', () => {
     expect(int.primaryKey()).toBeInstanceOf(ColumnDef)
     expect(text.unique()).toBeInstanceOf(ColumnDef)
     expect(text.default('x')).toBeInstanceOf(ColumnDef)
+  })
+
+  test('uuid creates a uuid column def', () => {
+    expect(uuid.opts.type).toBe('uuid')
+  })
+
+  test('.defaultRandom() sets isDefaultRandom', () => {
+    const col = uuid.primaryKey().defaultRandom()
+    expect(col.opts.isDefaultRandom).toBe(true)
+    expect(col.opts.hasDefault).toBe(true)
+    expect(col.opts.isPrimaryKey).toBe(true)
+  })
+
+  test('.defaultNow() sets isDefaultNow', () => {
+    const col = timestamp.defaultNow()
+    expect(col.opts.isDefaultNow).toBe(true)
+    expect(col.opts.hasDefault).toBe(true)
+  })
+
+  test('.references() sets ref options', () => {
+    const col = uuid.optional().references('users', 'id', 'cascade')
+    expect(col.opts.ref).toEqual({ table: 'users', column: 'id', onDelete: 'cascade' })
+    expect(col.opts.isOptional).toBe(true)
+  })
+
+  test('.references() defaults column to id', () => {
+    const col = uuid.references('users')
+    expect(col.opts.ref?.column).toBe('id')
+  })
+
+  test('.array() sets isArray', () => {
+    const col = text.array()
+    expect(col.opts.isArray).toBe(true)
+  })
+
+  test('uuid with full chain', () => {
+    const col = uuid.primaryKey().defaultRandom()
+    expect(col.opts.type).toBe('uuid')
+    expect(col.opts.isPrimaryKey).toBe(true)
+    expect(col.opts.isDefaultRandom).toBe(true)
   })
 })

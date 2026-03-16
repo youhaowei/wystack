@@ -4,10 +4,10 @@
 export { defineSchema } from './schema'
 export { createDb } from './driver'
 export { createTrackedDb, resetTracking } from './tracked-db'
-export { text, int, boolean, timestamp, jsonb, ColumnDef } from './dsl'
+export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
 
-export type { ColumnType, ColumnDefOptions, InferColumn, InferTable } from './dsl'
+export type { ColumnType, ColumnDefOptions, RefOptions, InferColumn, InferTable } from './dsl'
 export type { FilterOp, FilterDescriptor } from './operators'
 export type { TrackedDb, SelectBuilder, InsertBuilder } from './tracked-db'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'
