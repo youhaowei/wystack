@@ -5,6 +5,7 @@ export { query, mutation } from './functions'
 export { createWyStack } from './create'
 export { serve } from './transport'
 export { createSubscriptionManager } from './subscriptions'
+export { ValidationError } from './validation'
 
 export type { QueryDef, MutationDef, FunctionContext, FunctionDef, InferArgs, InferArg, DbInput } from './types'
 export type { WyStackApp } from './create'

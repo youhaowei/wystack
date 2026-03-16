@@ -1,7 +1,7 @@
-import type { ColumnDef } from '@wystack/db'
+import type { AnyColumnDef } from '@wystack/db'
 import type { FunctionContext, QueryDef, MutationDef, InferArgs } from './types'
 
-export function query<TArgSchema extends Record<string, ColumnDef<any, any>>, TReturn>(
+export function query<TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
   opts: {
     args: TArgSchema
     handler: (ctx: FunctionContext, args: InferArgs<TArgSchema>) => Promise<TReturn>
@@ -15,7 +15,7 @@ export function query<TArgSchema extends Record<string, ColumnDef<any, any>>, TR
   }
 }
 
-export function mutation<TArgSchema extends Record<string, ColumnDef<any, any>>, TReturn>(
+export function mutation<TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
   opts: {
     args: TArgSchema
     handler: (ctx: FunctionContext, args: InferArgs<TArgSchema>) => Promise<TReturn>
