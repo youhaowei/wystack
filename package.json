@@ -5,7 +5,9 @@
   "scripts": {
     "build": "bun run --filter '*' build",
     "dev": "bun run --filter '*' dev",
-    "lint": "bun run --filter '*' lint",
+    "lint": "oxlint packages/",
+    "format": "oxfmt packages/",
+    "format:check": "oxfmt --check packages/",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun run --filter '*' test"
   },
