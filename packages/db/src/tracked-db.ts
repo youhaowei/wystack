@@ -22,6 +22,9 @@ const drizzleOpMap = {
 export interface TrackedDb {
   tablesRead: Set<string>
   tablesWritten: Set<string>
+  /** Raw Drizzle instance for complex queries (joins, raw SQL). Caller must manually
+   *  record table reads/writes for reactive tracking to work. */
+  raw: DrizzleDb
   from<T extends AnyTable>(table: T): SelectBuilder<T>
   into<T extends AnyTable>(table: T): InsertBuilder<T>
 }
@@ -140,6 +143,7 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
   const tracker: TrackedDb = {
     tablesRead: new Set(),
     tablesWritten: new Set(),
+    raw: drizzleDb,
     from<T extends AnyTable>(table: T) {
       return new SelectBuilder(table, drizzleDb, tracker)
     },
