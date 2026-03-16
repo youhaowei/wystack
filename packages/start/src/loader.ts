@@ -13,12 +13,12 @@
 
 interface LoaderContext {
   queryClient: {
-    ensureQueryData: (opts: { queryKey: any[]; queryFn: () => Promise<any> }) => Promise<any>
+    ensureQueryData: (opts: { queryKey: unknown[]; queryFn: () => Promise<unknown> }) => Promise<unknown>
   }
-  [key: string]: any
+  [key: string]: unknown
 }
 
-export function wyLoader(path: string, args?: any) {
+export function wyLoader(path: string, args?: unknown) {
   const queryKey = args !== undefined
     ? ['wystack', path, args]
     : ['wystack', path]

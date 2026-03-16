@@ -14,13 +14,13 @@ export interface WyStartClient {
   url: string
   getToken: () => Promise<string | null> | string | null
   /** HTTP call to a WyStack function */
-  call: (path: string, args?: any) => Promise<any>
+  call: (path: string, args?: unknown) => Promise<unknown>
   /** WS connection for invalidation signals */
   ws: WebSocket | null
   connect: () => void
   disconnect: () => void
   /** Subscribe to invalidation signals for a function */
-  onInvalidate: (subId: string, path: string, args: any, callback: () => void) => void
+  onInvalidate: (subId: string, path: string, args: unknown, callback: () => void) => void
   offInvalidate: (subId: string) => void
 }
 
@@ -28,7 +28,7 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
   const baseUrl = config.url.replace(/\/$/, '')
   const getToken = config.getToken ?? (() => null)
   const invalidateHandlers = new Map<string, () => void>()
-  const activeSubs = new Map<string, { path: string; args: any }>()
+  const activeSubs = new Map<string, { path: string; args: unknown }>()
 
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -39,7 +39,7 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
     return token ? { Authorization: `Bearer ${token}` } : {}
   }
 
-  async function call(path: string, args: any = {}) {
+  async function call(path: string, args: unknown = {}) {
     const auth = await getAuthHeaders()
     const res = await fetch(`${baseUrl}/wystack/${path}`, {
       method: 'POST',
@@ -118,7 +118,7 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
     }
   }
 
-  function onInvalidate(subId: string, path: string, args: any, callback: () => void) {
+  function onInvalidate(subId: string, path: string, args: unknown, callback: () => void) {
     invalidateHandlers.set(subId, callback)
     activeSubs.set(subId, { path, args })
 

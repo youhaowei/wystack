@@ -11,9 +11,9 @@ function nextSubId() {
  * useWyQuery — subscribe to a reactive query via WebSocket.
  * Returns { data, isLoading, error } that auto-updates when data changes.
  */
-export function useWyQuery<TReturn = any>(
+export function useWyQuery<TReturn = unknown>(
   path: string,
-  args: any = {},
+  args: unknown = {},
 ): UseQueryResult<TReturn> {
   const client = useWyStackClient()
   const [data, setData] = useState<TReturn | undefined>(undefined)
@@ -25,13 +25,14 @@ export function useWyQuery<TReturn = any>(
     const subId = nextSubId()
     subIdRef.current = subId
 
-    client.ws.subscribe(subId, path, args, (msg) => {
+    client.ws.subscribe(subId, path, args, (raw) => {
+      const msg = raw as Record<string, unknown>
       if (msg.type === 'data') {
-        setData(msg.data)
+        setData(msg.data as TReturn)
         setIsLoading(false)
         setError(null)
       } else if (msg.type === 'error') {
-        setError(new Error(msg.error))
+        setError(new Error(msg.error as string))
         setIsLoading(false)
       }
     })
@@ -48,7 +49,7 @@ export function useWyQuery<TReturn = any>(
  * useWyMutation — HTTP POST mutation.
  * Returns { mutate, isLoading, error }.
  */
-export function useWyMutation<TArgs = any, TReturn = any>(
+export function useWyMutation<TArgs = unknown, TReturn = unknown>(
   path: string,
 ): UseMutationResult<TArgs, TReturn> {
   const client = useWyStackClient()
@@ -60,10 +61,11 @@ export function useWyMutation<TArgs = any, TReturn = any>(
     setError(null)
     try {
       const result = await client.call(path, args)
-      return result
-    } catch (err: any) {
-      setError(err)
-      throw err
+      return result as TReturn
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err))
+      setError(error)
+      throw error
     } finally {
       setIsLoading(false)
     }

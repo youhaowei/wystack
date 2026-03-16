@@ -3,12 +3,12 @@
  * reconnection, and dispatches messages to subscription handlers.
  */
 
-type MessageHandler = (data: any) => void
+type MessageHandler = (data: unknown) => void
 
 export interface WsManager {
   connect(): void
   disconnect(): void
-  subscribe(id: string, path: string, args: any, handler: MessageHandler): void
+  subscribe(id: string, path: string, args: unknown, handler: MessageHandler): void
   unsubscribe(id: string): void
   isConnected(): boolean
 }
@@ -19,7 +19,7 @@ export function createWsManager(url: string): WsManager {
   let reconnectAttempt = 0
   const maxReconnectDelay = 30000
   const handlers = new Map<string, MessageHandler>()
-  const activeSubs = new Map<string, { path: string; args: any }>()
+  const activeSubs = new Map<string, { path: string; args: unknown }>()
   let connected = false
 
   function scheduleReconnect() {
@@ -85,7 +85,7 @@ export function createWsManager(url: string): WsManager {
     }
   }
 
-  function subscribe(id: string, path: string, args: any, handler: MessageHandler) {
+  function subscribe(id: string, path: string, args: unknown, handler: MessageHandler) {
     handlers.set(id, handler)
     activeSubs.set(id, { path, args })
 

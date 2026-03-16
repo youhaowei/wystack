@@ -13,9 +13,9 @@ function nextSubId() {
  *
  * SSR flow: pair with wyLoader() in route loader for SSR hydration.
  */
-export function useWyQuery<T = any>(
+export function useWyQuery<T = unknown>(
   path: string,
-  args?: any,
+  args?: unknown,
 ): UseQueryResult<T> {
   const client = useWyStartClient()
   const queryClient = useQueryClient()
@@ -28,7 +28,7 @@ export function useWyQuery<T = any>(
   // HTTP fetch via React Query
   const query = useQuery<T>({
     queryKey,
-    queryFn: () => client.call(path, args),
+    queryFn: () => client.call(path, args) as Promise<T>,
   })
 
   // WS subscription for live invalidation
@@ -53,12 +53,12 @@ export function useWyQuery<T = any>(
  * Returns a standard React Query mutation result.
  * No manual invalidation needed — WS subscription handles it.
  */
-export function useWyMutation<TArgs = any, TReturn = any>(
+export function useWyMutation<TArgs = unknown, TReturn = unknown>(
   path: string,
 ): UseMutationResult<TReturn, Error, TArgs> {
   const client = useWyStartClient()
 
   return useMutation<TReturn, Error, TArgs>({
-    mutationFn: (args: TArgs) => client.call(path, args),
+    mutationFn: (args: TArgs) => client.call(path, args) as Promise<TReturn>,
   })
 }

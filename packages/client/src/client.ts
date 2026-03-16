@@ -10,7 +10,7 @@ export interface WyStackClient {
   wsUrl: string
   ws: WsManager
   /** HTTP call to a function */
-  call: (path: string, args?: any) => Promise<any>
+  call: (path: string, args?: unknown) => Promise<unknown>
 }
 
 export function createClient(config: WyStackClientConfig): WyStackClient {
@@ -23,7 +23,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     url: httpUrl,
     wsUrl,
     ws,
-    async call(path: string, args: any = {}) {
+    async call(path: string, args: unknown = {}) {
       const res = await fetch(`${httpUrl}/wystack/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

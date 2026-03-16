@@ -75,15 +75,17 @@ describe('WsManager', () => {
 
     // Subscribe and wait for confirmation
     await new Promise<void>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, (msg) => {
+      ws.subscribe('sub1', 'listTodos', {}, (raw) => {
+        const msg = raw as Record<string, unknown>
         if (msg.type === 'subscribed') resolve()
       })
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
     // Set up invalidation listener
-    const invalidation = new Promise<any>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, (msg) => {
+    const invalidation = new Promise<Record<string, unknown>>((resolve, reject) => {
+      ws.subscribe('sub1', 'listTodos', {}, (raw) => {
+        const msg = raw as Record<string, unknown>
         if (msg.type === 'invalidate') resolve(msg)
       })
       setTimeout(() => reject(new Error('timeout')), 5000)
