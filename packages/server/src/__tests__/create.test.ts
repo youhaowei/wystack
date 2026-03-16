@@ -57,8 +57,9 @@ describe('createWyStack', () => {
 
   test('call() executes a mutation and tracks writes', async () => {
     const { result, tablesWritten } = await app.call('addTodo', { title: 'Test' })
-    expect(result).toHaveLength(1)
-    expect(result[0].title).toBe('Test')
+    const rows = result as { title: string }[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0].title).toBe('Test')
     expect(tablesWritten.has('todos')).toBe(true)
   })
 

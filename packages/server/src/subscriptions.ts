@@ -6,7 +6,7 @@
 export interface Subscription {
   id: string
   functionPath: string
-  args: any
+  args: unknown
   tablesWatched: Set<string>
 }
 

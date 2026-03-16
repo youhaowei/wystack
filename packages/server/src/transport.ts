@@ -6,6 +6,11 @@
  */
 import type { WyStackApp } from './create'
 import type { ServerWebSocket } from 'bun'
+import { ValidationError } from './validation'
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
 
 interface ServeOptions {
   app: WyStackApp
@@ -13,12 +18,12 @@ interface ServeOptions {
   hostname?: string
   /** App-provided callback to build context from request (auth, tenant, etc.).
    *  WyStack never inspects the result — just passes it to function handlers. */
-  resolveContext?: (req: Request) => Promise<Record<string, any>>
+  resolveContext?: (req: Request) => Promise<Record<string, unknown>>
 }
 
 interface WsData {
   subscriptionIds: Set<string>
-  context: Record<string, any>
+  context: Record<string, unknown>
 }
 
 export function serve(opts: ServeOptions) {
@@ -42,10 +47,10 @@ export function serve(opts: ServeOptions) {
           const upgraded = server.upgrade(req, {
             data: { subscriptionIds: new Set<string>(), context },
           })
-          if (upgraded) return undefined as any
+          if (upgraded) return undefined as unknown as Response
           return new Response('WebSocket upgrade failed', { status: 400 })
-        } catch (err: any) {
-          return Response.json({ error: err.message }, { status: 401 })
+        } catch (err: unknown) {
+          return Response.json({ error: errorMessage(err) }, { status: 401 })
         }
       }
 
@@ -62,11 +67,11 @@ export function serve(opts: ServeOptions) {
       }
 
       // Resolve context per request
-      let context: Record<string, any>
+      let context: Record<string, unknown>
       try {
         context = await resolveContext(req)
-      } catch (err: any) {
-        return Response.json({ error: err.message }, { status: 401 })
+      } catch (err: unknown) {
+        return Response.json({ error: errorMessage(err) }, { status: 401 })
       }
 
       // GET: queries (cacheable, SSR-friendly)
@@ -76,8 +81,11 @@ export function serve(opts: ServeOptions) {
           const args = argsParam ? JSON.parse(argsParam) : {}
           const { result } = await app.call(functionPath, args, context)
           return Response.json({ data: result })
-        } catch (err: any) {
-          return Response.json({ error: err.message }, { status: 500 })
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return Response.json({ error: err.message, issues: err.issues }, { status: 400 })
+          }
+          return Response.json({ error: errorMessage(err) }, { status: 500 })
         }
       }
 
@@ -93,8 +101,11 @@ export function serve(opts: ServeOptions) {
           }
 
           return Response.json({ data: callResult.result })
-        } catch (err: any) {
-          return Response.json({ error: err.message }, { status: 500 })
+        } catch (err: unknown) {
+          if (err instanceof ValidationError) {
+            return Response.json({ error: err.message, issues: err.issues }, { status: 400 })
+          }
+          return Response.json({ error: errorMessage(err) }, { status: 500 })
         }
       }
 
@@ -107,11 +118,14 @@ export function serve(opts: ServeOptions) {
       },
 
       async message(ws, rawMessage) {
+        let msg: Record<string, unknown> | undefined
         try {
-          const msg = JSON.parse(String(rawMessage))
+          msg = JSON.parse(String(rawMessage))
 
-          if (msg.type === 'subscribe') {
-            const { id, path, args } = msg
+          if (msg?.type === 'subscribe') {
+            const id = msg.id as string
+            const path = msg.path as string
+            const args = (msg.args ?? {}) as Record<string, unknown>
             const fn = app.functions.get(path)
             if (!fn || fn.type !== 'query') {
               ws.send(JSON.stringify({ type: 'error', id, error: `Unknown query: ${path}` }))
@@ -119,13 +133,13 @@ export function serve(opts: ServeOptions) {
             }
 
             // Execute query with connection's auth context to discover table dependencies
-            const { tablesRead } = await app.call(path, args ?? {}, ws.data.context)
+            const { tablesRead } = await app.call(path, args, ws.data.context)
 
             // Register subscription
             app.subscriptions.add({
               id,
               functionPath: path,
-              args: args ?? {},
+              args,
               tablesWatched: tablesRead,
             })
             ws.data.subscriptionIds.add(id)
@@ -135,16 +149,20 @@ export function serve(opts: ServeOptions) {
             ws.send(JSON.stringify({ type: 'subscribed', id }))
           }
 
-          if (msg.type === 'unsubscribe') {
-            const sub = app.subscriptions.get(msg.id)
+          if (msg?.type === 'unsubscribe') {
+            const subId = msg.id as string
+            const sub = app.subscriptions.get(subId)
             if (sub) {
-              app.subscriptions.remove(msg.id)
-              ws.data.subscriptionIds.delete(msg.id)
-              subToWs.delete(msg.id)
+              app.subscriptions.remove(subId)
+              ws.data.subscriptionIds.delete(subId)
+              subToWs.delete(subId)
             }
           }
-        } catch (err: any) {
-          ws.send(JSON.stringify({ type: 'error', error: err.message }))
+        } catch (err: unknown) {
+          const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
+          if (err instanceof ValidationError) payload.issues = err.issues
+          if (msg?.id) payload.id = msg.id
+          ws.send(JSON.stringify(payload))
         }
       },
 
@@ -163,7 +181,7 @@ export function serve(opts: ServeOptions) {
 async function invalidateSubscriptions(
   app: WyStackApp,
   writtenTables: Set<string>,
-  subToWs: Map<string, ServerWebSocket<any>>,
+  subToWs: Map<string, ServerWebSocket<WsData>>,
 ) {
   const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
 
