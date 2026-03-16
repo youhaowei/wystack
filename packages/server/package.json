@@ -18,7 +18,8 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@wystack/db": "workspace:*"
+    "@wystack/db": "workspace:*",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.16",
