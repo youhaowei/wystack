@@ -1,7 +1,11 @@
-import type { TrackedDb, ColumnDef } from '@wystack/db'
+import type { TrackedDb, ColumnDef, DbConfig } from '@wystack/db'
 
+/** Function context passed to every query/mutation handler.
+ *  `db` is always provided by WyStack.
+ *  App-defined context (auth, tenant info) is merged in via createWyStack's generic. */
 export interface FunctionContext {
   db: TrackedDb
+  [key: string]: any
 }
 
 /** Maps DSL ColumnDef types to TypeScript types for arg validation */
@@ -26,3 +30,6 @@ export interface MutationDef<TArgs = any, TReturn = any> {
 }
 
 export type FunctionDef = QueryDef | MutationDef
+
+/** DB connection input — string URL, config object, or pre-built Drizzle instance (for tests) */
+export type DbInput = string | DbConfig | object

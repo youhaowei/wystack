@@ -15,6 +15,7 @@ const schema = defineSchema({
 
 let server: ReturnType<typeof serve>
 let wsUrl: string
+let baseUrl: string
 
 beforeEach(async () => {
   const pg = new PGlite()
@@ -27,8 +28,8 @@ beforeEach(async () => {
     )
   `)
 
-  const app = createWyStack({
-    drizzle: db,
+  const app = await createWyStack({
+    db,
     functions: {
       listTodos: query({
         args: {},
@@ -45,6 +46,7 @@ beforeEach(async () => {
 
   server = serve({ app, port: 0 })
   wsUrl = `ws://localhost:${server.port}/wystack/ws`
+  baseUrl = `http://localhost:${server.port}`
 })
 
 afterEach(() => {
@@ -63,48 +65,40 @@ describe('WsManager', () => {
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
-    expect(result.type).toBe('data')
-    expect(result.data).toEqual([])
+    expect(result.type).toBe('subscribed')
     ws.disconnect()
   })
 
-  test('receives updates after mutation', async () => {
+  test('receives invalidation after mutation', async () => {
     const ws = createWsManager(wsUrl)
     ws.connect()
 
-    // First subscribe and get initial data
-    const messages: any[] = []
+    // Subscribe and wait for confirmation
     await new Promise<void>((resolve, reject) => {
       ws.subscribe('sub1', 'listTodos', {}, (msg) => {
-        messages.push(msg)
-        if (messages.length === 1) resolve()
+        if (msg.type === 'subscribed') resolve()
       })
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
-    expect(messages[0].data).toEqual([])
+    // Set up invalidation listener
+    const invalidation = new Promise<any>((resolve, reject) => {
+      ws.subscribe('sub1', 'listTodos', {}, (msg) => {
+        if (msg.type === 'invalidate') resolve(msg)
+      })
+      setTimeout(() => reject(new Error('timeout')), 5000)
+    })
 
-    // Now mutate via HTTP
-    const baseUrl = `http://localhost:${server.port}`
+    // Mutate via HTTP
     await fetch(`${baseUrl}/wystack/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'From WS test' }),
     })
 
-    // Wait for the reactive update
-    await new Promise<void>((resolve, reject) => {
-      const check = () => {
-        if (messages.length >= 2) return resolve()
-        setTimeout(check, 50)
-      }
-      check()
-      setTimeout(() => reject(new Error('timeout waiting for update')), 5000)
-    })
-
-    expect(messages[1].type).toBe('data')
-    expect(messages[1].data).toHaveLength(1)
-    expect(messages[1].data[0].title).toBe('From WS test')
+    const msg = await invalidation
+    expect(msg.type).toBe('invalidate')
+    expect(msg.id).toBe('sub1')
 
     ws.disconnect()
   })

@@ -6,6 +6,6 @@ export { createWyStack } from './create'
 export { serve } from './transport'
 export { createSubscriptionManager } from './subscriptions'
 
-export type { QueryDef, MutationDef, FunctionContext, FunctionDef, InferArgs, InferArg } from './types'
+export type { QueryDef, MutationDef, FunctionContext, FunctionDef, InferArgs, InferArg, DbInput } from './types'
 export type { WyStackApp } from './create'
 export type { Subscription } from './subscriptions'

@@ -1,25 +1,43 @@
 /**
- * createWyStack — the main entry point that wires schema, functions,
- * and database together into a running app.
+ * createWyStack — the main entry point that wires DB, functions, and
+ * reactive subscriptions together into a running app.
  */
-import { createTrackedDb } from '@wystack/db'
-import type { FunctionDef, FunctionContext } from './types'
+import { createTrackedDb, createDb } from '@wystack/db'
+import type { DbConfig } from '@wystack/db'
+import type { FunctionDef, FunctionContext, DbInput } from './types'
 import { createSubscriptionManager } from './subscriptions'
-
-type DrizzleDb = Parameters<typeof createTrackedDb>[0]
 
 export interface WyStackApp {
   functions: Map<string, FunctionDef>
   subscriptions: ReturnType<typeof createSubscriptionManager>
-  call: (path: string, args: any) => Promise<{ result: any; tablesRead: Set<string>; tablesWritten: Set<string> }>
+  /** Internal dispatch — resolves DB, creates TrackedDb, runs handler with context */
+  call: (path: string, args: any, context?: Record<string, any>) => Promise<{
+    result: any
+    tablesRead: Set<string>
+    tablesWritten: Set<string>
+  }>
 }
 
-export function createWyStack(opts: {
-  drizzle: DrizzleDb
+function resolveDbConfig(db: DbInput): DbConfig | null {
+  if (typeof db === 'string') {
+    if (db.startsWith('pglite://')) return { dev: db }
+    return { url: db }
+  }
+  if ('dev' in db || 'prod' in db || 'url' in db) return db as DbConfig
+  return null // Pre-built Drizzle instance
+}
+
+export async function createWyStack(opts: {
+  db: DbInput
+  dialect?: 'postgres'
   functions: Record<string, FunctionDef>
-}): WyStackApp {
+}): Promise<WyStackApp> {
   const functions = new Map<string, FunctionDef>()
   const subscriptions = createSubscriptionManager()
+
+  // Resolve DB: either use createDb for config, or treat as raw Drizzle instance
+  const dbConfig = resolveDbConfig(opts.db)
+  const drizzleDb = dbConfig ? await createDb(dbConfig) : opts.db
 
   for (const [path, def] of Object.entries(opts.functions)) {
     def.path = path
@@ -30,13 +48,13 @@ export function createWyStack(opts: {
     functions,
     subscriptions,
 
-    async call(path: string, args: any) {
+    async call(path: string, args: any, context: Record<string, any> = {}) {
       const fn = functions.get(path)
       if (!fn) throw new Error(`Unknown function: ${path}`)
 
-      // Create a fresh TrackedDb per call to avoid race conditions
-      const tracked = createTrackedDb(opts.drizzle)
-      const ctx: FunctionContext = { db: tracked }
+      // Fresh TrackedDb per call — no shared mutable state
+      const tracked = createTrackedDb(drizzleDb)
+      const ctx: FunctionContext = { db: tracked, ...context }
       const result = await fn.handler(ctx, args)
 
       return {

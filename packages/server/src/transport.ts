@@ -1,6 +1,8 @@
 /**
- * Bun.serve() transport — HTTP for queries/mutations, WebSocket for subscriptions.
- * Reactive flow: mutation → TrackedDb records tables → find affected subs → re-run → send to owning ws.
+ * Bun.serve() transport — HTTP + WebSocket.
+ * - Queries: GET /wystack/:fn?args=... (cacheable, SSR-friendly)
+ * - Mutations: POST /wystack/:fn (with JSON body)
+ * - Subscriptions: WS /wystack/ws → receives invalidation signals
  */
 import type { WyStackApp } from './create'
 import type { ServerWebSocket } from 'bun'
@@ -9,14 +11,19 @@ interface ServeOptions {
   app: WyStackApp
   port?: number
   hostname?: string
+  /** App-provided callback to build context from request (auth, tenant, etc.).
+   *  WyStack never inspects the result — just passes it to function handlers. */
+  resolveContext?: (req: Request) => Promise<Record<string, any>>
 }
 
 interface WsData {
   subscriptionIds: Set<string>
+  context: Record<string, any>
 }
 
 export function serve(opts: ServeOptions) {
   const { app, port = 3000, hostname = '0.0.0.0' } = opts
+  const resolveContext = opts.resolveContext ?? (async () => ({}))
 
   // Map subscription ID → owning WebSocket for targeted message delivery
   const subToWs = new Map<string, ServerWebSocket<WsData>>()
@@ -28,29 +35,59 @@ export function serve(opts: ServeOptions) {
     async fetch(req, server) {
       const url = new URL(req.url)
 
-      // WebSocket upgrade
+      // WebSocket upgrade — resolve context at connection time
       if (url.pathname === '/wystack/ws') {
-        const upgraded = server.upgrade(req, {
-          data: { subscriptionIds: new Set<string>() },
-        })
-        if (upgraded) return undefined as any
-        return new Response('WebSocket upgrade failed', { status: 400 })
+        try {
+          const context = await resolveContext(req)
+          const upgraded = server.upgrade(req, {
+            data: { subscriptionIds: new Set<string>(), context },
+          })
+          if (upgraded) return undefined as any
+          return new Response('WebSocket upgrade failed', { status: 400 })
+        } catch (err: any) {
+          return Response.json({ error: err.message }, { status: 401 })
+        }
       }
 
-      // HTTP: POST /wystack/:functionName
-      if (req.method === 'POST' && url.pathname.startsWith('/wystack/')) {
-        const functionPath = url.pathname.replace('/wystack/', '')
-        const fn = app.functions.get(functionPath)
+      // Extract function path from /wystack/:functionName
+      if (!url.pathname.startsWith('/wystack/')) {
+        return new Response('Not found', { status: 404 })
+      }
 
-        if (!fn) {
-          return Response.json({ error: `Unknown function: ${functionPath}` }, { status: 404 })
+      const functionPath = url.pathname.replace('/wystack/', '')
+      const fn = app.functions.get(functionPath)
+
+      if (!fn) {
+        return Response.json({ error: `Unknown function: ${functionPath}` }, { status: 404 })
+      }
+
+      // Resolve context per request
+      let context: Record<string, any>
+      try {
+        context = await resolveContext(req)
+      } catch (err: any) {
+        return Response.json({ error: err.message }, { status: 401 })
+      }
+
+      // GET: queries (cacheable, SSR-friendly)
+      if (req.method === 'GET' && fn.type === 'query') {
+        try {
+          const argsParam = url.searchParams.get('args')
+          const args = argsParam ? JSON.parse(argsParam) : {}
+          const { result } = await app.call(functionPath, args, context)
+          return Response.json({ data: result })
+        } catch (err: any) {
+          return Response.json({ error: err.message }, { status: 500 })
         }
+      }
 
+      // POST: mutations (and queries for backward compat)
+      if (req.method === 'POST') {
         try {
           const body = await req.json().catch(() => ({}))
-          const callResult = await app.call(functionPath, body)
+          const callResult = await app.call(functionPath, body, context)
 
-          // If mutation wrote tables, invalidate subscriptions
+          // If mutation wrote tables, send invalidation to affected WS subscribers
           if (fn.type === 'mutation' && callResult.tablesWritten.size > 0) {
             await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
           }
@@ -61,12 +98,12 @@ export function serve(opts: ServeOptions) {
         }
       }
 
-      return new Response('Not found', { status: 404 })
+      return new Response('Method not allowed', { status: 405 })
     },
 
     websocket: {
       open(_ws) {
-        // Client sends subscribe messages after connecting
+        // Context already resolved during upgrade
       },
 
       async message(ws, rawMessage) {
@@ -81,10 +118,10 @@ export function serve(opts: ServeOptions) {
               return
             }
 
-            // Execute query and track which tables it reads
-            const { result, tablesRead } = await app.call(path, args ?? {})
+            // Execute query with connection's auth context to discover table dependencies
+            const { tablesRead } = await app.call(path, args ?? {}, ws.data.context)
 
-            // Register subscription with ownership tracking
+            // Register subscription
             app.subscriptions.add({
               id,
               functionPath: path,
@@ -94,8 +131,8 @@ export function serve(opts: ServeOptions) {
             ws.data.subscriptionIds.add(id)
             subToWs.set(id, ws)
 
-            // Send initial result
-            ws.send(JSON.stringify({ type: 'data', id, data: result }))
+            // Confirm subscription (client fetches initial data via HTTP)
+            ws.send(JSON.stringify({ type: 'subscribed', id }))
           }
 
           if (msg.type === 'unsubscribe') {
@@ -112,7 +149,6 @@ export function serve(opts: ServeOptions) {
       },
 
       close(ws) {
-        // Clean up all subscriptions owned by this socket
         for (const id of ws.data.subscriptionIds) {
           app.subscriptions.remove(id)
           subToWs.delete(id)
@@ -131,21 +167,19 @@ async function invalidateSubscriptions(
 ) {
   const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
 
-  // Deduplicate — each subscription gets exactly one re-query + send
   for (const sub of affected) {
     const ws = subToWs.get(sub.id)
     if (!ws) continue
 
+    // Re-run query to update table dependencies (tables watched may change)
     try {
-      const { result, tablesRead } = await app.call(sub.functionPath, sub.args)
-
-      // Update watched tables in case query now reads different tables
+      const { tablesRead } = await app.call(sub.functionPath, sub.args, ws.data.context)
       sub.tablesWatched = tablesRead
-
-      // Send directly to the owning WebSocket
-      ws.send(JSON.stringify({ type: 'data', id: sub.id, data: result }))
-    } catch (err: any) {
-      ws.send(JSON.stringify({ type: 'error', id: sub.id, error: err.message }))
+    } catch {
+      // If re-query fails, keep existing table watches
     }
+
+    // Send invalidation signal — client refetches via HTTP
+    ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
   }
 }

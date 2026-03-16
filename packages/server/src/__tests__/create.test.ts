@@ -13,7 +13,7 @@ const schema = defineSchema({
   },
 })
 
-let app: ReturnType<typeof createWyStack>
+let app: Awaited<ReturnType<typeof createWyStack>>
 
 beforeEach(async () => {
   const pg = new PGlite()
@@ -26,8 +26,8 @@ beforeEach(async () => {
     )
   `)
 
-  app = createWyStack({
-    drizzle: db,
+  app = await createWyStack({
+    db,
     functions: {
       listTodos: query({
         args: {},
