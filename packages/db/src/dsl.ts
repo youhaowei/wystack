@@ -90,6 +90,11 @@ export const timestamp = col<Date>('timestamp')
 export const jsonb = col<unknown>('jsonb')
 export const uuid = col<string>('uuid')
 
+/** Wildcard type for ColumnDef in generic constraints where type params don't matter.
+ *  Uses `any` because TypeScript's `extends` constraint + `infer` require it for correct inference. */
+// oxlint-disable-next-line typescript/no-explicit-any
+export type AnyColumnDef = ColumnDef<any, any>
+
 /** Infer the TypeScript type for a column: optional columns become T | undefined */
 export type InferColumn<C> = C extends ColumnDef<infer T, infer Opt>
   ? Opt extends true ? T | undefined : T

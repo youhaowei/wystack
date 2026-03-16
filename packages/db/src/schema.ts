@@ -11,11 +11,13 @@ import {
   jsonb as pgJsonb,
   uuid as pgUuid,
 } from 'drizzle-orm/pg-core'
-import type { ColumnDef, ColumnDefOptions } from './dsl'
+import type { AnyColumnDef, ColumnDefOptions } from './dsl'
 
-type TableDefs = Record<string, Record<string, ColumnDef<any, any>>>
+type TableDefs = Record<string, Record<string, AnyColumnDef>>
 
+// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
 function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<string, any>) {
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builder types vary per column type; no common base type
   let col: any
   const isSerial = opts.type === 'int' && opts.isPrimaryKey
 
@@ -75,7 +77,7 @@ function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<str
   if (opts.ref) {
     const refTable = allTables[opts.ref.table]
     if (refTable) {
-      const refOpts: Record<string, any> = {}
+      const refOpts: Record<string, unknown> = {}
       if (opts.ref.onDelete) refOpts.onDelete = opts.ref.onDelete
       col = col.references(() => refTable[opts.ref!.column], refOpts)
     }
@@ -85,9 +87,11 @@ function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<str
 }
 
 export function defineSchema<T extends TableDefs>(tables: T) {
+  // oxlint-disable-next-line typescript/no-explicit-any -- accumulates Drizzle pgTable objects passed to buildColumn for references
   const result: Record<string, any> = {}
 
   for (const [tableName, columns] of Object.entries(tables)) {
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
     const colDefs: Record<string, any> = {}
     for (const [colName, colDef] of Object.entries(columns)) {
       colDefs[colName] = buildColumn(colName, colDef.opts, result)

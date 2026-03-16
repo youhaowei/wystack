@@ -7,7 +7,9 @@ import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import { getTableName, getTableColumns } from 'drizzle-orm'
 
+// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle DB instance type varies by driver; no common typed interface
 type DrizzleDb = any
+// oxlint-disable-next-line typescript/no-explicit-any -- PgTableWithColumns requires a config generic; any is needed for polymorphic table usage
 type AnyTable = PgTableWithColumns<any>
 
 const drizzleOpMap = {
@@ -62,6 +64,7 @@ export class SelectBuilder<T extends AnyTable> {
   }
 
   private _buildConditions() {
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     return this._filters.map(f => {
       const col = columns[f.column]
@@ -80,7 +83,8 @@ export class SelectBuilder<T extends AnyTable> {
     }
 
     if (this._orderByCol) {
-      const columns = getTableColumns(this._table) as Record<string, any>
+      // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const columns = getTableColumns(this._table) as Record<string, any>
       const col = columns[this._orderByCol]
       if (col) {
         q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
