@@ -62,7 +62,7 @@ describe('Version', () => {
   })
 
   test('toString returns raw string', () => {
-    expect(new Version('1.2.3').toString()).toBe('1.2.3')
+    expect(String(new Version('1.2.3'))).toBe('1.2.3')
   })
 
   test('compares across Version instances and strings', () => {
@@ -71,6 +71,61 @@ describe('Version', () => {
     expect(a.lt(b)).toBe(true)
     expect(a.lt(semver('2.0.0'))).toBe(true)
     expect(a.lt('2.0.0')).toBe(true)
+  })
+
+  // Pre-release support
+  test('parses pre-release segment', () => {
+    const v = new Version('1.0.0-rc.1')
+    expect(v.major).toBe(1)
+    expect(v.minor).toBe(0)
+    expect(v.patch).toBe(0)
+    expect(v.prerelease).toBe('rc.1')
+  })
+
+  test('release has no prerelease', () => {
+    expect(new Version('1.0.0').prerelease).toBeUndefined()
+  })
+
+  test('prerelease is less than release (semver §11)', () => {
+    const rc = new Version('1.0.0-rc.1')
+    const release = new Version('1.0.0')
+    expect(rc.lt(release)).toBe(true)
+    expect(release.gt(rc)).toBe(true)
+  })
+
+  test('rc.1 < rc.2 < release', () => {
+    const rc1 = new Version('0.4.0-rc.1')
+    const rc2 = new Version('0.4.0-rc.2')
+    const release = new Version('0.4.0')
+    expect(rc1.lt(rc2)).toBe(true)
+    expect(rc2.lt(release)).toBe(true)
+    expect(rc1.lt(release)).toBe(true)
+  })
+
+  test('prerelease diff detection', () => {
+    expect(new Version('1.0.0-rc.1').diff('1.0.0')).toBe('prerelease')
+    expect(new Version('1.0.0-rc.1').diff('1.0.0-rc.2')).toBe('prerelease')
+    expect(new Version('1.0.0-rc.1').diff('1.0.0-rc.1')).toBeNull()
+  })
+
+  test('alpha < beta < rc (lexicographic)', () => {
+    expect(new Version('1.0.0-alpha').lt('1.0.0-beta')).toBe(true)
+    expect(new Version('1.0.0-beta').lt('1.0.0-rc.1')).toBe(true)
+  })
+
+  test('numeric prerelease segments compared as numbers', () => {
+    // "rc.9" < "rc.10" (numeric, not lexicographic)
+    expect(new Version('1.0.0-rc.9').lt('1.0.0-rc.10')).toBe(true)
+  })
+
+  test('eq works for prerelease versions', () => {
+    expect(new Version('1.0.0-rc.1').eq('1.0.0-rc.1')).toBe(true)
+    expect(new Version('1.0.0-rc.1').eq('1.0.0-rc.2')).toBe(false)
+    expect(new Version('1.0.0-rc.1').eq('1.0.0')).toBe(false)
+  })
+
+  test('toString includes prerelease', () => {
+    expect(String(new Version('1.0.0-rc.3'))).toBe('1.0.0-rc.3')
   })
 })
 
@@ -198,6 +253,40 @@ describe('SchemaVersion', () => {
     expect(schema.hasBreakingChangesSince(semver('1.0.0'))).toBe(true)
     expect(schema.hasBreakingChangesSince(semver('1.1.0'))).toBe(true)
     expect(schema.hasBreakingChangesSince(semver('2.0.0'))).toBe(false)
+  })
+
+  test('detects prerelease-to-release staleness', () => {
+    const schema = new SchemaVersion({
+      current: semver('0.4.0'),
+      changelog: [
+        { version: semver('0.4.0'), date: isoFrom('2026-03-19'), description: 'Org-scoped artifacts', breaking: false },
+      ],
+    })
+    const result = schema.checkStaleness({
+      schemaVersion: semver('0.4.0-rc.2'),
+      versionedAt: isoFrom(new Date()),
+    })
+    expect(result.stale).toBe(true)
+    if (result.stale) {
+      expect(result.reason).toBe('version_prerelease')
+      expect(result.diff).toBe('prerelease')
+    }
+  })
+
+  test('changesSince works with RC versions', () => {
+    const schema = new SchemaVersion({
+      current: semver('0.4.0'),
+      changelog: [
+        { version: semver('0.4.0-rc.1'), date: isoFrom('2026-03-17'), description: 'Extract plans', breaking: false },
+        { version: semver('0.4.0-rc.2'), date: isoFrom('2026-03-18'), description: 'Add orgId', breaking: false },
+        { version: semver('0.4.0'), date: isoFrom('2026-03-19'), description: 'Org-scoped artifacts', breaking: false },
+      ],
+    })
+    // Session at rc.1 should see rc.2 and release
+    const changes = schema.changesSince(semver('0.4.0-rc.1'))
+    expect(changes).toHaveLength(2)
+    expect(String(changes[0].version)).toBe('0.4.0-rc.2')
+    expect(String(changes[1].version)).toBe('0.4.0')
   })
 
   test('checkStaleness accepts now override for deterministic tests', () => {
