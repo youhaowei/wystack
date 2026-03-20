@@ -15,5 +15,6 @@
     "jsx": "react-jsx",
     "outDir": "dist",
     "rootDir": "src"
-  }
+  },
+  "exclude": ["**/dist", "**/__tests__"]
 }
