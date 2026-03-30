@@ -42,4 +42,4 @@ Full design: https://www.notion.so/320d48ccaf5481ca9e05c5eede6d5e4b
 
 - WorkHub — TanStack Start (migrating from raw Drizzle/PGlite)
 - DashFrame — Migrating from Next.js + Dexie
-- Workforce — Tauri desktop
+- Workforce — Electron desktop
