@@ -33,7 +33,3 @@ bun run build        # build all packages
 bun run typecheck    # typecheck all packages
 bun run test         # test all packages
 ```
-
-## Design Doc
-
-Full design: https://www.notion.so/320d48ccaf5481ca9e05c5eede6d5e4b
