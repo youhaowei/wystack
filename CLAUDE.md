@@ -25,6 +25,10 @@ Three core packages with a clean dependency chain:
 - **Client state**: TanStack DB + TanStack Query
 - **Monorepo**: Bun workspaces
 
+## Design
+
+See [DESIGN.md](./DESIGN.md) for the full framework design — architecture, DX, deployment modes, and implementation phases.
+
 ## Commands
 
 ```bash
