@@ -28,14 +28,6 @@ export interface RouteOptions {
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
 }
 
-/**
- * Create Hono routes for a WyStack app.
- *
- * Usage:
- *   const routes = createRoutes({ app }, upgradeWebSocket)
- *   honoApp.route('/', routes)            // embedded mount
- *   Bun.serve({ fetch: routes.fetch })    // standalone
- */
 export function createRoutes(
   opts: RouteOptions,
   upgradeWebSocket: UpgradeWebSocket,
@@ -46,12 +38,10 @@ export function createRoutes(
   const hono = new Hono()
 
   // --- Subscription tracking ---
-  // Map subscription ID → WSContext (for sending invalidation)
   const subToWs = new Map<string, WSContext>()
-  // Map raw platform socket → set of subscription IDs (for cleanup on close)
-  // Needed because Hono creates a new WSContext wrapper per event callback.
+  // ws.raw (platform socket) → subscription IDs. Needed because Hono
+  // creates a new WSContext wrapper per event — can't use === across events.
   const rawToSubIds = new Map<unknown, Set<string>>()
-  // Map raw platform socket → auth context resolved at upgrade time
   const rawToContext = new Map<unknown, Record<string, unknown>>()
 
   function addSub(id: string, ws: WSContext): void {
@@ -85,10 +75,8 @@ export function createRoutes(
   hono.get(
     `${prefix}/ws`,
     async (c, next) => {
-      // Resolve auth context before upgrade — reject unauthenticated requests
       try {
         const context = await resolveContext(c.req.raw)
-        // Stash context on a per-request basis; the upgrade handler picks it up
         c.set('wsContext' as never, context as never)
       } catch (err: unknown) {
         return c.json({ error: errorMessage(err) }, 401)
@@ -98,7 +86,6 @@ export function createRoutes(
     upgradeWebSocket((c) => {
       return {
         onOpen(_evt, ws) {
-          // Transfer context from middleware to raw socket map
           const context = c.get('wsContext' as never) as Record<string, unknown>
           rawToContext.set(ws.raw, context ?? {})
         },
@@ -120,12 +107,15 @@ export function createRoutes(
                 return
               }
 
-              // Execute query to discover table dependencies
               app.call(path, args, context).then(({ tablesRead }) => {
+                // Guard: socket may have closed while query was in-flight
+                if (!rawToContext.has(ws.raw)) return
+
                 app.subscriptions.add({
                   id,
                   functionPath: path,
                   args,
+                  context,
                   tablesWatched: tablesRead,
                 })
                 addSub(id, ws)
@@ -167,6 +157,10 @@ export function createRoutes(
       return c.json({ error: `Unknown function: ${functionPath}` }, 404)
     }
 
+    if (fn.type !== 'query') {
+      return c.json({ error: `${functionPath} is a mutation — use POST` }, 405)
+    }
+
     let context: Record<string, unknown>
     try {
       context = await resolveContext(c.req.raw)
@@ -174,21 +168,17 @@ export function createRoutes(
       return c.json({ error: errorMessage(err) }, 401)
     }
 
-    if (fn.type === 'query') {
-      try {
-        const argsParam = c.req.query('args')
-        const args = argsParam ? JSON.parse(argsParam) : {}
-        const { result } = await app.call(functionPath, args, context)
-        return c.json({ data: result })
-      } catch (err: unknown) {
-        if (err instanceof ValidationError) {
-          return c.json({ error: err.message, issues: err.issues }, 400)
-        }
-        return c.json({ error: errorMessage(err) }, 500)
+    try {
+      const argsParam = c.req.query('args')
+      const args = argsParam ? JSON.parse(argsParam) : {}
+      const { result } = await app.call(functionPath, args, context)
+      return c.json({ data: result })
+    } catch (err: unknown) {
+      if (err instanceof ValidationError) {
+        return c.json({ error: err.message, issues: err.issues }, 400)
       }
+      return c.json({ error: errorMessage(err) }, 500)
     }
-
-    return c.json({ error: `Unknown function: ${functionPath}` }, 404)
   })
 
   // --- HTTP: mutations (POST) ---
@@ -211,7 +201,6 @@ export function createRoutes(
       const body = await c.req.json().catch(() => ({}))
       const callResult = await app.call(functionPath, body, context)
 
-      // If mutation wrote tables, send invalidation to affected WS subscribers
       if (fn.type === 'mutation' && callResult.tablesWritten.size > 0) {
         await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
       }
@@ -235,18 +224,18 @@ async function invalidateSubscriptions(
 ) {
   const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
 
-  for (const sub of affected) {
+  await Promise.allSettled(affected.map(async (sub) => {
     const ws = subToWs.get(sub.id)
-    if (!ws) continue
+    if (!ws) return
 
     // Re-run query to update table dependencies (tables watched may change)
     try {
-      const { tablesRead } = await app.call(sub.functionPath, sub.args)
+      const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
       sub.tablesWatched = tablesRead
     } catch {
-      // If re-query fails, keep existing table watches
+      // Keep existing table watches — client will see the error on refetch
     }
 
     ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
-  }
+  }))
 }

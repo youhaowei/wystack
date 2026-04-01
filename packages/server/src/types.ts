@@ -36,3 +36,8 @@ export type FunctionDef = QueryDef | MutationDef
 
 /** DB connection input — string URL, config object, or pre-built Drizzle instance (for tests) */
 export type DbInput = string | DbConfig | object
+
+export interface WyStackServer {
+  port: number
+  stop(immediate?: boolean): void
+}

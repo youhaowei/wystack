@@ -8,21 +8,16 @@ import { Hono } from 'hono'
 import { serve as nodeServe } from '@hono/node-server'
 import { createNodeWebSocket } from '@hono/node-ws'
 import { createRoutes, type RouteOptions } from './routes'
+import type { WyStackServer } from './types'
 
 interface NodeServeOptions extends RouteOptions {
   port?: number
   hostname?: string
 }
 
-export interface WyStackServer {
-  port: number
-  stop(immediate?: boolean): void
-}
-
 export function serve(opts: NodeServeOptions): WyStackServer {
   const { port = 3000, hostname = '0.0.0.0' } = opts
 
-  // Node adapter requires the Hono app at construction time
   const nodeApp = new Hono()
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app: nodeApp })
 
