@@ -53,14 +53,14 @@ afterEach(() => {
 })
 
 describe('HTTP transport', () => {
-  test('GET /wystack/listTodos returns empty array', async () => {
-    const res = await fetch(`${baseUrl}/wystack/listTodos`)
+  test('GET /api/listTodos returns empty array', async () => {
+    const res = await fetch(`${baseUrl}/api/listTodos`)
     const json = await res.json()
     expect(json.data).toEqual([])
   })
 
-  test('POST /wystack/addTodo creates a todo', async () => {
-    const res = await fetch(`${baseUrl}/wystack/addTodo`, {
+  test('POST /api/addTodo creates a todo', async () => {
+    const res = await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'Test todo' }),
@@ -70,8 +70,8 @@ describe('HTTP transport', () => {
     expect(json.data[0].title).toBe('Test todo')
   })
 
-  test('POST /wystack/unknown returns 404', async () => {
-    const res = await fetch(`${baseUrl}/wystack/unknown`, { method: 'POST' })
+  test('POST /api/unknown returns 404', async () => {
+    const res = await fetch(`${baseUrl}/api/unknown`, { method: 'POST' })
     expect(res.status).toBe(404)
   })
 
@@ -81,13 +81,13 @@ describe('HTTP transport', () => {
   })
 
   test('GET query with args', async () => {
-    await fetch(`${baseUrl}/wystack/addTodo`, {
+    await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'Hello' }),
     })
 
-    const res = await fetch(`${baseUrl}/wystack/listTodos`)
+    const res = await fetch(`${baseUrl}/api/listTodos`)
     const json = await res.json()
     expect(json.data).toHaveLength(1)
     expect(json.data[0].title).toBe('Hello')
@@ -120,11 +120,11 @@ describe('HTTP transport', () => {
 
     try {
       // Without token → 401
-      const noAuth = await fetch(`http://localhost:${authServer.port}/wystack/whoami`)
+      const noAuth = await fetch(`http://localhost:${authServer.port}/api/whoami`)
       expect(noAuth.status).toBe(401)
 
       // With token → context passed through
-      const withAuth = await fetch(`http://localhost:${authServer.port}/wystack/whoami`, {
+      const withAuth = await fetch(`http://localhost:${authServer.port}/api/whoami`, {
         headers: { Authorization: 'Bearer user_123' },
       })
       const json = await withAuth.json()
@@ -137,7 +137,7 @@ describe('HTTP transport', () => {
 
 describe('WebSocket transport', () => {
   test('subscribe returns confirmation', async () => {
-    const ws = new WebSocket(`ws://localhost:${server.port}/wystack/ws`)
+    const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
 
     const result = await new Promise<any>((resolve, reject) => {
       ws.onopen = () => {
@@ -156,7 +156,7 @@ describe('WebSocket transport', () => {
   })
 
   test('mutation sends invalidation signal to subscriber', async () => {
-    const ws = new WebSocket(`ws://localhost:${server.port}/wystack/ws`)
+    const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
 
     // Subscribe first
     await new Promise<void>((resolve, reject) => {
@@ -177,7 +177,7 @@ describe('WebSocket transport', () => {
       setTimeout(() => reject(new Error('timeout waiting for invalidation')), 5000)
     })
 
-    await fetch(`${baseUrl}/wystack/addTodo`, {
+    await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'triggers invalidation' }),
@@ -191,7 +191,7 @@ describe('WebSocket transport', () => {
   })
 
   test('subscribe to unknown query returns error', async () => {
-    const ws = new WebSocket(`ws://localhost:${server.port}/wystack/ws`)
+    const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
 
     const result = await new Promise<any>((resolve, reject) => {
       ws.onopen = () => {
@@ -232,7 +232,7 @@ describe('WebSocket transport', () => {
 
     try {
       // Without token → HTTP 401 on upgrade
-      const res = await fetch(`http://localhost:${authServer.port}/wystack/ws`)
+      const res = await fetch(`http://localhost:${authServer.port}/api/ws`)
       expect(res.status).toBe(401)
     } finally {
       authServer.stop(true)

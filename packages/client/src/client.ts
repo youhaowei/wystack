@@ -15,7 +15,7 @@ export interface WyStackClient {
 
 export function createClient(config: WyStackClientConfig): WyStackClient {
   const httpUrl = config.url.replace(/\/$/, '')
-  const wsUrl = httpUrl.replace(/^http/, 'ws') + '/wystack/ws'
+  const wsUrl = httpUrl.replace(/^http/, 'ws') + '/ws'
   const ws = createWsManager(wsUrl)
   ws.connect()
 
@@ -24,7 +24,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     wsUrl,
     ws,
     async call(path: string, args: unknown = {}) {
-      const res = await fetch(`${httpUrl}/wystack/${path}`, {
+      const res = await fetch(`${httpUrl}/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(args),

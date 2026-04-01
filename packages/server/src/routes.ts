@@ -1,10 +1,10 @@
 /**
  * Hono route definitions for WyStack transport.
  *
- * Routes:
- *   GET  /wystack/:fn?args=...  — queries (cacheable, SSR-friendly)
- *   POST /wystack/:fn           — mutations (JSON body)
- *   WS   /wystack/ws            — subscribe/unsubscribe/invalidation
+ * Routes (default prefix /api):
+ *   GET  /api/:fn?args=...  — queries (cacheable, SSR-friendly)
+ *   POST /api/:fn           — mutations (JSON body)
+ *   WS   /api/ws            — subscribe/unsubscribe/invalidation
  *
  * Runtime-agnostic: each entrypoint (serve-bun, serve-node) provides its own
  * `upgradeWebSocket` adapter. The shared protocol is identical.
@@ -23,6 +23,8 @@ function errorMessage(err: unknown): string {
 
 export interface RouteOptions {
   app: WyStackApp
+  /** URL prefix for all routes. Default: '/api' */
+  prefix?: string
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
 }
 
@@ -38,7 +40,7 @@ export function createRoutes(
   opts: RouteOptions,
   upgradeWebSocket: UpgradeWebSocket,
 ) {
-  const { app } = opts
+  const { app, prefix = '/api' } = opts
   const resolveContext = opts.resolveContext ?? (async () => ({}))
 
   const hono = new Hono()
@@ -79,9 +81,9 @@ export function createRoutes(
     rawToContext.delete(ws.raw)
   }
 
-  // --- WebSocket (registered before /wystack/:fn to avoid param catch) ---
+  // --- WebSocket (registered before /:fn to avoid param catch) ---
   hono.get(
-    '/wystack/ws',
+    `${prefix}/ws`,
     async (c, next) => {
       // Resolve auth context before upgrade — reject unauthenticated requests
       try {
@@ -157,7 +159,7 @@ export function createRoutes(
   )
 
   // --- HTTP: queries (GET) ---
-  hono.get('/wystack/:fn', async (c) => {
+  hono.get(`${prefix}/:fn`, async (c) => {
     const functionPath = c.req.param('fn')
     const fn = app.functions.get(functionPath)
 
@@ -190,7 +192,7 @@ export function createRoutes(
   })
 
   // --- HTTP: mutations (POST) ---
-  hono.post('/wystack/:fn', async (c) => {
+  hono.post(`${prefix}/:fn`, async (c) => {
     const functionPath = c.req.param('fn')
     const fn = app.functions.get(functionPath)
 

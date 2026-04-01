@@ -67,7 +67,7 @@ afterEach(() => {
 
 describe('E2E: full reactive lifecycle', () => {
   test('subscribe → mutate → receive invalidation → refetch → mutate again → second invalidation', async () => {
-    const wsUrl = `ws://localhost:${server.port}/wystack/ws`
+    const wsUrl = `ws://localhost:${server.port}/api/ws`
     const ws = new WebSocket(wsUrl)
 
     // 1. Subscribe via WebSocket
@@ -84,7 +84,7 @@ describe('E2E: full reactive lifecycle', () => {
     })
 
     // 2. Verify initial state via HTTP GET
-    const initialRes = await fetch(`${baseUrl}/wystack/listTodos`)
+    const initialRes = await fetch(`${baseUrl}/api/listTodos`)
     const initialJson = await initialRes.json()
     expect(initialJson.data).toEqual([])
 
@@ -94,7 +94,7 @@ describe('E2E: full reactive lifecycle', () => {
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
-    const addRes = await fetch(`${baseUrl}/wystack/addTodo`, {
+    const addRes = await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'Buy groceries' }),
@@ -110,7 +110,7 @@ describe('E2E: full reactive lifecycle', () => {
     expect(inv1.id).toBe('e2e-sub')
 
     // 5. Refetch via HTTP GET (like React Query would)
-    const refetch1 = await fetch(`${baseUrl}/wystack/listTodos`)
+    const refetch1 = await fetch(`${baseUrl}/api/listTodos`)
     const refetch1Json = await refetch1.json()
     expect(refetch1Json.data).toHaveLength(1)
     expect(refetch1Json.data[0].title).toBe('Buy groceries')
@@ -122,7 +122,7 @@ describe('E2E: full reactive lifecycle', () => {
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
-    await fetch(`${baseUrl}/wystack/toggleTodo`, {
+    await fetch(`${baseUrl}/api/toggleTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: todoId }),
@@ -134,7 +134,7 @@ describe('E2E: full reactive lifecycle', () => {
     expect(inv2.id).toBe('e2e-sub')
 
     // 8. Refetch shows updated data
-    const refetch2 = await fetch(`${baseUrl}/wystack/listTodos`)
+    const refetch2 = await fetch(`${baseUrl}/api/listTodos`)
     const refetch2Json = await refetch2.json()
     expect(refetch2Json.data).toHaveLength(1)
     expect(refetch2Json.data[0].done).toBe(true)
@@ -166,7 +166,7 @@ describe('E2E: full reactive lifecycle', () => {
     })
 
     try {
-      const res = await fetch(`http://localhost:${authServer.port}/wystack/getContext`)
+      const res = await fetch(`http://localhost:${authServer.port}/api/getContext`)
       const json = await res.json()
       expect(json.data.orgId).toBe('org_abc')
       expect(json.data.userId).toBe('usr_123')
