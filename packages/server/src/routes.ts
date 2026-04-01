@@ -168,9 +168,14 @@ export function createRoutes(
       return c.json({ error: errorMessage(err) }, 401)
     }
 
+    const argsParam = c.req.query('args')
+    let args: unknown = {}
+    if (argsParam) {
+      try { args = JSON.parse(argsParam) }
+      catch { return c.json({ error: 'Invalid JSON in args parameter' }, 400) }
+    }
+
     try {
-      const argsParam = c.req.query('args')
-      const args = argsParam ? JSON.parse(argsParam) : {}
       const { result } = await app.call(functionPath, args, context)
       return c.json({ data: result })
     } catch (err: unknown) {
@@ -197,8 +202,16 @@ export function createRoutes(
       return c.json({ error: errorMessage(err) }, 401)
     }
 
+    let body: unknown = {}
     try {
-      const body = await c.req.json().catch(() => ({}))
+      body = await c.req.json()
+    } catch {
+      // Empty body is fine for no-arg mutations; malformed JSON is not
+      const text = await c.req.text().catch(() => '')
+      if (text.trim()) return c.json({ error: 'Invalid JSON in request body' }, 400)
+    }
+
+    try {
       const callResult = await app.call(functionPath, body, context)
 
       if (fn.type === 'mutation' && callResult.tablesWritten.size > 0) {
