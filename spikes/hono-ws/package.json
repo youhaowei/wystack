@@ -1,0 +1,15 @@
+{
+  "name": "hono-ws-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "hono": "latest",
+    "@hono/node-server": "latest",
+    "@hono/node-ws": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8"
+  }
+}

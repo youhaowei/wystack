@@ -45,7 +45,7 @@ beforeEach(async () => {
   })
 
   server = serve({ app, port: 0 })
-  wsUrl = `ws://localhost:${server.port}/wystack/ws`
+  wsUrl = `ws://localhost:${server.port}/api/ws`
   baseUrl = `http://localhost:${server.port}`
 })
 
@@ -92,7 +92,7 @@ describe('WsManager', () => {
     })
 
     // Mutate via HTTP
-    await fetch(`${baseUrl}/wystack/addTodo`, {
+    await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'From WS test' }),

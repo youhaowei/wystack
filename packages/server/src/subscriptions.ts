@@ -7,6 +7,8 @@ export interface Subscription {
   id: string
   functionPath: string
   args: unknown
+  /** Auth context at subscription time — used for invalidation re-queries */
+  context?: Record<string, unknown>
   tablesWatched: Set<string>
 }
 
