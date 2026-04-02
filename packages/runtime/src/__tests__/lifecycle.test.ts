@@ -74,6 +74,22 @@ describe('createLifecycle', () => {
     expect(lifecycle.state).toBe('stopped')
   })
 
+  test('start is idempotent when a hook throws — second call is a no-op', async () => {
+    let count = 0
+    const lifecycle = createLifecycle()
+
+    lifecycle.onStart(() => {
+      count++
+      throw new Error('start hook failed')
+    })
+
+    await expect(lifecycle.start()).rejects.toThrow('start hook failed')
+    // State is 'running' after the first call (set before the hook loop),
+    // so a second call must be a no-op and must NOT throw.
+    await expect(lifecycle.start()).resolves.toBeUndefined()
+    expect(count).toBe(1)
+  })
+
   test('stop hook errors do not prevent other hooks from running', async () => {
     const order: number[] = []
     const lifecycle = createLifecycle()
