@@ -5,3 +5,4 @@ dist
 .env.local
 data/pglite
 .*-test
+plugins/
