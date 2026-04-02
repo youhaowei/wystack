@@ -35,7 +35,8 @@ export function serve(opts: NodeServeOptions): WyStackServer {
     get port() {
       return resolvedPort
     },
-    stop(_immediate = false) {
+    stop(immediate = false) {
+      if (immediate) (server as any).closeAllConnections?.()
       server.close()
     },
   }

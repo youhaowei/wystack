@@ -34,7 +34,12 @@ function columnToZod(col: AnyColumnDef): z.ZodType {
 
   if (isArray) schema = z.array(schema)
   if (isOptional) schema = schema.optional()
-  if (hasDefault) schema = schema.optional().default(col.opts.defaultValue)
+  if (hasDefault) {
+    schema = schema.optional()
+    // Only apply Zod default for explicit values — DB-level defaults
+    // (defaultRandom, defaultNow) are handled by the database, not Zod
+    if (col.opts.defaultValue !== undefined) schema = schema.default(col.opts.defaultValue)
+  }
 
   return schema
 }

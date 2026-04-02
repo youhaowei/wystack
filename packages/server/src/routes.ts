@@ -119,7 +119,7 @@ export function createRoutes(
                   tablesWatched: tablesRead,
                 })
                 addSub(id, ws)
-                ws.send(JSON.stringify({ type: 'subscribed', id }))
+                try { ws.send(JSON.stringify({ type: 'subscribed', id })) } catch { /* socket closed */ }
               }).catch((err: unknown) => {
                 const payload: Record<string, unknown> = { type: 'error', id, error: errorMessage(err) }
                 if (err instanceof ValidationError) payload.issues = err.issues
@@ -195,6 +195,10 @@ export function createRoutes(
       return c.json({ error: `Unknown function: ${functionPath}` }, 404)
     }
 
+    if (fn.type !== 'mutation') {
+      return c.json({ error: `${functionPath} is a query — use GET` }, 405)
+    }
+
     let context: Record<string, unknown>
     try {
       context = await resolveContext(c.req.raw)
@@ -203,18 +207,19 @@ export function createRoutes(
     }
 
     let body: unknown = {}
-    try {
-      body = await c.req.json()
-    } catch {
-      // Empty body is fine for no-arg mutations; malformed JSON is not
-      const text = await c.req.text().catch(() => '')
-      if (text.trim()) return c.json({ error: 'Invalid JSON in request body' }, 400)
+    const rawText = await c.req.text()
+    if (rawText.trim()) {
+      try {
+        body = JSON.parse(rawText)
+      } catch {
+        return c.json({ error: 'Invalid JSON in request body' }, 400)
+      }
     }
 
     try {
       const callResult = await app.call(functionPath, body, context)
 
-      if (fn.type === 'mutation' && callResult.tablesWritten.size > 0) {
+      if (callResult.tablesWritten.size > 0) {
         await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
       }
 
@@ -249,6 +254,6 @@ async function invalidateSubscriptions(
       // Keep existing table watches — client will see the error on refetch
     }
 
-    ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
+    try { ws.send(JSON.stringify({ type: 'invalidate', id: sub.id })) } catch { /* socket closed */ }
   }))
 }
