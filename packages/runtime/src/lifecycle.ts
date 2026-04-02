@@ -46,10 +46,10 @@ export function createLifecycle(): Lifecycle {
 
     async start() {
       if (state !== 'idle') return
+      state = 'running'
       for (const hook of startHooks) {
         await hook()
       }
-      state = 'running'
     },
 
     async stop() {

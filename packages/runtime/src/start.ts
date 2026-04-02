@@ -64,10 +64,10 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
   const runtime = detectRuntime()
   const lifecycle = createLifecycle()
 
-  // 1. Find available port
+  // 1. Find available port — probe on the same hostname the server will bind to
   const port = requestedPort === 0
-    ? await findAvailablePort()
-    : await findAvailablePort({ preferred: requestedPort })
+    ? await findAvailablePort({ hostname })
+    : await findAvailablePort({ preferred: requestedPort, hostname })
 
   // 2. Start the server using the appropriate adapter
   const server = await startServer({
@@ -99,7 +99,10 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
   if (opts.onStart) lifecycle.onStart(opts.onStart)
   if (opts.onStop) lifecycle.onStop(opts.onStop)
 
-  // 6. Signal handling
+  // 6. Signal handling — declare handle before registering so the signal
+  //    callback closes over a binding that is always initialised by the time
+  //    a signal can fire (after the server is up).
+  let handle: RuntimeHandle
   let signalCleanup: (() => void) | undefined
   if (signals) {
     const onSignal = () => {
@@ -113,12 +116,19 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
     }
   }
 
-  // 7. Run start hooks
-  await lifecycle.start()
+  // 7. Run start hooks — if they throw, tear everything down before re-throwing
+  try {
+    await lifecycle.start()
+  } catch (err) {
+    signalCleanup?.()
+    server.stop(false)
+    if (dir) await removePortFile({ dir }).catch(() => {})
+    throw err
+  }
 
-  const handle: RuntimeHandle = {
+  handle = {
     port: actualPort,
-    url: `http://localhost:${actualPort}`,
+    url: `http://${hostname === '0.0.0.0' ? 'localhost' : hostname}:${actualPort}`,
     runtime,
     pid: process.pid,
 
@@ -145,6 +155,12 @@ interface StartServerOptions {
 async function startServer(opts: StartServerOptions): Promise<WyStackServer> {
   const { app, port, hostname, prefix, resolveContext, runtime } = opts
   const serveOpts = { app, prefix, resolveContext, port, hostname }
+
+  if (runtime !== 'bun' && runtime !== 'node' && runtime !== 'electron') {
+    throw new Error(
+      `Unsupported runtime: ${runtime}. startRuntime supports 'bun', 'node', and 'electron'.`
+    )
+  }
 
   // Bun native adapter — best performance, native WebSocket support
   if (runtime === 'bun') {

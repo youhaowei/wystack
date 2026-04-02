@@ -13,10 +13,10 @@ describe('findAvailablePort', () => {
   })
 
   test('returns a different port when preferred is taken', async () => {
-    // Occupy a port on 127.0.0.1 (same address isPortAvailable checks)
+    // Occupy a port on 0.0.0.0 (same address isPortAvailable probes by default)
     const blocker = createServer()
     const occupied = await new Promise<number>((resolve) => {
-      blocker.listen(0, '127.0.0.1', () => {
+      blocker.listen(0, '0.0.0.0', () => {
         const addr = blocker.address()
         resolve(typeof addr === 'object' && addr ? addr.port : 0)
       })
@@ -45,10 +45,10 @@ describe('findAvailablePort', () => {
   })
 
   test('throws when no port available in tight range', async () => {
-    // Occupy a single-port range on 127.0.0.1
+    // Occupy a single-port range on 0.0.0.0 (same address isPortAvailable probes by default)
     const blocker = createServer()
     const occupied = await new Promise<number>((resolve) => {
-      blocker.listen(0, '127.0.0.1', () => {
+      blocker.listen(0, '0.0.0.0', () => {
         const addr = blocker.address()
         resolve(typeof addr === 'object' && addr ? addr.port : 0)
       })

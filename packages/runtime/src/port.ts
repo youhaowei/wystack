@@ -19,14 +19,21 @@ export interface FindPortOptions {
   preferred?: number
   /** Port range to scan [min, max]. Default: [3000, 3999]. */
   range?: [min: number, max: number]
+  /**
+   * Hostname / address to probe when checking availability.
+   * Must match the address the server will bind to — otherwise a port that
+   * appears free here may already be occupied on the target interface.
+   * Default: '0.0.0.0' (matches the startRuntime default).
+   */
+  hostname?: string
 }
 
-/** Try to bind to a port and immediately release it. Returns true if available. */
-function isPortAvailable(port: number): Promise<boolean> {
+/** Try to bind to a port on the given hostname and immediately release it. Returns true if available. */
+function isPortAvailable(port: number, hostname = '0.0.0.0'): Promise<boolean> {
   return new Promise((resolve) => {
     const server = createServer()
     server.once('error', () => resolve(false))
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(port, hostname, () => {
       server.close(() => resolve(true))
     })
   })
@@ -41,18 +48,18 @@ function isPortAvailable(port: number): Promise<boolean> {
  * 3. Fall back to OS-assigned port (port 0)
  */
 export async function findAvailablePort(opts: FindPortOptions = {}): Promise<number> {
-  const { preferred, range } = opts
+  const { preferred, range, hostname = '0.0.0.0' } = opts
   const [min, max] = range ?? [3000, 3999]
 
   // Try preferred first
   if (preferred !== undefined) {
-    if (await isPortAvailable(preferred)) return preferred
+    if (await isPortAvailable(preferred, hostname)) return preferred
     // If we have a range constraint and preferred is outside it, don't fall through
   }
 
   // Scan range
   for (let port = min; port <= max; port++) {
-    if (await isPortAvailable(port)) return port
+    if (await isPortAvailable(port, hostname)) return port
   }
 
   // If range was explicitly set and exhausted, that's an error
@@ -66,7 +73,7 @@ export async function findAvailablePort(opts: FindPortOptions = {}): Promise<num
   // Final fallback: let the OS pick
   return new Promise((resolve, reject) => {
     const server = createServer()
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, hostname, () => {
       const addr = server.address()
       const port = typeof addr === 'object' && addr ? addr.port : 0
       server.close(() => {
