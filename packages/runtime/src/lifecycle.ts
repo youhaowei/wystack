@@ -54,6 +54,7 @@ export function createLifecycle(): Lifecycle {
 
     async stop() {
       if (state === 'stopped') return []
+      state = 'stopped'
       const errors: Error[] = []
       // Run in reverse order — last registered runs first
       for (let i = stopHooks.length - 1; i >= 0; i--) {
@@ -63,7 +64,6 @@ export function createLifecycle(): Lifecycle {
           errors.push(err instanceof Error ? err : new Error(String(err)))
         }
       }
-      state = 'stopped'
       return errors
     },
   }
