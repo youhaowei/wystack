@@ -1,0 +1,29 @@
+{
+  "name": "@wystack/runtime",
+  "version": "0.0.1",
+  "description": "Universal app bootstrap, port discovery, and lifecycle management for WyStack",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@wystack/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.16",
+    "@wystack/db": "workspace:*",
+    "drizzle-orm": "^0.45.1",
+    "typescript": "^5.8.3"
+  }
+}
