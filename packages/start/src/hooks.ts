@@ -2,9 +2,8 @@ import { useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient, type UseQueryResult, type UseMutationResult } from '@tanstack/react-query'
 import { useWyStartClient } from './provider'
 
-let subIdCounter = 0
 function nextSubId() {
-  return `wy_${++subIdCounter}`
+  return `wy_${crypto.randomUUID()}`
 }
 
 /**

@@ -52,7 +52,7 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
   }
 
   function connect() {
-    if (ws?.readyState === WebSocket.OPEN) return
+    if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
     const wsUrl = baseUrl.replace(/^http/, 'ws') + '/wystack/ws'
 
