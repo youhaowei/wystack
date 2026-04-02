@@ -10,6 +10,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./bun": {
+      "import": "./dist/serve-bun.js",
+      "types": "./dist/serve-bun.d.ts"
+    },
     "./node": {
       "import": "./dist/serve-node.js",
       "types": "./dist/serve-node.d.ts"

@@ -2,7 +2,8 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
-import { createWyStack, query, mutation, serve } from '@wystack/server'
+import { createWyStack, query, mutation } from '@wystack/server'
+import { serve } from '@wystack/server/bun'
 import { createWsManager } from '../ws'
 
 const schema = defineSchema({

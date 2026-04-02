@@ -8,7 +8,7 @@ import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
-import { serve } from '../transport'
+import { serve } from '../serve-bun'
 
 const schema = defineSchema({
   todos: {
