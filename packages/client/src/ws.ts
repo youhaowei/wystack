@@ -33,7 +33,7 @@ export function createWsManager(url: string): WsManager {
   }
 
   function connect() {
-    if (ws?.readyState === WebSocket.OPEN) return
+    if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
     try {
       ws = new WebSocket(url)

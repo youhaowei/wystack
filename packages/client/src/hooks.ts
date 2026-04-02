@@ -2,9 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import type { UseQueryResult, UseMutationResult } from './types'
 import { useWyStackClient } from './provider'
 
-let subIdCounter = 0
 function nextSubId() {
-  return `sub_${++subIdCounter}`
+  return `sub_${crypto.randomUUID()}`
 }
 
 /**
