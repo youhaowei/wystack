@@ -90,7 +90,21 @@ export function defineSchema<T extends TableDefs>(tables: T) {
   // oxlint-disable-next-line typescript/no-explicit-any -- accumulates Drizzle pgTable objects passed to buildColumn for references
   const result: Record<string, any> = {}
 
+  // Pass 1: create all tables without foreign key references
   for (const [tableName, columns] of Object.entries(tables)) {
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
+    const colDefs: Record<string, any> = {}
+    for (const [colName, colDef] of Object.entries(columns)) {
+      colDefs[colName] = buildColumn(colName, colDef.opts, {})
+    }
+    result[tableName] = pgTable(tableName, colDefs)
+  }
+
+  // Pass 2: rebuild tables that have foreign key references (now all tables exist)
+  for (const [tableName, columns] of Object.entries(tables)) {
+    const hasRefs = Object.values(columns).some((c) => c.opts.ref)
+    if (!hasRefs) continue
+
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
     const colDefs: Record<string, any> = {}
     for (const [colName, colDef] of Object.entries(columns)) {

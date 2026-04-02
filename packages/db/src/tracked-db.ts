@@ -84,11 +84,10 @@ export class SelectBuilder<T extends AnyTable> {
 
     if (this._orderByCol) {
       // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
+      const columns = getTableColumns(this._table) as Record<string, any>
       const col = columns[this._orderByCol]
-      if (col) {
-        q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
-      }
+      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
+      q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
     }
 
     if (this._limitVal !== undefined) {
@@ -158,9 +157,7 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
   return tracker
 }
 
-/** Create a fresh TrackedDb that shares the same Drizzle connection but resets tracking sets */
+/** Create a fresh TrackedDb that shares the same Drizzle connection but with empty tracking sets */
 export function resetTracking(tracked: TrackedDb): TrackedDb {
-  tracked.tablesRead.clear()
-  tracked.tablesWritten.clear()
-  return tracked
+  return createTrackedDb(tracked.raw)
 }

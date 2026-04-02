@@ -50,7 +50,7 @@ describe('TrackedDb', () => {
 
   test('select all records tablesRead', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const rows = await tracked.from(schema.todos).all()
     expect(tracked.tablesRead.has('todos')).toBe(true)
@@ -60,7 +60,7 @@ describe('TrackedDb', () => {
   test('select with where filter', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     await tracked.into(schema.todos).insert({ title: 'B', done: true })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const rows = await tracked.from(schema.todos).where(eq('done', true)).all()
     expect(rows).toHaveLength(1)
@@ -71,7 +71,7 @@ describe('TrackedDb', () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     await tracked.into(schema.todos).insert({ title: 'B', done: false })
     await tracked.into(schema.todos).insert({ title: 'C', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const rows = await tracked.from(schema.todos).limit(2).all()
     expect(rows).toHaveLength(2)
@@ -82,7 +82,7 @@ describe('TrackedDb', () => {
     expect(empty).toBeNull()
 
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const row = await tracked.from(schema.todos).first()
     expect(row).not.toBeNull()
@@ -91,7 +91,7 @@ describe('TrackedDb', () => {
 
   test('update records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const updated = await tracked
       .from(schema.todos)
@@ -105,7 +105,7 @@ describe('TrackedDb', () => {
 
   test('delete records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const deleted = await tracked
       .from(schema.todos)
@@ -120,7 +120,7 @@ describe('TrackedDb', () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     expect(tracked.tablesWritten.size).toBe(1)
 
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
     expect(tracked.tablesWritten.size).toBe(0)
     expect(tracked.tablesRead.size).toBe(0)
   })
@@ -129,13 +129,13 @@ describe('TrackedDb', () => {
     await tracked.into(schema.todos).insert({ title: 'B', done: false })
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     await tracked.into(schema.todos).insert({ title: 'C', done: false })
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
 
     const asc = await tracked.from(schema.todos).orderBy('title').all()
     expect(asc[0].title).toBe('A')
     expect(asc[2].title).toBe('C')
 
-    resetTracking(tracked)
+    tracked = resetTracking(tracked)
     const descRows = await tracked.from(schema.todos).orderBy('title', 'desc').all()
     expect(descRows[0].title).toBe('C')
     expect(descRows[2].title).toBe('A')
