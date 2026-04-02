@@ -3,7 +3,6 @@
 
 export { query, mutation } from './functions'
 export { createWyStack } from './create'
-export { serve } from './transport'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
