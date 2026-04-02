@@ -3,8 +3,10 @@
  * a consumer's existing Hono app via .route().
  *
  * This is the pattern TASK-453 (Workforce adoption) depends on:
- *   const wyRoutes = createRoutes({ app: wyApp }, upgradeWebSocket)
+ *   const wyRoutes = createRoutes({ app: wyApp, prefix: '/api' }, upgradeWebSocket)
  *   consumerApp.route('/wystack', wyRoutes)
+ *
+ * All tests below use prefix: '/api', so routes are reachable at /wystack/api/*.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { Hono } from 'hono'
@@ -128,36 +130,38 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
   test('WS subscribe + invalidation at mounted prefix', async () => {
     const ws = new WebSocket(`ws://localhost:${server.port}/wystack/api/ws`)
 
-    // Subscribe
-    await new Promise<void>((resolve, reject) => {
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'subscribe', id: 'emb-sub', path: 'listItems', args: {} }))
-      }
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data)
-        if (msg.type === 'subscribed') resolve()
-      }
-      ws.onerror = reject
-      setTimeout(() => reject(new Error('timeout')), 5000)
-    })
+    try {
+      // Subscribe
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'subscribe', id: 'emb-sub', path: 'listItems', args: {} }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'subscribed') resolve()
+        }
+        ws.onerror = reject
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
 
-    // Mutate via HTTP and expect invalidation
-    const invalidation = new Promise<any>((resolve, reject) => {
-      ws.onmessage = (event) => resolve(JSON.parse(event.data))
-      setTimeout(() => reject(new Error('timeout waiting for invalidation')), 5000)
-    })
+      // Mutate via HTTP and expect invalidation
+      const invalidation = new Promise<any>((resolve, reject) => {
+        ws.onmessage = (event) => resolve(JSON.parse(event.data))
+        setTimeout(() => reject(new Error('timeout waiting for invalidation')), 5000)
+      })
 
-    await fetch(`${baseUrl}/wystack/api/addItem`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Doohickey' }),
-    })
+      await fetch(`${baseUrl}/wystack/api/addItem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Doohickey' }),
+      })
 
-    const msg = await invalidation
-    expect(msg.type).toBe('invalidate')
-    expect(msg.id).toBe('emb-sub')
-
-    ws.close()
+      const msg = await invalidation
+      expect(msg.type).toBe('invalidate')
+      expect(msg.id).toBe('emb-sub')
+    } finally {
+      ws.close()
+    }
   })
 
   test('resolveContext works in embedded mode', async () => {
