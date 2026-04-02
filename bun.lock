@@ -16,6 +16,7 @@
       "version": "0.0.1",
       "devDependencies": {
         "@electric-sql/pglite": ">=0.3.0",
+        "@tanstack/react-query": "^5.90.0",
         "@types/react": "^19.0.0",
         "@wystack/db": "workspace:*",
         "@wystack/server": "workspace:*",
@@ -24,6 +25,7 @@
         "typescript": "^5.8.3",
       },
       "peerDependencies": {
+        "@tanstack/react-query": ">=5.0.0",
         "react": ">=19.0.0",
       },
     },
@@ -59,20 +61,6 @@
         "@electric-sql/pglite": "^0.3.16",
         "drizzle-orm": "^0.45.1",
         "typescript": "^5.8.3",
-      },
-    },
-    "packages/start": {
-      "name": "@wystack/start",
-      "version": "0.0.1",
-      "devDependencies": {
-        "@tanstack/react-query": "^5.90.0",
-        "@types/react": "^19.0.0",
-        "react": "^19.0.0",
-        "typescript": "^5.8.3",
-      },
-      "peerDependencies": {
-        "@tanstack/react-query": ">=5.0.0",
-        "react": ">=19.0.0",
       },
     },
     "packages/types": {
@@ -115,8 +103,6 @@
     "@wystack/db": ["@wystack/db@workspace:packages/db"],
 
     "@wystack/server": ["@wystack/server@workspace:packages/server"],
-
-    "@wystack/start": ["@wystack/start@workspace:packages/start"],
 
     "@wystack/types": ["@wystack/types@workspace:packages/types"],
 

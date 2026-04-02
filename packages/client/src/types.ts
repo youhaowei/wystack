@@ -1,17 +1,8 @@
 export interface WyStackClientConfig {
+  /** WyStack server URL (e.g., 'http://localhost:3001') */
   url: string
   /** URL prefix matching the server's route prefix. Default: '/api' */
   prefix?: string
-}
-
-export interface UseQueryResult<T> {
-  data: T | undefined
-  isLoading: boolean
-  error: Error | null
-}
-
-export interface UseMutationResult<TArgs, TReturn> {
-  mutate: (args: TArgs) => Promise<TReturn>
-  isLoading: boolean
-  error: Error | null
+  /** App-provided function to get auth token. Called per HTTP request and on WS connect. */
+  getToken?: () => Promise<string | null> | string | null
 }

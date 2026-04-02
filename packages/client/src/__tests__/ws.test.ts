@@ -54,42 +54,47 @@ afterEach(() => {
 })
 
 describe('WsManager', () => {
-  test('connects and subscribes to a query', async () => {
-    const ws = createWsManager(wsUrl)
+  test('connects and reports connected', async () => {
+    const ws = createWsManager({ url: wsUrl })
     ws.connect()
 
-    const result = await new Promise<any>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, (msg) => {
-        resolve(msg)
-      })
-      setTimeout(() => reject(new Error('timeout')), 5000)
+    // Wait for connection
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (ws.isConnected()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 50)
     })
 
-    expect(result.type).toBe('subscribed')
+    expect(ws.isConnected()).toBe(true)
     ws.disconnect()
+    expect(ws.isConnected()).toBe(false)
   })
 
   test('receives invalidation after mutation', async () => {
-    const ws = createWsManager(wsUrl)
+    const ws = createWsManager({ url: wsUrl })
     ws.connect()
 
-    // Subscribe and wait for confirmation
-    await new Promise<void>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, (raw) => {
-        const msg = raw as Record<string, unknown>
-        if (msg.type === 'subscribed') resolve()
-      })
+    // Wait for connection
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (ws.isConnected()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 50)
+    })
+
+    // Subscribe — handler fires on invalidation only
+    const invalidated = new Promise<void>((resolve, reject) => {
+      ws.subscribe('sub1', 'listTodos', {}, () => resolve())
       setTimeout(() => reject(new Error('timeout')), 5000)
     })
 
-    // Set up invalidation listener
-    const invalidation = new Promise<Record<string, unknown>>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, (raw) => {
-        const msg = raw as Record<string, unknown>
-        if (msg.type === 'invalidate') resolve(msg)
-      })
-      setTimeout(() => reject(new Error('timeout')), 5000)
-    })
+    // Give server time to process subscription
+    await new Promise((r) => setTimeout(r, 100))
 
     // Mutate via HTTP
     await fetch(`${baseUrl}/api/addTodo`, {
@@ -98,28 +103,113 @@ describe('WsManager', () => {
       body: JSON.stringify({ title: 'From WS test' }),
     })
 
-    const msg = await invalidation
-    expect(msg.type).toBe('invalidate')
-    expect(msg.id).toBe('sub1')
+    await invalidated
+    ws.disconnect()
+  })
+
+  test('unsubscribe stops receiving invalidations', async () => {
+    const ws = createWsManager({ url: wsUrl })
+    ws.connect()
+
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (ws.isConnected()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 50)
+    })
+
+    let invalidateCount = 0
+    ws.subscribe('sub1', 'listTodos', {}, () => {
+      invalidateCount++
+    })
+
+    await new Promise((r) => setTimeout(r, 100))
+
+    // First mutation — should trigger invalidation
+    await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'First' }),
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+    expect(invalidateCount).toBe(1)
+
+    // Unsubscribe
+    ws.unsubscribe('sub1')
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Second mutation — should NOT trigger
+    await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Second' }),
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+    expect(invalidateCount).toBe(1)
 
     ws.disconnect()
   })
 
-  test('unsubscribe stops receiving messages', async () => {
-    const ws = createWsManager(wsUrl)
+  test('re-subscribes on reconnect', async () => {
+    const ws = createWsManager({ url: wsUrl })
     ws.connect()
 
-    let received = false
-    await new Promise<void>((resolve, reject) => {
-      ws.subscribe('sub1', 'listTodos', {}, () => {
-        received = true
-        resolve()
-      })
-      setTimeout(() => reject(new Error('timeout')), 5000)
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (ws.isConnected()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 50)
     })
 
-    expect(received).toBe(true)
-    ws.unsubscribe('sub1')
+    let invalidateCount = 0
+    ws.subscribe('sub1', 'listTodos', {}, () => {
+      invalidateCount++
+    })
+
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Trigger invalidation before disconnect
+    await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Before reconnect' }),
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+    expect(invalidateCount).toBe(1)
+
+    // Force reconnect by disconnecting + reconnecting
+    ws.disconnect()
+    ws.connect()
+
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (ws.isConnected()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 50)
+    })
+
+    // Give server time to process re-subscriptions
+    await new Promise((r) => setTimeout(r, 200))
+
+    // Trigger invalidation after reconnect
+    await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'After reconnect' }),
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+    expect(invalidateCount).toBe(2)
+
     ws.disconnect()
   })
 })

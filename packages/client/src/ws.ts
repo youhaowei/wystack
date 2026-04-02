@@ -1,24 +1,37 @@
 /**
  * WebSocket Manager — manages connection lifecycle, exponential backoff
- * reconnection, and dispatches messages to subscription handlers.
+ * reconnection, subscription tracking, and invalidation dispatch.
+ *
+ * Protocol (matches @wystack/server):
+ *   Client → Server: { type: 'subscribe', id, path, args }
+ *   Client → Server: { type: 'unsubscribe', id }
+ *   Server → Client: { type: 'subscribed', id }
+ *   Server → Client: { type: 'invalidate', id }
+ *   Server → Client: { type: 'error', id?, error }
  */
 
-type MessageHandler = (data: unknown) => void
+type InvalidateHandler = () => void
+
+export interface WsManagerConfig {
+  url: string
+  getToken?: () => Promise<string | null> | string | null
+}
 
 export interface WsManager {
   connect(): void
   disconnect(): void
-  subscribe(id: string, path: string, args: unknown, handler: MessageHandler): void
+  subscribe(id: string, path: string, args: unknown, onInvalidate: InvalidateHandler): void
   unsubscribe(id: string): void
   isConnected(): boolean
 }
 
-export function createWsManager(url: string): WsManager {
+export function createWsManager(config: WsManagerConfig): WsManager {
+  const { url, getToken } = config
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let reconnectAttempt = 0
   const maxReconnectDelay = 30000
-  const handlers = new Map<string, MessageHandler>()
+  const handlers = new Map<string, InvalidateHandler>()
   const activeSubs = new Map<string, { path: string; args: unknown }>()
   let connected = false
 
@@ -32,44 +45,54 @@ export function createWsManager(url: string): WsManager {
     }, delay)
   }
 
+  function sendSubscriptions() {
+    for (const [id, sub] of activeSubs) {
+      ws!.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
+    }
+  }
+
   function connect() {
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-    try {
-      ws = new WebSocket(url)
-    } catch {
-      scheduleReconnect()
-      return
-    }
+    Promise.resolve(getToken?.()).then(token => {
+      // Re-check after async — another connect() may have fired
+      if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-    ws.onopen = () => {
-      connected = true
-      reconnectAttempt = 0
-      // Re-subscribe all active subscriptions on reconnect
-      for (const [id, sub] of activeSubs) {
-        ws!.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
-      }
-    }
+      const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url
 
-    ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data)
-        if (msg.id && handlers.has(msg.id)) {
-          handlers.get(msg.id)!(msg)
-        }
+        ws = new WebSocket(wsUrl)
       } catch {
-        // Ignore malformed messages
+        scheduleReconnect()
+        return
       }
-    }
 
-    ws.onclose = () => {
-      connected = false
-      scheduleReconnect()
-    }
+      ws.onopen = () => {
+        connected = true
+        reconnectAttempt = 0
+        sendSubscriptions()
+      }
 
-    ws.onerror = () => {
-      // onclose will fire after this
-    }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'invalidate' && msg.id) {
+            handlers.get(msg.id)?.()
+          }
+        } catch {
+          // Ignore malformed messages
+        }
+      }
+
+      ws.onclose = () => {
+        connected = false
+        scheduleReconnect()
+      }
+
+      ws.onerror = () => {
+        // onclose will fire after this
+      }
+    })
   }
 
   function disconnect() {
@@ -85,8 +108,8 @@ export function createWsManager(url: string): WsManager {
     }
   }
 
-  function subscribe(id: string, path: string, args: unknown, handler: MessageHandler) {
-    handlers.set(id, handler)
+  function subscribe(id: string, path: string, args: unknown, onInvalidate: InvalidateHandler) {
+    handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
 
     if (ws?.readyState === WebSocket.OPEN) {
