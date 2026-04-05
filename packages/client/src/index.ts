@@ -9,3 +9,6 @@ export { createWsManager } from './ws'
 export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { WyStackClientConfig } from './types'
+
+export { createWyClient } from './proxy'
+export type { ProxyClient } from './proxy'
