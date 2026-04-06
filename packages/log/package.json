@@ -8,10 +8,18 @@
     "./client": "./src/client.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "pino": "^9.6.0"
+  },
+  "peerDependencies": {
+    "pino-pretty": "^13.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pino-pretty": { "optional": true }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

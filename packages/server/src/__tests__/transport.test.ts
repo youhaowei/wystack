@@ -141,6 +141,7 @@ describe('WebSocket transport', () => {
   test('subscribe returns confirmation', async () => {
     const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
 
+    // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
     const result = await new Promise<any>((resolve, reject) => {
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'subscribe', id: 'sub1', path: 'listTodos', args: {} }))
@@ -174,6 +175,7 @@ describe('WebSocket transport', () => {
     })
 
     // Mutate via HTTP
+    // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
     const invalidation = new Promise<any>((resolve, reject) => {
       ws.onmessage = (event) => resolve(JSON.parse(event.data))
       setTimeout(() => reject(new Error('timeout waiting for invalidation')), 5000)
@@ -195,6 +197,7 @@ describe('WebSocket transport', () => {
   test('subscribe to unknown query returns error', async () => {
     const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
 
+    // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
     const result = await new Promise<any>((resolve, reject) => {
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'subscribe', id: 'sub1', path: 'nonexistent', args: {} }))
@@ -220,7 +223,7 @@ describe('WebSocket transport', () => {
     const app = await createWyStack({
       db,
       functions: {
-        listTodos: query({ args: {}, handler: async (ctx) => [] }),
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
       },
     })
 

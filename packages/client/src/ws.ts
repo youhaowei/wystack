@@ -37,7 +37,9 @@ export function createWsManager(config: WsManagerConfig): WsManager {
 
   function scheduleReconnect() {
     if (reconnectTimer) return
-    const delay = Math.min(1000 * 2 ** reconnectAttempt, maxReconnectDelay)
+    const base = 1000 * 2 ** Math.min(reconnectAttempt, 5)
+    const jitter = base * (0.5 + Math.random() * 0.5)
+    const delay = Math.min(jitter, maxReconnectDelay)
     reconnectAttempt++
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
@@ -54,45 +56,52 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function connect() {
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-    Promise.resolve(getToken?.()).then((token) => {
-      // Re-check after async — another connect() may have fired
-      if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
+    // TODO: move auth to post-connection message to avoid token appearing in server logs/browser history
+    Promise.resolve(getToken?.())
+      .then((token) => {
+        // Re-check after async — another connect() may have fired
+        if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-      const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url
+        const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url
 
-      try {
-        ws = new WebSocket(wsUrl)
-      } catch {
-        scheduleReconnect()
-        return
-      }
-
-      ws.onopen = () => {
-        connected = true
-        reconnectAttempt = 0
-        sendSubscriptions()
-      }
-
-      ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data)
-          if (msg.type === 'invalidate' && msg.id) {
-            handlers.get(msg.id)?.()
-          }
+          ws = new WebSocket(wsUrl)
         } catch {
-          // Ignore malformed messages
+          scheduleReconnect()
+          return
         }
-      }
 
-      ws.onclose = () => {
-        connected = false
+        ws.onopen = () => {
+          connected = true
+          reconnectAttempt = 0
+          sendSubscriptions()
+        }
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data)
+            if (msg.type === 'invalidate' && msg.id) {
+              handlers.get(msg.id)?.()
+            }
+          } catch (err) {
+            if (process.env.NODE_ENV !== 'production') {
+              console.warn('[wystack/ws] Failed to parse message:', err)
+            }
+          }
+        }
+
+        ws.onclose = () => {
+          connected = false
+          scheduleReconnect()
+        }
+
+        ws.onerror = () => {
+          // onclose will fire after this
+        }
+      })
+      .catch(() => {
         scheduleReconnect()
-      }
-
-      ws.onerror = () => {
-        // onclose will fire after this
-      }
-    })
+      })
   }
 
   function disconnect() {

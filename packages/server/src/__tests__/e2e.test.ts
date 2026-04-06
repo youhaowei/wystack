@@ -86,6 +86,7 @@ describe('E2E: full reactive lifecycle', () => {
     expect(initialJson.data).toEqual([])
 
     // 3. Mutate via HTTP POST — add a todo
+    // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
     const invalidation1 = new Promise<any>((resolve, reject) => {
       ws.onmessage = (event) => resolve(JSON.parse(event.data))
       setTimeout(() => reject(new Error('timeout')), 5000)
@@ -114,6 +115,7 @@ describe('E2E: full reactive lifecycle', () => {
     expect(refetch1Json.data[0].done).toBe(false)
 
     // 6. Mutate again — toggle the todo
+    // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
     const invalidation2 = new Promise<any>((resolve, reject) => {
       ws.onmessage = (event) => resolve(JSON.parse(event.data))
       setTimeout(() => reject(new Error('timeout')), 5000)

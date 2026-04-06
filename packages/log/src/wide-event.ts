@@ -4,6 +4,7 @@ import type { WideEventFields } from './types'
 export class WideEvent {
   private fields: Partial<WideEventFields> = {}
   private startTime: number
+  private flushed = false
 
   constructor(eventName: string) {
     this.startTime = performance.now()
@@ -21,6 +22,8 @@ export class WideEvent {
   }
 
   flush() {
+    if (this.flushed) return
+    this.flushed = true
     this.fields.duration_ms = Math.round(performance.now() - this.startTime)
     const { event_name, ...rest } = this.fields
 

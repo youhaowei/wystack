@@ -15,5 +15,5 @@
     "verbatimModuleSyntax": true,
     "jsx": "react-jsx"
   },
-  "exclude": ["**/dist", "**/__tests__"]
+  "exclude": ["**/dist"]
 }

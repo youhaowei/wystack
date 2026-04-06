@@ -11,11 +11,12 @@
       "persistent": true
     },
     "test": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^typecheck"],
       "cache": true
     },
     "typecheck": {
-      "dependsOn": ["^typecheck"]
+      "dependsOn": ["^typecheck"],
+      "inputs": ["src/**/*.ts", "tsconfig.json"]
     },
     "clean": {
       "cache": false

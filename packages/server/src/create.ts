@@ -71,7 +71,7 @@ export async function createWyStack(opts: {
 
       // Fresh TrackedDb per call — no shared mutable state
       const tracked = createTrackedDb(drizzleDb)
-      const ctx: FunctionContext = { db: tracked, ...context }
+      const ctx: FunctionContext = { ...context, db: tracked }
       const result = await fn.handler(ctx, validatedArgs)
 
       return {

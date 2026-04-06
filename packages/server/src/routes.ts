@@ -74,6 +74,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     async (c, next) => {
       try {
         const context = await resolveContext(c.req.raw)
+        // TODO: type properly via Hono Variables generic
         c.set('wsContext' as never, context as never)
       } catch (err: unknown) {
         return c.json({ error: errorMessage(err) }, 401)
@@ -83,6 +84,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     upgradeWebSocket((c) => {
       return {
         onOpen(_evt, ws) {
+          // TODO: type properly via Hono Variables generic
           const context = c.get('wsContext' as never) as Record<string, unknown>
           rawToContext.set(ws.raw, context ?? {})
         },
@@ -94,6 +96,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             const msg = JSON.parse(String(event.data)) as Record<string, unknown>
             msgId = msg.id as string | undefined
 
+            // TODO: scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
               const id = msg.id as string
               const path = msg.path as string
@@ -149,7 +152,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
             if (err instanceof ValidationError) payload.issues = err.issues
             if (msgId) payload.id = msgId
-            ws.send(JSON.stringify(payload))
+            try {
+              ws.send(JSON.stringify(payload))
+            } catch {
+              /* socket closed */
+            }
           }
         },
 
@@ -250,6 +257,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   return hono
 }
 
+// TODO: serialize invalidation per-subscription to prevent tablesWatched race under concurrent mutations
 async function invalidateSubscriptions(
   app: WyStackApp,
   writtenTables: Set<string>,

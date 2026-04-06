@@ -70,7 +70,14 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
       ? await findAvailablePort({ hostname })
       : await findAvailablePort({ preferred: requestedPort, hostname })
 
-  // 2. Start the server using the appropriate adapter
+  // 2. Register user hooks
+  if (opts.onStart) lifecycle.onStart(opts.onStart)
+  if (opts.onStop) lifecycle.onStop(opts.onStop)
+
+  // 3. Run start hooks before accepting traffic — if they throw, nothing to tear down
+  await lifecycle.start()
+
+  // 4. Start the server (now accepting requests — onStart hooks have completed)
   const server = await startServer({
     app,
     port,
@@ -80,10 +87,9 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
     runtime,
   })
 
-  // The actual port might differ from requested (server may have picked another)
   const actualPort = server.port
 
-  // 3. Write port file (if dir provided)
+  // 5. Write port file (if dir provided)
   if (dir) {
     await writePortFile(actualPort, { dir })
     lifecycle.onStop(async () => {
@@ -91,43 +97,14 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
     })
   }
 
-  // 4. Register server stop on lifecycle
+  // 6. Register server stop on lifecycle
   lifecycle.onStop(() => {
     server.stop(false)
   })
 
-  // 5. Register user hooks
-  if (opts.onStart) lifecycle.onStart(opts.onStart)
-  if (opts.onStop) lifecycle.onStop(opts.onStop)
-
-  // 6. Signal handling — declare handle before registering so the signal
-  //    callback closes over a binding that is always initialised by the time
-  //    a signal can fire (after the server is up).
-  let handle: RuntimeHandle
+  // 7. Signal handling
   let signalCleanup: (() => void) | undefined
-  if (signals) {
-    const onSignal = () => {
-      handle.shutdown()
-    }
-    process.on('SIGINT', onSignal)
-    process.on('SIGTERM', onSignal)
-    signalCleanup = () => {
-      process.removeListener('SIGINT', onSignal)
-      process.removeListener('SIGTERM', onSignal)
-    }
-  }
-
-  // 7. Run start hooks — if they throw, tear everything down before re-throwing
-  try {
-    await lifecycle.start()
-  } catch (err) {
-    signalCleanup?.()
-    server.stop(false)
-    if (dir) await removePortFile({ dir }).catch(() => {})
-    throw err
-  }
-
-  handle = {
+  const handle: RuntimeHandle = {
     port: actualPort,
     url: `http://${hostname === '0.0.0.0' ? 'localhost' : hostname}:${actualPort}`,
     runtime,
@@ -137,6 +114,16 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
       signalCleanup?.()
       await lifecycle.stop()
     },
+  }
+
+  if (signals) {
+    const onSignal = () => handle.shutdown()
+    process.on('SIGINT', onSignal)
+    process.on('SIGTERM', onSignal)
+    signalCleanup = () => {
+      process.removeListener('SIGINT', onSignal)
+      process.removeListener('SIGTERM', onSignal)
+    }
   }
 
   return handle

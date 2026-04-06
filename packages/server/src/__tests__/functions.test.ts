@@ -6,7 +6,7 @@ describe('query()', () => {
   test('creates a QueryDef with correct type', () => {
     const q = query({
       args: { type: text.optional() },
-      handler: async (ctx, args) => {
+      handler: async (_ctx, _args) => {
         return []
       },
     })
@@ -22,6 +22,7 @@ describe('query()', () => {
         return { received: args.id }
       },
     })
+    // oxlint-disable-next-line typescript/no-explicit-any -- mock context; full db type not needed in unit test
     const result = await q.handler({ db: {} as any }, { id: 42 })
     expect(result).toEqual({ received: 42 })
   })
@@ -31,7 +32,7 @@ describe('mutation()', () => {
   test('creates a MutationDef with correct type', () => {
     const m = mutation({
       args: { title: text },
-      handler: async (ctx, args) => {
+      handler: async (_ctx, _args) => {
         return { created: true }
       },
     })

@@ -37,11 +37,15 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
     async query(path: string, args?: unknown) {
       const auth = await getAuthHeaders()
+      // TODO: fall back to POST for large args that would exceed URL length limits
       const argsParam =
         args !== undefined ? `?args=${encodeURIComponent(JSON.stringify(args))}` : ''
       const res = await fetch(`${httpUrl}${prefix}/${path}${argsParam}`, {
         headers: auth,
       })
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
+      }
       const json = await res.json()
       if (json.error) throw new Error(json.error)
       return json.data
@@ -54,6 +58,9 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
         headers: { 'Content-Type': 'application/json', ...auth },
         body: JSON.stringify(args ?? {}),
       })
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
+      }
       const json = await res.json()
       if (json.error) throw new Error(json.error)
       return json.data

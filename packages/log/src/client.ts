@@ -4,7 +4,13 @@ interface PageMark {
   marks: Record<string, number>
 }
 
-const active = new Map<string, PageMark>()
+const isDev =
+  typeof import.meta !== 'undefined' &&
+  !!import.meta.env?.DEV
+
+const globals = globalThis as Record<string, unknown>
+// __wystack_page_marks__ is a reserved globalThis key — do not use elsewhere
+const active = (globals.__wystack_page_marks__ ??= new Map()) as Map<string, PageMark>
 
 export function startPageMark(name: string) {
   active.set(name, { name, start: performance.now(), marks: {} })
@@ -28,11 +34,6 @@ export function flushPageMark(pageName: string) {
     ...safeMarks
   } = page.marks as Record<string, number>
   const entry = { page: page.name, total_ms: total, ...safeMarks }
-
-  const isDev =
-    typeof import.meta !== 'undefined' &&
-    import.meta.env &&
-    (import.meta.env.DEV || import.meta.env.NODE_ENV !== 'production')
 
   if (isDev) {
     if (total > 1000) {

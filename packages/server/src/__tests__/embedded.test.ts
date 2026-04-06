@@ -142,6 +142,7 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
       })
 
       // Mutate via HTTP and expect invalidation
+      // oxlint-disable-next-line typescript/no-explicit-any -- WS message payload is dynamically typed JSON
       const invalidation = new Promise<any>((resolve, reject) => {
         ws.onmessage = (event) => resolve(JSON.parse(event.data))
         setTimeout(() => reject(new Error('timeout waiting for invalidation')), 5000)

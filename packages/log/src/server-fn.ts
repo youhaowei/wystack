@@ -4,13 +4,15 @@ interface HandlerContext<T> {
   data: T
 }
 
-interface LoggingOptions {
+interface LoggingOptions<TInput> {
   name: string
   method?: 'GET' | 'POST'
+  /** Extract additional fields from the input context to include in the wide event. */
+  context?: (data: TInput) => Record<string, unknown>
 }
 
 export function withLogging<TInput, TOutput>(
-  opts: LoggingOptions,
+  opts: LoggingOptions<TInput>,
   handler: (ctx: HandlerContext<TInput>, event: WideEvent) => Promise<TOutput>,
 ) {
   return async (ctx: HandlerContext<TInput>): Promise<TOutput> => {
@@ -20,13 +22,10 @@ export function withLogging<TInput, TOutput>(
       fn_method: opts.method,
     })
 
-    // Extract orgId if present in data
-    const data = ctx.data as Record<string, unknown>
-    if (data && typeof data.orgId === 'string') {
-      event.set({ org_id: data.orgId })
-    }
-
     try {
+      if (opts.context) {
+        event.set(opts.context(ctx.data))
+      }
       const result = await handler(ctx, event)
 
       // Auto-detect result count for arrays
