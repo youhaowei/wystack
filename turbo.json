@@ -11,7 +11,7 @@
       "persistent": true
     },
     "test": {
-      "dependsOn": ["^typecheck"],
+      "dependsOn": ["^build"],
       "cache": true
     },
     "typecheck": {
