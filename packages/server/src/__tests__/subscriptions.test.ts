@@ -20,11 +20,16 @@ describe('SubscriptionManager', () => {
     const mgr = createSubscriptionManager()
     mgr.add({ id: 'sub1', functionPath: 'listTodos', args: {}, tablesWatched: new Set(['todos']) })
     mgr.add({ id: 'sub2', functionPath: 'listUsers', args: {}, tablesWatched: new Set(['users']) })
-    mgr.add({ id: 'sub3', functionPath: 'listAll', args: {}, tablesWatched: new Set(['todos', 'users']) })
+    mgr.add({
+      id: 'sub3',
+      functionPath: 'listAll',
+      args: {},
+      tablesWatched: new Set(['todos', 'users']),
+    })
 
     const affected = mgr.getAffectedSubscriptions(new Set(['todos']))
     expect(affected).toHaveLength(2)
-    const ids = affected.map(s => s.id).sort()
+    const ids = affected.map((s) => s.id).sort()
     expect(ids).toEqual(['sub1', 'sub3'])
   })
 

@@ -96,7 +96,9 @@ describe('HTTP transport', () => {
   test('resolveContext is called per request', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,
@@ -211,7 +213,9 @@ describe('WebSocket transport', () => {
   test('WS with resolveContext rejects unauthenticated', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,

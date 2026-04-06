@@ -37,9 +37,8 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
     async query(path: string, args?: unknown) {
       const auth = await getAuthHeaders()
-      const argsParam = args !== undefined
-        ? `?args=${encodeURIComponent(JSON.stringify(args))}`
-        : ''
+      const argsParam =
+        args !== undefined ? `?args=${encodeURIComponent(JSON.stringify(args))}` : ''
       const res = await fetch(`${httpUrl}${prefix}/${path}${argsParam}`, {
         headers: auth,
       })

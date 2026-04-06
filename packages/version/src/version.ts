@@ -58,8 +58,8 @@ export class Version {
     // Pre-release versions have lower precedence than release (semver spec §11)
     // No prerelease = release, which is greater than any prerelease
     if (this.prerelease === other.prerelease) return 0
-    if (this.prerelease === undefined) return 1   // release > prerelease
-    if (other.prerelease === undefined) return -1  // prerelease < release
+    if (this.prerelease === undefined) return 1 // release > prerelease
+    if (other.prerelease === undefined) return -1 // prerelease < release
     return comparePrerelease(this.prerelease, other.prerelease)
   }
 
@@ -78,7 +78,7 @@ function comparePrerelease(a: string, b: string): number {
   const partsB = b.split('.')
   const len = Math.max(partsA.length, partsB.length)
   for (let i = 0; i < len; i++) {
-    if (i >= partsA.length) return -1  // fewer segments = lower precedence
+    if (i >= partsA.length) return -1 // fewer segments = lower precedence
     if (i >= partsB.length) return 1
     const segA = partsA[i]
     const segB = partsB[i]
@@ -87,7 +87,7 @@ function comparePrerelease(a: string, b: string): number {
     if (numA !== null && numB !== null) {
       if (numA !== numB) return numA - numB
     } else if (numA !== null) {
-      return -1  // numeric < alphanumeric
+      return -1 // numeric < alphanumeric
     } else if (numB !== null) {
       return 1
     } else {

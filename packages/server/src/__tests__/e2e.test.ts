@@ -48,10 +48,7 @@ beforeEach(async () => {
       toggleTodo: mutation({
         args: { id: int },
         handler: async (ctx, args) => {
-          return ctx.db
-            .from(schema.todos)
-            .where(eq('id', args.id))
-            .update({ done: true })
+          return ctx.db.from(schema.todos).where(eq('id', args.id)).update({ done: true })
         },
       }),
     },
@@ -145,7 +142,9 @@ describe('E2E: full reactive lifecycle', () => {
   test('context passed through to handlers', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,

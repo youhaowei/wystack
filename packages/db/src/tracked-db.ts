@@ -2,7 +2,16 @@
  * TrackedDb — fluent query builder wrapping Drizzle that auto-records
  * tablesRead / tablesWritten for reactive invalidation.
  */
-import { eq as drizzleEq, ne as drizzleNe, gt as drizzleGt, gte as drizzleGte, lt as drizzleLt, lte as drizzleLte, asc, desc } from 'drizzle-orm'
+import {
+  eq as drizzleEq,
+  ne as drizzleNe,
+  gt as drizzleGt,
+  gte as drizzleGte,
+  lt as drizzleLt,
+  lte as drizzleLte,
+  asc,
+  desc,
+} from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import { getTableName, getTableColumns } from 'drizzle-orm'
@@ -66,7 +75,7 @@ export class SelectBuilder<T extends AnyTable> {
   private _buildConditions() {
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
-    return this._filters.map(f => {
+    return this._filters.map((f) => {
       const col = columns[f.column]
       if (!col) throw new Error(`Unknown column: ${f.column}`)
       return drizzleOpMap[f.op](col, f.value)

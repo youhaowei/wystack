@@ -28,10 +28,7 @@ export interface RouteOptions {
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
 }
 
-export function createRoutes(
-  opts: RouteOptions,
-  upgradeWebSocket: UpgradeWebSocket,
-) {
+export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSocket) {
   const { app, prefix = '/api' } = opts
   const resolveContext = opts.resolveContext ?? (async () => ({}))
 
@@ -107,24 +104,39 @@ export function createRoutes(
                 return
               }
 
-              app.call(path, args, context).then(({ tablesRead }) => {
-                // Guard: socket may have closed while query was in-flight
-                if (!rawToContext.has(ws.raw)) return
+              app
+                .call(path, args, context)
+                .then(({ tablesRead }) => {
+                  // Guard: socket may have closed while query was in-flight
+                  if (!rawToContext.has(ws.raw)) return
 
-                app.subscriptions.add({
-                  id,
-                  functionPath: path,
-                  args,
-                  context,
-                  tablesWatched: tablesRead,
+                  app.subscriptions.add({
+                    id,
+                    functionPath: path,
+                    args,
+                    context,
+                    tablesWatched: tablesRead,
+                  })
+                  addSub(id, ws)
+                  try {
+                    ws.send(JSON.stringify({ type: 'subscribed', id }))
+                  } catch {
+                    /* socket closed */
+                  }
                 })
-                addSub(id, ws)
-                try { ws.send(JSON.stringify({ type: 'subscribed', id })) } catch { /* socket closed */ }
-              }).catch((err: unknown) => {
-                const payload: Record<string, unknown> = { type: 'error', id, error: errorMessage(err) }
-                if (err instanceof ValidationError) payload.issues = err.issues
-                ws.send(JSON.stringify(payload))
-              })
+                .catch((err: unknown) => {
+                  const payload: Record<string, unknown> = {
+                    type: 'error',
+                    id,
+                    error: errorMessage(err),
+                  }
+                  if (err instanceof ValidationError) payload.issues = err.issues
+                  try {
+                    ws.send(JSON.stringify(payload))
+                  } catch {
+                    // WebSocket may have closed between error and send
+                  }
+                })
               return
             }
 
@@ -171,8 +183,11 @@ export function createRoutes(
     const argsParam = c.req.query('args')
     let args: unknown = {}
     if (argsParam) {
-      try { args = JSON.parse(argsParam) }
-      catch { return c.json({ error: 'Invalid JSON in args parameter' }, 400) }
+      try {
+        args = JSON.parse(argsParam)
+      } catch {
+        return c.json({ error: 'Invalid JSON in args parameter' }, 400)
+      }
     }
 
     try {
@@ -242,18 +257,24 @@ async function invalidateSubscriptions(
 ) {
   const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
 
-  await Promise.allSettled(affected.map(async (sub) => {
-    const ws = subToWs.get(sub.id)
-    if (!ws) return
+  await Promise.allSettled(
+    affected.map(async (sub) => {
+      const ws = subToWs.get(sub.id)
+      if (!ws) return
 
-    // Re-run query to update table dependencies (tables watched may change)
-    try {
-      const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
-      sub.tablesWatched = tablesRead
-    } catch {
-      // Keep existing table watches — client will see the error on refetch
-    }
+      // Re-run query to update table dependencies (tables watched may change)
+      try {
+        const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
+        sub.tablesWatched = tablesRead
+      } catch {
+        // Keep existing table watches — client will see the error on refetch
+      }
 
-    try { ws.send(JSON.stringify({ type: 'invalidate', id: sub.id })) } catch { /* socket closed */ }
-  }))
+      try {
+        ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
+      } catch {
+        /* socket closed */
+      }
+    }),
+  )
 }

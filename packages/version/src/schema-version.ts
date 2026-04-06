@@ -22,18 +22,24 @@ export interface VersionedRecord {
 }
 
 export type StalenessPriority = 'critical' | 'recommended' | 'optional' | 'low'
-export type StalenessReason = 'version_major' | 'version_minor' | 'version_patch' | 'version_prerelease' | 'time_expired'
+export type StalenessReason =
+  | 'version_major'
+  | 'version_minor'
+  | 'version_patch'
+  | 'version_prerelease'
+  | 'time_expired'
 
 export type StalenessResult =
   | { stale: true; reason: StalenessReason; priority: StalenessPriority; diff?: VersionDiff }
   | { stale: false }
 
-const PRIORITY_MAP: Record<VersionDiff, { reason: StalenessReason; priority: StalenessPriority }> = {
-  major: { reason: 'version_major', priority: 'critical' },
-  minor: { reason: 'version_minor', priority: 'recommended' },
-  patch: { reason: 'version_patch', priority: 'optional' },
-  prerelease: { reason: 'version_prerelease', priority: 'optional' },
-}
+const PRIORITY_MAP: Record<VersionDiff, { reason: StalenessReason; priority: StalenessPriority }> =
+  {
+    major: { reason: 'version_major', priority: 'critical' },
+    minor: { reason: 'version_minor', priority: 'recommended' },
+    patch: { reason: 'version_patch', priority: 'optional' },
+    prerelease: { reason: 'version_prerelease', priority: 'optional' },
+  }
 
 export class SchemaVersion {
   readonly current: Version

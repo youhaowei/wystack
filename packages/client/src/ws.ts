@@ -54,7 +54,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function connect() {
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-    Promise.resolve(getToken?.()).then(token => {
+    Promise.resolve(getToken?.()).then((token) => {
       // Re-check after async — another connect() may have fired
       if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 

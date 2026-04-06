@@ -7,7 +7,16 @@ export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
 
-export type { QueryDef, MutationDef, FunctionContext, FunctionDef, InferArgs, InferArg, DbInput, WyStackServer } from './types'
+export type {
+  QueryDef,
+  MutationDef,
+  FunctionContext,
+  FunctionDef,
+  InferArgs,
+  InferArg,
+  DbInput,
+  WyStackServer,
+} from './types'
 export type { WyStackApp } from './create'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'

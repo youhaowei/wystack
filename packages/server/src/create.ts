@@ -12,7 +12,11 @@ export interface WyStackApp {
   functions: Map<string, FunctionDef>
   subscriptions: ReturnType<typeof createSubscriptionManager>
   /** Internal dispatch — resolves DB, creates TrackedDb, runs handler with context */
-  call: (path: string, args: unknown, context?: Record<string, unknown>) => Promise<{
+  call: (
+    path: string,
+    args: unknown,
+    context?: Record<string, unknown>,
+  ) => Promise<{
     result: unknown
     tablesRead: Set<string>
     tablesWritten: Set<string>

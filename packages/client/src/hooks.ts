@@ -11,17 +11,12 @@ function nextSubId() {
  * useWyQuery — fetches data via HTTP GET (React Query), subscribes via WS for
  * live invalidation. Returns a standard React Query result.
  */
-export function useWyQuery<T = unknown>(
-  path: string,
-  args?: unknown,
-): UseQueryResult<T> {
+export function useWyQuery<T = unknown>(path: string, args?: unknown): UseQueryResult<T> {
   const client = useWyStackClient()
   const queryClient = useQueryClient()
   const subIdRef = useRef<string | null>(null)
 
-  const queryKey = args !== undefined
-    ? ['wystack', path, args]
-    : ['wystack', path]
+  const queryKey = args !== undefined ? ['wystack', path, args] : ['wystack', path]
 
   const query = useQuery<T>({
     queryKey,

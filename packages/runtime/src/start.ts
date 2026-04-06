@@ -65,9 +65,10 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
   const lifecycle = createLifecycle()
 
   // 1. Find available port — probe on the same hostname the server will bind to
-  const port = requestedPort === 0
-    ? await findAvailablePort({ hostname })
-    : await findAvailablePort({ preferred: requestedPort, hostname })
+  const port =
+    requestedPort === 0
+      ? await findAvailablePort({ hostname })
+      : await findAvailablePort({ preferred: requestedPort, hostname })
 
   // 2. Start the server using the appropriate adapter
   const server = await startServer({
@@ -158,7 +159,7 @@ async function startServer(opts: StartServerOptions): Promise<WyStackServer> {
 
   if (runtime !== 'bun' && runtime !== 'node' && runtime !== 'electron') {
     throw new Error(
-      `Unsupported runtime: ${runtime}. startRuntime supports 'bun', 'node', and 'electron'.`
+      `Unsupported runtime: ${runtime}. startRuntime supports 'bun', 'node', and 'electron'.`,
     )
   }
 

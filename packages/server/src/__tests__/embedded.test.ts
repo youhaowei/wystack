@@ -63,10 +63,7 @@ beforeEach(async () => {
   consumerApp.get('/health', (c) => c.json({ status: 'ok' }))
 
   // Mount WyStack routes under /wystack prefix
-  const wyRoutes = createRoutes(
-    { app, prefix: '/api' },
-    upgradeWebSocket,
-  )
+  const wyRoutes = createRoutes({ app, prefix: '/api' }, upgradeWebSocket)
   consumerApp.route('/wystack', wyRoutes)
 
   server = Bun.serve({
@@ -167,7 +164,9 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
   test('resolveContext works in embedded mode', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,

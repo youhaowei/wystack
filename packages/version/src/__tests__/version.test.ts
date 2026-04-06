@@ -133,9 +133,24 @@ describe('SchemaVersion', () => {
   const config = {
     current: semver('2.0.0'),
     changelog: [
-      { version: semver('1.0.0'), date: isoFrom('2026-01-15'), description: 'Initial', breaking: false },
-      { version: semver('1.1.0'), date: isoFrom('2026-02-20'), description: 'Added feature', breaking: false },
-      { version: semver('2.0.0'), date: isoFrom('2026-03-16'), description: 'Breaking change', breaking: true },
+      {
+        version: semver('1.0.0'),
+        date: isoFrom('2026-01-15'),
+        description: 'Initial',
+        breaking: false,
+      },
+      {
+        version: semver('1.1.0'),
+        date: isoFrom('2026-02-20'),
+        description: 'Added feature',
+        breaking: false,
+      },
+      {
+        version: semver('2.0.0'),
+        date: isoFrom('2026-03-16'),
+        description: 'Breaking change',
+        breaking: true,
+      },
     ],
     staleness: { maxAgeDays: 30 },
   }
@@ -259,7 +274,12 @@ describe('SchemaVersion', () => {
     const schema = new SchemaVersion({
       current: semver('0.4.0'),
       changelog: [
-        { version: semver('0.4.0'), date: isoFrom('2026-03-19'), description: 'Org-scoped artifacts', breaking: false },
+        {
+          version: semver('0.4.0'),
+          date: isoFrom('2026-03-19'),
+          description: 'Org-scoped artifacts',
+          breaking: false,
+        },
       ],
     })
     const result = schema.checkStaleness({
@@ -277,9 +297,24 @@ describe('SchemaVersion', () => {
     const schema = new SchemaVersion({
       current: semver('0.4.0'),
       changelog: [
-        { version: semver('0.4.0-rc.1'), date: isoFrom('2026-03-17'), description: 'Extract plans', breaking: false },
-        { version: semver('0.4.0-rc.2'), date: isoFrom('2026-03-18'), description: 'Add orgId', breaking: false },
-        { version: semver('0.4.0'), date: isoFrom('2026-03-19'), description: 'Org-scoped artifacts', breaking: false },
+        {
+          version: semver('0.4.0-rc.1'),
+          date: isoFrom('2026-03-17'),
+          description: 'Extract plans',
+          breaking: false,
+        },
+        {
+          version: semver('0.4.0-rc.2'),
+          date: isoFrom('2026-03-18'),
+          description: 'Add orgId',
+          breaking: false,
+        },
+        {
+          version: semver('0.4.0'),
+          date: isoFrom('2026-03-19'),
+          description: 'Org-scoped artifacts',
+          breaking: false,
+        },
       ],
     })
     // Session at rc.1 should see rc.2 and release

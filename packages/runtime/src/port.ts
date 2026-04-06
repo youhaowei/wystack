@@ -65,8 +65,7 @@ export async function findAvailablePort(opts: FindPortOptions = {}): Promise<num
   // If range was explicitly set and exhausted, that's an error
   if (range) {
     throw new Error(
-      `No available port in range ${min}-${max}. ` +
-      `All ${max - min + 1} ports are in use.`
+      `No available port in range ${min}-${max}. ` + `All ${max - min + 1} ports are in use.`,
     )
   }
 
