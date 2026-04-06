@@ -1,6 +1,6 @@
 import pino from 'pino'
 import type { TraceyConfig } from './types'
-import { DEFAULT_RING_SIZE, initRingBuffer } from './ring-buffer'
+import { DEFAULT_RING_SIZE, initRingBuffer, clearRingBuffer } from './ring-buffer'
 import { Writable } from 'node:stream'
 
 const isDev = process.env.NODE_ENV !== 'production'
@@ -90,6 +90,8 @@ export function initTracey(config: TraceyConfig) {
       },
     })
     streams.push({ level: level as pino.Level, stream: ringStream })
+  } else {
+    clearRingBuffer()
   }
 
   const opts: pino.LoggerOptions = {
