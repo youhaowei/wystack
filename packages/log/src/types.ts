@@ -32,8 +32,10 @@ export interface WideEventFields {
   [key: string]: unknown
 }
 
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal'
+
 export interface TraceyConfig {
-  level?: string
+  level?: LogLevel
   redact?: boolean
   ringBuffer?: number | false
 }

@@ -35,7 +35,7 @@ bun run check      # lint + format + typecheck + test
 
 ## Architecture
 
-```
+```text
 @wystack/db  <--  @wystack/server  <--  @wystack/client
 (detection)       (distribution)        (consumption)
 ```

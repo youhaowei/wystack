@@ -22,7 +22,12 @@ export function flushPageMark(pageName: string) {
   active.delete(pageName)
 
   const total = Math.round(performance.now() - page.start)
-  const entry = { page: page.name, total_ms: total, ...page.marks }
+  const {
+    page: _reserved1,
+    total_ms: _reserved2,
+    ...safeMarks
+  } = page.marks as Record<string, number>
+  const entry = { page: page.name, total_ms: total, ...safeMarks }
 
   const isDev =
     typeof import.meta !== 'undefined' &&
