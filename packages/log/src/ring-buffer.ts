@@ -34,10 +34,7 @@ export class LogRingBuffer {
       return this.entries.slice(0, this._count) as LogEntry[]
     }
     // Insertion order: oldest (head) to newest (head - 1)
-    return [
-      ...this.entries.slice(this.head),
-      ...this.entries.slice(0, this.head),
-    ] as LogEntry[]
+    return [...this.entries.slice(this.head), ...this.entries.slice(0, this.head)] as LogEntry[]
   }
 
   getEntriesByLevel(level: string): ReadonlyArray<LogEntry> {

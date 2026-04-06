@@ -4,9 +4,7 @@ interface PageMark {
   marks: Record<string, number>
 }
 
-const isDev =
-  typeof import.meta !== 'undefined' &&
-  !!import.meta.env?.DEV
+const isDev = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV
 
 const globals = globalThis as Record<string, unknown>
 // __wystack_page_marks__ is a reserved globalThis key — do not use elsewhere

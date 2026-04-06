@@ -15,7 +15,7 @@
       "cache": true
     },
     "typecheck": {
-      "dependsOn": ["^typecheck"],
+      "dependsOn": ["^build"],
       "inputs": ["src/**/*.ts", "tsconfig.json"]
     },
     "clean": {
