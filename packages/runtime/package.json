@@ -24,6 +24,7 @@
     "@electric-sql/pglite": "^0.3.16",
     "@wystack/db": "workspace:*",
     "drizzle-orm": "^0.45.1",
+    "@types/node": "^22.0.0",
     "typescript": "^5.8.3"
   }
 }

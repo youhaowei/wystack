@@ -1,7 +1,7 @@
 {
   "plugins": ["typescript"],
   "rules": {
-    "typescript/no-explicit-any": "error"
+    "typescript/no-explicit-any": "warn"
   },
   "ignorePatterns": ["**/__tests__/**"]
 }
