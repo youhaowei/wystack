@@ -6,9 +6,15 @@ describe('createLifecycle', () => {
     const order: number[] = []
     const lifecycle = createLifecycle()
 
-    lifecycle.onStart(() => { order.push(1) })
-    lifecycle.onStart(() => { order.push(2) })
-    lifecycle.onStart(() => { order.push(3) })
+    lifecycle.onStart(() => {
+      order.push(1)
+    })
+    lifecycle.onStart(() => {
+      order.push(2)
+    })
+    lifecycle.onStart(() => {
+      order.push(3)
+    })
 
     await lifecycle.start()
     expect(order).toEqual([1, 2, 3])
@@ -18,9 +24,15 @@ describe('createLifecycle', () => {
     const order: number[] = []
     const lifecycle = createLifecycle()
 
-    lifecycle.onStop(() => { order.push(1) })
-    lifecycle.onStop(() => { order.push(2) })
-    lifecycle.onStop(() => { order.push(3) })
+    lifecycle.onStop(() => {
+      order.push(1)
+    })
+    lifecycle.onStop(() => {
+      order.push(2)
+    })
+    lifecycle.onStop(() => {
+      order.push(3)
+    })
 
     await lifecycle.stop()
     expect(order).toEqual([3, 2, 1])
@@ -34,7 +46,9 @@ describe('createLifecycle', () => {
       await new Promise((r) => setTimeout(r, 10))
       order.push('async-start')
     })
-    lifecycle.onStart(() => { order.push('sync-start') })
+    lifecycle.onStart(() => {
+      order.push('sync-start')
+    })
 
     await lifecycle.start()
     expect(order).toEqual(['async-start', 'sync-start'])
@@ -44,7 +58,9 @@ describe('createLifecycle', () => {
     let count = 0
     const lifecycle = createLifecycle()
 
-    lifecycle.onStop(() => { count++ })
+    lifecycle.onStop(() => {
+      count++
+    })
 
     await lifecycle.stop()
     await lifecycle.stop()
@@ -55,7 +71,9 @@ describe('createLifecycle', () => {
     let count = 0
     const lifecycle = createLifecycle()
 
-    lifecycle.onStart(() => { count++ })
+    lifecycle.onStart(() => {
+      count++
+    })
 
     await lifecycle.start()
     await lifecycle.start()
@@ -94,9 +112,15 @@ describe('createLifecycle', () => {
     const order: number[] = []
     const lifecycle = createLifecycle()
 
-    lifecycle.onStop(() => { order.push(1) })
-    lifecycle.onStop(() => { throw new Error('hook 2 failed') })
-    lifecycle.onStop(() => { order.push(3) })
+    lifecycle.onStop(() => {
+      order.push(1)
+    })
+    lifecycle.onStop(() => {
+      throw new Error('hook 2 failed')
+    })
+    lifecycle.onStop(() => {
+      order.push(3)
+    })
 
     // Should not throw
     const errors = await lifecycle.stop()

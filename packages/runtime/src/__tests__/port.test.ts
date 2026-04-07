@@ -55,9 +55,7 @@ describe('findAvailablePort', () => {
     })
 
     try {
-      await expect(
-        findAvailablePort({ range: [occupied, occupied] })
-      ).rejects.toThrow()
+      await expect(findAvailablePort({ range: [occupied, occupied] })).rejects.toThrow()
     } finally {
       blocker.close()
     }

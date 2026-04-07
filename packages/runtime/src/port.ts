@@ -48,13 +48,17 @@ function isPortAvailable(port: number, hostname = '0.0.0.0'): Promise<boolean> {
  * 3. Fall back to OS-assigned port (port 0)
  */
 export async function findAvailablePort(opts: FindPortOptions = {}): Promise<number> {
-  const { preferred, range, hostname = '0.0.0.0' } = opts
+  let { preferred, range, hostname = '0.0.0.0' } = opts
   const [min, max] = range ?? [3000, 3999]
+
+  // If preferred is outside the specified range, ignore it
+  if (preferred !== undefined && range && (preferred < range[0] || preferred > range[1])) {
+    preferred = undefined
+  }
 
   // Try preferred first
   if (preferred !== undefined) {
     if (await isPortAvailable(preferred, hostname)) return preferred
-    // If we have a range constraint and preferred is outside it, don't fall through
   }
 
   // Scan range
@@ -65,8 +69,7 @@ export async function findAvailablePort(opts: FindPortOptions = {}): Promise<num
   // If range was explicitly set and exhausted, that's an error
   if (range) {
     throw new Error(
-      `No available port in range ${min}-${max}. ` +
-      `All ${max - min + 1} ports are in use.`
+      `No available port in range ${min}-${max}. ` + `All ${max - min + 1} ports are in use.`,
     )
   }
 

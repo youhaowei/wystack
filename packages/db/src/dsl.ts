@@ -60,7 +60,11 @@ export class ColumnDef<TType = unknown, TOptional extends boolean = false> {
   }
 
   /** Foreign key reference: .references('tableName') or .references('tableName', 'columnName') */
-  references(table: string, column: string = 'id', onDelete?: 'cascade' | 'set null' | 'no action'): ColumnDef<TType, TOptional> {
+  references(
+    table: string,
+    column: string = 'id',
+    onDelete?: 'cascade' | 'set null' | 'no action',
+  ): ColumnDef<TType, TOptional> {
     return new ColumnDef({ ...this.opts, ref: { table, column, onDelete } })
   }
 
@@ -96,9 +100,8 @@ export const uuid = col<string>('uuid')
 export type AnyColumnDef = ColumnDef<any, any>
 
 /** Infer the TypeScript type for a column: optional columns become T | undefined */
-export type InferColumn<C> = C extends ColumnDef<infer T, infer Opt>
-  ? Opt extends true ? T | undefined : T
-  : never
+export type InferColumn<C> =
+  C extends ColumnDef<infer T, infer Opt> ? (Opt extends true ? T | undefined : T) : never
 
 /** Infer the TypeScript type for a table definition */
 export type InferTable<T extends Record<string, ColumnDef>> = {

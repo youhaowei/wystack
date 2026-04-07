@@ -2,6 +2,5 @@
   "plugins": ["typescript"],
   "rules": {
     "typescript/no-explicit-any": "error"
-  },
-  "ignorePatterns": ["**/__tests__/**"]
+  }
 }

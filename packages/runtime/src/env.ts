@@ -18,20 +18,12 @@ export function detectRuntime(): Runtime {
   if (typeof g.Deno !== 'undefined') return 'deno'
 
   // Electron — has `process.versions.electron`
-  if (
-    typeof process !== 'undefined' &&
-    process.versions &&
-    'electron' in process.versions
-  ) {
+  if (typeof process !== 'undefined' && process.versions && 'electron' in process.versions) {
     return 'electron'
   }
 
   // Node.js
-  if (
-    typeof process !== 'undefined' &&
-    process.versions &&
-    'node' in process.versions
-  ) {
+  if (typeof process !== 'undefined' && process.versions && 'node' in process.versions) {
     return 'node'
   }
 

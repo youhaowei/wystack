@@ -103,8 +103,12 @@ describe('startRuntime', () => {
       app,
       port: 0,
       dir: tmpDir,
-      onStart: () => { events.push('started') },
-      onStop: () => { events.push('stopped') },
+      onStart: () => {
+        events.push('started')
+      },
+      onStop: () => {
+        events.push('stopped')
+      },
     })
 
     expect(events).toEqual(['started'])

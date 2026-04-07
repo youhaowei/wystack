@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { UseQueryResult, UseMutationResult } from '@tanstack/react-query'
 import { useWyStackClient } from './provider'
@@ -11,36 +11,33 @@ function nextSubId() {
  * useWyQuery — fetches data via HTTP GET (React Query), subscribes via WS for
  * live invalidation. Returns a standard React Query result.
  */
-export function useWyQuery<T = unknown>(
-  path: string,
-  args?: unknown,
-): UseQueryResult<T> {
+export function useWyQuery<T = unknown>(path: string, args?: unknown): UseQueryResult<T> {
   const client = useWyStackClient()
   const queryClient = useQueryClient()
-  const subIdRef = useRef<string | null>(null)
 
-  const queryKey = args !== undefined
-    ? ['wystack', path, args]
-    : ['wystack', path]
+  const stableArgsKey = JSON.stringify(args)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableArgs = useMemo(() => args, [stableArgsKey])
+
+  const queryKey = stableArgs !== undefined ? ['wystack', path, stableArgs] : ['wystack', path]
 
   const query = useQuery<T>({
     queryKey,
-    queryFn: () => client.query(path, args) as Promise<T>,
+    queryFn: () => client.query(path, stableArgs) as Promise<T>,
   })
 
   // WS subscription for live invalidation
   useEffect(() => {
     const subId = nextSubId()
-    subIdRef.current = subId
 
-    client.ws.subscribe(subId, path, args ?? {}, () => {
+    client.ws.subscribe(subId, path, stableArgs ?? {}, () => {
       queryClient.invalidateQueries({ queryKey })
     })
 
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [path, JSON.stringify(args)])
+  }, [client.ws, queryClient, path, stableArgsKey])
 
   return query
 }

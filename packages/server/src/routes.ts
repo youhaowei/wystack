@@ -28,10 +28,7 @@ export interface RouteOptions {
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
 }
 
-export function createRoutes(
-  opts: RouteOptions,
-  upgradeWebSocket: UpgradeWebSocket,
-) {
+export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSocket) {
   const { app, prefix = '/api' } = opts
   const resolveContext = opts.resolveContext ?? (async () => ({}))
 
@@ -77,6 +74,7 @@ export function createRoutes(
     async (c, next) => {
       try {
         const context = await resolveContext(c.req.raw)
+        // TODO: type properly via Hono Variables generic
         c.set('wsContext' as never, context as never)
       } catch (err: unknown) {
         return c.json({ error: errorMessage(err) }, 401)
@@ -86,6 +84,7 @@ export function createRoutes(
     upgradeWebSocket((c) => {
       return {
         onOpen(_evt, ws) {
+          // TODO: type properly via Hono Variables generic
           const context = c.get('wsContext' as never) as Record<string, unknown>
           rawToContext.set(ws.raw, context ?? {})
         },
@@ -97,6 +96,7 @@ export function createRoutes(
             const msg = JSON.parse(String(event.data)) as Record<string, unknown>
             msgId = msg.id as string | undefined
 
+            // TODO: scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
               const id = msg.id as string
               const path = msg.path as string
@@ -107,24 +107,39 @@ export function createRoutes(
                 return
               }
 
-              app.call(path, args, context).then(({ tablesRead }) => {
-                // Guard: socket may have closed while query was in-flight
-                if (!rawToContext.has(ws.raw)) return
+              app
+                .call(path, args, context)
+                .then(({ tablesRead }) => {
+                  // Guard: socket may have closed while query was in-flight
+                  if (!rawToContext.has(ws.raw)) return
 
-                app.subscriptions.add({
-                  id,
-                  functionPath: path,
-                  args,
-                  context,
-                  tablesWatched: tablesRead,
+                  app.subscriptions.add({
+                    id,
+                    functionPath: path,
+                    args,
+                    context,
+                    tablesWatched: tablesRead,
+                  })
+                  addSub(id, ws)
+                  try {
+                    ws.send(JSON.stringify({ type: 'subscribed', id }))
+                  } catch {
+                    /* socket closed */
+                  }
                 })
-                addSub(id, ws)
-                try { ws.send(JSON.stringify({ type: 'subscribed', id })) } catch { /* socket closed */ }
-              }).catch((err: unknown) => {
-                const payload: Record<string, unknown> = { type: 'error', id, error: errorMessage(err) }
-                if (err instanceof ValidationError) payload.issues = err.issues
-                ws.send(JSON.stringify(payload))
-              })
+                .catch((err: unknown) => {
+                  const payload: Record<string, unknown> = {
+                    type: 'error',
+                    id,
+                    error: errorMessage(err),
+                  }
+                  if (err instanceof ValidationError) payload.issues = err.issues
+                  try {
+                    ws.send(JSON.stringify(payload))
+                  } catch {
+                    // WebSocket may have closed between error and send
+                  }
+                })
               return
             }
 
@@ -137,7 +152,11 @@ export function createRoutes(
             const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
             if (err instanceof ValidationError) payload.issues = err.issues
             if (msgId) payload.id = msgId
-            ws.send(JSON.stringify(payload))
+            try {
+              ws.send(JSON.stringify(payload))
+            } catch {
+              /* socket closed */
+            }
           }
         },
 
@@ -171,8 +190,11 @@ export function createRoutes(
     const argsParam = c.req.query('args')
     let args: unknown = {}
     if (argsParam) {
-      try { args = JSON.parse(argsParam) }
-      catch { return c.json({ error: 'Invalid JSON in args parameter' }, 400) }
+      try {
+        args = JSON.parse(argsParam)
+      } catch {
+        return c.json({ error: 'Invalid JSON in args parameter' }, 400)
+      }
     }
 
     try {
@@ -235,6 +257,7 @@ export function createRoutes(
   return hono
 }
 
+// TODO: serialize invalidation per-subscription to prevent tablesWatched race under concurrent mutations
 async function invalidateSubscriptions(
   app: WyStackApp,
   writtenTables: Set<string>,
@@ -242,18 +265,24 @@ async function invalidateSubscriptions(
 ) {
   const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
 
-  await Promise.allSettled(affected.map(async (sub) => {
-    const ws = subToWs.get(sub.id)
-    if (!ws) return
+  await Promise.allSettled(
+    affected.map(async (sub) => {
+      const ws = subToWs.get(sub.id)
+      if (!ws) return
 
-    // Re-run query to update table dependencies (tables watched may change)
-    try {
-      const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
-      sub.tablesWatched = tablesRead
-    } catch {
-      // Keep existing table watches — client will see the error on refetch
-    }
+      // Re-run query to update table dependencies (tables watched may change)
+      try {
+        const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
+        sub.tablesWatched = tablesRead
+      } catch {
+        // Keep existing table watches — client will see the error on refetch
+      }
 
-    try { ws.send(JSON.stringify({ type: 'invalidate', id: sub.id })) } catch { /* socket closed */ }
-  }))
+      try {
+        ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
+      } catch {
+        /* socket closed */
+      }
+    }),
+  )
 }

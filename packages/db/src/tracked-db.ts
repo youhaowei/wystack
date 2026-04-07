@@ -2,7 +2,17 @@
  * TrackedDb — fluent query builder wrapping Drizzle that auto-records
  * tablesRead / tablesWritten for reactive invalidation.
  */
-import { eq as drizzleEq, ne as drizzleNe, gt as drizzleGt, gte as drizzleGte, lt as drizzleLt, lte as drizzleLte, asc, desc } from 'drizzle-orm'
+import {
+  eq as drizzleEq,
+  ne as drizzleNe,
+  gt as drizzleGt,
+  gte as drizzleGte,
+  lt as drizzleLt,
+  lte as drizzleLte,
+  asc,
+  desc,
+  and,
+} from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import { getTableName, getTableColumns } from 'drizzle-orm'
@@ -48,7 +58,7 @@ export class SelectBuilder<T extends AnyTable> {
 
   where(filters: FilterDescriptor | FilterDescriptor[]) {
     const toAdd = Array.isArray(filters) ? filters : [filters]
-    this._filters = [...this._filters, ...toAdd]
+    this._filters.push(...toAdd)
     return this
   }
 
@@ -63,10 +73,9 @@ export class SelectBuilder<T extends AnyTable> {
     return this
   }
 
-  private _buildConditions() {
-    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
-    return this._filters.map(f => {
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  private _buildConditions(columns: Record<string, any>) {
+    return this._filters.map((f) => {
       const col = columns[f.column]
       if (!col) throw new Error(`Unknown column: ${f.column}`)
       return drizzleOpMap[f.op](col, f.value)
@@ -77,14 +86,14 @@ export class SelectBuilder<T extends AnyTable> {
     this._tracker.tablesRead.add(getTableName(this._table))
     let q = this._db.select().from(this._table)
 
-    const conditions = this._buildConditions()
-    for (const cond of conditions) {
-      q = q.where(cond)
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const columns = getTableColumns(this._table) as Record<string, any>
+    const conditions = this._buildConditions(columns)
+    if (conditions.length > 0) {
+      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
 
     if (this._orderByCol) {
-      // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-      const columns = getTableColumns(this._table) as Record<string, any>
       const col = columns[this._orderByCol]
       if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
       q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
@@ -106,9 +115,10 @@ export class SelectBuilder<T extends AnyTable> {
   async update(values: Partial<T['$inferInsert']>) {
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.update(this._table).set(values)
-    const conditions = this._buildConditions()
-    for (const cond of conditions) {
-      q = q.where(cond)
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
+    if (conditions.length > 0) {
+      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
     return q.returning()
   }
@@ -116,9 +126,10 @@ export class SelectBuilder<T extends AnyTable> {
   async delete() {
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.delete(this._table)
-    const conditions = this._buildConditions()
-    for (const cond of conditions) {
-      q = q.where(cond)
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
+    if (conditions.length > 0) {
+      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
     return q.returning()
   }

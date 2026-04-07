@@ -36,6 +36,7 @@ export function serve(opts: NodeServeOptions): WyStackServer {
       return resolvedPort
     },
     stop(immediate = false) {
+      // oxlint-disable-next-line typescript/no-explicit-any -- @hono/node-server doesn't expose closeAllConnections in its types
       if (immediate) (server as any).closeAllConnections?.()
       server.close()
     },

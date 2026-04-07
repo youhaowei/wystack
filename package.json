@@ -1,20 +1,24 @@
 {
   "name": "wystack",
   "private": true,
+  "packageManager": "bun@1.3.5",
   "workspaces": ["packages/*"],
   "scripts": {
-    "build": "bun run --filter '*' build",
-    "dev": "bun run --filter '*' dev",
+    "build": "turbo build",
+    "dev": "turbo dev",
     "lint": "oxlint packages/",
     "format": "oxfmt packages/",
     "format:check": "oxfmt --check packages/",
-    "typecheck": "bun run --filter '*' typecheck",
-    "test": "bun run --filter '*' test"
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "check": "oxlint packages/ && oxfmt --check packages/ && turbo typecheck test",
+    "clean": "turbo clean"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.16",
     "@types/bun": "^1.3.10",
     "postgres": "^3.4.8",
+    "turbo": "^2.9.3",
     "typescript": "^5.8.3"
   }
 }

@@ -93,10 +93,7 @@ describe('TrackedDb', () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     tracked = resetTracking(tracked)
 
-    const updated = await tracked
-      .from(schema.todos)
-      .where(eq('title', 'A'))
-      .update({ done: true })
+    const updated = await tracked.from(schema.todos).where(eq('title', 'A')).update({ done: true })
 
     expect(tracked.tablesWritten.has('todos')).toBe(true)
     expect(updated).toHaveLength(1)
@@ -107,10 +104,7 @@ describe('TrackedDb', () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     tracked = resetTracking(tracked)
 
-    const deleted = await tracked
-      .from(schema.todos)
-      .where(eq('title', 'A'))
-      .delete()
+    const deleted = await tracked.from(schema.todos).where(eq('title', 'A')).delete()
 
     expect(tracked.tablesWritten.has('todos')).toBe(true)
     expect(deleted).toHaveLength(1)

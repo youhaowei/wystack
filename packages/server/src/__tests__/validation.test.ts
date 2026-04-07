@@ -136,7 +136,7 @@ describe('validation in call()', () => {
         }),
         searchTodos: query({
           args: { query: text.optional(), limit: int.default(10) },
-          handler: async (ctx, args) => [],
+          handler: async (_ctx, _args) => [],
         }),
       },
     })
