@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack, query, mutation } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
+import { createClient } from '../client'
 import { createWsManager } from '../ws'
 
 const schema = defineSchema({
@@ -288,6 +289,37 @@ describe('WsManager', () => {
     } finally {
       authServer.stop(true)
     }
+  })
+
+  test('createClient requiresAuth:false keeps WS no-auth even with getToken configured', async () => {
+    let tokenCalls = 0
+    const client = createClient({
+      url: baseUrl,
+      requiresAuth: false,
+      getToken: () => {
+        tokenCalls++
+        throw new Error('WS no-auth path must not call getToken')
+      },
+    })
+
+    client.ws.connect()
+
+    const invalidated = new Promise<void>((resolve, reject) => {
+      client.ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+      setTimeout(() => reject(new Error('timeout')), 5000)
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+    await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Trusted local runtime' }),
+    })
+
+    await invalidated
+    expect(tokenCalls).toBe(0)
+    expect(client.ws.isConnected()).toBe(true)
+    client.ws.disconnect()
   })
 
   test('does not reconnect on close code 4001', async () => {
