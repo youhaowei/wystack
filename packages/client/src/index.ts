@@ -1,14 +1,35 @@
 // @wystack/client
-// React hooks and reactive client for WyStack
+// Typed reactive client for WyStack
 
+// Primary API — one-line setup
+export { createWyStack } from './setup'
+export type { WyStackInstance } from './setup'
+
+// Standalone hooks — Convex-style
+export { useQuery, useMutation } from './hooks'
+export type { Skip } from './hooks'
+
+// Function reference types
+export type {
+  QueryRef,
+  MutationRef,
+  FunctionRef,
+  ApiFromFunctions,
+  RefArgs,
+  RefReturn,
+} from './refs'
+
+// Api builder (advanced — usually called via createWyStack)
+export { createApi } from './api'
+
+// Legacy string-based hooks (backward compatible)
+export { useWyQuery, useWyMutation } from './hooks'
+
+// Low-level client (advanced)
 export { createClient } from './client'
 export { WyStackProvider, useWyStackClient } from './provider'
-export { useWyQuery, useWyMutation } from './hooks'
 export { createWsManager } from './ws'
 
 export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { WyStackClientConfig } from './types'
-
-export { createWyClient } from './proxy'
-export type { ProxyClient } from './proxy'
