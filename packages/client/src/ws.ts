@@ -3,7 +3,7 @@
  * reconnection, subscription tracking, and invalidation dispatch.
  *
  * Protocol (matches @wystack/server):
- *   Client → Server: { type: 'auth', v, token }           (first frame when auth is configured)
+ *   Client → Server: { type: 'auth', token }              (first frame when auth is configured)
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
  *   Server → Client: { type: 'authenticated' }            (ack for successful auth)
@@ -15,15 +15,6 @@
  *   4001 — auth failed / missing / protocol violation → do NOT reconnect
  *   4002 — auth timeout → reconnect per normal backoff
  */
-
-/**
- * WS wire-protocol version. Distinct from `@wystack/client` package version:
- * bumped only on wire-format changes.
- *
- * SYNC: keep in lockstep with `WS_PROTOCOL_VERSION` in `@wystack/server`
- * (`packages/server/src/routes.ts`).
- */
-const WS_PROTOCOL_VERSION = '0.1.0'
 
 type InvalidateHandler = () => void
 
@@ -107,7 +98,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           // then closes without any response (e.g., auth-required server +
           // no-token client → 4002 timeout loop).
           if (requiresAuth) {
-            ws!.send(JSON.stringify({ type: 'auth', v: WS_PROTOCOL_VERSION, token }))
+            ws!.send(JSON.stringify({ type: 'auth', token }))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
             // If no ack arrives, close 4002 (transient/retry) so normal backoff
             // applies. Real auth rejections arrive as an explicit server-side
@@ -166,17 +157,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
             // surfaces the error. If HTTP succeeds, data is fresh but
             // real-time updates stay off until disconnect() + reconnect()
             // with a new token.
-            // Per-handler try/catch: one throwing consumer must not drop
-            // remaining invalidations.
-            for (const handler of handlers.values()) {
-              try {
-                handler()
-              } catch (err) {
-                if (process.env.NODE_ENV !== 'production') {
-                  console.warn('[wystack/ws] invalidation handler threw on 4001:', err)
-                }
-              }
-            }
+            for (const handler of handlers.values()) handler()
             return
           }
           scheduleReconnect()
