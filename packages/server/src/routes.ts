@@ -63,10 +63,23 @@ function isCompatibleProtocol(clientVersion: string): boolean {
  */
 interface Connection {
   authenticated: boolean
+  /**
+   * True while a `{type:"auth"}` frame's `resolveContext` is in-flight. Blocks
+   * a second auth frame from racing the first — otherwise two concurrent
+   * resolves could interleave `conn.token` and authenticate later subscribes
+   * as the wrong identity, or close a socket the first frame just authed.
+   */
+  authInFlight: boolean
   token: string | null
   upgradeRequest: Request
   timeout: ReturnType<typeof setTimeout> | null
   subIds: Set<string>
+  /**
+   * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
+   * `unsubscribe` arriving mid-await cancel the pending registration so the
+   * resolved subscription doesn't orphan itself in `app.subscriptions`.
+   */
+  pendingSubIds: Set<string>
 }
 
 function errorMessage(err: unknown): string {
@@ -111,6 +124,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     const headers = new Headers(upgradeRequest.headers)
     if (token !== null && token.length > 0) {
       headers.set('authorization', `Bearer ${token}`)
+    } else {
+      // Anonymous path: strip any Authorization that leaked via upgrade headers
+      // (cookie proxy, stale query, reverse proxy) so the WS auth frame is the
+      // sole identity source. Without this, a null-token client could
+      // silently authenticate as whatever identity the upgrade request carried.
+      headers.delete('authorization')
     }
     return new Request(upgradeRequest.url, {
       method: upgradeRequest.method,
@@ -147,7 +166,202 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       app.subscriptions.remove(id)
       subToWs.delete(id)
     }
+    // Drop pending-subscribe IDs so any in-flight resolveContext/.then bails.
+    conn.pendingSubIds.clear()
     rawToConnection.delete(keyOf(ws))
+  }
+
+  /**
+   * Validate `v` on any inbound auth frame — applies to both the initial
+   * handshake (auth-required) and the idempotent-ACK reply (no-auth server +
+   * token-configured client). Returns true if the socket remains open and
+   * version-compatible. Closes 4001 and returns false otherwise.
+   */
+  function validateAuthVersion(msg: Record<string, unknown>, ws: WSContext): boolean {
+    if (typeof msg.v !== 'string') {
+      ws.close(4001, 'missing protocol version')
+      return false
+    }
+    if (!isCompatibleProtocol(msg.v)) {
+      ws.close(4001, 'incompatible protocol version')
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Handle an inbound `{type:"auth", v, token}` frame. Three paths:
+   *
+   *   1. Auth-required, unauthenticated → run resolveContext under a timeout
+   *      race and ACK or close 4001.
+   *   2. Already authenticated (no-auth server OR repeat auth frame) →
+   *      idempotent ACK so the client's ack-wait doesn't expire.
+   *   3. Another auth frame while a resolve is in-flight → close 4001 to
+   *      prevent interleaved `conn.token` writes authenticating subscribes
+   *      as the wrong identity.
+   *
+   * Version validation runs up front for all paths so no-auth servers still
+   * reject wire-incompatible clients.
+   */
+  async function handleAuthFrame(
+    msg: Record<string, unknown>,
+    ws: WSContext,
+    conn: Connection,
+    rawSocket: object,
+  ): Promise<void> {
+    if (!validateAuthVersion(msg, ws)) return
+
+    if (conn.authInFlight) {
+      ws.close(4001, 'auth already in progress')
+      return
+    }
+
+    if (conn.authenticated) {
+      // Idempotent ACK. Covers: no-auth server + token-client pair (client
+      // would otherwise wait authAckTimeoutMs, close 4002, reconnect-loop),
+      // and a double-auth from a buggy client on an auth-required server.
+      try {
+        ws.send(JSON.stringify({ type: 'authenticated' }))
+      } catch {
+        /* socket closed */
+      }
+      return
+    }
+
+    // Full handshake: resolveContext races against authTimeoutMs so a hung
+    // backend can't leak the socket. Hung promise is not cancellable yet
+    // (resolveContext has no AbortSignal in v1) — leaks in memory until it
+    // settles, but the socket closes.
+    if (conn.timeout) clearTimeout(conn.timeout)
+    conn.timeout = null
+
+    const rawToken = msg.token
+    const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
+    conn.token = token
+    conn.authInFlight = true
+
+    let raceTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        resolveSubContext(rawSocket),
+        new Promise((_, rej) => {
+          raceTimer = setTimeout(
+            () => rej(new Error('resolveContext timeout')),
+            authTimeoutMs,
+          )
+        }),
+      ])
+      if (!rawToConnection.has(rawSocket)) return
+      conn.authenticated = true
+      try {
+        ws.send(JSON.stringify({ type: 'authenticated' }))
+      } catch {
+        // Can't ack → client will buffer forever. Close so onClose cleanup
+        // runs and the client sees a well-defined failure.
+        ws.close(4001, 'ack send failed')
+      }
+    } catch (err) {
+      // TODO: replace with @wystack/log once server logging lands.
+      console.warn('[wystack/server] resolveContext failed for WS auth:', err)
+      conn.token = null
+      if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
+    } finally {
+      if (raceTimer) clearTimeout(raceTimer)
+      conn.authInFlight = false
+    }
+  }
+
+  /**
+   * Handle an inbound `{type:"subscribe", id, path, args}` frame. Races
+   * `resolveContext` against `authTimeoutMs` so a hung adapter can't stall
+   * the handler indefinitely. Uses `conn.pendingSubIds` so an `unsubscribe`
+   * arriving during the await cleanly cancels the registration.
+   */
+  async function handleSubscribe(
+    msg: Record<string, unknown>,
+    ws: WSContext,
+    conn: Connection,
+    rawSocket: object,
+  ): Promise<void> {
+    const id = msg.id as string
+    const path = msg.path as string
+    const args = (msg.args ?? {}) as Record<string, unknown>
+    const fn = app.functions.get(path)
+    if (!fn || fn.type !== 'query') {
+      try {
+        ws.send(JSON.stringify({ type: 'error', id, error: `Unknown query: ${path}` }))
+      } catch {
+        /* socket closed */
+      }
+      return
+    }
+
+    conn.pendingSubIds.add(id)
+
+    // Resolve context PER subscription — Spec Decision:
+    // "Context resolved at subscription time, preserved for re-queries"
+    let context: Record<string, unknown>
+    let raceTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      context = (await Promise.race([
+        resolveSubContext(rawSocket),
+        new Promise<never>((_, rej) => {
+          raceTimer = setTimeout(
+            () => rej(new Error('resolveContext timeout')),
+            authTimeoutMs,
+          )
+        }),
+      ])) as Record<string, unknown>
+    } catch (err) {
+      conn.pendingSubIds.delete(id)
+      try {
+        ws.send(JSON.stringify({ type: 'error', id, error: errorMessage(err) }))
+      } catch {
+        /* socket closed */
+      }
+      return
+    } finally {
+      if (raceTimer) clearTimeout(raceTimer)
+    }
+
+    // Unsubscribe may have arrived during the await — it dropped `id` from
+    // pendingSubIds. Bail before running the query.
+    if (!conn.pendingSubIds.has(id)) return
+
+    app
+      .call(path, args, context)
+      .then(({ tablesRead }) => {
+        // Guard: socket closed, OR unsubscribe arrived during the query.
+        if (!rawToConnection.has(rawSocket) || !conn.pendingSubIds.has(id)) return
+        conn.pendingSubIds.delete(id)
+        app.subscriptions.add({
+          id,
+          functionPath: path,
+          args,
+          context,
+          tablesWatched: tablesRead,
+        })
+        addSub(id, ws)
+        try {
+          ws.send(JSON.stringify({ type: 'subscribed', id }))
+        } catch {
+          /* socket closed */
+        }
+      })
+      .catch((err: unknown) => {
+        conn.pendingSubIds.delete(id)
+        const payload: Record<string, unknown> = {
+          type: 'error',
+          id,
+          error: errorMessage(err),
+        }
+        if (err instanceof ValidationError) payload.issues = err.issues
+        try {
+          ws.send(JSON.stringify(payload))
+        } catch {
+          /* socket closed */
+        }
+      })
   }
 
   // --- WebSocket (registered before /:fn to avoid param catch) ---
@@ -165,18 +379,22 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             }, authTimeoutMs)
             rawToConnection.set(rawSocket, {
               authenticated: false,
+              authInFlight: false,
               token: null,
               upgradeRequest,
               timeout,
               subIds: new Set(),
+              pendingSubIds: new Set(),
             })
           } else {
             rawToConnection.set(rawSocket, {
               authenticated: true,
+              authInFlight: false,
               token: null,
               upgradeRequest,
               timeout: null,
               subIds: new Set(),
+              pendingSubIds: new Set(),
             })
           }
         },
@@ -189,150 +407,54 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             return
           }
 
-          // Auth handshake guard — before authenticated, only `auth` messages allowed.
-          if (!conn.authenticated) {
-            let authMsg: Record<string, unknown>
-            try {
-              authMsg = JSON.parse(String(event.data)) as Record<string, unknown>
-            } catch {
+          let msg: Record<string, unknown>
+          try {
+            msg = JSON.parse(String(event.data)) as Record<string, unknown>
+          } catch {
+            // In the pre-auth window an unparseable first frame is a protocol
+            // violation worth closing on. Post-auth, we keep parity with the
+            // outer error path below (send error, stay open).
+            if (!conn.authenticated) {
               ws.close(4001, 'invalid first message')
               return
             }
-            if (authMsg.type !== 'auth') {
-              ws.close(4001, 'first message must be auth')
-              return
-            }
-            // Protocol version is required. Missing `v` is a one-way door —
-            // tolerating it now means legacy "no-v" clients exist forever.
-            // Strict reject while the window's still open.
-            if (typeof authMsg.v !== 'string') {
-              ws.close(4001, 'missing protocol version')
-              return
-            }
-            if (!isCompatibleProtocol(authMsg.v)) {
-              ws.close(4001, 'incompatible protocol version')
-              return
-            }
-            // Auth frame arrived — stop the "no frame sent" timer. Whatever
-            // resolveContext takes is not the 4002 failure mode.
-            if (conn.timeout) clearTimeout(conn.timeout)
-            conn.timeout = null
-
-            const rawToken = authMsg.token
-            const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-            conn.token = token
-            // Race resolveContext against authTimeoutMs so a hung auth
-            // backend doesn't leak the socket. The hung promise is not
-            // cancellable today (resolveContext has no AbortSignal in v1);
-            // it leaks in memory until it settles, but the socket closes.
-            // clearTimeout in finally so a successful auth doesn't leave a
-            // timer running for the rest of authTimeoutMs.
-            let raceTimer: ReturnType<typeof setTimeout> | undefined
             try {
-              await Promise.race([
-                resolveSubContext(rawSocket),
-                new Promise((_, rej) => {
-                  raceTimer = setTimeout(
-                    () => rej(new Error('resolveContext timeout')),
-                    authTimeoutMs,
-                  )
-                }),
-              ])
-              // Socket may have closed during the await (disconnect, network).
-              if (!rawToConnection.has(rawSocket)) return
-              conn.authenticated = true
-              try {
-                ws.send(JSON.stringify({ type: 'authenticated' }))
-              } catch {
-                // Can't ack → client will buffer forever. Close so onClose
-                // cleanup runs and the client sees a well-defined failure.
-                ws.close(4001, 'ack send failed')
-              }
-            } catch (err) {
-              // TODO: replace with @wystack/log once server logging lands.
-              console.warn('[wystack/server] resolveContext failed for WS auth:', err)
-              conn.token = null
-              if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
-            } finally {
-              if (raceTimer) clearTimeout(raceTimer)
+              ws.send(JSON.stringify({ type: 'error', error: 'invalid JSON' }))
+            } catch {
+              /* socket closed */
             }
+            return
+          }
+
+          // `auth` is the only message type allowed to cross the unauth boundary.
+          // Running version validation for both auth-required AND no-auth servers
+          // here is the single choke-point; auth-required runs the full handshake,
+          // no-auth replies idempotently so token-configured clients don't hang.
+          if (msg.type === 'auth') {
+            await handleAuthFrame(msg, ws, conn, rawSocket)
+            return
+          }
+
+          if (!conn.authenticated) {
+            ws.close(4001, 'first message must be auth')
             return
           }
 
           let msgId: string | undefined
           try {
-            const msg = JSON.parse(String(event.data)) as Record<string, unknown>
             msgId = msg.id as string | undefined
-
-            // Idempotent auth ACK:
-            // - No-auth server, token-configured client → ack so client doesn't hang
-            //   waiting for `authenticated`
-            // - Auth server, already-authenticated → ignore (avoid double sendSubscriptions
-            //   on the client)
-            if (msg.type === 'auth') {
-              if (!requiresAuth) {
-                try {
-                  ws.send(JSON.stringify({ type: 'authenticated' }))
-                } catch {
-                  /* socket closed */
-                }
-              }
-              return
-            }
 
             // TODO: scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
-              const id = msg.id as string
-              const path = msg.path as string
-              const args = (msg.args ?? {}) as Record<string, unknown>
-              const fn = app.functions.get(path)
-              if (!fn || fn.type !== 'query') {
-                ws.send(JSON.stringify({ type: 'error', id, error: `Unknown query: ${path}` }))
-                return
-              }
-
-              // Resolve context PER subscription — Spec Decision:
-              // "Context resolved at subscription time, preserved for re-queries"
-              const context = await resolveSubContext(rawSocket)
-
-              app
-                .call(path, args, context)
-                .then(({ tablesRead }) => {
-                  // Guard: socket may have closed while query was in-flight
-                  if (!rawToConnection.has(rawSocket)) return
-
-                  app.subscriptions.add({
-                    id,
-                    functionPath: path,
-                    args,
-                    context,
-                    tablesWatched: tablesRead,
-                  })
-                  addSub(id, ws)
-                  try {
-                    ws.send(JSON.stringify({ type: 'subscribed', id }))
-                  } catch {
-                    /* socket closed */
-                  }
-                })
-                .catch((err: unknown) => {
-                  const payload: Record<string, unknown> = {
-                    type: 'error',
-                    id,
-                    error: errorMessage(err),
-                  }
-                  if (err instanceof ValidationError) payload.issues = err.issues
-                  try {
-                    ws.send(JSON.stringify(payload))
-                  } catch {
-                    // WebSocket may have closed between error and send
-                  }
-                })
+              await handleSubscribe(msg, ws, conn, rawSocket)
               return
             }
 
             if (msg.type === 'unsubscribe') {
               const subId = msg.id as string
+              // Cancel a pending (in-flight) subscribe before it finishes, so
+              // the .then() that registers it sees "not pending" and bails.
+              conn.pendingSubIds.delete(subId)
               const sub = app.subscriptions.get(subId)
               if (sub) removeSub(subId, ws)
             }

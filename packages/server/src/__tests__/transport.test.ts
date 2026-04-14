@@ -471,6 +471,174 @@ describe('WebSocket transport', () => {
     }
   })
 
+  test('WS missing `v` field closes 4001', async () => {
+    // Strict reject — missing `v` is a one-way door. Tolerating it would
+    // create legacy "no-v" clients forever. Distinct code path from invalid-
+    // semver `v` (which the matrix already covers).
+    const app = await makeAuthApp()
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (_req) => ({ userId: 'anyone' }),
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          // No `v` field at all
+          ws.send(JSON.stringify({ type: 'auth', token: 'valid' }))
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4001)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS idempotent auth ACK on no-auth server (token-configured client)', async () => {
+    // No-auth server + token-configured client: client sends `auth` frame,
+    // server must ACK so the client's authAckTimer doesn't fire and force a
+    // 4002 reconnect loop. The server does not run resolveContext in this
+    // path — the ACK is structural.
+    const app = await makeAuthApp()
+    const noAuthServer = serve({ app, port: 0 }) // no resolveContext
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${noAuthServer.port}/api/ws`)
+      const outcome = await new Promise<'authenticated' | number>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: 'anything' }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'authenticated') resolve('authenticated')
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      ws.close()
+      expect(outcome).toBe('authenticated')
+    } finally {
+      noAuthServer.stop(true)
+    }
+  })
+
+  test('WS idempotent ACK path still validates `v` (no-auth server, incompatible client)', async () => {
+    // The version gate must apply on the no-auth server's ACK path too —
+    // otherwise wire-incompatible clients silently connect and subscribe.
+    const app = await makeAuthApp()
+    const noAuthServer = serve({ app, port: 0 })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${noAuthServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', v: '99.0.0', token: null }))
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4001)
+    } finally {
+      noAuthServer.stop(true)
+    }
+  })
+
+  test('WS invalidation re-queries with the subscription-time context (not a fresh resolve)', async () => {
+    // Spec decision: "Context resolved at subscription time, preserved for
+    // re-queries." The invalidation re-run must reuse sub.context, not call
+    // resolveContext again. We observe this by (1) counting handler calls
+    // per userId and (2) asserting resolveContext isn't invoked by the re-run.
+    let resolveCount = 0
+    let resolveCaller = 0
+    const handlerCalls: Array<{ userId: string }> = []
+
+    const app = await makeAuthApp({
+      whoami: query({
+        args: {},
+        handler: async (ctx) => {
+          handlerCalls.push({ userId: ctx.userId as string })
+          return { userId: ctx.userId as string, todos: ctx.db.from(schema.todos).all() }
+        },
+      }),
+      addTodo: mutation({
+        args: { title: text },
+        handler: async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
+      }),
+    })
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (_req) => {
+        resolveCount++
+        resolveCaller++
+        return { userId: `caller${resolveCaller}` }
+      },
+    })
+
+    try {
+      // 1. Open WS, auth, subscribe — resolveContext called once (for sub).
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const subId = 'sub-ctx-preserve'
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: 'tok' }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'authenticated') {
+            ws.send(JSON.stringify({ type: 'subscribe', id: subId, path: 'whoami', args: {} }))
+          } else if (msg.type === 'subscribed' && msg.id === subId) {
+            resolve()
+          }
+        }
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('subscribe timeout')), 5000)
+      })
+
+      // resolveContext runs for auth handshake (call 1) AND for subscribe
+      // (call 2) — per-spec. The subscription's preserved context is the
+      // second one (caller2), which is what the handler saw.
+      const subCaller = handlerCalls[0]?.userId
+      expect(handlerCalls).toHaveLength(1)
+      expect(subCaller).toMatch(/^caller\d+$/)
+      const beforeMutation = resolveCount
+
+      // 2. Mutate over HTTP → triggers invalidation re-run. The mutation's
+      //    own resolveContext increments the counter; the re-run MUST NOT.
+      const invalidated = new Promise<void>((resolve) => {
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'invalidate' && msg.id === subId) resolve()
+        }
+      })
+      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok' },
+        body: JSON.stringify({ title: 'test' }),
+      })
+      await invalidated
+      ws.close()
+
+      // Handler must have re-run with the PRESERVED subscribe-time userId,
+      // not a fresh resolve. The mutation's own resolveContext increments
+      // the counter once; the invalidation re-run must not.
+      expect(handlerCalls.length).toBeGreaterThanOrEqual(2)
+      expect(handlerCalls.every((c) => c.userId === subCaller)).toBe(true)
+      // beforeMutation + 1 (mutation auth) === after. Re-run adds 0.
+      expect(resolveCount).toBe(beforeMutation + 1)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
   test('WS auth timeout closes 4002', async () => {
     const app = await makeAuthApp()
     const authServer = serve({
