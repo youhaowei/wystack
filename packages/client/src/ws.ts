@@ -159,7 +159,17 @@ export function createWsManager(config: WsManagerConfig): WsManager {
             // surfaces the error. If HTTP succeeds, data is fresh but
             // real-time updates stay off until disconnect() + reconnect()
             // with a new token.
-            for (const handler of handlers.values()) handler()
+            // Per-handler try/catch: one throwing consumer must not drop
+            // remaining invalidations.
+            for (const handler of handlers.values()) {
+              try {
+                handler()
+              } catch (err) {
+                if (process.env.NODE_ENV !== 'production') {
+                  console.warn('[wystack/ws] invalidation handler threw on 4001:', err)
+                }
+              }
+            }
             return
           }
           scheduleReconnect()

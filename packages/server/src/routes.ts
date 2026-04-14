@@ -202,10 +202,14 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               ws.close(4001, 'first message must be auth')
               return
             }
-            // Protocol version check. Absent `v` is tolerated and treated as
-            // matching server (lets legacy clients speak the current protocol).
-            const clientV = typeof authMsg.v === 'string' ? authMsg.v : WS_PROTOCOL_VERSION
-            if (!isCompatibleProtocol(clientV)) {
+            // Protocol version is required. Missing `v` is a one-way door —
+            // tolerating it now means legacy "no-v" clients exist forever.
+            // Strict reject while the window's still open.
+            if (typeof authMsg.v !== 'string') {
+              ws.close(4001, 'missing protocol version')
+              return
+            }
+            if (!isCompatibleProtocol(authMsg.v)) {
               ws.close(4001, 'incompatible protocol version')
               return
             }
@@ -217,16 +221,22 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             const rawToken = authMsg.token
             const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
             conn.token = token
+            // Race resolveContext against authTimeoutMs so a hung auth
+            // backend doesn't leak the socket. The hung promise is not
+            // cancellable today (resolveContext has no AbortSignal in v1);
+            // it leaks in memory until it settles, but the socket closes.
+            // clearTimeout in finally so a successful auth doesn't leave a
+            // timer running for the rest of authTimeoutMs.
+            let raceTimer: ReturnType<typeof setTimeout> | undefined
             try {
-              // Race resolveContext against authTimeoutMs so a hung auth
-              // backend doesn't leak the socket. The hung promise is not
-              // cancellable today (resolveContext has no AbortSignal in v1);
-              // it leaks in memory until it settles, but the socket closes.
               await Promise.race([
                 resolveSubContext(rawSocket),
-                new Promise((_, rej) =>
-                  setTimeout(() => rej(new Error('resolveContext timeout')), authTimeoutMs),
-                ),
+                new Promise((_, rej) => {
+                  raceTimer = setTimeout(
+                    () => rej(new Error('resolveContext timeout')),
+                    authTimeoutMs,
+                  )
+                }),
               ])
               // Socket may have closed during the await (disconnect, network).
               if (!rawToConnection.has(rawSocket)) return
@@ -243,6 +253,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               console.warn('[wystack/server] resolveContext failed for WS auth:', err)
               conn.token = null
               if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
+            } finally {
+              if (raceTimer) clearTimeout(raceTimer)
             }
             return
           }

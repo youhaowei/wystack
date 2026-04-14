@@ -283,7 +283,7 @@ describe('WebSocket transport', () => {
       const messages: any[] = []
       const done = new Promise<void>((resolve, reject) => {
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'auth', token: 'user_123' }))
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: 'user_123' }))
         }
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data)
@@ -325,7 +325,7 @@ describe('WebSocket transport', () => {
       const closeCode = await new Promise<number>((resolve, reject) => {
         ws.onopen = () => {
           // Auth message with no token → resolveContext throws
-          ws.send(JSON.stringify({ type: 'auth', token: null }))
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: null }))
         }
         ws.onclose = (event) => resolve(event.code)
         ws.onerror = () => reject(new Error('ws error'))
@@ -356,7 +356,7 @@ describe('WebSocket transport', () => {
       let subscribedCount = 0
       await new Promise<void>((resolve, reject) => {
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'auth', token: 'user_123' }))
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: 'user_123' }))
         }
         ws.onmessage = (event) => {
           const msg = JSON.parse(event.data)
