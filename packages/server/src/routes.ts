@@ -56,18 +56,15 @@ function isCompatibleProtocol(clientVersion: string): boolean {
  * primitive keys from accidentally compiling.
  *
  * `upgradeRequest` is the original HTTP upgrade Request — captured once so
- * `resolveContext` can see cookies, forwarded headers, URL, and origin.
- *
- * `authRequest` is the post-auth Request (upgradeRequest + `Authorization:
- * Bearer`). Built once at auth success and reused per subscription, so the
- * per-sub context resolution doesn't re-allocate Headers + Request on every
- * subscribe message.
+ * `resolveContext` can see cookies, forwarded headers, URL, and origin. A
+ * fresh `Request` with the Bearer header layered on is built per subscribe
+ * (see `resolveSubContext`) so adapters get a unique Request per call, avoiding
+ * shared-mutation and identity-keyed deduplication hazards.
  */
 interface Connection {
   authenticated: boolean
   token: string | null
   upgradeRequest: Request
-  authRequest: Request
   timeout: ReturnType<typeof setTimeout> | null
   subIds: Set<string>
 }
@@ -105,6 +102,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   // sub ID → WSContext, for invalidation dispatch.
   const subToWs = new Map<string, WSContext>()
 
+  // Hono types `ws.raw` as `unknown`; in practice it's always the platform
+  // socket object (Bun ServerWebSocket, etc.). Single cast site so if Hono
+  // ever tightens the type, there's one place to update.
+  const keyOf = (ws: WSContext): object => ws.raw as object
+
   function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
     const headers = new Headers(upgradeRequest.headers)
     if (token !== null && token.length > 0) {
@@ -119,30 +121,33 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   async function resolveSubContext(rawSocket: object): Promise<Record<string, unknown>> {
     const conn = rawToConnection.get(rawSocket)
     if (!conn) throw new Error('connection not registered')
-    return (await resolveContext(conn.authRequest)) ?? {}
+    // Build a fresh Request per call so adapters see a unique identity and
+    // don't accumulate mutations across subscriptions on the same connection.
+    const req = buildAuthRequest(conn.upgradeRequest, conn.token)
+    return (await resolveContext(req)) ?? {}
   }
 
   function addSub(id: string, ws: WSContext): void {
     subToWs.set(id, ws)
-    const conn = rawToConnection.get(ws.raw as object)
+    const conn = rawToConnection.get(keyOf(ws))
     if (conn) conn.subIds.add(id)
   }
 
   function removeSub(id: string, ws: WSContext): void {
     app.subscriptions.remove(id)
     subToWs.delete(id)
-    rawToConnection.get(ws.raw as object)?.subIds.delete(id)
+    rawToConnection.get(keyOf(ws))?.subIds.delete(id)
   }
 
   function removeAllForSocket(ws: WSContext): void {
-    const conn = rawToConnection.get(ws.raw as object)
+    const conn = rawToConnection.get(keyOf(ws))
     if (!conn) return
     if (conn.timeout) clearTimeout(conn.timeout)
     for (const id of conn.subIds) {
       app.subscriptions.remove(id)
       subToWs.delete(id)
     }
-    rawToConnection.delete(ws.raw as object)
+    rawToConnection.delete(keyOf(ws))
   }
 
   // --- WebSocket (registered before /:fn to avoid param catch) ---
@@ -153,7 +158,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       const upgradeRequest = c.req.raw
       return {
         onOpen(_evt, ws) {
-          const rawSocket = ws.raw as object
+          const rawSocket = keyOf(ws)
           if (requiresAuth) {
             const timeout = setTimeout(() => {
               ws.close(4002, 'auth timeout')
@@ -162,8 +167,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               authenticated: false,
               token: null,
               upgradeRequest,
-              // Placeholder — built with real token after auth succeeds.
-              authRequest: upgradeRequest,
               timeout,
               subIds: new Set(),
             })
@@ -172,7 +175,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               authenticated: true,
               token: null,
               upgradeRequest,
-              authRequest: upgradeRequest,
               timeout: null,
               subIds: new Set(),
             })
@@ -180,7 +182,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         },
 
         async onMessage(event, ws) {
-          const rawSocket = ws.raw as object
+          const rawSocket = keyOf(ws)
           const conn = rawToConnection.get(rawSocket)
           if (!conn) {
             ws.close(4001, 'no connection state')
@@ -212,14 +214,20 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             if (conn.timeout) clearTimeout(conn.timeout)
             conn.timeout = null
 
-            // Build and cache the authenticated Request (upgrade Request +
-            // Bearer header). Reused per subscribe without reallocating.
             const rawToken = authMsg.token
             const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
             conn.token = token
-            conn.authRequest = buildAuthRequest(conn.upgradeRequest, token)
             try {
-              await resolveSubContext(rawSocket)
+              // Race resolveContext against authTimeoutMs so a hung auth
+              // backend doesn't leak the socket. The hung promise is not
+              // cancellable today (resolveContext has no AbortSignal in v1);
+              // it leaks in memory until it settles, but the socket closes.
+              await Promise.race([
+                resolveSubContext(rawSocket),
+                new Promise((_, rej) =>
+                  setTimeout(() => rej(new Error('resolveContext timeout')), authTimeoutMs),
+                ),
+              ])
               // Socket may have closed during the await (disconnect, network).
               if (!rawToConnection.has(rawSocket)) return
               conn.authenticated = true

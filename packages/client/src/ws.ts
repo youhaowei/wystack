@@ -109,12 +109,12 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           if (requiresAuth) {
             ws!.send(JSON.stringify({ type: 'auth', v: WS_PROTOCOL_VERSION, token }))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
-            // If no ack arrives, mark authFailed and close — catches misconfig
-            // (server has no resolveContext) or server bugs where the ack never fires.
+            // If no ack arrives, close 4002 (transient/retry) so normal backoff
+            // applies. Real auth rejections arrive as an explicit server-side
+            // 4001 and latch authFailed in onclose — not here.
             authAckTimer = setTimeout(() => {
               authAckTimer = null
-              authFailed = true
-              ws?.close()
+              ws?.close(4002, 'auth ack timeout')
             }, authAckTimeoutMs)
           } else {
             sendSubscriptions()

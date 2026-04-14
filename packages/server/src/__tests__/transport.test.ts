@@ -381,30 +381,58 @@ describe('WebSocket transport', () => {
     }
   })
 
-  test('WS auth with incompatible protocol version closes 4001', async () => {
-    const app = await makeAuthApp()
-    const authServer = serve({
-      app,
-      port: 0,
-      resolveContext: async (_req) => ({ userId: 'anyone' }),
-    })
+  // Protocol version compatibility matrix — server is at 0.1.0 (pre-1.0).
+  // Pre-1.0 rule: only patch and prerelease differences are compatible.
+  const protocolVersionCases: Array<{ v: string; accept: boolean; why: string }> = [
+    { v: '0.1.0', accept: true, why: 'exact match' },
+    { v: '0.1.5', accept: true, why: 'patch diff — compatible' },
+    { v: '0.1.0-alpha', accept: true, why: 'prerelease — compatible' },
+    { v: '0.2.0', accept: false, why: 'pre-1.0 minor bump — breaking' },
+    { v: '99.0.0', accept: false, why: 'major diff — breaking' },
+    { v: 'not-a-version', accept: false, why: 'invalid semver' },
+  ]
 
-    try {
-      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
-      const closeCode = await new Promise<number>((resolve, reject) => {
-        ws.onopen = () => {
-          // Future major version server doesn't know about.
-          ws.send(JSON.stringify({ type: 'auth', v: '99.0.0', token: 'valid' }))
-        }
-        ws.onclose = (event) => resolve(event.code)
-        ws.onerror = () => reject(new Error('ws error'))
-        setTimeout(() => reject(new Error('timeout')), 5000)
+  for (const { v, accept, why } of protocolVersionCases) {
+    test(`WS protocol version ${v} ${accept ? 'accepted' : 'rejected'} (${why})`, async () => {
+      const app = await makeAuthApp()
+      const authServer = serve({
+        app,
+        port: 0,
+        resolveContext: async (_req) => ({ userId: 'anyone' }),
       })
-      expect(closeCode).toBe(4001)
-    } finally {
-      authServer.stop(true)
-    }
-  })
+
+      try {
+        const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+        const outcome = await new Promise<'authenticated' | number>((resolve, reject) => {
+          ws.onopen = () => {
+            ws.send(JSON.stringify({ type: 'auth', v, token: 'valid' }))
+          }
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data)
+            if (msg.type === 'authenticated') resolve('authenticated')
+          }
+          ws.onclose = (event) => resolve(event.code)
+          ws.onerror = () => reject(new Error('ws error'))
+          setTimeout(() => reject(new Error('timeout')), 5000)
+        })
+        ws.close()
+        if (accept) {
+          expect(outcome).toBe('authenticated')
+        } else {
+          expect(outcome).toBe(4001)
+        }
+      } finally {
+        authServer.stop(true)
+      }
+    })
+  }
+
+  // NOTE: a test for the "hung resolveContext → close 4001 via Promise.race"
+  // path was attempted but removed because bun:test waits for pending promises
+  // to settle at process exit. A long-but-finite resolveContext keeps the
+  // event loop alive beyond the test's assertion. Covered by the Promise.race
+  // in routes.ts (see auth handshake block) and tracked for the vitest
+  // migration ticket, where fake timers make this testable without real waits.
 
   test('WS auth timeout closes 4002', async () => {
     const app = await makeAuthApp()
