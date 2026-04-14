@@ -155,6 +155,118 @@ describe('WsManager', () => {
     ws.disconnect()
   })
 
+  test('sends auth handshake and buffers subscribes until authenticated', async () => {
+    // Separate server requiring auth
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({
+          args: {},
+          handler: async (ctx) => ctx.db.from(schema.todos).all(),
+        }),
+        addTodo: mutation({
+          args: { title: text },
+          handler: async (ctx, args) =>
+            ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
+        }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => 'user_123',
+      })
+      ws.connect()
+
+      const invalidated = new Promise<void>((resolve, reject) => {
+        // Call subscribe immediately — before WS even opens. Must not lose the sub.
+        ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+
+      // Trigger invalidation via HTTP mutation
+      await new Promise((r) => setTimeout(r, 200))
+      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer user_123',
+        },
+        body: JSON.stringify({ title: 'Authed' }),
+      })
+
+      await invalidated
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('does not reconnect on close code 4001', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+      },
+    })
+
+    // Count auth attempts on the server. Each connection attempt runs
+    // resolveContext once at handshake time (per Finding #1 fix).
+    // No retries ⇒ count === 1. A reconnect loop ⇒ count > 1.
+    let authAttempts = 0
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        authAttempts++
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => null, // triggers server close 4001
+      })
+      ws.connect()
+
+      // Wait well past the first reconnect window (~1-1.5s). If the client
+      // were retrying, authAttempts would tick up every cycle.
+      await new Promise((r) => setTimeout(r, 2500))
+
+      expect(ws.isConnected()).toBe(false)
+      expect(authAttempts).toBe(1) // exactly one connection attempt, no retry
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
   test('re-subscribes on reconnect', async () => {
     const ws = createWsManager({ url: wsUrl })
     ws.connect()

@@ -213,7 +213,7 @@ describe('WebSocket transport', () => {
     expect(result.type).toBe('error')
   })
 
-  test('WS with resolveContext rejects unauthenticated', async () => {
+  test('WS subscribe before auth handshake closes with 4001', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
     await db.execute(
@@ -231,16 +231,254 @@ describe('WebSocket transport', () => {
       app,
       port: 0,
       resolveContext: async (req) => {
-        const token = new URL(req.url).searchParams.get('token')
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
         if (!token) throw new Error('Unauthorized')
         return { userId: token }
       },
     })
 
     try {
-      // Without token → HTTP 401 on upgrade
-      const res = await fetch(`http://localhost:${authServer.port}/api/ws`)
-      expect(res.status).toBe(401)
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          // Violate protocol: send subscribe before auth
+          ws.send(JSON.stringify({ type: 'subscribe', id: 'sub1', path: 'listTodos', args: {} }))
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4001)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS auth handshake succeeds and subscribe works', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId as string }) }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      // oxlint-disable-next-line typescript/no-explicit-any -- dynamic JSON
+      const messages: any[] = []
+      const done = new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', token: 'user_123' }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          messages.push(msg)
+          if (msg.type === 'authenticated') {
+            ws.send(JSON.stringify({ type: 'subscribe', id: 'sub1', path: 'whoami', args: {} }))
+          }
+          if (msg.type === 'subscribed') resolve()
+        }
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      await done
+      ws.close()
+      const authenticated = messages.find((m) => m.type === 'authenticated')
+      const subscribed = messages.find((m) => m.type === 'subscribed')
+      expect(authenticated).toBeDefined()
+      expect(subscribed).toBeDefined()
+      expect(subscribed.id).toBe('sub1')
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS auth with invalid token closes 4001', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          // Auth message with no token → resolveContext throws
+          ws.send(JSON.stringify({ type: 'auth', token: null }))
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4001)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('resolveContext runs per subscription (AC #7: subscription-time context)', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+      },
+    })
+
+    let resolveCount = 0
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        resolveCount++
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      let subscribedCount = 0
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', token: 'user_123' }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'authenticated') {
+            ws.send(JSON.stringify({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} }))
+            ws.send(JSON.stringify({ type: 'subscribe', id: 's2', path: 'listTodos', args: {} }))
+          }
+          if (msg.type === 'subscribed') {
+            subscribedCount++
+            if (subscribedCount === 2) resolve()
+          }
+        }
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      ws.close()
+
+      // 1 call at auth handshake + 1 per subscription = 3 total
+      expect(resolveCount).toBe(3)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS auth with incompatible protocol version closes 4001', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (_req) => ({ userId: 'anyone' }),
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          // Future major version server doesn't know about.
+          ws.send(JSON.stringify({ type: 'auth', v: '99.0.0', token: 'valid' }))
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4001)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS auth timeout closes 4002', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      authTimeoutMs: 500,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        ws.onopen = () => {
+          // Don't send anything — wait for timeout
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      expect(closeCode).toBe(4002)
     } finally {
       authServer.stop(true)
     }

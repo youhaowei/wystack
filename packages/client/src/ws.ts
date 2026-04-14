@@ -3,12 +3,25 @@
  * reconnection, subscription tracking, and invalidation dispatch.
  *
  * Protocol (matches @wystack/server):
+ *   Client → Server: { type: 'auth', v, token }           (first frame when auth is configured)
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
+ *   Server → Client: { type: 'authenticated' }            (ack for successful auth)
  *   Server → Client: { type: 'subscribed', id }
  *   Server → Client: { type: 'invalidate', id }
  *   Server → Client: { type: 'error', id?, error }
+ *
+ * Close codes:
+ *   4001 — auth failed / missing / protocol violation → do NOT reconnect
+ *   4002 — auth timeout → reconnect per normal backoff
  */
+
+/**
+ * WS wire-protocol version. Distinct from `@wystack/client` package version:
+ * bumped only on wire-format changes. Kept in sync with `@wystack/server`'s
+ * `WS_PROTOCOL_VERSION` constant.
+ */
+const WS_PROTOCOL_VERSION = '0.1.0'
 
 type InvalidateHandler = () => void
 
@@ -27,15 +40,23 @@ export interface WsManager {
 
 export function createWsManager(config: WsManagerConfig): WsManager {
   const { url, getToken } = config
+  const requiresAuth = getToken !== undefined
+  // Fail fast if the server never sends `{type:"authenticated"}`. Catches
+  // config mismatches (server without resolveContext) and server bugs.
+  const authAckTimeoutMs = 10_000
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let authAckTimer: ReturnType<typeof setTimeout> | null = null
   let reconnectAttempt = 0
   const maxReconnectDelay = 30000
   const handlers = new Map<string, InvalidateHandler>()
   const activeSubs = new Map<string, { path: string; args: unknown }>()
   let connected = false
+  let authenticated = false
+  let authFailed = false
 
   function scheduleReconnect() {
+    if (authFailed) return
     if (reconnectTimer) return
     const base = 1000 * 2 ** Math.min(reconnectAttempt, 5)
     const jitter = base * (0.5 + Math.random() * 0.5)
@@ -48,38 +69,65 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   }
 
   function sendSubscriptions() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !authenticated) return
     for (const [id, sub] of activeSubs) {
-      ws!.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
+      ws.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
     }
   }
 
   function connect() {
+    if (authFailed) return
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-    // TODO: move auth to post-connection message to avoid token appearing in server logs/browser history
     Promise.resolve(getToken?.())
       .then((token) => {
-        // Re-check after async — another connect() may have fired
+        if (authFailed) return
         if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
-        const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url
-
         try {
-          ws = new WebSocket(wsUrl)
+          ws = new WebSocket(url)
         } catch {
           scheduleReconnect()
           return
         }
 
+        authenticated = !requiresAuth
+
         ws.onopen = () => {
           connected = true
-          reconnectAttempt = 0
-          sendSubscriptions()
+          // Do not reset reconnectAttempt here — wait until the server sends
+          // a message. Prevents tight reconnect loops when the server opens
+          // then closes without any response (e.g., auth-required server +
+          // no-token client → 4002 timeout loop).
+          if (requiresAuth) {
+            ws!.send(JSON.stringify({ type: 'auth', v: WS_PROTOCOL_VERSION, token }))
+            // Wait for {type:"authenticated"} ack before replaying subscriptions.
+            // If no ack arrives, mark authFailed and close — catches misconfig
+            // (server has no resolveContext) or server bugs where the ack never fires.
+            authAckTimer = setTimeout(() => {
+              authAckTimer = null
+              authFailed = true
+              ws?.close()
+            }, authAckTimeoutMs)
+          } else {
+            sendSubscriptions()
+          }
         }
 
         ws.onmessage = (event) => {
+          // Any server message proves the connection is actually useful.
+          reconnectAttempt = 0
           try {
             const msg = JSON.parse(event.data)
+            if (msg.type === 'authenticated') {
+              authenticated = true
+              if (authAckTimer) {
+                clearTimeout(authAckTimer)
+                authAckTimer = null
+              }
+              sendSubscriptions()
+              return
+            }
             if (msg.type === 'invalidate' && msg.id) {
               handlers.get(msg.id)?.()
             }
@@ -90,8 +138,23 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           }
         }
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           connected = false
+          authenticated = false
+          if (authAckTimer) {
+            clearTimeout(authAckTimer)
+            authAckTimer = null
+          }
+          if (event.code === 4001 || authFailed) {
+            authFailed = true
+            // Fire all invalidation callbacks so consumers refetch via HTTP.
+            // If HTTP auth also fails on the same token, TanStack Query
+            // surfaces the error. If HTTP succeeds, data is fresh but
+            // real-time updates stay off until disconnect() + reconnect()
+            // with a new token.
+            for (const handler of handlers.values()) handler()
+            return
+          }
           scheduleReconnect()
         }
 
@@ -109,7 +172,14 @@ export function createWsManager(config: WsManagerConfig): WsManager {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
+    if (authAckTimer) {
+      clearTimeout(authAckTimer)
+      authAckTimer = null
+    }
     connected = false
+    authenticated = false
+    // Reset authFailed so a later connect() (e.g., after re-login) can try again.
+    authFailed = false
     if (ws) {
       ws.onclose = null
       ws.close()
@@ -120,19 +190,19 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function subscribe(id: string, path: string, args: unknown, onInvalidate: InvalidateHandler) {
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
-
-    if (ws?.readyState === WebSocket.OPEN) {
+    if (ws?.readyState === WebSocket.OPEN && authenticated) {
       ws.send(JSON.stringify({ type: 'subscribe', id, path, args }))
     }
+    // Otherwise: replayed on (re)connect via sendSubscriptions()
   }
 
   function unsubscribe(id: string) {
     handlers.delete(id)
     activeSubs.delete(id)
-
-    if (ws?.readyState === WebSocket.OPEN) {
+    if (ws?.readyState === WebSocket.OPEN && authenticated) {
       ws.send(JSON.stringify({ type: 'unsubscribe', id }))
     }
+    // If not sent to server yet, removing from activeSubs is enough.
   }
 
   return {
