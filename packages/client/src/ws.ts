@@ -18,8 +18,10 @@
 
 /**
  * WS wire-protocol version. Distinct from `@wystack/client` package version:
- * bumped only on wire-format changes. Kept in sync with `@wystack/server`'s
- * `WS_PROTOCOL_VERSION` constant.
+ * bumped only on wire-format changes.
+ *
+ * SYNC: keep in lockstep with `WS_PROTOCOL_VERSION` in `@wystack/server`
+ * (`packages/server/src/routes.ts`).
  */
 const WS_PROTOCOL_VERSION = '0.1.0'
 
@@ -28,6 +30,11 @@ type InvalidateHandler = () => void
 export interface WsManagerConfig {
   url: string
   getToken?: () => Promise<string | null> | string | null
+  /**
+   * Max ms to wait for the server's `{type:"authenticated"}` ack after sending
+   * the auth frame. Only applies when `getToken` is configured. Default: 10_000.
+   */
+  authAckTimeoutMs?: number
 }
 
 export interface WsManager {
@@ -43,7 +50,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   const requiresAuth = getToken !== undefined
   // Fail fast if the server never sends `{type:"authenticated"}`. Catches
   // config mismatches (server without resolveContext) and server bugs.
-  const authAckTimeoutMs = 10_000
+  const authAckTimeoutMs = config.authAckTimeoutMs ?? 10_000
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let authAckTimer: ReturnType<typeof setTimeout> | null = null

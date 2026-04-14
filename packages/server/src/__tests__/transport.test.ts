@@ -14,6 +14,29 @@ const schema = defineSchema({
   },
 })
 
+// Per-test app factory for auth scenarios: each test creates its own
+// PGlite + createWyStack + serve so resolveContext can vary freely.
+// Default functions cover the common cases (listTodos + whoami); override
+// via `functions` when a test needs something specific.
+type AuthTestFunctions = NonNullable<Parameters<typeof createWyStack>[0]['functions']>
+async function makeAuthApp(functions?: AuthTestFunctions) {
+  const pg = new PGlite()
+  const db = drizzle(pg)
+  await db.execute(
+    `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+  )
+  const defaults = {
+    listTodos: query({ args: {}, handler: async (_ctx) => [] }),
+    whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId as string }) }),
+    addTodo: mutation({
+      args: { title: text },
+      handler: async (ctx, args) =>
+        ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
+    }),
+  }
+  return createWyStack({ db, functions: functions ?? defaults })
+}
+
 let server: ReturnType<typeof serve>
 let baseUrl: string
 
@@ -214,19 +237,7 @@ describe('WebSocket transport', () => {
   })
 
   test('WS subscribe before auth handshake closes with 4001', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-      },
-    })
-
+    const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,
@@ -255,19 +266,7 @@ describe('WebSocket transport', () => {
   })
 
   test('WS auth handshake succeeds and subscribe works', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId as string }) }),
-      },
-    })
-
+    const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,
@@ -310,19 +309,7 @@ describe('WebSocket transport', () => {
   })
 
   test('WS auth with invalid token closes 4001', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-      },
-    })
-
+    const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,
@@ -351,19 +338,7 @@ describe('WebSocket transport', () => {
   })
 
   test('resolveContext runs per subscription (AC #7: subscription-time context)', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-      },
-    })
-
+    const app = await makeAuthApp()
     let resolveCount = 0
     const authServer = serve({
       app,
@@ -407,19 +382,7 @@ describe('WebSocket transport', () => {
   })
 
   test('WS auth with incompatible protocol version closes 4001', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-      },
-    })
-
+    const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,
@@ -444,19 +407,7 @@ describe('WebSocket transport', () => {
   })
 
   test('WS auth timeout closes 4002', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
-    await db.execute(
-      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
-    )
-
-    const app = await createWyStack({
-      db,
-      functions: {
-        listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-      },
-    })
-
+    const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,

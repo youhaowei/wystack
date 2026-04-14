@@ -20,6 +20,7 @@
  */
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
+import { isSemVer } from '@wystack/types'
 import { Version } from '@wystack/version'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
@@ -27,26 +28,48 @@ import { ValidationError } from './validation'
 /**
  * WS wire-protocol version. Distinct from `@wystack/server` package version:
  * bumped only on wire-format changes (new message type, renamed field,
- * close-code semantics). Kept in sync with `@wystack/client`'s
- * `WS_PROTOCOL_VERSION` constant.
+ * close-code semantics).
+ *
+ * SYNC: keep in lockstep with `WS_PROTOCOL_VERSION` in `@wystack/client`
+ * (`packages/client/src/ws.ts`).
  *
  * Pre-1.0 semver rule: any minor bump is breaking.
  */
 const WS_PROTOCOL_VERSION = '0.1.0'
 
 function isCompatibleProtocol(clientVersion: string): boolean {
-  let client: Version
-  let server: Version
-  try {
-    client = new Version(clientVersion)
-    server = new Version(WS_PROTOCOL_VERSION)
-  } catch {
-    return false
-  }
+  if (!isSemVer(clientVersion)) return false
+  const client = new Version(clientVersion)
+  const server = new Version(WS_PROTOCOL_VERSION)
   const d = server.diff(client)
+  // Prerelease clients on the same base are accepted — same wire format,
+  // experimental tag only. If prerelease ever means "different wire", tighten here.
   if (d === null || d === 'patch' || d === 'prerelease') return true
   if (server.major === 0) return false // pre-1.0: any non-patch diff is breaking
   return d !== 'major'
+}
+
+/**
+ * Per-connection state, keyed by the platform socket (`ws.raw`). Hono creates
+ * a new `WSContext` per event callback, so its identity is not stable — the
+ * raw socket object is. Map<object, …> (rather than Map<unknown, …>) prevents
+ * primitive keys from accidentally compiling.
+ *
+ * `upgradeRequest` is the original HTTP upgrade Request — captured once so
+ * `resolveContext` can see cookies, forwarded headers, URL, and origin.
+ *
+ * `authRequest` is the post-auth Request (upgradeRequest + `Authorization:
+ * Bearer`). Built once at auth success and reused per subscription, so the
+ * per-sub context resolution doesn't re-allocate Headers + Request on every
+ * subscribe message.
+ */
+interface Connection {
+  authenticated: boolean
+  token: string | null
+  upgradeRequest: Request
+  authRequest: Request
+  timeout: ReturnType<typeof setTimeout> | null
+  subIds: Set<string>
 }
 
 function errorMessage(err: unknown): string {
@@ -74,68 +97,52 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
   const hono = new Hono()
 
-  // --- Per-connection state ---
-  //
-  // `rawToConnection` is the single source of truth per WebSocket. Keyed by
-  // `ws.raw` (the platform socket) because Hono creates a new WSContext per
-  // event callback — WSContext identity is not stable across events.
-  //
-  // `upgradeRequest` is the original HTTP upgrade Request — the one-time
-  // chance to capture cookies, forwarded headers, URL, origin. The client
-  // token from the auth frame is stored separately and layered on top via
-  // `resolveSubContext` (Authorization: Bearer). Adapters (e.g., BetterAuth)
-  // see cookies AND Bearer together.
-  //
-  // NOTE: if a client sends the auth token in the upgrade URL (which AC #1 of
-  // TASK-489 prohibits), it will be visible to adapters. URL-leak prevention
-  // depends on the client following the contract.
-  interface Connection {
-    authenticated: boolean
-    token: string | null
-    upgradeRequest: Request
-    timeout: ReturnType<typeof setTimeout> | null
-    subIds: Set<string>
-  }
-  const rawToConnection = new Map<unknown, Connection>()
+  // Per-connection state (see Connection doc at module scope).
+  // NOTE: if a client sends the auth token in the upgrade URL (which AC #1
+  // of TASK-489 prohibits), it will be visible to adapters via upgradeRequest.
+  // URL-leak prevention depends on the client following the contract.
+  const rawToConnection = new Map<object, Connection>()
   // sub ID → WSContext, for invalidation dispatch.
   const subToWs = new Map<string, WSContext>()
 
-  async function resolveSubContext(rawSocket: unknown): Promise<Record<string, unknown>> {
-    const conn = rawToConnection.get(rawSocket)
-    if (!conn) throw new Error('connection not registered')
-    const headers = new Headers(conn.upgradeRequest.headers)
-    if (conn.token !== null && conn.token.length > 0) {
-      headers.set('authorization', `Bearer ${conn.token}`)
+  function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
+    const headers = new Headers(upgradeRequest.headers)
+    if (token !== null && token.length > 0) {
+      headers.set('authorization', `Bearer ${token}`)
     }
-    const req = new Request(conn.upgradeRequest.url, {
-      method: conn.upgradeRequest.method,
+    return new Request(upgradeRequest.url, {
+      method: upgradeRequest.method,
       headers,
     })
-    const context = await resolveContext(req)
-    return context ?? {}
+  }
+
+  async function resolveSubContext(rawSocket: object): Promise<Record<string, unknown>> {
+    const conn = rawToConnection.get(rawSocket)
+    if (!conn) throw new Error('connection not registered')
+    return (await resolveContext(conn.authRequest)) ?? {}
   }
 
   function addSub(id: string, ws: WSContext): void {
     subToWs.set(id, ws)
-    const conn = rawToConnection.get(ws.raw)
+    const conn = rawToConnection.get(ws.raw as object)
     if (conn) conn.subIds.add(id)
   }
 
   function removeSub(id: string, ws: WSContext): void {
     app.subscriptions.remove(id)
     subToWs.delete(id)
-    rawToConnection.get(ws.raw)?.subIds.delete(id)
+    rawToConnection.get(ws.raw as object)?.subIds.delete(id)
   }
 
   function removeAllForSocket(ws: WSContext): void {
-    const conn = rawToConnection.get(ws.raw)
+    const conn = rawToConnection.get(ws.raw as object)
     if (!conn) return
     if (conn.timeout) clearTimeout(conn.timeout)
     for (const id of conn.subIds) {
       app.subscriptions.remove(id)
       subToWs.delete(id)
     }
-    rawToConnection.delete(ws.raw)
+    rawToConnection.delete(ws.raw as object)
   }
 
   // --- WebSocket (registered before /:fn to avoid param catch) ---
@@ -146,22 +153,26 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       const upgradeRequest = c.req.raw
       return {
         onOpen(_evt, ws) {
+          const rawSocket = ws.raw as object
           if (requiresAuth) {
             const timeout = setTimeout(() => {
               ws.close(4002, 'auth timeout')
             }, authTimeoutMs)
-            rawToConnection.set(ws.raw, {
+            rawToConnection.set(rawSocket, {
               authenticated: false,
               token: null,
               upgradeRequest,
+              // Placeholder — built with real token after auth succeeds.
+              authRequest: upgradeRequest,
               timeout,
               subIds: new Set(),
             })
           } else {
-            rawToConnection.set(ws.raw, {
+            rawToConnection.set(rawSocket, {
               authenticated: true,
               token: null,
               upgradeRequest,
+              authRequest: upgradeRequest,
               timeout: null,
               subIds: new Set(),
             })
@@ -169,7 +180,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         },
 
         async onMessage(event, ws) {
-          const conn = rawToConnection.get(ws.raw)
+          const rawSocket = ws.raw as object
+          const conn = rawToConnection.get(rawSocket)
           if (!conn) {
             ws.close(4001, 'no connection state')
             return
@@ -200,15 +212,16 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             if (conn.timeout) clearTimeout(conn.timeout)
             conn.timeout = null
 
-            // Validate the token by running resolveContext through resolveSubContext,
-            // then store the token so each subscribe re-resolves (per-sub context).
+            // Build and cache the authenticated Request (upgrade Request +
+            // Bearer header). Reused per subscribe without reallocating.
             const rawToken = authMsg.token
             const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
             conn.token = token
+            conn.authRequest = buildAuthRequest(conn.upgradeRequest, token)
             try {
-              await resolveSubContext(ws.raw)
+              await resolveSubContext(rawSocket)
               // Socket may have closed during the await (disconnect, network).
-              if (!rawToConnection.has(ws.raw)) return
+              if (!rawToConnection.has(rawSocket)) return
               conn.authenticated = true
               try {
                 ws.send(JSON.stringify({ type: 'authenticated' }))
@@ -221,7 +234,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               // TODO: replace with @wystack/log once server logging lands.
               console.warn('[wystack/server] resolveContext failed for WS auth:', err)
               conn.token = null
-              if (rawToConnection.has(ws.raw)) ws.close(4001, 'auth failed')
+              if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
             }
             return
           }
@@ -260,13 +273,13 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
               // Resolve context PER subscription — Spec Decision:
               // "Context resolved at subscription time, preserved for re-queries"
-              const context = await resolveSubContext(ws.raw)
+              const context = await resolveSubContext(rawSocket)
 
               app
                 .call(path, args, context)
                 .then(({ tablesRead }) => {
                   // Guard: socket may have closed while query was in-flight
-                  if (!rawToConnection.has(ws.raw)) return
+                  if (!rawToConnection.has(rawSocket)) return
 
                   app.subscriptions.add({
                     id,
