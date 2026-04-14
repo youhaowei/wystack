@@ -374,8 +374,11 @@ describe('WebSocket transport', () => {
       })
       ws.close()
 
-      // 1 call at auth handshake + 1 per subscription = 3 total
-      expect(resolveCount).toBe(3)
+      // Spec: "Context resolved at subscription time". At minimum, resolveContext
+      // runs per-subscription → >= 2 calls for 2 subs. A tighter implementation
+      // may also call at handshake (current impl → 3); a spec-compliant one that
+      // skips the handshake call → 2. Both are acceptable.
+      expect(resolveCount).toBeGreaterThanOrEqual(2)
     } finally {
       authServer.stop(true)
     }
@@ -433,6 +436,40 @@ describe('WebSocket transport', () => {
   // event loop alive beyond the test's assertion. Covered by the Promise.race
   // in routes.ts (see auth handshake block) and tracked for the vitest
   // migration ticket, where fake timers make this testable without real waits.
+
+  test('WS anonymous auth succeeds (null token + accepting resolveContext)', async () => {
+    // Real production case: public server that accepts unauthenticated users
+    // as anonymous. resolveContext does NOT throw on missing Authorization.
+    const app = await makeAuthApp()
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '') ?? null
+        return { userId: token ?? 'anon' }
+      },
+    })
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+      const outcome = await new Promise<'authenticated' | number>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', v: '0.1.0', token: null }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'authenticated') resolve('authenticated')
+        }
+        ws.onclose = (event) => resolve(event.code)
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      ws.close()
+      expect(outcome).toBe('authenticated')
+    } finally {
+      authServer.stop(true)
+    }
+  })
 
   test('WS auth timeout closes 4002', async () => {
     const app = await makeAuthApp()
