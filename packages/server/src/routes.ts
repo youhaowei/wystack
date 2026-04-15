@@ -54,6 +54,14 @@ interface Connection {
    * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
    * `unsubscribe` arriving mid-await cancel the pending registration so the
    * resolved subscription doesn't orphan itself in `app.subscriptions`.
+   *
+   * known-debt: this is flag-check cancellation, not signal-plumbing. The
+   * adapter's `resolveContext` keeps running to completion even after
+   * cancellation — we bail at the `.then` boundary. Wasted work for expensive
+   * adapters (external auth service, DB session lookup). Upgrading to
+   * `AbortSignal` on the `Request` passed to `resolveContext` would let
+   * adapters opt into cancellation. Deferred until an adapter proposal makes
+   * the cost measurable. Search: `kb search "AbortSignal resolveContext"`.
    */
   pendingSubIds: Set<string>
 }

@@ -98,6 +98,17 @@ describe('WsManager', () => {
     expect(ws.isConnected()).toBe(false)
   })
 
+  // TODO(flake-risk): several tests below use `setTimeout(r, 100|200)` as a
+  // synchronization barrier between subscribe and mutation, or between
+  // mutation and assertion. These are race-prone under CI load — they rely
+  // on the server processing subscription registration within 100-200ms.
+  // Event-driven alternatives (await a `subscribed` confirmation from the
+  // server, or poll until the subscription is registered) would be
+  // deterministic. Not reworked proactively — will surface as CI flake on
+  // real contention, triggering the fix naturally. The 2500ms "no-retry"
+  // bound at the 4001 test is fine — it's a bounded-wait, not a race.
+  // Search: `kb search "WS test flakiness sleep barriers"`.
+
   test('receives invalidation after mutation', async () => {
     const ws = createWsManager({ url: wsUrl })
     ws.connect()

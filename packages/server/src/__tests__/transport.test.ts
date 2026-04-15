@@ -205,6 +205,21 @@ describe('HTTP transport', () => {
   })
 })
 
+// TODO(test-coverage): three known gaps from TASK-489 review, left inline
+// rather than filed because none have a near-term trigger:
+//   1. 4002 auto-reconnect: AC #5 promises reconnect on 4002, but no test
+//      drives a server-side 4002 + verifies client retries. Needs a server
+//      that times out the first handshake and accepts the second.
+//   2. Malformed first-frame → 4001: `parseClientMessage` rejects non-JSON,
+//      `null`, arrays, and non-string `type`. Only the well-formed
+//      "subscribe before auth" variant is tested today.
+//   3. Direct header assertion: "WS auth handshake succeeds" proves the
+//      Bearer header arrived only by consequence (resolveContext would
+//      throw otherwise). An explicit `expect(capturedHeader).toBe('Bearer
+//      user_123')` would be more robust.
+// Search: `kb search "WS test coverage gaps"`. Add when a real bug surfaces
+// that one of these tests would have caught.
+
 describe('WebSocket transport', () => {
   test('subscribe returns confirmation', async () => {
     const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
