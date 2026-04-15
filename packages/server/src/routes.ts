@@ -76,13 +76,6 @@ function safeSend(ws: WSContext, payload: unknown): void {
 }
 
 /**
- * Parse a client WS frame as a plain object. Rejects non-object JSON
- * (`null`, arrays, primitives) and non-string `type` up front so downstream
- * dispatch never faces a TypeError from `msg.type` on a null body or routes
- * on a numeric `type`. Returns null for any invalid shape — caller picks
- * the close code (pre-auth 4001 vs post-auth error frame).
- */
-/**
  * Build the synthetic `Request` passed to `resolveContext` for a WS subscribe.
  *
  * When `token` is a non-empty string, layers `Authorization: Bearer ${token}`
@@ -105,6 +98,13 @@ export function buildAuthRequest(upgradeRequest: Request, token: string | null):
   })
 }
 
+/**
+ * Parse a client WS frame as a plain object. Rejects non-object JSON
+ * (`null`, arrays, primitives) and non-string `type` up front so downstream
+ * dispatch never faces a TypeError from `msg.type` on a null body or routes
+ * on a numeric `type`. Returns null for any invalid shape — caller picks
+ * the close code (pre-auth 4001 vs post-auth error frame).
+ */
 function parseClientMessage(data: string): Record<string, unknown> | null {
   let parsed: unknown
   try {
