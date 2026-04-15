@@ -385,7 +385,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           try {
             msgId = msg.id as string | undefined
 
-            // TODO: scope subscription IDs per-socket to prevent cross-socket collision
+            // Filed: TASK-490 — scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
               await handleSubscribe(msg, ws, conn, rawSocket)
               return

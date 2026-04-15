@@ -105,14 +105,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
             // 4001 and latch authFailed in onclose — not here.
             authAckTimer = setTimeout(() => {
               authAckTimer = null
-              // Defense against late-fire: if the ACK message was already
-              // dispatched but our onmessage hasn't run yet (event-loop
-              // starvation, microtask backlog), closing here would force a
-              // spurious reconnect on a perfectly healthy socket. Skip when
-              // we're already authenticated or the socket is no longer OPEN.
-              if (authenticated) return
-              if (ws?.readyState !== WebSocket.OPEN) return
-              ws.close(4002, 'auth ack timeout')
+              ws?.close(4002, 'auth ack timeout')
             }, authAckTimeoutMs)
           } else {
             sendSubscriptions()
