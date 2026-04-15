@@ -53,6 +53,13 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   let authenticated = false
   let authFailed = false
 
+  function clearAuthAckTimer() {
+    if (authAckTimer) {
+      clearTimeout(authAckTimer)
+      authAckTimer = null
+    }
+  }
+
   function scheduleReconnect() {
     if (authFailed) return
     if (reconnectTimer) return
@@ -119,10 +126,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
             const msg = JSON.parse(event.data)
             if (msg.type === 'authenticated') {
               authenticated = true
-              if (authAckTimer) {
-                clearTimeout(authAckTimer)
-                authAckTimer = null
-              }
+              clearAuthAckTimer()
               sendSubscriptions()
               return
             }
@@ -139,10 +143,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
         ws.onclose = (event) => {
           connected = false
           authenticated = false
-          if (authAckTimer) {
-            clearTimeout(authAckTimer)
-            authAckTimer = null
-          }
+          clearAuthAckTimer()
           if (event.code === 4001 || authFailed) {
             authFailed = true
             // Fire all invalidation callbacks so consumers refetch via HTTP.
@@ -170,10 +171,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
-    if (authAckTimer) {
-      clearTimeout(authAckTimer)
-      authAckTimer = null
-    }
+    clearAuthAckTimer()
     connected = false
     authenticated = false
     // Reset authFailed so a later connect() (e.g., after re-login) can try again.

@@ -55,6 +55,19 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * Send JSON over a WS, swallowing the post-close throw. Every outbound
+ * frame in this module races against an unrelated close; collapsing the
+ * try/catch at the call site keeps handler logic linear.
+ */
+function safeSend(ws: WSContext, payload: unknown): void {
+  try {
+    ws.send(JSON.stringify(payload))
+  } catch {
+    /* socket closed */
+  }
+}
+
+/**
  * Parse a client WS frame as a plain object. Rejects non-object JSON
  * (`null`, arrays, primitives) and non-string `type` up front so downstream
  * dispatch never faces a TypeError from `msg.type` on a null body or routes
@@ -176,11 +189,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     rawSocket: object,
   ): Promise<void> {
     if (conn.authenticated) {
-      try {
-        ws.send(JSON.stringify({ type: 'authenticated' }))
-      } catch {
-        /* socket closed */
-      }
+      safeSend(ws, { type: 'authenticated' })
       return
     }
 
@@ -225,17 +234,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     // registry lookup. Non-string values (object, number) would bypass
     // `pendingSubIds` reference-identity guards and silently orphan the sub.
     if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-      try {
-        ws.send(
-          JSON.stringify({
-            type: 'error',
-            id: typeof msg.id === 'string' ? msg.id : undefined,
-            error: 'invalid subscribe message',
-          }),
-        )
-      } catch {
-        /* socket closed */
-      }
+      safeSend(ws, {
+        type: 'error',
+        id: typeof msg.id === 'string' ? msg.id : undefined,
+        error: 'invalid subscribe message',
+      })
       return
     }
     const id = msg.id
@@ -243,11 +246,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     const args = (msg.args ?? {}) as Record<string, unknown>
     const fn = app.functions.get(path)
     if (!fn || fn.type !== 'query') {
-      try {
-        ws.send(JSON.stringify({ type: 'error', id, error: `Unknown query: ${path}` }))
-      } catch {
-        /* socket closed */
-      }
+      safeSend(ws, { type: 'error', id, error: `Unknown query: ${path}` })
       return
     }
 
@@ -260,11 +259,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       context = await resolveSubContext(rawSocket)
     } catch (err) {
       conn.pendingSubIds.delete(id)
-      try {
-        ws.send(JSON.stringify({ type: 'error', id, error: errorMessage(err) }))
-      } catch {
-        /* socket closed */
-      }
+      safeSend(ws, { type: 'error', id, error: errorMessage(err) })
       return
     }
 
@@ -286,11 +281,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           tablesWatched: tablesRead,
         })
         addSub(id, ws)
-        try {
-          ws.send(JSON.stringify({ type: 'subscribed', id }))
-        } catch {
-          /* socket closed */
-        }
+        safeSend(ws, { type: 'subscribed', id })
       })
       .catch((err: unknown) => {
         conn.pendingSubIds.delete(id)
@@ -300,11 +291,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           error: errorMessage(err),
         }
         if (err instanceof ValidationError) payload.issues = err.issues
-        try {
-          ws.send(JSON.stringify(payload))
-        } catch {
-          /* socket closed */
-        }
+        safeSend(ws, payload)
       })
   }
 
@@ -316,29 +303,17 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       const upgradeRequest = c.req.raw
       return {
         onOpen(_evt, ws) {
-          const rawSocket = keyOf(ws)
-          if (requiresAuth) {
-            const timeout = setTimeout(() => {
-              ws.close(4002, 'auth timeout')
-            }, authTimeoutMs)
-            rawToConnection.set(rawSocket, {
-              authenticated: false,
-              token: null,
-              upgradeRequest,
-              timeout,
-              subIds: new Set(),
-              pendingSubIds: new Set(),
-            })
-          } else {
-            rawToConnection.set(rawSocket, {
-              authenticated: true,
-              token: null,
-              upgradeRequest,
-              timeout: null,
-              subIds: new Set(),
-              pendingSubIds: new Set(),
-            })
-          }
+          const timeout = requiresAuth
+            ? setTimeout(() => ws.close(4002, 'auth timeout'), authTimeoutMs)
+            : null
+          rawToConnection.set(keyOf(ws), {
+            authenticated: !requiresAuth,
+            token: null,
+            upgradeRequest,
+            timeout,
+            subIds: new Set(),
+            pendingSubIds: new Set(),
+          })
         },
 
         async onMessage(event, ws) {
@@ -359,11 +334,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               ws.close(4001, 'invalid first message')
               return
             }
-            try {
-              ws.send(JSON.stringify({ type: 'error', error: 'invalid message' }))
-            } catch {
-              /* socket closed */
-            }
+            safeSend(ws, { type: 'error', error: 'invalid message' })
             return
           }
 
@@ -393,11 +364,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
             if (msg.type === 'unsubscribe') {
               if (typeof msg.id !== 'string') {
-                try {
-                  ws.send(JSON.stringify({ type: 'error', error: 'invalid unsubscribe message' }))
-                } catch {
-                  /* socket closed */
-                }
+                safeSend(ws, { type: 'error', error: 'invalid unsubscribe message' })
                 return
               }
               const subId = msg.id
@@ -410,26 +377,16 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             }
 
             // Unknown type post-auth. Help devs during protocol evolution.
-            try {
-              ws.send(
-                JSON.stringify({
-                  type: 'error',
-                  id: typeof msg.id === 'string' ? msg.id : undefined,
-                  error: `unknown message type: ${String(msg.type)}`,
-                }),
-              )
-            } catch {
-              /* socket closed */
-            }
+            safeSend(ws, {
+              type: 'error',
+              id: typeof msg.id === 'string' ? msg.id : undefined,
+              error: `unknown message type: ${String(msg.type)}`,
+            })
           } catch (err: unknown) {
             const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
             if (err instanceof ValidationError) payload.issues = err.issues
             if (msgId) payload.id = msgId
-            try {
-              ws.send(JSON.stringify(payload))
-            } catch {
-              /* socket closed */
-            }
+            safeSend(ws, payload)
           }
         },
 
@@ -551,11 +508,7 @@ async function invalidateSubscriptions(
         // Keep existing table watches — client will see the error on refetch
       }
 
-      try {
-        ws.send(JSON.stringify({ type: 'invalidate', id: sub.id }))
-      } catch {
-        /* socket closed */
-      }
+      safeSend(ws, { type: 'invalidate', id: sub.id })
     }),
   )
 }
