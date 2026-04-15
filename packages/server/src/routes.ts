@@ -63,9 +63,15 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * Send JSON over a WS, swallowing the post-close throw. Every outbound
- * frame in this module races against an unrelated close; collapsing the
- * try/catch at the call site keeps handler logic linear.
+ * Send JSON over a WS, swallowing the post-close throw. Outbound frames
+ * race against unrelated closes; collapsing the try/catch at the call
+ * site keeps handler logic linear.
+ *
+ * One outbound frame deliberately does NOT use this helper: the
+ * `authenticated` ack in `handleAuthFrame` uses raw `ws.send` so it can
+ * catch the post-close throw and close 4002 (transient — auth succeeded
+ * but transport died). Using `safeSend` there would silently drop the
+ * ack and leave the client stuck waiting on its ack timer.
  */
 function safeSend(ws: WSContext, payload: unknown): void {
   try {
@@ -235,10 +241,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   }
 
   /**
-   * Handle an inbound `{type:"subscribe", id, path, args}` frame. Races
-   * `resolveContext` against `authTimeoutMs` so a hung adapter can't stall
-   * the handler indefinitely. Uses `conn.pendingSubIds` so an `unsubscribe`
-   * arriving during the await cleanly cancels the registration.
+   * Handle an inbound `{type:"subscribe", id, path, args}` frame. Uses
+   * `conn.pendingSubIds` so an `unsubscribe` arriving during the
+   * `resolveContext` await cleanly cancels the registration, rather than
+   * orphaning the sub in `app.subscriptions`. A hung adapter has no timer
+   * here — cancellation arrives via client unsubscribe or socket close
+   * (both drop the id from `pendingSubIds` and the `.then` bails).
    */
   async function handleSubscribe(
     msg: Record<string, unknown>,

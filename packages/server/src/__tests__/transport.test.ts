@@ -107,14 +107,15 @@ describe('buildAuthRequest (unit)', () => {
   })
 
   test('with empty-string token: treated as null (strips Authorization)', () => {
-    // The server normalizes `typeof token === 'string' && token.length > 0`
-    // to keep the token; empty-string falls through to strip. Pin the invariant
-    // so the normalization can't regress without a test failure.
+    // buildAuthRequest's `token.length > 0` branch: an empty-string token
+    // must strip, not layer `Bearer `. handleAuthFrame normalizes '' → null
+    // before it ever reaches this function at runtime, but pinning the
+    // invariant here prevents silent regression if that normalization moves.
     const upgrade = new Request('http://x/api/ws', {
       method: 'GET',
       headers: new Headers({ authorization: 'Bearer stale' }),
     })
-    const req = buildAuthRequest(upgrade, null)
+    const req = buildAuthRequest(upgrade, '')
     expect(req.headers.get('authorization')).toBeNull()
   })
 })
