@@ -12,9 +12,17 @@
  * WS auth: when `resolveContext` is configured, the client must send
  * `{ type: "auth", token }` as the first frame. Server calls `resolveContext`
  * with a synthetic Request carrying `Authorization: Bearer ${token}`; on
- * success responds `{ type: "authenticated" }`, on failure closes 4001. If
- * the handshake doesn't complete within `authTimeoutMs`, the socket is
- * closed 4002.
+ * success responds `{ type: "authenticated" }`, on failure closes 4001.
+ *
+ * If the client sends `token: null` (anonymous), any Authorization header
+ * that leaked into the upgrade request (cookie proxy, reverse proxy, stale
+ * query) is stripped before `resolveContext` runs — the WS auth frame is
+ * the sole identity source for the connection. Adapters can rely on this.
+ *
+ * Close codes:
+ *   4001 — auth failed / missing / protocol violation (client does not retry)
+ *   4002 — transient: handshake timed out within `authTimeoutMs`, or server
+ *          failed to send the `authenticated` ack (client retries with backoff)
  *
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
@@ -74,6 +82,29 @@ function safeSend(ws: WSContext, payload: unknown): void {
  * on a numeric `type`. Returns null for any invalid shape — caller picks
  * the close code (pre-auth 4001 vs post-auth error frame).
  */
+/**
+ * Build the synthetic `Request` passed to `resolveContext` for a WS subscribe.
+ *
+ * When `token` is a non-empty string, layers `Authorization: Bearer ${token}`
+ * over the upgrade request's headers. When `token` is `null` (anonymous),
+ * strips any inherited Authorization header so the WS auth frame is the sole
+ * identity source — prevents a null-token client from silently inheriting an
+ * identity that leaked into the upgrade via cookie proxy, reverse proxy, or
+ * stale query handoff. Exported for direct unit testing of this invariant.
+ */
+export function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
+  const headers = new Headers(upgradeRequest.headers)
+  if (token !== null && token.length > 0) {
+    headers.set('authorization', `Bearer ${token}`)
+  } else {
+    headers.delete('authorization')
+  }
+  return new Request(upgradeRequest.url, {
+    method: upgradeRequest.method,
+    headers,
+  })
+}
+
 function parseClientMessage(data: string): Record<string, unknown> | null {
   let parsed: unknown
   try {
@@ -109,9 +140,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   const hono = new Hono()
 
   // Per-connection state (see Connection doc at module scope).
-  // NOTE: if a client sends the auth token in the upgrade URL (which AC #1
-  // of TASK-489 prohibits), it will be visible to adapters via upgradeRequest.
-  // URL-leak prevention depends on the client following the contract.
+  // URL-leak prevention is a client-side contract: the WyStack client never
+  // appends `?token=...` to the WS URL. If a custom client does, the server
+  // can't redact it from upgradeRequest — adapters will see it. Server-side
+  // enforcement would require parsing every upgrade URL and is out of scope.
   const rawToConnection = new Map<object, Connection>()
   // sub ID → WSContext, for invalidation dispatch.
   const subToWs = new Map<string, WSContext>()
@@ -120,23 +152,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   // socket object (Bun ServerWebSocket, etc.). Single cast site so if Hono
   // ever tightens the type, there's one place to update.
   const keyOf = (ws: WSContext): object => ws.raw as object
-
-  function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
-    const headers = new Headers(upgradeRequest.headers)
-    if (token !== null && token.length > 0) {
-      headers.set('authorization', `Bearer ${token}`)
-    } else {
-      // Anonymous path: strip any Authorization that leaked via upgrade headers
-      // (cookie proxy, stale query, reverse proxy) so the WS auth frame is the
-      // sole identity source. Without this, a null-token client could
-      // silently authenticate as whatever identity the upgrade request carried.
-      headers.delete('authorization')
-    }
-    return new Request(upgradeRequest.url, {
-      method: upgradeRequest.method,
-      headers,
-    })
-  }
 
   async function resolveSubContext(rawSocket: object): Promise<Record<string, unknown>> {
     const conn = rawToConnection.get(rawSocket)
@@ -206,9 +221,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       try {
         ws.send(JSON.stringify({ type: 'authenticated' }))
       } catch {
-        // Can't ack → client will buffer forever. Close so onClose cleanup
-        // runs and the client sees a well-defined failure.
-        ws.close(4001, 'ack send failed')
+        // Auth succeeded but the transport died before we could ack. This is
+        // a network flake, not an auth failure — close 4002 so the client
+        // retries with backoff rather than latching authFailed and giving up.
+        ws.close(4002, 'ack send failed')
       }
     } catch (err) {
       // TODO: replace with @wystack/log once server logging lands.

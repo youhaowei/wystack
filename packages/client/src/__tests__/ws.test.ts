@@ -200,9 +200,16 @@ describe('WsManager', () => {
       })
       ws.connect()
 
+      // Count per-handler calls so we can assert exactly-one-fires, not just
+      // that *something* resolved the promise. Catches mechanism-change
+      // regressions where the handler could fire for the wrong sub or twice.
+      let sub1Invalidations = 0
       const invalidated = new Promise<void>((resolve, reject) => {
         // Call subscribe immediately — before WS even opens. Must not lose the sub.
-        ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+        ws.subscribe('sub1', 'listTodos', {}, () => {
+          sub1Invalidations++
+          resolve()
+        })
         setTimeout(() => reject(new Error('timeout')), 5000)
       })
 
@@ -218,6 +225,11 @@ describe('WsManager', () => {
       })
 
       await invalidated
+
+      // Prove the buffered-subscribe-then-flush actually happened end-to-end:
+      expect(sub1Invalidations).toBe(1)
+      expect(ws.isConnected()).toBe(true)
+
       ws.disconnect()
     } finally {
       authServer.stop(true)

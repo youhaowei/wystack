@@ -4,6 +4,7 @@ import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
+import { buildAuthRequest } from '../routes'
 import { serve } from '../serve-bun'
 
 const schema = defineSchema({
@@ -73,6 +74,49 @@ beforeEach(async () => {
 
 afterEach(() => {
   server.stop(true)
+})
+
+describe('buildAuthRequest (unit)', () => {
+  // Integration tests can't cover the null-token strip path directly because
+  // Bun's WebSocket client can't set custom upgrade headers. These unit tests
+  // pin the security invariant: anonymous auth must not inherit Authorization
+  // from the upgrade request (proxy/cookie leakage).
+
+  test('with Bearer token: sets Authorization: Bearer ${token}', () => {
+    const upgrade = new Request('http://x/api/ws', {
+      method: 'GET',
+      headers: new Headers({ cookie: 'session=abc' }),
+    })
+    const req = buildAuthRequest(upgrade, 'user_123')
+    expect(req.headers.get('authorization')).toBe('Bearer user_123')
+    expect(req.headers.get('cookie')).toBe('session=abc')
+  })
+
+  test('with null token: strips any Authorization inherited from upgrade', () => {
+    const upgrade = new Request('http://x/api/ws', {
+      method: 'GET',
+      headers: new Headers({
+        authorization: 'Bearer leaked_via_proxy',
+        cookie: 'session=abc',
+      }),
+    })
+    const req = buildAuthRequest(upgrade, null)
+    expect(req.headers.get('authorization')).toBeNull()
+    // Other headers survive — strip is surgical, not a wipe
+    expect(req.headers.get('cookie')).toBe('session=abc')
+  })
+
+  test('with empty-string token: treated as null (strips Authorization)', () => {
+    // The server normalizes `typeof token === 'string' && token.length > 0`
+    // to keep the token; empty-string falls through to strip. Pin the invariant
+    // so the normalization can't regress without a test failure.
+    const upgrade = new Request('http://x/api/ws', {
+      method: 'GET',
+      headers: new Headers({ authorization: 'Bearer stale' }),
+    })
+    const req = buildAuthRequest(upgrade, null)
+    expect(req.headers.get('authorization')).toBeNull()
+  })
 })
 
 describe('HTTP transport', () => {

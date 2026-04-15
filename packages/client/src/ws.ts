@@ -12,8 +12,9 @@
  *   Server → Client: { type: 'error', id?, error }
  *
  * Close codes:
- *   4001 — auth failed / missing / protocol violation → do NOT reconnect
- *   4002 — auth timeout → reconnect per normal backoff
+ *   4001 — auth failed / missing / protocol violation → latch authFailed, do NOT reconnect
+ *   4002 — transient (auth-frame timeout, ack-send transport flake, ack-receive timeout)
+ *          → reconnect per normal exponential backoff
  */
 
 type InvalidateHandler = () => void
