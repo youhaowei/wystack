@@ -7,20 +7,24 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js"
     },
     "./bun": {
-      "import": "./dist/serve-bun.js",
-      "types": "./dist/serve-bun.d.ts"
+      "types": "./dist/serve-bun.d.ts",
+      "bun": "./src/serve-bun.ts",
+      "import": "./dist/serve-bun.js"
     },
     "./node": {
-      "import": "./dist/serve-node.js",
-      "types": "./dist/serve-node.d.ts"
+      "types": "./dist/serve-node.d.ts",
+      "bun": "./src/serve-node.ts",
+      "import": "./dist/serve-node.js"
     },
     "./routes": {
-      "import": "./dist/routes.js",
-      "types": "./dist/routes.d.ts"
+      "types": "./dist/routes.d.ts",
+      "bun": "./src/routes.ts",
+      "import": "./dist/routes.js"
     }
   },
   "scripts": {
