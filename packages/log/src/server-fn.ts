@@ -11,12 +11,27 @@ interface LoggingOptions<TInput> {
   context?: (data: TInput) => Record<string, unknown>
 }
 
+// Bun's `mock.module()` is process-global with no unmock API, so a test file
+// that mocks '../wide-event' poisons every later test file. Injecting the
+// factory lets tests swap WideEvent without touching the module cache.
+let wideEventFactory: (name: string) => WideEvent = (name) => new WideEvent(name)
+
+/** @internal Test-only hook to swap the WideEvent factory. */
+export function __setWideEventFactory(factory: (name: string) => WideEvent): void {
+  wideEventFactory = factory
+}
+
+/** @internal Reset the WideEvent factory to the default. */
+export function __resetWideEventFactory(): void {
+  wideEventFactory = (name) => new WideEvent(name)
+}
+
 export function withLogging<TInput, TOutput>(
   opts: LoggingOptions<TInput>,
   handler: (ctx: HandlerContext<TInput>, event: WideEvent) => Promise<TOutput>,
 ) {
   return async (ctx: HandlerContext<TInput>): Promise<TOutput> => {
-    const event = new WideEvent(`server.${opts.name}`)
+    const event = wideEventFactory(`server.${opts.name}`)
     event.set({
       fn_name: opts.name,
       fn_method: opts.method,
