@@ -59,6 +59,12 @@
         "pino-pretty": "^13.0.0",
         "typescript": "^5.8.3",
       },
+      "peerDependencies": {
+        "pino-pretty": "^13.0.0",
+      },
+      "optionalPeers": [
+        "pino-pretty",
+      ],
     },
     "packages/runtime": {
       "name": "@wystack/runtime",
