@@ -53,6 +53,12 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   let connected = false
   let authenticated = false
   let authFailed = false
+  // `connect()` awaits `getToken()` before constructing the WebSocket. If
+  // `disconnect()` is called during that await, the `.then` would otherwise
+  // still create a fresh socket (ws is null, so the readyState guards pass)
+  // and leave a live connection after the caller requested teardown. This
+  // flag latches on disconnect and is checked post-await.
+  let connectAborted = false
 
   function clearAuthAckTimer() {
     if (authAckTimer) {
@@ -84,9 +90,11 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function connect() {
     if (authFailed) return
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
+    connectAborted = false
 
     Promise.resolve(getToken?.())
       .then((token) => {
+        if (connectAborted) return
         if (authFailed) return
         if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
@@ -168,6 +176,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   }
 
   function disconnect() {
+    connectAborted = true
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null

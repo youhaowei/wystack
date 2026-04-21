@@ -46,6 +46,14 @@ import { ValidationError } from './validation'
  */
 interface Connection {
   authenticated: boolean
+  /**
+   * Captured once from the client's auth frame and reused by every subsequent
+   * `resolveSubContext` call for the lifetime of this connection. If the JWT
+   * expires mid-session, new subscriptions present the stale token to
+   * `resolveContext` and fail; the client must reconnect to supply a fresh
+   * one. The `getToken` callback is invoked per-connect, so
+   * disconnect()+connect() on the client is the supported rotation path.
+   */
   token: string | null
   upgradeRequest: Request
   timeout: ReturnType<typeof setTimeout> | null
