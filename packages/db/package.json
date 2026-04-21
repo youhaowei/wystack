@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./pg": {
+      "import": "./dist/pg.js",
+      "types": "./dist/pg.d.ts"
     }
   },
   "scripts": {

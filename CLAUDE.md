@@ -33,6 +33,17 @@ Full-stack reactive data framework built on open standards.
 - **stdui** -- `@wystack/ui`, `@wystack/icons` (design system, published to npm)
 - **unifai** -- `@wystack/agent` (multi-provider agent abstraction, published to npm)
 
+## Dialect policy (`@wystack/db`)
+
+Dialect-flexible by construction — each SQL dialect lives at its own boundary.
+
+- **Root** (`@wystack/db`) — dialect-agnostic: `defineSchema`, `createDb`, tracked queries, the schema DSL (`text`, `int`, `uuid`, `timestamp`, `jsonb`, `boolean`), operators (`eq`, `ne`, `gt`, …). This is the primary surface.
+- **Subpaths** — escape hatch for dialect-specific primitives not yet in the DSL (e.g. `bytea`, composite uniques, custom types):
+  - `@wystack/db/pg` (Postgres + PGlite) — today
+  - `@wystack/db/mysql`, `/sqlite`, `/mssql` — land as needed
+
+Consumer packages MUST NOT import from `drizzle-orm` directly. Route through `@wystack/db` (DSL) or the matching subpath (dialect-specific). When a new dialect lands, add its subpath file; never mix dialects at the root.
+
 ## Commands
 
 ```bash
