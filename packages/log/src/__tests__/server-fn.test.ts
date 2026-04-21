@@ -1,4 +1,6 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test'
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test'
+import type { WideEvent } from '../wide-event'
+import { withLogging, __setWideEventFactory, __resetWideEventFactory } from '../server-fn'
 
 // Instances are tracked here so tests can inspect them
 const createdInstances: MockWideEventInstance[] = []
@@ -22,11 +24,11 @@ class MockWideEvent {
   }
 }
 
-mock.module('../wide-event', () => ({
-  WideEvent: MockWideEvent,
-}))
+__setWideEventFactory((name) => new MockWideEvent(name) as unknown as WideEvent)
 
-const { withLogging } = await import('../server-fn')
+afterAll(() => {
+  __resetWideEventFactory()
+})
 
 function lastInstance(): MockWideEventInstance {
   return createdInstances[createdInstances.length - 1]
