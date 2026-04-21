@@ -138,6 +138,9 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           try {
             const msg = JSON.parse(event.data)
             if (msg.type === 'authenticated') {
+              // Idempotent guard: if a duplicate ACK arrives (e.g., from a
+              // concurrent server-side auth race), don't replay subscriptions.
+              if (authenticated) return
               authenticated = true
               clearAuthAckTimer()
               sendSubscriptions()

@@ -237,6 +237,14 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       await resolveSubContext(rawSocket)
       if (!rawToConnection.has(rawSocket)) return
+      // Re-check after await: Bun dispatches onMessage without awaiting the
+      // previous handler, so two rapid auth frames can both pass the pre-await
+      // guard. The second to land finds conn.authenticated already true and
+      // sends an idempotent ACK rather than replaying the full setup path.
+      if (conn.authenticated) {
+        safeSend(ws, { type: 'authenticated' })
+        return
+      }
       if (conn.timeout) clearTimeout(conn.timeout)
       conn.timeout = null
       conn.authenticated = true
