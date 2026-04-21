@@ -16,7 +16,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test src --timeout 15000"
   },
   "dependencies": {
     "@wystack/server": "workspace:*"

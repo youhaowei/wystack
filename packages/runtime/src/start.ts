@@ -64,11 +64,16 @@ export async function startRuntime(opts: RuntimeOptions): Promise<RuntimeHandle>
   const runtime = detectRuntime()
   const lifecycle = createLifecycle()
 
-  // 1. Find available port — probe on the same hostname the server will bind to
+  // 1. Resolve port.
+  // - `0` = let the server adapter delegate OS port assignment. Probing with
+  //   node:net and then binding with Bun.serve introduces a TOCTOU race (the
+  //   probe socket isn't fully released before the real bind), which hits
+  //   EADDRINUSE reliably under Linux TIME_WAIT behaviour on CI.
+  // - Any other number = try preferred first, then scan for a nearby
+  //   alternative. The probe is safe here because Bun.serve retries against a
+  //   specific port rather than re-racing against 0.
   const port =
-    requestedPort === 0
-      ? await findAvailablePort({ hostname })
-      : await findAvailablePort({ preferred: requestedPort, hostname })
+    requestedPort === 0 ? 0 : await findAvailablePort({ preferred: requestedPort, hostname })
 
   // 2. Register user hooks
   if (opts.onStart) lifecycle.onStart(opts.onStart)

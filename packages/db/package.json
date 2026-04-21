@@ -10,13 +10,18 @@
       "types": "./dist/index.d.ts",
       "bun": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./pg": {
+      "types": "./dist/pg.d.ts",
+      "bun": "./src/pg.ts",
+      "import": "./dist/pg.js"
     }
   },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test src"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.1"

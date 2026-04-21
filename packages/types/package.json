@@ -15,7 +15,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test src"
   },
   "devDependencies": {
     "typescript": "^5.8.3"
