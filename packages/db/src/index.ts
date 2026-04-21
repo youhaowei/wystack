@@ -4,6 +4,7 @@
 export { defineSchema } from './schema'
 export { createDb } from './driver'
 export { createTrackedDb, resetTracking } from './tracked-db'
+export { syncSchema, renderCreateTableIfNotExists } from './sync'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
 
@@ -16,5 +17,6 @@ export type {
   InferTable,
 } from './dsl'
 export type { FilterOp, FilterDescriptor } from './operators'
+export type { SyncTarget } from './sync'
 export type { TrackedDb, SelectBuilder, InsertBuilder } from './tracked-db'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'
