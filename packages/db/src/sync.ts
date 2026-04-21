@@ -36,10 +36,7 @@ export interface SyncTarget {
   execute: (query: ReturnType<typeof sql>) => Promise<any>
 }
 
-export async function syncSchema(
-  db: SyncTarget,
-  schema: Record<string, PgTable>,
-): Promise<void> {
+export async function syncSchema(db: SyncTarget, schema: Record<string, PgTable>): Promise<void> {
   const tables = Object.values(schema)
   const ordered = sortByFkDeps(tables)
   for (const table of ordered) {
@@ -125,14 +122,16 @@ function renderDefault(value: unknown): string | null {
   // oxlint-disable-next-line typescript/no-explicit-any
   const obj = value as any
   if (obj && Array.isArray(obj.queryChunks)) {
-    return obj.queryChunks
-      // oxlint-disable-next-line typescript/no-explicit-any
-      .map((chunk: any) => {
-        const v = chunk?.value
-        if (Array.isArray(v)) return v.join('')
-        return String(v ?? '')
-      })
-      .join('')
+    return (
+      obj.queryChunks
+        // oxlint-disable-next-line typescript/no-explicit-any
+        .map((chunk: any) => {
+          const v = chunk?.value
+          if (Array.isArray(v)) return v.join('')
+          return String(v ?? '')
+        })
+        .join('')
+    )
   }
 
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)

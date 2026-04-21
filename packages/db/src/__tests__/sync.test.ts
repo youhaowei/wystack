@@ -61,7 +61,9 @@ describe('renderCreateTableIfNotExists', () => {
     )
 
     const ddl = renderCreateTableIfNotExists(t)
-    expect(ddl).toContain('CONSTRAINT "secrets_source_name_unique" UNIQUE ("source_id", "secret_name")')
+    expect(ddl).toContain(
+      'CONSTRAINT "secrets_source_name_unique" UNIQUE ("source_id", "secret_name")',
+    )
     expect(ddl).toContain('"ciphertext" bytea NOT NULL')
   })
 })
