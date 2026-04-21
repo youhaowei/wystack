@@ -1,7 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
-import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack, query, mutation } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
 import { createWsManager } from '../ws'
@@ -17,8 +15,7 @@ const schema = defineSchema({
 // Per-test app factory for auth scenarios — each test creates its own
 // PGlite + createWyStack so resolveContext can vary freely.
 async function makeAuthApp() {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -43,8 +40,7 @@ let wsUrl: string
 let baseUrl: string
 
 beforeEach(async () => {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,

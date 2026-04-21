@@ -53,12 +53,12 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   let connected = false
   let authenticated = false
   let authFailed = false
-  // `connect()` awaits `getToken()` before constructing the WebSocket. If
-  // `disconnect()` is called during that await, the `.then` would otherwise
-  // still create a fresh socket (ws is null, so the readyState guards pass)
-  // and leave a live connection after the caller requested teardown. This
-  // flag latches on disconnect and is checked post-await.
-  let connectAborted = false
+  // `connect()` awaits `getToken()` before constructing the WebSocket. A
+  // monotonic generation counter lets each attempt self-identify: disconnect()
+  // and subsequent connect() calls both increment the counter, so a stale
+  // `.then` or `.catch` can detect it's no longer the active attempt and bail
+  // without racing on a shared boolean.
+  let connectGeneration = 0
 
   function clearAuthAckTimer() {
     if (authAckTimer) {
@@ -90,11 +90,11 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function connect() {
     if (authFailed) return
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
-    connectAborted = false
+    const generation = ++connectGeneration
 
     Promise.resolve(getToken?.())
       .then((token) => {
-        if (connectAborted) return
+        if (generation !== connectGeneration) return
         if (authFailed) return
         if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
@@ -105,30 +105,34 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           return
         }
 
+        // Capture a local reference so stale callbacks (authAckTimer, onclose,
+        // onmessage, onerror) cannot accidentally act on a socket created by a
+        // later connect() call.
+        const socket = ws
         authenticated = !requiresAuth
 
-        ws.onopen = () => {
+        socket.onopen = () => {
           connected = true
           // Do not reset reconnectAttempt here — wait until the server sends
           // a message. Prevents tight reconnect loops when the server opens
           // then closes without any response (e.g., auth-required server +
           // no-token client → 4002 timeout loop).
           if (requiresAuth) {
-            ws!.send(JSON.stringify({ type: 'auth', token }))
+            socket.send(JSON.stringify({ type: 'auth', token }))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
             // If no ack arrives, close 4002 (transient/retry) so normal backoff
             // applies. Real auth rejections arrive as an explicit server-side
             // 4001 and latch authFailed in onclose — not here.
             authAckTimer = setTimeout(() => {
               authAckTimer = null
-              ws?.close(4002, 'auth ack timeout')
+              socket.close(4002, 'auth ack timeout')
             }, authAckTimeoutMs)
           } else {
             sendSubscriptions()
           }
         }
 
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
           // Any server message proves the connection is actually useful.
           reconnectAttempt = 0
           try {
@@ -149,7 +153,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           }
         }
 
-        ws.onclose = (event) => {
+        socket.onclose = (event) => {
           connected = false
           authenticated = false
           clearAuthAckTimer()
@@ -166,17 +170,18 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           scheduleReconnect()
         }
 
-        ws.onerror = () => {
+        socket.onerror = () => {
           // onclose will fire after this
         }
       })
       .catch(() => {
+        if (generation !== connectGeneration) return
         scheduleReconnect()
       })
   }
 
   function disconnect() {
-    connectAborted = true
+    connectGeneration++
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null

@@ -250,7 +250,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       }
     } catch (err) {
       // TODO: replace with @wystack/log once server logging lands.
-      console.warn('[wystack/server] resolveContext failed for WS auth:', err)
+      console.warn('[wystack/server] WS auth failed')
       conn.token = null
       if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
     }
