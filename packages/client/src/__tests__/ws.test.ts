@@ -14,6 +14,30 @@ const schema = defineSchema({
   },
 })
 
+// Per-test app factory for auth scenarios — each test creates its own
+// PGlite + createWyStack so resolveContext can vary freely.
+async function makeAuthApp() {
+  const pg = new PGlite()
+  const db = drizzle(pg)
+  await db.execute(
+    `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+  )
+  return createWyStack({
+    db,
+    functions: {
+      listTodos: query({
+        args: {},
+        handler: async (ctx) => ctx.db.from(schema.todos).all(),
+      }),
+      addTodo: mutation({
+        args: { title: text },
+        handler: async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
+      }),
+    },
+  })
+}
+
 let server: ReturnType<typeof serve>
 let wsUrl: string
 let baseUrl: string
@@ -73,6 +97,17 @@ describe('WsManager', () => {
     ws.disconnect()
     expect(ws.isConnected()).toBe(false)
   })
+
+  // TODO(flake-risk): several tests below use `setTimeout(r, 100|200)` as a
+  // synchronization barrier between subscribe and mutation, or between
+  // mutation and assertion. These are race-prone under CI load — they rely
+  // on the server processing subscription registration within 100-200ms.
+  // Event-driven alternatives (await a `subscribed` confirmation from the
+  // server, or poll until the subscription is registered) would be
+  // deterministic. Not reworked proactively — will surface as CI flake on
+  // real contention, triggering the fix naturally. The 2500ms "no-retry"
+  // bound at the 4001 test is fine — it's a bounded-wait, not a race.
+  // Search: `kb search "WS test flakiness sleep barriers"`.
 
   test('receives invalidation after mutation', async () => {
     const ws = createWsManager({ url: wsUrl })
@@ -153,6 +188,100 @@ describe('WsManager', () => {
     expect(invalidateCount).toBe(1)
 
     ws.disconnect()
+  })
+
+  test('sends auth handshake and buffers subscribes until authenticated', async () => {
+    // Separate server requiring auth
+    const app = await makeAuthApp()
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => 'user_123',
+      })
+      ws.connect()
+
+      // Count per-handler calls so we can assert exactly-one-fires, not just
+      // that *something* resolved the promise. Catches mechanism-change
+      // regressions where the handler could fire for the wrong sub or twice.
+      let sub1Invalidations = 0
+      const invalidated = new Promise<void>((resolve, reject) => {
+        // Call subscribe immediately — before WS even opens. Must not lose the sub.
+        ws.subscribe('sub1', 'listTodos', {}, () => {
+          sub1Invalidations++
+          resolve()
+        })
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+
+      // Trigger invalidation via HTTP mutation
+      await new Promise((r) => setTimeout(r, 200))
+      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer user_123',
+        },
+        body: JSON.stringify({ title: 'Authed' }),
+      })
+
+      await invalidated
+
+      // Prove the buffered-subscribe-then-flush actually happened end-to-end:
+      expect(sub1Invalidations).toBe(1)
+      expect(ws.isConnected()).toBe(true)
+
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('does not reconnect on close code 4001', async () => {
+    const app = await makeAuthApp()
+
+    // Count auth attempts on the server. Each connection attempt runs
+    // resolveContext once at handshake time (per Finding #1 fix).
+    // No retries ⇒ count === 1. A reconnect loop ⇒ count > 1.
+    let authAttempts = 0
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        authAttempts++
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => null, // triggers server close 4001
+      })
+      ws.connect()
+
+      // Wait well past the first reconnect window (~1-1.5s). If the client
+      // were retrying, authAttempts would tick up every cycle.
+      await new Promise((r) => setTimeout(r, 2500))
+
+      expect(ws.isConnected()).toBe(false)
+      expect(authAttempts).toBe(1) // exactly one connection attempt, no retry
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
   })
 
   test('re-subscribes on reconnect', async () => {
