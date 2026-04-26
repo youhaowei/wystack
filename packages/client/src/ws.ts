@@ -3,7 +3,7 @@
  * reconnection, subscription tracking, and invalidation dispatch.
  *
  * Protocol (matches @wystack/server):
- *   Client → Server: { type: 'auth', token }              (first frame when auth is configured)
+ *   Client → Server: { type: 'auth', token }              (first frame when requiresAuth is true; token may be null for cookie/proxy auth)
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
  *   Server → Client: { type: 'authenticated' }            (ack for successful auth)
@@ -21,10 +21,31 @@ type InvalidateHandler = () => void
 
 export interface WsManagerConfig {
   url: string
+  /**
+   * Provide a token for Bearer auth. When set, the client sends an auth frame
+   * on connect and waits for the server's `{type:"authenticated"}` ack before
+   * replaying subscriptions. Return `null` for anonymous auth (e.g., cookie /
+   * session-based) — the auth frame is still sent with no token, triggering
+   * `resolveContext` on the server with the original upgrade request headers.
+   *
+   * Omitting `getToken` entirely means no auth frame is sent. This is correct
+   * only when the server has NO `resolveContext` configured. If the server uses
+   * `resolveContext` for any purpose (including cookie auth), either provide
+   * `getToken` or set `requiresAuth: true`.
+   */
   getToken?: () => Promise<string | null> | string | null
   /**
+   * Send an auth frame on connect even when `getToken` is not provided.
+   * Use this for servers that have `resolveContext` configured but authenticate
+   * via cookies or proxy headers rather than a client-supplied token — the auth
+   * frame carries no token but still triggers `resolveContext` on the server.
+   *
+   * Defaults to `true` when `getToken` is set, `false` otherwise.
+   */
+  requiresAuth?: boolean
+  /**
    * Max ms to wait for the server's `{type:"authenticated"}` ack after sending
-   * the auth frame. Only applies when `getToken` is configured. Default: 10_000.
+   * the auth frame. Only applies when auth is required. Default: 10_000.
    */
   authAckTimeoutMs?: number
 }
@@ -39,7 +60,7 @@ export interface WsManager {
 
 export function createWsManager(config: WsManagerConfig): WsManager {
   const { url, getToken } = config
-  const requiresAuth = getToken !== undefined
+  const requiresAuth = config.requiresAuth ?? getToken !== undefined
   // Fail fast if the server never sends `{type:"authenticated"}`. Catches
   // config mismatches (server without resolveContext) and server bugs.
   const authAckTimeoutMs = config.authAckTimeoutMs ?? 10_000
