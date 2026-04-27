@@ -272,7 +272,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       // Log message only — not the full error — to avoid leaking token/header
       // values that resolveContext implementations may embed in thrown errors.
       console.warn('[wystack/server] WS auth failed:', errorMessage(err))
-      if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
+      // Guard conn.authenticated: if the concurrent winning frame already
+      // succeeded, don't tear down an authenticated connection with 4001.
+      if (rawToConnection.has(rawSocket) && !conn.authenticated) ws.close(4001, 'auth failed')
     }
   }
 
