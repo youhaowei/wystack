@@ -113,8 +113,11 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
     const generation = ++connectGeneration
 
-    Promise.resolve(getToken?.())
-      .then((token) => {
+    // Only invoke getToken when auth is actually required. If requiresAuth is
+    // false (explicit override or no getToken), skip the token fetch entirely
+    // so a slow or throwing getToken can't block or crash a no-auth connection.
+    const tokenPromise = requiresAuth ? Promise.resolve(getToken?.()) : Promise.resolve(null)
+    tokenPromise.then((token) => {
         if (generation !== connectGeneration) return
         if (authFailed) return
         if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
