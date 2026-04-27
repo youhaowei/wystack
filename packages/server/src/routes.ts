@@ -267,9 +267,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         // retries with backoff rather than latching authFailed and giving up.
         ws.close(4002, 'ack send failed')
       }
-    } catch {
+    } catch (err) {
       // TODO: replace with @wystack/log once server logging lands.
-      console.warn('[wystack/server] WS auth failed')
+      // Log message only — not the full error — to avoid leaking token/header
+      // values that resolveContext implementations may embed in thrown errors.
+      console.warn('[wystack/server] WS auth failed:', errorMessage(err))
       if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
     }
   }
