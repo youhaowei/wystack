@@ -502,6 +502,44 @@ describe('WebSocket transport', () => {
     }
   })
 
+  test('WS auth frame on no-auth server does not adopt token into subscription context', async () => {
+    const observedContexts: Record<string, unknown>[] = []
+    const app = await makeAuthApp({
+      whoami: query({
+        args: {},
+        handler: async (ctx) => {
+          observedContexts.push(ctx)
+          return { userId: ctx.userId ?? null }
+        },
+      }),
+    })
+    const noAuthServer = serve({ app, port: 0 }) // no resolveContext: trusted/no-auth mode
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${noAuthServer.port}/api/ws`)
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'auth', token: 'must_not_be_trusted' }))
+        }
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'authenticated') {
+            ws.send(JSON.stringify({ type: 'subscribe', id: 'sub1', path: 'whoami', args: {} }))
+          }
+          if (msg.type === 'subscribed') resolve()
+        }
+        ws.onerror = () => reject(new Error('ws error'))
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+      ws.close()
+
+      expect(observedContexts).toHaveLength(1)
+      expect(observedContexts[0].userId).toBeUndefined()
+    } finally {
+      noAuthServer.stop(true)
+    }
+  })
+
   test('WS invalidation re-queries with the subscription-time context (not a fresh resolve)', async () => {
     // Spec decision: "Context resolved at subscription time, preserved for
     // re-queries." The invalidation re-run must reuse sub.context, not call

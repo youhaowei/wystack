@@ -14,6 +14,11 @@
  * with a synthetic Request carrying `Authorization: Bearer ${token}`; on
  * success responds `{ type: "authenticated" }`, on failure closes 4001.
  *
+ * No-auth servers (`resolveContext` omitted) start the connection authenticated:
+ * subscribe/unsubscribe frames can be the first message. If a legacy or
+ * token-configured client sends `auth` anyway, the server sends a structural ACK
+ * but does not resolve, store, or trust that token.
+ *
  * If the client sends `token: null` (anonymous), any Authorization header
  * that leaked into the upgrade request (cookie proxy, reverse proxy, stale
  * query) is stripped before `resolveContext` runs — the WS auth frame is
@@ -220,7 +225,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
    *      trips it, closing the socket (resolveContext completes into a
    *      dead socket — harmless).
    *   2. Already authenticated (no-auth server OR repeat frame) →
-   *      idempotent ACK so the client's ack-wait doesn't expire.
+   *      idempotent ACK so a token-configured client does not hang. This path
+   *      never adopts the token; no-auth transports rely on connection trust,
+   *      not WS credentials.
    */
   async function handleAuthFrame(
     msg: Record<string, unknown>,
@@ -401,9 +408,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           }
 
           // `auth` is the only message type allowed to cross the unauth boundary.
-          // Running version validation for both auth-required AND no-auth servers
-          // here is the single choke-point; auth-required runs the full handshake,
-          // no-auth replies idempotently so token-configured clients don't hang.
+          // Auth-required servers run the full handshake; no-auth servers reply
+          // with a compatibility ACK and ignore any supplied token.
           if (msg.type === 'auth') {
             await handleAuthFrame(msg, ws, conn, rawSocket)
             return
