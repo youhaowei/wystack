@@ -22,9 +22,6 @@ export type {
 // Api builder (advanced — usually called via createWyStack)
 export { createApi } from './api'
 
-// Legacy string-based hooks (backward compatible)
-export { useWyQuery, useWyMutation } from './hooks'
-
 // Low-level client (advanced)
 export { createClient } from './client'
 export { WyStackProvider, useWyStackClient } from './provider'
