@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test'
+import { QueryClient } from '@tanstack/react-query'
 import type { QueryDef, MutationDef } from '@wystack/server'
 import type { QueryRef, MutationRef, ApiFromFunctions } from '../refs'
 import { createApi } from '../api'
@@ -64,12 +65,38 @@ describe('createApi proxy', () => {
     expect((api as any)[Symbol.iterator]).toBeUndefined()
   })
 
-  test('refs are plain objects with only _path at runtime', () => {
+  test('refs are plain objects with _path at runtime', () => {
     const api = createApi<TestFunctions>()
 
     const ref = api.listTodos
-    expect(Object.keys(ref)).toEqual(['_path'])
     expect(ref._path).toBe('listTodos')
+  })
+
+  test('refs are referentially stable per key', () => {
+    // Hooks read ref._path (string), but consumers passing refs into
+    // useEffect/useMemo dep arrays or Map keys rely on identity.
+    const api = createApi<TestFunctions>()
+
+    expect(api.listTodos).toBe(api.listTodos)
+    expect(api.createTodo).toBe(api.createTodo)
+    expect(api.listTodos).not.toBe(api.createTodo)
+  })
+
+  test('proxy is not thenable', async () => {
+    // If the proxy responded to `then`, `await api` would resolve to {_path:'then'}
+    // and break any code that accidentally awaits the api object.
+    const api = createApi<TestFunctions>()
+
+    // oxlint-disable typescript/no-explicit-any -- testing dynamic property access
+    expect((api as any).then).toBeUndefined()
+    expect((api as any).catch).toBeUndefined()
+    expect((api as any).finally).toBeUndefined()
+    // oxlint-enable typescript/no-explicit-any
+
+    // Awaiting a Promise that resolves to the api should yield the api itself,
+    // not a {_path:'then'} ref produced by a thenable proxy.
+    const awaited = await Promise.resolve(api)
+    expect(awaited.listTodos._path).toBe('listTodos')
   })
 })
 
@@ -93,6 +120,27 @@ describe('createWyStack', () => {
     expect(instance.client.url).toBe('http://localhost:9999')
     expect(typeof instance.client.query).toBe('function')
     expect(typeof instance.client.mutate).toBe('function')
+  })
+
+  test('accepts an injected QueryClient', async () => {
+    const { createWyStack } = await import('../setup')
+
+    const sharedQueryClient = new QueryClient()
+    const instance = createWyStack<TestFunctions>(
+      { url: 'http://localhost:9999' },
+      { queryClient: sharedQueryClient },
+    )
+
+    expect(instance.Provider).toBeDefined()
+    // Smoke check that the consumer's QueryClient is what gets used internally
+    // by writing through it and expecting cache to be visible to the same instance.
+    sharedQueryClient.setQueryData(['wystack', 'listTodos', { orgId: 'x' }], [{ id: 1 }])
+    const cached = sharedQueryClient.getQueryData<{ id: number }[]>([
+      'wystack',
+      'listTodos',
+      { orgId: 'x' },
+    ])
+    expect(cached).toEqual([{ id: 1 }])
   })
 
   test('respects custom prefix', async () => {

@@ -4,7 +4,7 @@
  * Returns { Provider, api, client } — everything needed to use WyStack in React.
  * The Provider is pre-bound to the client it creates internally.
  */
-import { createElement, useEffect } from 'react'
+import { createElement } from 'react'
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query'
 import type { FunctionDef } from '@wystack/server'
 import type { WyStackClientConfig } from './types'
@@ -23,25 +23,32 @@ export interface WyStackInstance<T extends Record<string, FunctionDef>> {
   client: WyStackClient
 }
 
+export interface CreateWyStackOptions {
+  /**
+   * Optional TanStack QueryClient to share with the rest of the app. If
+   * omitted, a fresh QueryClient with default config is created.
+   */
+  queryClient?: QueryClient
+}
+
 /**
- * One-line setup:
+ * One-line setup. Call at module scope — never inside a component, or every
+ * render will mint a new client and wipe the cache.
+ *
  * ```ts
  * const { Provider, api, client } = createWyStack<typeof functions>({ url })
  * ```
  */
 export function createWyStack<T extends Record<string, FunctionDef>>(
   config: WyStackClientConfig,
+  options: CreateWyStackOptions = {},
 ): WyStackInstance<T> {
   const client = createClient(config)
   const api = createApi<T>()
-  const queryClient = new QueryClient()
+  const queryClient = options.queryClient ?? new QueryClient()
 
   function Provider({ children }: { children: React.ReactNode }) {
-    useEffect(() => {
-      client.ws.connect()
-      return () => client.ws.disconnect()
-    }, [])
-
+    // WS lifecycle is owned by InternalProvider's useEffect; do not duplicate it here.
     return createElement(
       QueryClientProvider,
       { client: queryClient },

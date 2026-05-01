@@ -17,22 +17,17 @@ function nextSubId() {
   return `wy_${crypto.randomUUID()}`
 }
 
-// ---------------------------------------------------------------------------
-// Skip sentinel
-// ---------------------------------------------------------------------------
-
 /** Sentinel value to disable a query. `useQuery(api.listTodos, 'skip')` */
 export type Skip = 'skip'
-
-// ---------------------------------------------------------------------------
-// Standalone hooks — Convex-style: useQuery(ref, args), useMutation(ref)
-// ---------------------------------------------------------------------------
 
 type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'queryFn'>
 
 /**
  * useQuery — fetches data via HTTP GET (TanStack Query), subscribes via WS
  * for live invalidation. Accepts a typed QueryRef from the api object.
+ *
+ * Args must be JSON-serializable (no Date/Map/Set/BigInt). Object key order
+ * matters for cache identity — use a consistent shape per call site.
  *
  * ```ts
  * const todos = useQuery(api.listTodos, { orgId })
@@ -49,13 +44,14 @@ export function useQuery<TArgs, TReturn>(
 
   const skip = args === 'skip'
   const resolvedArgs = skip ? undefined : (args as TArgs | undefined)
+  const normalizedArgs = (resolvedArgs ?? {}) as TArgs | Record<string, never>
 
-  const stableArgsKey = JSON.stringify(resolvedArgs)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const stableArgs = useMemo(() => resolvedArgs, [stableArgsKey])
+  const stableArgsKey = JSON.stringify(normalizedArgs)
+  // oxlint-disable-next-line react-hooks/exhaustive-deps -- stableArgsKey is the structural identity
+  const stableArgs = useMemo(() => normalizedArgs, [stableArgsKey])
 
   const path = ref._path
-  const queryKey = stableArgs !== undefined ? ['wystack', path, stableArgs] : ['wystack', path]
+  const queryKey = ['wystack', path, stableArgs] as const
 
   const query = useTanstackQuery<TReturn>({
     ...options,
@@ -70,14 +66,14 @@ export function useQuery<TArgs, TReturn>(
 
     const subId = nextSubId()
 
-    client.ws.subscribe(subId, path, stableArgs ?? {}, () => {
-      queryClient.invalidateQueries({ queryKey })
+    client.ws.subscribe(subId, path, stableArgs, () => {
+      queryClient.invalidateQueries({ queryKey: ['wystack', path, stableArgs] })
     })
 
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgsKey, skip])
+  }, [client.ws, queryClient, path, stableArgs, stableArgsKey, skip])
 
   return query
 }
@@ -103,59 +99,7 @@ export function useMutation<TArgs, TReturn>(
   const client = useWyStackClient()
 
   return useTanstackMutation<TReturn, Error, TArgs>({
-    mutationFn: (args: TArgs) => client.mutate(ref._path, args) as Promise<TReturn>,
     ...options,
-  })
-}
-
-// ---------------------------------------------------------------------------
-// Legacy string-based hooks — backward compatible, shared query keys
-// ---------------------------------------------------------------------------
-
-/**
- * useWyQuery — string-based hook for incremental migration.
- * Produces the same query keys as useQuery(ref), so cache is shared.
- */
-export function useWyQuery<T = unknown>(path: string, args?: unknown): UseQueryResult<T> {
-  const client = useWyStackClient()
-  const queryClient = useQueryClient()
-
-  const stableArgsKey = JSON.stringify(args)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const stableArgs = useMemo(() => args, [stableArgsKey])
-
-  const queryKey = stableArgs !== undefined ? ['wystack', path, stableArgs] : ['wystack', path]
-
-  const query = useTanstackQuery<T>({
-    queryKey,
-    queryFn: () => client.query(path, stableArgs) as Promise<T>,
-  })
-
-  // WS subscription for live invalidation
-  useEffect(() => {
-    const subId = nextSubId()
-
-    client.ws.subscribe(subId, path, stableArgs ?? {}, () => {
-      queryClient.invalidateQueries({ queryKey })
-    })
-
-    return () => {
-      client.ws.unsubscribe(subId)
-    }
-  }, [client.ws, queryClient, path, stableArgsKey])
-
-  return query
-}
-
-/**
- * useWyMutation — string-based hook for incremental migration.
- */
-export function useWyMutation<TArgs = unknown, TReturn = unknown>(
-  path: string,
-): UseMutationResult<TReturn, Error, TArgs> {
-  const client = useWyStackClient()
-
-  return useTanstackMutation<TReturn, Error, TArgs>({
-    mutationFn: (args: TArgs) => client.mutate(path, args) as Promise<TReturn>,
+    mutationFn: (args: TArgs) => client.mutate(ref._path, args) as Promise<TReturn>,
   })
 }
