@@ -11,4 +11,4 @@ plugins/
 .next
 storybook-static
 build/
-.claude/scheduled_tasks.lock
+.claude/
