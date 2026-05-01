@@ -3,12 +3,14 @@ import { QueryClient } from '@tanstack/react-query'
 import type { QueryDef, MutationDef } from '@wystack/server'
 import type { QueryRef, MutationRef, ApiFromFunctions } from '../refs'
 import { createApi } from '../api'
+import { useQuery } from '../hooks'
 
 // ---------------------------------------------------------------------------
 // Type-level tests — if these compile, the type system is correct
 // ---------------------------------------------------------------------------
 
 type TestFunctions = {
+  allTodos: QueryDef<Record<string, never>, { id: number; title: string }[]>
   listTodos: QueryDef<{ orgId: string }, { id: number; title: string }[]>
   getTodo: QueryDef<{ id: number }, { id: number; title: string }>
   createTodo: MutationDef<{ title: string }, { id: number }>
@@ -35,6 +37,27 @@ const _notMutation: Api['listTodos'] extends MutationRef ? never : true = true
 
 // MutationRef is NOT a QueryRef
 const _notQuery: Api['createTodo'] extends QueryRef ? never : true = true
+
+declare const typecheckApi: Api
+
+function assertHookTypes() {
+  useQuery(typecheckApi.allTodos)
+  useQuery(typecheckApi.allTodos, { staleTime: 1_000 })
+  useQuery(typecheckApi.listTodos, { args: { orgId: 'org_123' } })
+  useQuery(typecheckApi.listTodos, {
+    args: undefined,
+    skip: true,
+  })
+
+  // @ts-expect-error required-arg queries need explicit args unless skipped
+  useQuery(typecheckApi.listTodos)
+  // @ts-expect-error required-arg queries cannot omit args without skip
+  useQuery(typecheckApi.listTodos, { staleTime: 1_000 })
+  // @ts-expect-error skip is an explicit config field, not a positional sentinel
+  useQuery(typecheckApi.listTodos, 'skip')
+}
+
+void assertHookTypes
 
 test('maps function definitions to typed refs', () => {
   expect(_listTodos).toBe(true)
