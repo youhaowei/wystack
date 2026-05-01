@@ -1,7 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
-import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
 import { buildAuthRequest } from '../routes'
@@ -21,8 +19,7 @@ const schema = defineSchema({
 // via `functions` when a test needs something specific.
 type AuthTestFunctions = NonNullable<Parameters<typeof createWyStack>[0]['functions']>
 async function makeAuthApp(functions?: AuthTestFunctions) {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -42,8 +39,7 @@ let server: ReturnType<typeof serve>
 let baseUrl: string
 
 beforeEach(async () => {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,
@@ -162,8 +158,7 @@ describe('HTTP transport', () => {
   })
 
   test('resolveContext is called per request', async () => {
-    const pg = new PGlite()
-    const db = drizzle(pg)
+    const db = await createDb({ dev: 'pglite://' })
     await db.execute(
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
     )

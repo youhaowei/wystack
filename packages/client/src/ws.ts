@@ -3,7 +3,7 @@
  * reconnection, subscription tracking, and invalidation dispatch.
  *
  * Protocol (matches @wystack/server):
- *   Client → Server: { type: 'auth', token }              (first frame when auth is configured)
+ *   Client → Server: { type: 'auth', token }              (first frame when requiresAuth is true; token may be null for cookie/proxy auth)
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
  *   Server → Client: { type: 'authenticated' }            (ack for successful auth)
@@ -21,10 +21,31 @@ type InvalidateHandler = () => void
 
 export interface WsManagerConfig {
   url: string
+  /**
+   * Provide a token for Bearer auth. When set, the client sends an auth frame
+   * on connect and waits for the server's `{type:"authenticated"}` ack before
+   * replaying subscriptions. Return `null` for anonymous auth (e.g., cookie /
+   * session-based) — the auth frame is still sent with no token, triggering
+   * `resolveContext` on the server with the original upgrade request headers.
+   *
+   * Omitting `getToken` entirely means no auth frame is sent. This is correct
+   * only when the server has NO `resolveContext` configured. If the server uses
+   * `resolveContext` for any purpose (including cookie auth), either provide
+   * `getToken` or set `requiresAuth: true`.
+   */
   getToken?: () => Promise<string | null> | string | null
   /**
+   * Send an auth frame on connect even when `getToken` is not provided.
+   * Use this for servers that have `resolveContext` configured but authenticate
+   * via cookies or proxy headers rather than a client-supplied token — the auth
+   * frame carries no token but still triggers `resolveContext` on the server.
+   *
+   * Defaults to `true` when `getToken` is set, `false` otherwise.
+   */
+  requiresAuth?: boolean
+  /**
    * Max ms to wait for the server's `{type:"authenticated"}` ack after sending
-   * the auth frame. Only applies when `getToken` is configured. Default: 10_000.
+   * the auth frame. Only applies when auth is required. Default: 10_000.
    */
   authAckTimeoutMs?: number
 }
@@ -39,7 +60,7 @@ export interface WsManager {
 
 export function createWsManager(config: WsManagerConfig): WsManager {
   const { url, getToken } = config
-  const requiresAuth = getToken !== undefined
+  const requiresAuth = config.requiresAuth ?? getToken !== undefined
   // Fail fast if the server never sends `{type:"authenticated"}`. Catches
   // config mismatches (server without resolveContext) and server bugs.
   const authAckTimeoutMs = config.authAckTimeoutMs ?? 10_000
@@ -53,12 +74,12 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   let connected = false
   let authenticated = false
   let authFailed = false
-  // `connect()` awaits `getToken()` before constructing the WebSocket. If
-  // `disconnect()` is called during that await, the `.then` would otherwise
-  // still create a fresh socket (ws is null, so the readyState guards pass)
-  // and leave a live connection after the caller requested teardown. This
-  // flag latches on disconnect and is checked post-await.
-  let connectAborted = false
+  // `connect()` awaits `getToken()` before constructing the WebSocket. A
+  // monotonic generation counter lets each attempt self-identify: disconnect()
+  // and subsequent connect() calls both increment the counter, so a stale
+  // `.then` or `.catch` can detect it's no longer the active attempt and bail
+  // without racing on a shared boolean.
+  let connectGeneration = 0
 
   function clearAuthAckTimer() {
     if (authAckTimer) {
@@ -90,11 +111,15 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function connect() {
     if (authFailed) return
     if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
-    connectAborted = false
+    const generation = ++connectGeneration
 
-    Promise.resolve(getToken?.())
+    // Only invoke getToken when auth is actually required. If requiresAuth is
+    // false (explicit override or no getToken), skip the token fetch entirely
+    // so a slow or throwing getToken can't block or crash a no-auth connection.
+    const tokenPromise = requiresAuth ? Promise.resolve(getToken?.()) : Promise.resolve(null)
+    tokenPromise
       .then((token) => {
-        if (connectAborted) return
+        if (generation !== connectGeneration) return
         if (authFailed) return
         if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
 
@@ -105,35 +130,42 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           return
         }
 
+        // Capture a local reference so stale callbacks (authAckTimer, onclose,
+        // onmessage, onerror) cannot accidentally act on a socket created by a
+        // later connect() call.
+        const socket = ws
         authenticated = !requiresAuth
 
-        ws.onopen = () => {
+        socket.onopen = () => {
           connected = true
           // Do not reset reconnectAttempt here — wait until the server sends
           // a message. Prevents tight reconnect loops when the server opens
           // then closes without any response (e.g., auth-required server +
           // no-token client → 4002 timeout loop).
           if (requiresAuth) {
-            ws!.send(JSON.stringify({ type: 'auth', token }))
+            socket.send(JSON.stringify({ type: 'auth', token }))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
             // If no ack arrives, close 4002 (transient/retry) so normal backoff
             // applies. Real auth rejections arrive as an explicit server-side
             // 4001 and latch authFailed in onclose — not here.
             authAckTimer = setTimeout(() => {
               authAckTimer = null
-              ws?.close(4002, 'auth ack timeout')
+              socket.close(4002, 'auth ack timeout')
             }, authAckTimeoutMs)
           } else {
             sendSubscriptions()
           }
         }
 
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
           // Any server message proves the connection is actually useful.
           reconnectAttempt = 0
           try {
             const msg = JSON.parse(event.data)
             if (msg.type === 'authenticated') {
+              // Idempotent guard: if a duplicate ACK arrives (e.g., from a
+              // concurrent server-side auth race), don't replay subscriptions.
+              if (authenticated) return
               authenticated = true
               clearAuthAckTimer()
               sendSubscriptions()
@@ -149,7 +181,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           }
         }
 
-        ws.onclose = (event) => {
+        socket.onclose = (event) => {
           connected = false
           authenticated = false
           clearAuthAckTimer()
@@ -166,17 +198,18 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           scheduleReconnect()
         }
 
-        ws.onerror = () => {
+        socket.onerror = () => {
           // onclose will fire after this
         }
       })
       .catch(() => {
+        if (generation !== connectGeneration) return
         scheduleReconnect()
       })
   }
 
   function disconnect() {
-    connectAborted = true
+    connectGeneration++
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null

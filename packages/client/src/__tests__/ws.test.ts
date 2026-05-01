@@ -1,7 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
-import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack, query, mutation } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
 import { createWsManager } from '../ws'
@@ -17,8 +15,7 @@ const schema = defineSchema({
 // Per-test app factory for auth scenarios — each test creates its own
 // PGlite + createWyStack so resolveContext can vary freely.
 async function makeAuthApp() {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -43,8 +40,7 @@ let wsUrl: string
 let baseUrl: string
 
 beforeEach(async () => {
-  const pg = new PGlite()
-  const db = drizzle(pg)
+  const db = await createDb({ dev: 'pglite://' })
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,
@@ -241,6 +237,49 @@ describe('WsManager', () => {
       expect(sub1Invalidations).toBe(1)
       expect(ws.isConnected()).toBe(true)
 
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('requiresAuth:true without getToken sends null-token auth frame (cookie/session auth)', async () => {
+    // Simulates a server that uses resolveContext for cookie/proxy-header auth —
+    // no JWT, but the client still needs to trigger the handshake so the server
+    // can run resolveContext against the upgrade request headers.
+    const app = await makeAuthApp()
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (_req) => {
+        // In real usage this would read cookies; here we just accept anonymously
+        // to prove the auth frame was sent and the handshake completed.
+        return { userId: 'cookie-user' }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        requiresAuth: true, // no getToken — cookie auth pattern
+      })
+      ws.connect()
+
+      const invalidated = new Promise<void>((resolve, reject) => {
+        ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+
+      await new Promise((r) => setTimeout(r, 200))
+      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Cookie authed' }),
+      })
+
+      await invalidated
+      expect(ws.isConnected()).toBe(true)
       ws.disconnect()
     } finally {
       authServer.stop(true)

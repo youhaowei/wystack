@@ -175,12 +175,15 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   // ever tightens the type, there's one place to update.
   const keyOf = (ws: WSContext): object => ws.raw as object
 
-  async function resolveSubContext(rawSocket: object): Promise<Record<string, unknown>> {
+  async function resolveSubContext(
+    rawSocket: object,
+    token: string | null,
+  ): Promise<Record<string, unknown>> {
     const conn = rawToConnection.get(rawSocket)
     if (!conn) throw new Error('connection not registered')
     // Build a fresh Request per call so adapters see a unique identity and
     // don't accumulate mutations across subscriptions on the same connection.
-    const req = buildAuthRequest(conn.upgradeRequest, conn.token)
+    const req = buildAuthRequest(conn.upgradeRequest, token)
     return (await resolveContext(req)) ?? {}
   }
 
@@ -231,12 +234,28 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     }
 
     const rawToken = msg.token
+    // Parse the token locally — do NOT write conn.token yet. Two concurrent
+    // auth frames can both pass the pre-await authenticated===false check.
+    // Writing conn.token here would let the slower frame overwrite the faster
+    // frame's token before resolveSubContext reads it, causing the winning
+    // frame to authenticate under a different identity. Commit only after
+    // confirming we won the race below.
     const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-    conn.token = token
 
     try {
-      await resolveSubContext(rawSocket)
+      await resolveSubContext(rawSocket, token)
       if (!rawToConnection.has(rawSocket)) return
+      // Re-check after await: Bun dispatches onMessage without awaiting the
+      // previous handler, so two rapid auth frames can both pass the pre-await
+      // guard. The slower frame finds conn.authenticated already true and sends
+      // an idempotent ACK — it must NOT overwrite conn.token (that would swap
+      // the winning identity's token under live subscriptions).
+      if (conn.authenticated) {
+        safeSend(ws, { type: 'authenticated' })
+        return
+      }
+      // Won the race — commit token and mark authenticated.
+      conn.token = token
       if (conn.timeout) clearTimeout(conn.timeout)
       conn.timeout = null
       conn.authenticated = true
@@ -250,9 +269,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       }
     } catch (err) {
       // TODO: replace with @wystack/log once server logging lands.
-      console.warn('[wystack/server] resolveContext failed for WS auth:', err)
-      conn.token = null
-      if (rawToConnection.has(rawSocket)) ws.close(4001, 'auth failed')
+      // Log message only — not the full error — to avoid leaking token/header
+      // values that resolveContext implementations may embed in thrown errors.
+      console.warn('[wystack/server] WS auth failed:', errorMessage(err))
+      // Guard conn.authenticated: if the concurrent winning frame already
+      // succeeded, don't tear down an authenticated connection with 4001.
+      if (rawToConnection.has(rawSocket) && !conn.authenticated) ws.close(4001, 'auth failed')
     }
   }
 
@@ -296,7 +318,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     // "Context resolved at subscription time, preserved for re-queries"
     let context: Record<string, unknown>
     try {
-      context = await resolveSubContext(rawSocket)
+      context = await resolveSubContext(rawSocket, conn.token)
     } catch (err) {
       conn.pendingSubIds.delete(id)
       safeSend(ws, { type: 'error', id, error: errorMessage(err) })
