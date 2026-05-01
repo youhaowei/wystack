@@ -17,10 +17,22 @@ function nextSubId() {
   return `wy_${crypto.randomUUID()}`
 }
 
-/** Sentinel value to disable a query. `useQuery(api.listTodos, 'skip')` */
-export type Skip = 'skip'
-
 type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'queryFn'>
+
+export type QueryConfig<TArgs, TReturn> = WyQueryOptions<TReturn> & {
+  args?: TArgs | undefined
+  skip?: boolean
+}
+
+type EmptyArgs = Record<string, never>
+
+type QueryConfigArg<TArgs, TReturn> = TArgs extends EmptyArgs
+  ? [config?: QueryConfig<TArgs, TReturn>]
+  : [
+      config:
+        | (QueryConfig<TArgs, TReturn> & { args: TArgs; skip?: boolean })
+        | (QueryConfig<TArgs, TReturn> & { args?: TArgs; skip: true }),
+    ]
 
 /**
  * useQuery — fetches data via HTTP GET (TanStack Query), subscribes via WS
@@ -30,21 +42,19 @@ type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'quer
  * matters for cache identity — use a consistent shape per call site.
  *
  * ```ts
- * const todos = useQuery(api.listTodos, { orgId })
- * const user = useQuery(api.getUser, userId ? { userId } : 'skip')
+ * const todos = useQuery(api.listTodos, { args: { orgId } })
+ * const user = useQuery(api.getUser, { args: userId ? { userId } : undefined, skip: !userId })
  * ```
  */
 export function useQuery<TArgs, TReturn>(
   ref: QueryRef<TArgs, TReturn>,
-  args?: TArgs | Skip,
-  options?: WyQueryOptions<TReturn>,
+  ...[config]: QueryConfigArg<TArgs, TReturn>
 ): UseQueryResult<TReturn> {
   const client = useWyStackClient()
   const queryClient = useQueryClient()
 
-  const skip = args === 'skip'
-  const resolvedArgs = skip ? undefined : (args as TArgs | undefined)
-  const normalizedArgs = (resolvedArgs ?? {}) as TArgs | Record<string, never>
+  const { args, skip = false, ...options } = config ?? {}
+  const normalizedArgs = (args ?? {}) as TArgs | Record<string, never>
 
   const stableArgsKey = JSON.stringify(normalizedArgs)
   // oxlint-disable-next-line react-hooks/exhaustive-deps -- stableArgsKey is the structural identity
@@ -56,7 +66,7 @@ export function useQuery<TArgs, TReturn>(
   const query = useTanstackQuery<TReturn>({
     ...options,
     queryKey,
-    queryFn: () => client.query(path, stableArgs) as Promise<TReturn>,
+    queryFn: () => client.query(ref, stableArgs as TArgs),
     enabled: !skip && (options?.enabled ?? true),
   })
 
@@ -67,13 +77,13 @@ export function useQuery<TArgs, TReturn>(
     const subId = nextSubId()
 
     client.ws.subscribe(subId, path, stableArgs, () => {
-      queryClient.invalidateQueries({ queryKey: ['wystack', path, stableArgs] })
+      queryClient.invalidateQueries({ queryKey })
     })
 
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgs, stableArgsKey, skip])
+  }, [client.ws, queryClient, path, stableArgs, skip])
 
   return query
 }
@@ -100,6 +110,6 @@ export function useMutation<TArgs, TReturn>(
 
   return useTanstackMutation<TReturn, Error, TArgs>({
     ...options,
-    mutationFn: (args: TArgs) => client.mutate(ref._path, args) as Promise<TReturn>,
+    mutationFn: (args: TArgs) => client.mutate(ref, args),
   })
 }

@@ -7,7 +7,7 @@ export type { WyStackInstance } from './setup'
 
 // Standalone hooks — Convex-style
 export { useQuery, useMutation } from './hooks'
-export type { Skip } from './hooks'
+export type { QueryConfig } from './hooks'
 
 // Function reference types
 export type {

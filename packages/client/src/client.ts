@@ -9,18 +9,14 @@ import type { WyStackClientConfig } from './types'
 import type { QueryRef, MutationRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
-type FunctionPath = string | { readonly _path: string }
-
 export interface WyStackClient {
   url: string
   prefix: string
   ws: WsManager
   /** Fetch a query result via GET */
   query<TRef extends QueryRef>(ref: TRef, args: RefArgs<TRef>): Promise<RefReturn<TRef>>
-  query<T = unknown>(path: string, args?: unknown): Promise<T>
   /** Execute a mutation via POST */
   mutate<TRef extends MutationRef>(ref: TRef, args: RefArgs<TRef>): Promise<RefReturn<TRef>>
-  mutate<TArgs = unknown, TReturn = unknown>(path: string, args?: TArgs): Promise<TReturn>
 }
 
 export function createClient(config: WyStackClientConfig): WyStackClient {
@@ -36,17 +32,13 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     return token ? { Authorization: `Bearer ${token}` } : {}
   }
 
-  function resolvePath(pathOrRef: FunctionPath): string {
-    return typeof pathOrRef === 'string' ? pathOrRef : pathOrRef._path
-  }
-
   return {
     url: httpUrl,
     prefix,
     ws,
 
-    async query(pathOrRef: FunctionPath, args?: unknown) {
-      const path = resolvePath(pathOrRef)
+    async query(ref: QueryRef, args?: unknown) {
+      const path = ref._path
       const auth = await getAuthHeaders()
       // TODO: fall back to POST for large args that would exceed URL length limits
       const argsParam =
@@ -62,8 +54,8 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
       return json.data
     },
 
-    async mutate(pathOrRef: FunctionPath, args?: unknown) {
-      const path = resolvePath(pathOrRef)
+    async mutate(ref: MutationRef, args?: unknown) {
+      const path = ref._path
       const auth = await getAuthHeaders()
       const res = await fetch(`${httpUrl}${prefix}/${path}`, {
         method: 'POST',
