@@ -38,6 +38,22 @@ async function makeAuthApp(functions?: AuthTestFunctions) {
 let server: ReturnType<typeof serve>
 let baseUrl: string
 
+function withTimeout<T>(promise: Promise<T>, label: string, ms = 5000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`${label} timeout`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timeout)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timeout)
+        reject(err)
+      },
+    )
+  })
+}
+
 beforeEach(async () => {
   const db = await createDb({ dev: 'pglite://' })
   await db.execute(`
@@ -200,21 +216,6 @@ describe('HTTP transport', () => {
   })
 })
 
-// TODO(test-coverage): three known gaps from TASK-489 review, left inline
-// rather than filed because none have a near-term trigger:
-//   1. 4002 auto-reconnect: AC #5 promises reconnect on 4002, but no test
-//      drives a server-side 4002 + verifies client retries. Needs a server
-//      that times out the first handshake and accepts the second.
-//   2. Malformed first-frame → 4001: `parseClientMessage` rejects non-JSON,
-//      `null`, arrays, and non-string `type`. Only the well-formed
-//      "subscribe before auth" variant is tested today.
-//   3. Direct header assertion: "WS auth handshake succeeds" proves the
-//      Bearer header arrived only by consequence (resolveContext would
-//      throw otherwise). An explicit `expect(capturedHeader).toBe('Bearer
-//      user_123')` would be more robust.
-// Search: `kb search "WS test coverage gaps"`. Add when a real bug surfaces
-// that one of these tests would have caught.
-
 describe('WebSocket transport', () => {
   test('subscribe returns confirmation', async () => {
     const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
@@ -320,12 +321,51 @@ describe('WebSocket transport', () => {
     }
   })
 
-  test('WS auth handshake succeeds and subscribe works', async () => {
+  test('WS malformed first frame closes with 4001', async () => {
     const app = await makeAuthApp()
     const authServer = serve({
       app,
       port: 0,
       resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const malformedFrames = ['not json', 'null', '[]', JSON.stringify({ type: 123 })]
+
+      for (const frame of malformedFrames) {
+        const ws = new WebSocket(`ws://localhost:${authServer.port}/api/ws`)
+        const closeCode = await withTimeout(
+          new Promise<number>((resolve, reject) => {
+            ws.onopen = () => {
+              ws.send(frame)
+            }
+            ws.onclose = (event) => resolve(event.code)
+            ws.onerror = () => reject(new Error('ws error'))
+          }),
+          'malformed first frame close',
+        )
+        expect(closeCode).toBe(4001)
+      }
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('WS auth handshake succeeds and subscribe works', async () => {
+    const app = await makeAuthApp()
+    // Capture every header `resolveContext` sees (handshake + per-subscribe).
+    // A single overwriteable variable would silently hide future per-subscribe
+    // header drift; an array forces every call to match.
+    const capturedHeaders: (string | null)[] = []
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        capturedHeaders.push(req.headers.get('authorization'))
         const token = req.headers.get('authorization')?.replace('Bearer ', '')
         if (!token) throw new Error('Unauthorized')
         return { userId: token }
@@ -358,6 +398,8 @@ describe('WebSocket transport', () => {
       expect(authenticated).toBeDefined()
       expect(subscribed).toBeDefined()
       expect(subscribed.id).toBe('sub1')
+      expect(capturedHeaders.length).toBeGreaterThan(0)
+      for (const h of capturedHeaders) expect(h).toBe('Bearer user_123')
     } finally {
       authServer.stop(true)
     }
