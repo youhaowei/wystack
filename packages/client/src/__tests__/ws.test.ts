@@ -575,5 +575,4 @@ describe('WsManager', () => {
       authServer.stop(true)
     }
   })
-
 })

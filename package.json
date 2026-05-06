@@ -7,11 +7,11 @@
     "build": "turbo build",
     "dev": "turbo dev",
     "lint": "oxlint packages/",
-    "format": "oxfmt packages/",
-    "format:check": "oxfmt --check packages/",
+    "format": "bunx oxfmt packages/*/src",
+    "format:check": "bunx oxfmt --check packages/*/src",
     "typecheck": "turbo typecheck",
     "test": "turbo test",
-    "check": "oxlint packages/ && oxfmt --check packages/ && turbo typecheck test",
+    "check": "oxlint packages/ && bunx oxfmt --check packages/*/src && turbo typecheck test",
     "clean": "turbo clean"
   },
   "devDependencies": {
