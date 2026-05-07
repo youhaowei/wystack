@@ -2,7 +2,8 @@
  * WyStack Client — manages HTTP calls (GET queries, POST mutations)
  * and WS connection for live invalidation.
  *
- * The app provides getToken for auth; WyStack never touches auth internals.
+ * The app provides getToken for HTTP auth. WebSocket auth is optional and can
+ * be disabled for trusted transports via `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
 import { createWsManager, type WsManager } from './ws'
@@ -23,7 +24,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
   const getToken = config.getToken
 
   const wsUrl = httpUrl.replace(/^http/, 'ws') + `${prefix}/ws`
-  const ws = createWsManager({ url: wsUrl, getToken })
+  const ws = createWsManager({ url: wsUrl, getToken, requiresAuth: config.requiresAuth })
 
   async function getAuthHeaders(): Promise<Record<string, string>> {
     const token = await getToken?.()

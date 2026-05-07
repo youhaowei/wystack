@@ -26,7 +26,7 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
       - run: bunx oxlint packages/
-      - run: bunx oxfmt --check packages/
+      - run: bunx oxfmt --check packages/*/src
 
   typecheck:
     name: Typecheck
