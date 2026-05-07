@@ -39,6 +39,7 @@ async function makeAuthApp() {
 let server: ReturnType<typeof serve>
 let wsUrl: string
 let baseUrl: string
+let app: Awaited<ReturnType<typeof createWyStack>>
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -80,6 +81,20 @@ async function waitForConnected(ws: ReturnType<typeof createWsManager>): Promise
   )
 }
 
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  await withTimeout(
+    new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (predicate()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 10)
+    }),
+    label,
+  )
+}
+
 async function mutateTodo(
   url: string,
   title: string,
@@ -116,7 +131,14 @@ async function mutateUntilInvalidated(
 
   for (let attempt = 0; !done; attempt++) {
     await mutateTodo(url, `${title} ${attempt}`, headers)
-    await Promise.race([invalidated, new Promise<void>((resolve) => setTimeout(resolve, 25))])
+    let pause: ReturnType<typeof setTimeout> | null = null
+    await Promise.race([
+      invalidated,
+      new Promise<void>((resolve) => {
+        pause = setTimeout(resolve, 25)
+      }),
+    ])
+    if (pause !== null) clearTimeout(pause)
   }
 }
 
@@ -169,7 +191,7 @@ beforeEach(async () => {
     )
   `)
 
-  const app = await createWyStack({
+  app = await createWyStack({
     db,
     functions: {
       listTodos: query({
@@ -270,6 +292,7 @@ describe('WsManager', () => {
     const probe = await openProbeSubscription(wsUrl, 'probe-after-unsubscribe')
 
     ws.unsubscribe('sub1')
+    await waitUntil(() => !app.subscriptions.get('sub1'), 'unsubscribe processed')
 
     // Second mutation — should NOT trigger
     const probeInvalidated = probe.nextInvalidation()
