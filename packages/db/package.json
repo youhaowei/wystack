@@ -21,6 +21,8 @@
     "drizzle-orm": "^0.45.1"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "postgres": "^3.0.0",
     "typescript": "^5.8.3"
   },
   "peerDependencies": {
@@ -28,7 +30,11 @@
     "postgres": ">=3.0.0"
   },
   "peerDependenciesMeta": {
-    "@electric-sql/pglite": { "optional": true },
-    "postgres": { "optional": true }
+    "@electric-sql/pglite": {
+      "optional": true
+    },
+    "postgres": {
+      "optional": true
+    }
   }
 }
