@@ -48,6 +48,8 @@ export interface WsManagerConfig {
    * the auth frame. Only applies when auth is required. Default: 10_000.
    */
   authAckTimeoutMs?: number
+  /** Test/diagnostic hook for the server's subscription acknowledgement. */
+  onSubscribed?: (id: string) => void
 }
 
 export interface WsManager {
@@ -173,6 +175,9 @@ export function createWsManager(config: WsManagerConfig): WsManager {
             }
             if (msg.type === 'invalidate' && msg.id) {
               handlers.get(msg.id)?.()
+            }
+            if (msg.type === 'subscribed' && msg.id) {
+              config.onSubscribed?.(msg.id)
             }
           } catch (err) {
             if (process.env.NODE_ENV !== 'production') {
