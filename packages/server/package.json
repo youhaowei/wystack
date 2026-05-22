@@ -25,6 +25,16 @@
       "types": "./dist/routes.d.ts",
       "bun": "./src/routes.ts",
       "import": "./dist/routes.js"
+    },
+    "./transport": {
+      "types": "./src/transport.ts",
+      "bun": "./src/transport.ts",
+      "import": "./dist/transport.js"
+    },
+    "./electron": {
+      "types": "./src/electron.ts",
+      "bun": "./src/electron.ts",
+      "import": "./dist/electron.js"
     }
   },
   "scripts": {
