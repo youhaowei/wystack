@@ -66,6 +66,13 @@
         "pino-pretty",
       ],
     },
+    "packages/protocol": {
+      "name": "@wystack/protocol",
+      "version": "0.0.1",
+      "devDependencies": {
+        "typescript": "^5.8.3",
+      },
+    },
     "packages/runtime": {
       "name": "@wystack/runtime",
       "version": "0.0.1",
@@ -152,6 +159,8 @@
     "@wystack/db": ["@wystack/db@workspace:packages/db"],
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
+
+    "@wystack/protocol": ["@wystack/protocol@workspace:packages/protocol"],
 
     "@wystack/runtime": ["@wystack/runtime@workspace:packages/runtime"],
 
