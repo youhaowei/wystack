@@ -1,0 +1,23 @@
+{
+  "name": "@wystack/protocol",
+  "version": "0.0.1",
+  "description": "Typed wire-protocol contract shared by @wystack/server and @wystack/client",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
