@@ -6,7 +6,7 @@
  *   Client → Server: { type: 'auth', token }              (first frame when requiresAuth is true; token may be null for cookie/proxy auth)
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
- *   Server → Client: { type: 'authenticated' }            (ack for successful auth)
+ *   Server → Client: { type: 'authenticated' }            (ack when WS auth is enabled)
  *   Server → Client: { type: 'subscribed', id }
  *   Server → Client: { type: 'invalidate', id }
  *   Server → Client: { type: 'error', id?, error }
@@ -28,10 +28,9 @@ export interface WsManagerConfig {
    * session-based) — the auth frame is still sent with no token, triggering
    * `resolveContext` on the server with the original upgrade request headers.
    *
-   * Omitting `getToken` entirely means no auth frame is sent. This is correct
-   * only when the server has NO `resolveContext` configured. If the server uses
-   * `resolveContext` for any purpose (including cookie auth), either provide
-   * `getToken` or set `requiresAuth: true`.
+   * Set `requiresAuth: false` to force a trusted/no-auth WS connection even
+   * when `getToken` exists for HTTP. This is the intended mode for transports
+   * with in-process trust, such as IPC-backed local runtimes.
    */
   getToken?: () => Promise<string | null> | string | null
   /**
@@ -63,8 +62,8 @@ export interface WsManager {
 export function createWsManager(config: WsManagerConfig): WsManager {
   const { url, getToken } = config
   const requiresAuth = config.requiresAuth ?? getToken !== undefined
-  // Fail fast if the server never sends `{type:"authenticated"}`. Catches
-  // config mismatches (server without resolveContext) and server bugs.
+  // Fail fast only when WS auth is enabled and the server never sends
+  // `{type:"authenticated"}`. No-auth transports start usable immediately.
   const authAckTimeoutMs = config.authAckTimeoutMs ?? 10_000
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -118,7 +117,9 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     // Only invoke getToken when auth is actually required. If requiresAuth is
     // false (explicit override or no getToken), skip the token fetch entirely
     // so a slow or throwing getToken can't block or crash a no-auth connection.
-    const tokenPromise = requiresAuth ? Promise.resolve(getToken?.()) : Promise.resolve(null)
+    const tokenPromise = requiresAuth
+      ? Promise.resolve().then(() => getToken?.())
+      : Promise.resolve(null)
     tokenPromise
       .then((token) => {
         if (generation !== connectGeneration) return

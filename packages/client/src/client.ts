@@ -2,9 +2,11 @@
  * WyStack Client — manages HTTP calls (GET queries, POST mutations)
  * and WS connection for live invalidation.
  *
- * The app provides getToken for auth; WyStack never touches auth internals.
+ * The app provides getToken for HTTP auth. WebSocket auth is optional and can
+ * be disabled for trusted transports via `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
+import type { QueryRef, MutationRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
 export interface WyStackClient {
@@ -12,9 +14,9 @@ export interface WyStackClient {
   prefix: string
   ws: WsManager
   /** Fetch a query result via GET */
-  query: (path: string, args?: unknown) => Promise<unknown>
+  query<TRef extends QueryRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
   /** Execute a mutation via POST */
-  mutate: (path: string, args?: unknown) => Promise<unknown>
+  mutate<TRef extends MutationRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
 }
 
 export function createClient(config: WyStackClientConfig): WyStackClient {
@@ -23,7 +25,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
   const getToken = config.getToken
 
   const wsUrl = httpUrl.replace(/^http/, 'ws') + `${prefix}/ws`
-  const ws = createWsManager({ url: wsUrl, getToken })
+  const ws = createWsManager({ url: wsUrl, getToken, requiresAuth: config.requiresAuth })
 
   async function getAuthHeaders(): Promise<Record<string, string>> {
     const token = await getToken?.()
@@ -35,7 +37,8 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     prefix,
     ws,
 
-    async query(path: string, args?: unknown) {
+    async query(ref: QueryRef, args?: unknown) {
+      const path = ref._path
       const auth = await getAuthHeaders()
       // TODO: fall back to POST for large args that would exceed URL length limits
       const argsParam =
@@ -51,7 +54,8 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
       return json.data
     },
 
-    async mutate(path: string, args?: unknown) {
+    async mutate(ref: MutationRef, args?: unknown) {
+      const path = ref._path
       const auth = await getAuthHeaders()
       const res = await fetch(`${httpUrl}${prefix}/${path}`, {
         method: 'POST',
