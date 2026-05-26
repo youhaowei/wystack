@@ -472,9 +472,12 @@ describe('WebSocket transport', () => {
       ws.close()
 
       // Spec: "Context resolved at subscription time". At minimum, resolveContext
-      // runs per-subscription → >= 2 calls for 2 subs. A tighter implementation
-      // may also call at handshake (current impl → 3); a spec-compliant one that
-      // skips the handshake call → 2. Both are acceptable.
+      // runs per-subscription → >= 2 calls for 2 subs. Current impl also calls
+      // at handshake (fail-fast, result discarded) → 3. Both 2 and 3 are
+      // acceptable here. A count of 4+ would mean resolveContext is running on
+      // invalidation re-queries — a regression caught by the companion test
+      // "WS invalidation re-queries with the subscription-time context (not a
+      // fresh resolve)", not by this assertion.
       expect(resolveCount).toBeGreaterThanOrEqual(2)
     } finally {
       authServer.stop(true)

@@ -361,7 +361,7 @@ describe('WsManager', () => {
     }
   })
 
-  test('requiresAuth:true without getToken sends null-token auth frame (cookie/session auth)', async () => {
+  test('requiresAuth:true without getToken sends auth frame with null token (cookie/session auth)', async () => {
     // Simulates a server that uses resolveContext for cookie/proxy-header auth —
     // no JWT, but the client still needs to trigger the handshake so the server
     // can run resolveContext against the upgrade request headers.
