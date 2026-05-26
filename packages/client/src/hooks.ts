@@ -94,7 +94,7 @@ export function useQuery<TArgs, TReturn>(
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgs, skip, queryKey])
+  }, [client.ws, queryClient, path, stableArgs, skip])
 
   return query
 }
