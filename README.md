@@ -11,7 +11,6 @@ Full-stack reactive data framework built on open standards.
 | `@wystack/db` | Schema (Drizzle), SQL-agnostic drivers, read/write tracking |
 | `@wystack/server` | Function registry, reactive engine, transports (WS/REST) |
 | `@wystack/client` | React hooks, TanStack DB, sync engine |
-| `@wystack/runtime` | App bootstrap, port discovery, lifecycle |
 | `@wystack/log` | Structured logging (pino, wide events, ring buffer) |
 | `@wystack/types` | Branded primitive types |
 | `@wystack/version` | Semver utilities |

@@ -73,20 +73,6 @@
         "typescript": "^5.8.3",
       },
     },
-    "packages/runtime": {
-      "name": "@wystack/runtime",
-      "version": "0.0.1",
-      "dependencies": {
-        "@wystack/server": "workspace:*",
-      },
-      "devDependencies": {
-        "@electric-sql/pglite": "^0.3.16",
-        "@types/node": "^22.0.0",
-        "@wystack/db": "workspace:*",
-        "drizzle-orm": "^0.45.1",
-        "typescript": "^5.8.3",
-      },
-    },
     "packages/server": {
       "name": "@wystack/server",
       "version": "0.0.1",
@@ -161,8 +147,6 @@
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
 
     "@wystack/protocol": ["@wystack/protocol@workspace:packages/protocol"],
-
-    "@wystack/runtime": ["@wystack/runtime@workspace:packages/runtime"],
 
     "@wystack/server": ["@wystack/server@workspace:packages/server"],
 
