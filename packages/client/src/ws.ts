@@ -146,7 +146,12 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           // then closes without any response (e.g., auth-required server +
           // no-token client → 4002 timeout loop).
           if (requiresAuth) {
-            socket.send(JSON.stringify({ type: 'auth', token }))
+            // Send `token: null` explicitly (not undefined) so the wire frame
+            // always carries the field. `undefined` would serialize as absent,
+            // leaving the server's `token: null` path (anonymous / cookie auth)
+            // untested from this code path. `null` is the correct sentinel for
+            // "no bearer token; use upgrade-request headers (cookies, proxy)".
+            socket.send(JSON.stringify({ type: 'auth', token: token ?? null }))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
             // If no ack arrives, close 4002 (transient/retry) so normal backoff
             // applies. Real auth rejections arrive as an explicit server-side

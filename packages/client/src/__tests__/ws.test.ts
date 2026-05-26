@@ -39,6 +39,7 @@ async function makeAuthApp() {
 let server: ReturnType<typeof serve>
 let wsUrl: string
 let baseUrl: string
+let app: Awaited<ReturnType<typeof createWyStack>>
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -50,17 +51,23 @@ function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
-function withTimeout<T>(promise: Promise<T>, message = 'timeout'): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), 5000)
-  })
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer)
+function withTimeout<T>(promise: Promise<T>, label: string, ms = 5000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`${label} timeout`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timeout)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timeout)
+        reject(err)
+      },
+    )
   })
 }
 
-async function waitForConnected(ws: ReturnType<typeof createWsManager>) {
+async function waitForConnected(ws: ReturnType<typeof createWsManager>): Promise<void> {
   await withTimeout(
     new Promise<void>((resolve) => {
       const check = setInterval(() => {
@@ -68,10 +75,110 @@ async function waitForConnected(ws: ReturnType<typeof createWsManager>) {
           clearInterval(check)
           resolve()
         }
-      }, 50)
+      }, 10)
     }),
-    'timeout waiting for connection',
+    'connect',
   )
+}
+
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  await withTimeout(
+    new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (predicate()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, 10)
+    }),
+    label,
+  )
+}
+
+async function mutateTodo(
+  url: string,
+  title: string,
+  headers: Record<string, string> = {},
+): Promise<void> {
+  await fetch(`${url}/api/addTodo`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ title }),
+  })
+}
+
+// Test pragma: `subscribe()` returns synchronously while the `subscribed` ack
+// is still in flight, so a single mutation can race the registration. We loop
+// mutations until invalidate fires. Assumes the server collapses repeated
+// invalidations into one per sub — if that ever changes, this loop will need
+// reshaping. Durable fix is exposing `subscribe(): Promise<void>` resolving on
+// the ack; tracked separately.
+async function mutateUntilInvalidated(
+  url: string,
+  title: string,
+  invalidated: Promise<void>,
+  headers?: Record<string, string>,
+): Promise<void> {
+  let done = false
+  invalidated.then(
+    () => {
+      done = true
+    },
+    () => {
+      done = true
+    },
+  )
+
+  for (let attempt = 0; !done; attempt++) {
+    await mutateTodo(url, `${title} ${attempt}`, headers)
+    let pause: ReturnType<typeof setTimeout> | null = null
+    await Promise.race([
+      invalidated,
+      new Promise<void>((resolve) => {
+        pause = setTimeout(resolve, 25)
+      }),
+    ])
+    if (pause !== null) clearTimeout(pause)
+  }
+}
+
+async function openProbeSubscription(
+  url: string,
+  id: string,
+): Promise<{
+  ws: WebSocket
+  nextInvalidation: () => Promise<void>
+}> {
+  const probe = new WebSocket(url)
+
+  let resolveNextInvalidation: (() => void) | null = null
+  const nextInvalidation = () =>
+    withTimeout(
+      new Promise<void>((resolve) => {
+        resolveNextInvalidation = resolve
+      }),
+      'probe invalidation',
+    )
+
+  await withTimeout(
+    new Promise<void>((resolve, reject) => {
+      probe.onopen = () => {
+        probe.send(JSON.stringify({ type: 'subscribe', id, path: 'listTodos', args: {} }))
+      }
+      probe.onmessage = (event) => {
+        const msg = JSON.parse(event.data)
+        if (msg.type === 'subscribed' && msg.id === id) resolve()
+        if (msg.type === 'invalidate' && msg.id === id) {
+          resolveNextInvalidation?.()
+          resolveNextInvalidation = null
+        }
+      }
+      probe.onerror = () => reject(new Error('probe ws error'))
+    }),
+    'probe subscribe',
+  )
+
+  return { ws: probe, nextInvalidation }
 }
 
 beforeEach(async () => {
@@ -84,7 +191,7 @@ beforeEach(async () => {
     )
   `)
 
-  const app = await createWyStack({
+  app = await createWyStack({
     db,
     functions: {
       listTodos: query({
@@ -123,7 +230,6 @@ describe('WsManager', () => {
 
   test('receives invalidation after mutation', async () => {
     const subscribed = deferred<void>()
-    const invalidated = deferred<void>()
     const ws = createWsManager({
       url: wsUrl,
       onSubscribed: (id) => {
@@ -133,22 +239,22 @@ describe('WsManager', () => {
     ws.connect()
 
     await waitForConnected(ws)
-    ws.subscribe('sub1', 'listTodos', {}, () => invalidated.resolve())
-    await withTimeout(subscribed.promise, 'timeout waiting for subscription')
 
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'From WS test' }),
-    })
+    // Subscribe — handler fires on invalidation only
+    const invalidated = withTimeout(
+      new Promise<void>((resolve) => {
+        ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+      }),
+      'invalidation',
+    )
 
-    await withTimeout(invalidated.promise, 'timeout waiting for invalidation')
+    await mutateUntilInvalidated(baseUrl, 'From WS test', invalidated)
+    await invalidated
     ws.disconnect()
   })
 
   test('unsubscribe stops receiving invalidations', async () => {
     const subscribed = deferred<void>()
-    const firstInvalidation = deferred<void>()
     const ws = createWsManager({
       url: wsUrl,
       onSubscribed: (id) => {
@@ -160,31 +266,41 @@ describe('WsManager', () => {
     await waitForConnected(ws)
 
     let invalidateCount = 0
+    const firstInvalidation = deferred<void>()
     ws.subscribe('sub1', 'listTodos', {}, () => {
       invalidateCount++
       firstInvalidation.resolve()
     })
     await withTimeout(subscribed.promise, 'timeout waiting for subscription')
 
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'First' }),
-    })
-
-    await withTimeout(firstInvalidation.promise, 'timeout waiting for invalidation')
+    // First mutation — should trigger invalidation
+    const firstInvalidationRace = withTimeout(
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (invalidateCount === 1) {
+            clearInterval(check)
+            resolve()
+          }
+        }, 10)
+      }),
+      'first invalidation',
+    )
+    await mutateUntilInvalidated(baseUrl, 'First', firstInvalidationRace)
+    await firstInvalidationRace
     expect(invalidateCount).toBe(1)
+
+    const probe = await openProbeSubscription(wsUrl, 'probe-after-unsubscribe')
 
     ws.unsubscribe('sub1')
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'Second' }),
-    })
+    await waitUntil(() => !app.subscriptions.get('sub1'), 'unsubscribe processed')
 
-    await new Promise((r) => setTimeout(r, 200))
+    // Second mutation — should NOT trigger
+    const probeInvalidated = probe.nextInvalidation()
+    await mutateTodo(baseUrl, 'Second')
+    await probeInvalidated
     expect(invalidateCount).toBe(1)
 
+    probe.ws.close()
     ws.disconnect()
   })
 
@@ -204,7 +320,6 @@ describe('WsManager', () => {
 
     try {
       const subscribed = deferred<void>()
-      const invalidated = deferred<void>()
       const ws = createWsManager({
         url: `ws://localhost:${authServer.port}/api/ws`,
         getToken: () => 'user_123',
@@ -218,23 +333,23 @@ describe('WsManager', () => {
       // that *something* resolved the promise. Catches mechanism-change
       // regressions where the handler could fire for the wrong sub or twice.
       let sub1Invalidations = 0
-      // Call subscribe immediately — before WS even opens. Must not lose the sub.
-      ws.subscribe('sub1', 'listTodos', {}, () => {
-        sub1Invalidations++
-        invalidated.resolve()
-      })
-      await withTimeout(subscribed.promise, 'timeout waiting for subscription')
+      const invalidated = withTimeout(
+        new Promise<void>((resolve) => {
+          // Call subscribe immediately — before WS even opens. Must not lose the sub.
+          ws.subscribe('sub1', 'listTodos', {}, () => {
+            sub1Invalidations++
+            resolve()
+          })
+        }),
+        'authenticated invalidation',
+      )
 
-      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: 'Bearer user_123',
-        },
-        body: JSON.stringify({ title: 'Authed' }),
+      // Trigger invalidation via HTTP mutation
+      await mutateUntilInvalidated(`http://localhost:${authServer.port}`, 'Authed', invalidated, {
+        Authorization: 'Bearer user_123',
       })
 
-      await withTimeout(invalidated.promise, 'timeout waiting for invalidation')
+      await invalidated
 
       // Prove the buffered-subscribe-then-flush actually happened end-to-end:
       expect(sub1Invalidations).toBe(1)
@@ -246,7 +361,7 @@ describe('WsManager', () => {
     }
   })
 
-  test('requiresAuth:true without getToken sends null-token auth frame (cookie/session auth)', async () => {
+  test('requiresAuth:true without getToken sends auth frame with null token (cookie/session auth)', async () => {
     // Simulates a server that uses resolveContext for cookie/proxy-header auth —
     // no JWT, but the client still needs to trigger the handshake so the server
     // can run resolveContext against the upgrade request headers.
@@ -264,7 +379,6 @@ describe('WsManager', () => {
 
     try {
       const subscribed = deferred<void>()
-      const invalidated = deferred<void>()
       const ws = createWsManager({
         url: `ws://localhost:${authServer.port}/api/ws`,
         requiresAuth: true, // no getToken — cookie auth pattern
@@ -274,16 +388,20 @@ describe('WsManager', () => {
       })
       ws.connect()
 
-      ws.subscribe('sub1', 'listTodos', {}, () => invalidated.resolve())
-      await withTimeout(subscribed.promise, 'timeout waiting for subscription')
+      const invalidated = withTimeout(
+        new Promise<void>((resolve) => {
+          ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+        }),
+        'cookie auth invalidation',
+      )
 
-      await fetch(`http://localhost:${authServer.port}/api/addTodo`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'Cookie authed' }),
-      })
+      await mutateUntilInvalidated(
+        `http://localhost:${authServer.port}`,
+        'Cookie authed',
+        invalidated,
+      )
 
-      await withTimeout(invalidated.promise, 'timeout waiting for invalidation')
+      await invalidated
       expect(ws.isConnected()).toBe(true)
       ws.disconnect()
     } finally {
@@ -304,17 +422,14 @@ describe('WsManager', () => {
 
     client.ws.connect()
 
-    const invalidated = new Promise<void>((resolve, reject) => {
-      client.ws.subscribe('sub1', 'listTodos', {}, () => resolve())
-      setTimeout(() => reject(new Error('timeout')), 5000)
-    })
+    const invalidated = withTimeout(
+      new Promise<void>((resolve) => {
+        client.ws.subscribe('sub1', 'listTodos', {}, () => resolve())
+      }),
+      'trusted runtime invalidation',
+    )
 
-    await new Promise((r) => setTimeout(r, 200))
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'Trusted local runtime' }),
-    })
+    await mutateUntilInvalidated(baseUrl, 'Trusted local runtime', invalidated)
 
     await invalidated
     expect(tokenCalls).toBe(0)
@@ -387,13 +502,19 @@ describe('WsManager', () => {
     await withTimeout(firstSubscribed.promise, 'timeout waiting for subscription')
 
     // Trigger invalidation before disconnect
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'Before reconnect' }),
-    })
-
-    await withTimeout(firstInvalidation.promise, 'timeout waiting for invalidation')
+    const firstInvalidationRace = withTimeout(
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (invalidateCount === 1) {
+            clearInterval(check)
+            resolve()
+          }
+        }, 10)
+      }),
+      'first reconnect-test invalidation',
+    )
+    await mutateUntilInvalidated(baseUrl, 'Before reconnect', firstInvalidationRace)
+    await firstInvalidationRace
     expect(invalidateCount).toBe(1)
 
     // Force reconnect by disconnecting + reconnecting
@@ -404,15 +525,127 @@ describe('WsManager', () => {
     await withTimeout(secondSubscribed.promise, 'timeout waiting for resubscription')
 
     // Trigger invalidation after reconnect
-    await fetch(`${baseUrl}/api/addTodo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'After reconnect' }),
-    })
-
-    await withTimeout(secondInvalidation.promise, 'timeout waiting for invalidation')
+    const secondInvalidationRace = withTimeout(
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (invalidateCount === 2) {
+            clearInterval(check)
+            resolve()
+          }
+        }, 10)
+      }),
+      'second reconnect-test invalidation',
+    )
+    await mutateUntilInvalidated(baseUrl, 'After reconnect', secondInvalidationRace)
+    await secondInvalidationRace
     expect(invalidateCount).toBe(2)
 
     ws.disconnect()
+  })
+
+  test('reconnects after server-side 4002 auth timeout', async () => {
+    // Server hangs the FIRST resolveContext past authTimeoutMs so it closes
+    // 4002, then completes normally on the retry. Proves the WyStack client
+    // treats 4002 as transient and reconnects with backoff (vs. 4001 which
+    // latches authFailed and stops).
+    const app = await makeAuthApp()
+    let resolveCount = 0
+    const authServer = serve({
+      app,
+      port: 0,
+      authTimeoutMs: 50,
+      resolveContext: async (req) => {
+        resolveCount++
+        if (resolveCount === 1) {
+          await new Promise(() => {
+            // Intentionally hang forever; the server's authTimeoutMs (50ms)
+            // closes the socket 4002 before this ever resolves. The hung
+            // promise leaks until the server stops in finally — harmless.
+          })
+        }
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => 'user_123',
+        authAckTimeoutMs: 500,
+      })
+      ws.connect()
+
+      await withTimeout(
+        new Promise<void>((resolve) => {
+          const check = setInterval(() => {
+            if (ws.isConnected() && resolveCount >= 2) {
+              clearInterval(check)
+              resolve()
+            }
+          }, 10)
+        }),
+        '4002 retry',
+      )
+
+      expect(resolveCount).toBeGreaterThanOrEqual(2)
+      expect(ws.isConnected()).toBe(true)
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('requiresAuth:false against auth-required server closes 4001 and stops retrying', async () => {
+    // Mismatched contract: client thinks WS is trusted, server requires auth.
+    // First subscribe frame arrives unauthenticated → server closes 4001 →
+    // client latches authFailed and never retries. Loud failure mode.
+    const app = await makeAuthApp()
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      let connectCount = 0
+      // Spy on the global WebSocket constructor to count connection attempts
+      // without depending on the manager's internals.
+      const RealWebSocket = global.WebSocket
+      class CountingWebSocket extends RealWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          connectCount++
+          super(url, protocols)
+        }
+      }
+      ;(global as { WebSocket: typeof WebSocket }).WebSocket =
+        CountingWebSocket as unknown as typeof WebSocket
+
+      try {
+        const ws = createWsManager({
+          url: `ws://localhost:${authServer.port}/api/ws`,
+          requiresAuth: false,
+        })
+        ws.connect()
+        ws.subscribe('sub1', 'listTodos', {}, () => {})
+
+        // Wait long enough for the server to close 4001 and for any
+        // exponential-backoff retry to have fired (would be ~1-2s).
+        await new Promise((r) => setTimeout(r, 2500))
+
+        expect(connectCount).toBe(1)
+        expect(ws.isConnected()).toBe(false)
+        ws.disconnect()
+      } finally {
+        ;(global as { WebSocket: typeof WebSocket }).WebSocket = RealWebSocket
+      }
+    } finally {
+      authServer.stop(true)
+    }
   })
 })
