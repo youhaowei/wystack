@@ -14,9 +14,9 @@ export interface WyStackClient {
   prefix: string
   ws: WsManager
   /** Fetch a query result via GET */
-  query<TRef extends QueryRef>(ref: TRef, args: RefArgs<TRef>): Promise<RefReturn<TRef>>
+  query<TRef extends QueryRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
   /** Execute a mutation via POST */
-  mutate<TRef extends MutationRef>(ref: TRef, args: RefArgs<TRef>): Promise<RefReturn<TRef>>
+  mutate<TRef extends MutationRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
 }
 
 export function createClient(config: WyStackClientConfig): WyStackClient {

@@ -19,6 +19,17 @@ function nextSubId() {
 
 type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'queryFn'>
 
+/**
+ * Configuration for {@link useQuery}.
+ *
+ * Cache key shape is always `['wystack', path, args ?? {}]` — three elements,
+ * including for no-arg queries (the empty object is preserved for stable
+ * identity). Imperative cache reads must use the same three-element form:
+ *
+ * ```ts
+ * queryClient.setQueryData(['wystack', 'allTodos', {}], next)
+ * ```
+ */
 export type QueryConfig<TArgs, TReturn> = WyQueryOptions<TReturn> & {
   args?: TArgs | undefined
   skip?: boolean
@@ -83,7 +94,7 @@ export function useQuery<TArgs, TReturn>(
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgs, skip])
+  }, [client.ws, queryClient, path, stableArgs, skip, queryKey])
 
   return query
 }
