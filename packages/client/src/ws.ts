@@ -16,6 +16,8 @@
  *   4002 — transient (auth-frame timeout, ack-send transport flake, ack-receive timeout)
  *          → reconnect per normal exponential backoff
  */
+import type { AuthFrame, ClientFrame, InvalidateFrame, ServerFrame } from '@wystack/protocol'
+import { WS_CLOSE_AUTH_FAILED } from '@wystack/protocol'
 
 type InvalidateHandler = () => void
 
@@ -104,7 +106,8 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   function sendSubscriptions() {
     if (!ws || ws.readyState !== WebSocket.OPEN || !authenticated) return
     for (const [id, sub] of activeSubs) {
-      ws.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
+      const frame: ClientFrame = { type: 'subscribe', id, path: sub.path, args: sub.args }
+      ws.send(JSON.stringify(frame))
     }
   }
 
@@ -143,7 +146,8 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           // then closes without any response (e.g., auth-required server +
           // no-token client → 4002 timeout loop).
           if (requiresAuth) {
-            socket.send(JSON.stringify({ type: 'auth', token }))
+            const frame: AuthFrame = { type: 'auth', token }
+            socket.send(JSON.stringify(frame))
             // Wait for {type:"authenticated"} ack before replaying subscriptions.
             // If no ack arrives, close 4002 (transient/retry) so normal backoff
             // applies. Real auth rejections arrive as an explicit server-side
@@ -171,7 +175,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
               sendSubscriptions()
               return
             }
-            if (msg.type === 'invalidate' && msg.id) {
+            if (isInvalidateFrame(msg)) {
               handlers.get(msg.id)?.()
             }
           } catch (err) {
@@ -185,7 +189,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
           connected = false
           authenticated = false
           clearAuthAckTimer()
-          if (event.code === 4001 || authFailed) {
+          if (event.code === WS_CLOSE_AUTH_FAILED || authFailed) {
             authFailed = true
             // Fire all invalidation callbacks so consumers refetch via HTTP.
             // If HTTP auth also fails on the same token, TanStack Query
@@ -230,7 +234,8 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (ws?.readyState === WebSocket.OPEN && authenticated) {
-      ws.send(JSON.stringify({ type: 'subscribe', id, path, args }))
+      const frame: ClientFrame = { type: 'subscribe', id, path, args }
+      ws.send(JSON.stringify(frame))
     }
     // Otherwise: replayed on (re)connect via sendSubscriptions()
   }
@@ -239,7 +244,8 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     handlers.delete(id)
     activeSubs.delete(id)
     if (ws?.readyState === WebSocket.OPEN && authenticated) {
-      ws.send(JSON.stringify({ type: 'unsubscribe', id }))
+      const frame: ClientFrame = { type: 'unsubscribe', id }
+      ws.send(JSON.stringify(frame))
     }
     // If not sent to server yet, removing from activeSubs is enough.
   }
@@ -251,4 +257,13 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     unsubscribe,
     isConnected: () => connected,
   }
+}
+
+function isInvalidateFrame(msg: ServerFrame | unknown): msg is InvalidateFrame {
+  return (
+    msg !== null &&
+    typeof msg === 'object' &&
+    (msg as { type?: unknown }).type === 'invalidate' &&
+    typeof (msg as { id?: unknown }).id === 'string'
+  )
 }

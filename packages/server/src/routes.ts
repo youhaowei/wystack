@@ -29,6 +29,8 @@
  */
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
+import type { AuthFrame, ClientFrame, ServerFrame, SubscribeFrame } from '@wystack/protocol'
+import { WS_CLOSE_AUTH_FAILED, WS_CLOSE_TRANSIENT } from '@wystack/protocol'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
 
@@ -89,7 +91,7 @@ function errorMessage(err: unknown): string {
  * but transport died). Using `safeSend` there would silently drop the
  * ack and leave the client stuck waiting on its ack timer.
  */
-function safeSend(ws: WSContext, payload: unknown): void {
+function safeSend(ws: WSContext, payload: ServerFrame): void {
   try {
     ws.send(JSON.stringify(payload))
   } catch {
@@ -127,7 +129,9 @@ export function buildAuthRequest(upgradeRequest: Request, token: string | null):
  * on a numeric `type`. Returns null for any invalid shape — caller picks
  * the close code (pre-auth 4001 vs post-auth error frame).
  */
-function parseClientMessage(data: string): Record<string, unknown> | null {
+type ParsedClientMessage = ClientFrame | (Record<string, unknown> & { type: string })
+
+function parseClientMessage(data: string): ParsedClientMessage | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(data)
@@ -137,7 +141,19 @@ function parseClientMessage(data: string): Record<string, unknown> | null {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
   const msg = parsed as Record<string, unknown>
   if (typeof msg.type !== 'string') return null
-  return msg
+  return msg as ParsedClientMessage
+}
+
+function isAuthFrame(msg: ParsedClientMessage): msg is AuthFrame {
+  return msg.type === 'auth'
+}
+
+function isSubscribeFrame(msg: ParsedClientMessage): msg is SubscribeFrame {
+  return msg.type === 'subscribe' && typeof msg.id === 'string' && typeof msg.path === 'string'
+}
+
+function isUnsubscribeFrame(msg: ParsedClientMessage): msg is { type: 'unsubscribe'; id: string } {
+  return msg.type === 'unsubscribe' && typeof msg.id === 'string'
 }
 
 export interface RouteOptions {
@@ -223,7 +239,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
    *      idempotent ACK so the client's ack-wait doesn't expire.
    */
   async function handleAuthFrame(
-    msg: Record<string, unknown>,
+    msg: AuthFrame,
     ws: WSContext,
     conn: Connection,
     rawSocket: object,
@@ -265,7 +281,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         // Auth succeeded but the transport died before we could ack. This is
         // a network flake, not an auth failure — close 4002 so the client
         // retries with backoff rather than latching authFailed and giving up.
-        ws.close(4002, 'ack send failed')
+        ws.close(WS_CLOSE_TRANSIENT, 'ack send failed')
       }
     } catch (err) {
       // TODO: replace with @wystack/log once server logging lands.
@@ -274,7 +290,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       console.warn('[wystack/server] WS auth failed:', errorMessage(err))
       // Guard conn.authenticated: if the concurrent winning frame already
       // succeeded, don't tear down an authenticated connection with 4001.
-      if (rawToConnection.has(rawSocket) && !conn.authenticated) ws.close(4001, 'auth failed')
+      if (rawToConnection.has(rawSocket) && !conn.authenticated) {
+        ws.close(WS_CLOSE_AUTH_FAILED, 'auth failed')
+      }
     }
   }
 
@@ -287,7 +305,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
    * (both drop the id from `pendingSubIds` and the `.then` bails).
    */
   async function handleSubscribe(
-    msg: Record<string, unknown>,
+    msg: SubscribeFrame,
     ws: WSContext,
     conn: Connection,
     rawSocket: object,
@@ -295,14 +313,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     // Runtime narrowing: `id` is used as a Map key and `path` as a function
     // registry lookup. Non-string values (object, number) would bypass
     // `pendingSubIds` reference-identity guards and silently orphan the sub.
-    if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-      safeSend(ws, {
-        type: 'error',
-        id: typeof msg.id === 'string' ? msg.id : undefined,
-        error: 'invalid subscribe message',
-      })
-      return
-    }
     const id = msg.id
     const path = msg.path
     const args = (msg.args ?? {}) as Record<string, unknown>
@@ -347,7 +357,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       })
       .catch((err: unknown) => {
         conn.pendingSubIds.delete(id)
-        const payload: Record<string, unknown> = {
+        const payload: ServerFrame = {
           type: 'error',
           id,
           error: errorMessage(err),
@@ -366,7 +376,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return {
         onOpen(_evt, ws) {
           const timeout = requiresAuth
-            ? setTimeout(() => ws.close(4002, 'auth timeout'), authTimeoutMs)
+            ? setTimeout(() => ws.close(WS_CLOSE_TRANSIENT, 'auth timeout'), authTimeoutMs)
             : null
           rawToConnection.set(keyOf(ws), {
             authenticated: !requiresAuth,
@@ -382,7 +392,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           const rawSocket = keyOf(ws)
           const conn = rawToConnection.get(rawSocket)
           if (!conn) {
-            ws.close(4001, 'no connection state')
+            ws.close(WS_CLOSE_AUTH_FAILED, 'no connection state')
             return
           }
 
@@ -393,7 +403,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             // protocol violation (close 4001 — AC #2 / PRD edge case).
             // Post-auth send an error frame and stay open.
             if (!conn.authenticated) {
-              ws.close(4001, 'invalid first message')
+              ws.close(WS_CLOSE_AUTH_FAILED, 'invalid first message')
               return
             }
             safeSend(ws, { type: 'error', error: 'invalid message' })
@@ -404,28 +414,36 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           // Running version validation for both auth-required AND no-auth servers
           // here is the single choke-point; auth-required runs the full handshake,
           // no-auth replies idempotently so token-configured clients don't hang.
-          if (msg.type === 'auth') {
+          if (isAuthFrame(msg)) {
             await handleAuthFrame(msg, ws, conn, rawSocket)
             return
           }
 
           if (!conn.authenticated) {
-            ws.close(4001, 'first message must be auth')
+            ws.close(WS_CLOSE_AUTH_FAILED, 'first message must be auth')
             return
           }
 
           let msgId: string | undefined
           try {
-            msgId = msg.id as string | undefined
+            msgId = typeof msg.id === 'string' ? msg.id : undefined
 
             // Filed: TASK-490 — scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
+              if (!isSubscribeFrame(msg)) {
+                safeSend(ws, {
+                  type: 'error',
+                  id: typeof msg.id === 'string' ? msg.id : undefined,
+                  error: 'invalid subscribe message',
+                })
+                return
+              }
               await handleSubscribe(msg, ws, conn, rawSocket)
               return
             }
 
             if (msg.type === 'unsubscribe') {
-              if (typeof msg.id !== 'string') {
+              if (!isUnsubscribeFrame(msg)) {
                 safeSend(ws, { type: 'error', error: 'invalid unsubscribe message' })
                 return
               }
@@ -441,11 +459,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             // Unknown type post-auth. Help devs during protocol evolution.
             safeSend(ws, {
               type: 'error',
-              id: typeof msg.id === 'string' ? msg.id : undefined,
+              id: 'id' in msg && typeof msg.id === 'string' ? msg.id : undefined,
               error: `unknown message type: ${String(msg.type)}`,
             })
           } catch (err: unknown) {
-            const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
+            const payload: ServerFrame = { type: 'error', error: errorMessage(err) }
             if (err instanceof ValidationError) payload.issues = err.issues
             if (msgId) payload.id = msgId
             safeSend(ws, payload)

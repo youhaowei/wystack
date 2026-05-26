@@ -18,7 +18,9 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test src"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@wystack/protocol": "workspace:*"
+  },
   "devDependencies": {
     "@electric-sql/pglite": ">=0.3.0",
     "@tanstack/react-query": "^5.90.0",

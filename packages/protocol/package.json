@@ -1,0 +1,24 @@
+{
+  "name": "@wystack/protocol",
+  "version": "0.0.1",
+  "description": "Shared WyStack wire protocol message types",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
