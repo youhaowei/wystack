@@ -12,3 +12,4 @@ plugins/
 storybook-static
 build/
 .claude/
+.wystack/
