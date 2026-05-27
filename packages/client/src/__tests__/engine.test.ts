@@ -51,11 +51,7 @@ function deferred<T = void>() {
   return { promise, resolve }
 }
 
-/**
- * Drain enough microtasks for the engine's Promise.all → then chain to land.
- * One queueMicrotask isn't enough; the engine does Promise.all over two
- * thenables before assigning `pipe` and attaching message/close handlers.
- */
+/** Drain enough microtasks for the engine's async open chain to land. */
 async function settle() {
   for (let i = 0; i < 8; i++) await Promise.resolve()
 }
@@ -243,8 +239,8 @@ describe('createEngine', () => {
     // Close transiently (any non-4001) — engine schedules backoff reconnect.
     harness.closeActive(1006)
 
-    // Backoff base is 1000ms with ±25% jitter — wait long enough for the
-    // first attempt to fire.
+    // Backoff base is 1000ms with [50%, 100%) jitter — wait long enough for
+    // the first attempt to fire.
     await new Promise((r) => setTimeout(r, 1800))
     expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
 
@@ -368,6 +364,51 @@ describe('createEngine', () => {
     expect(createdAndClosed).toBe(true)
     expect(engine.isConnected()).toBe(false)
   })
+
+  test('pending pipe readiness does not report connected', async () => {
+    const harness = makeServerSide()
+    const ready = deferred<void>()
+    const engine = createEngine({
+      createPipe: () => ({ ...harness.createPipe(), ready: ready.promise }),
+    })
+
+    engine.connect()
+    await settle()
+
+    expect(harness.pairCount()).toBe(1)
+    expect(engine.isConnected()).toBe(false)
+
+    ready.resolve()
+    await settle()
+
+    expect(engine.isConnected()).toBe(true)
+    engine.disconnect()
+  })
+
+  test('auth ack timeout starts after pipe readiness', async () => {
+    const harness = makeServerSide()
+    const ready = deferred<void>()
+    const engine = createEngine({
+      createPipe: () => ({ ...harness.createPipe(), ready: ready.promise }),
+      getToken: () => 'tkn',
+      authAckTimeoutMs: 30,
+    })
+
+    engine.connect()
+    await settle()
+
+    await new Promise((r) => setTimeout(r, 80))
+    expect(harness.pairCount()).toBe(1)
+    expect(harness.server().received).toEqual([])
+
+    ready.resolve()
+    await settle()
+    expect(harness.server().received).toEqual([{ type: 'auth', token: 'tkn' }])
+
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+    engine.disconnect()
+  }, 10_000)
 
   test('requiresAuth:false with getToken set sends no auth frame', async () => {
     // Spec contract: requiresAuth:false suppresses the auth handshake even

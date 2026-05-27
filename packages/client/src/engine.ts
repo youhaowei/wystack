@@ -16,7 +16,7 @@
 //   - close-code 4001 → latch `authFailed`, fire invalidations to nudge HTTP
 //     refetch, stop retrying.
 //   - any other close → exponential backoff (1s base, ×2 per attempt, capped
-//     at 30s, ±25% jitter).
+//     at 30s, [50%, 100%) of base jitter).
 //   - `connectGeneration` invalidates stale async callbacks (token fetch,
 //     pipe open) when a newer `connect()` or `disconnect()` has happened.
 
@@ -42,6 +42,8 @@ export interface CloseInfo {
  * not under test.
  */
 export type EnginePipe = Pipe<ServerMessage, ClientMessage> & {
+  /** Resolves when the underlying carrier can accept frames. */
+  ready?: Promise<void>
   onClose(handler: (info: CloseInfo) => void): () => void
 }
 
@@ -255,14 +257,28 @@ export function createEngine(config: EngineConfig): Engine {
       }
 
       pipe = opened
+      pipeMessageUnsub = opened.onMessage(handleMessage)
+      pipeCloseUnsub = opened.onClose((info) => handleClose(info, generation))
+
+      try {
+        await opened.ready
+      } catch {
+        if (generation === connectGeneration && pipe === opened) {
+          handleClose({ code: 1006 }, generation)
+        }
+        return
+      }
+
+      if (generation !== connectGeneration || authFailed || pipe !== opened) {
+        opened.close()
+        return
+      }
+
       connected = true
       // Don't reset reconnectAttempt here — wait until a message arrives
       // (handleMessage). Prevents a "server opens then closes immediately"
       // pattern from collapsing the backoff.
       authenticated = !requiresAuth
-
-      pipeMessageUnsub = opened.onMessage(handleMessage)
-      pipeCloseUnsub = opened.onClose((info) => handleClose(info, generation))
 
       if (requiresAuth) {
         // `token: null` (not undefined) — the wire frame must always carry

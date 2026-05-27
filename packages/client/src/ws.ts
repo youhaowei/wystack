@@ -90,11 +90,18 @@ function createWebSocketPipe(url: string): EnginePipe {
   const messageHandlers = new Set<(msg: ServerMessage) => void>()
   const closeHandlers = new Set<(info: CloseInfo) => void>()
   const outboundBuffer: ClientMessage[] = []
+  let resolveReady!: () => void
+  let rejectReady!: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
   let opened = false
   let closed = false
 
   socket.onopen = () => {
     opened = true
+    resolveReady()
     for (const msg of outboundBuffer) socket.send(JSON.stringify(msg))
     outboundBuffer.length = 0
   }
@@ -113,6 +120,7 @@ function createWebSocketPipe(url: string): EnginePipe {
     // close, or one of our app-level codes (4001/4002). All are surfaced
     // verbatim so the engine policy lives in one place.
     const info: CloseInfo = { code: event.code }
+    if (!opened) rejectReady(new Error(`WebSocket closed before open (${event.code})`))
     for (const handler of Array.from(closeHandlers)) handler(info)
   }
 
@@ -141,6 +149,7 @@ function createWebSocketPipe(url: string): EnginePipe {
       // Mark closed locally first so a subsequent close() callback from the
       // socket itself doesn't re-fire onClose handlers.
       closed = true
+      if (!opened) rejectReady(new Error('WebSocket closed before open'))
       // Drop the onclose listener so the engine doesn't receive a phantom
       // close event for its own request.
       socket.onclose = null
@@ -150,6 +159,7 @@ function createWebSocketPipe(url: string): EnginePipe {
 
   return {
     ...pipe,
+    ready,
     onClose(handler: (info: CloseInfo) => void): () => void {
       closeHandlers.add(handler)
       return () => {
