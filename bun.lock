@@ -66,13 +66,6 @@
         "pino-pretty",
       ],
     },
-    "packages/protocol": {
-      "name": "@wystack/protocol",
-      "version": "0.0.1",
-      "devDependencies": {
-        "typescript": "^5.8.3",
-      },
-    },
     "packages/server": {
       "name": "@wystack/server",
       "version": "0.0.1",
@@ -86,6 +79,13 @@
       "devDependencies": {
         "@electric-sql/pglite": "^0.3.16",
         "drizzle-orm": "^0.45.1",
+        "typescript": "^5.8.3",
+      },
+    },
+    "packages/transport": {
+      "name": "@wystack/transport",
+      "version": "0.0.1",
+      "devDependencies": {
         "typescript": "^5.8.3",
       },
     },
@@ -146,9 +146,9 @@
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
 
-    "@wystack/protocol": ["@wystack/protocol@workspace:packages/protocol"],
-
     "@wystack/server": ["@wystack/server@workspace:packages/server"],
+
+    "@wystack/transport": ["@wystack/transport@workspace:packages/transport"],
 
     "@wystack/types": ["@wystack/types@workspace:packages/types"],
 
