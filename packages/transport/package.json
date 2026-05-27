@@ -1,7 +1,7 @@
 {
-  "name": "@wystack/protocol",
+  "name": "@wystack/transport",
   "version": "0.0.1",
-  "description": "Typed wire-protocol contract shared by @wystack/server and @wystack/client",
+  "description": "Transport substrate: per-connection Pipe interface, in-memory loopback adapter, and the typed wire-protocol contract shared by @wystack/server and @wystack/client",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

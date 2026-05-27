@@ -1,4 +1,4 @@
-// @wystack/protocol
+// @wystack/transport — wire protocol
 //
 // Typed wire-protocol contract for the WyStack WebSocket transport.
 //

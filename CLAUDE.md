@@ -13,6 +13,7 @@ Full-stack reactive data framework built on open standards.
 - `@wystack/db` -- Schema (Drizzle), SQL-agnostic drivers, read/write tracking
 - `@wystack/server` -- Function registry, reactive engine, transports (WS/REST)
 - `@wystack/client` -- Typed function refs, Convex-style hooks (useQuery/useMutation), TanStack Query, WS reactivity
+- `@wystack/transport` -- Transport substrate: per-connection `Pipe` interface + in-memory loopback adapter + typed wire-protocol contract (shared by server and client)
 - `@wystack/log` -- Structured logging (pino, wide events, ring buffer)
 - `@wystack/types` -- Branded primitive types
 - `@wystack/version` -- Semver utilities
