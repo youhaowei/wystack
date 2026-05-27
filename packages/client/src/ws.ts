@@ -55,17 +55,19 @@ export interface WsManager {
 }
 
 export function createWsManager(config: WsManagerConfig): WsManager {
+  const onProtocolError = (error: unknown) => {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[wystack/ws] Failed to parse message:', error)
+    }
+  }
+
   const engine = createClientEngine({
-    createPipe: () => createWebSocketPipe(config.url),
+    createPipe: () => createWebSocketPipe(config.url, onProtocolError),
     getToken: config.getToken,
     requiresAuth: config.requiresAuth,
     authAckTimeoutMs: config.authAckTimeoutMs,
     onSubscribed: config.onSubscribed,
-    onProtocolError: (error) => {
-      if (process.env.NODE_ENV !== 'production') {
-        console.warn('[wystack/ws] Failed to parse message:', error)
-      }
-    },
+    onProtocolError,
   })
 
   return {
@@ -79,7 +81,10 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   }
 }
 
-function createWebSocketPipe(url: string): Promise<{
+function createWebSocketPipe(
+  url: string,
+  onProtocolError: (error: unknown) => void,
+): Promise<{
   pipe: Pipe<ServerMessage, ClientMessage>
   closed: Promise<{ code?: number; reason?: string }>
 }> {
@@ -121,7 +126,6 @@ function createWebSocketPipe(url: string): Promise<{
       },
       close() {
         if (socket.readyState === WebSocket.CLOSED) {
-          finishClose({})
           return
         }
         socket.close()
@@ -137,9 +141,7 @@ function createWebSocketPipe(url: string): Promise<{
       if (typeof event.data !== 'string') return
       const message = parseServerMessage(event.data)
       if (message === null) {
-        if (process.env.NODE_ENV !== 'production') {
-          console.warn('[wystack/ws] Failed to parse message:', event.data)
-        }
+        onProtocolError(new Error(`Malformed server message: ${event.data}`))
         return
       }
       for (const handler of handlers) handler(message)

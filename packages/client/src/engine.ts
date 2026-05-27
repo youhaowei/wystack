@@ -101,6 +101,10 @@ export function createClientEngine(config: ClientEngineConfig): ClientEngine {
     }
     if (message.type === 'subscribed') {
       config.onSubscribed?.(message.id)
+      return
+    }
+    if (message.type === 'error') {
+      config.onProtocolError?.(message)
     }
   }
 
@@ -130,8 +134,13 @@ export function createClientEngine(config: ClientEngineConfig): ClientEngine {
       : Promise.resolve(null)
 
     tokenPromise
-      .then((token) => Promise.resolve(config.createPipe()).then((next) => ({ token, next })))
-      .then(({ token, next }) => {
+      .then((token) => {
+        if (generation !== connectGeneration || authFailed) return null
+        return Promise.resolve(config.createPipe()).then((next) => ({ token, next }))
+      })
+      .then((result) => {
+        if (result === null) return
+        const { token, next } = result
         if (generation !== connectGeneration || authFailed || pipe) {
           void next.pipe.close()
           return
@@ -143,10 +152,17 @@ export function createClientEngine(config: ClientEngineConfig): ClientEngine {
         authenticated = !requiresAuth
         unsubscribeMessages = next.pipe.onMessage(handleMessage)
 
-        next.closed.then((event) => {
-          if (generation !== connectGeneration) return
-          handleClose(event)
-        })
+        next.closed.then(
+          (event) => {
+            if (generation !== connectGeneration) return
+            handleClose(event)
+          },
+          (error) => {
+            if (generation !== connectGeneration) return
+            config.onProtocolError?.(error)
+            handleClose({})
+          },
+        )
 
         if (requiresAuth) {
           void next.pipe.send({ type: 'auth', token: token ?? null })

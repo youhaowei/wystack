@@ -31,6 +31,25 @@ function withTimeout<T>(promise: Promise<T>, label: string, ms = 1000): Promise<
   })
 }
 
+function waitUntil(
+  condition: () => boolean,
+  label: string,
+  { interval = 10, timeout = 1000 }: { interval?: number; timeout?: number } = {},
+): Promise<void> {
+  return withTimeout(
+    new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (condition()) {
+          clearInterval(check)
+          resolve()
+        }
+      }, interval)
+    }),
+    label,
+    timeout,
+  )
+}
+
 function makeHarness() {
   let serverPipe!: Pipe<ClientMessage, ServerMessage>
   const closed = deferred<{ code?: number; reason?: string }>()
@@ -82,18 +101,76 @@ describe('ClientEngine', () => {
     const [client] = createLoopbackPair<ServerMessage, ClientMessage>()
     opened.resolve({ pipe: client, closed: new Promise(() => {}) })
 
-    await withTimeout(
-      new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (engine.isConnected()) {
-            clearInterval(check)
-            resolve()
-          }
-        }, 10)
-      }),
-      'pending connect resolve',
-    )
+    await waitUntil(() => engine.isConnected(), 'pending connect resolve')
     expect(createPipeCalls).toBe(1)
+  })
+
+  test('does not create a pipe after disconnect invalidates token fetch', async () => {
+    const token = deferred<string | null>()
+    let createPipeCalls = 0
+
+    const engine = createClientEngine({
+      getToken: () => token.promise,
+      createPipe: () => {
+        createPipeCalls++
+        const [client] = createLoopbackPair<ServerMessage, ClientMessage>()
+        return { pipe: client, closed: new Promise(() => {}) }
+      },
+    })
+
+    engine.connect()
+    engine.disconnect()
+    token.resolve('user_123')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(createPipeCalls).toBe(0)
+    expect(engine.isConnected()).toBe(false)
+  })
+
+  test('surfaces server error frames through onProtocolError', async () => {
+    const [client, server] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const protocolError = deferred<unknown>()
+    const engine = createClientEngine({
+      requiresAuth: false,
+      createPipe: () => ({ pipe: client, closed: new Promise(() => {}) }),
+      onProtocolError: protocolError.resolve,
+    })
+
+    engine.connect()
+    await waitUntil(() => engine.isConnected(), 'engine connect')
+
+    await server.send({ type: 'error', id: 'sub1', error: 'No such function' })
+    expect(await withTimeout(protocolError.promise, 'protocol error')).toEqual({
+      type: 'error',
+      id: 'sub1',
+      error: 'No such function',
+    })
+  })
+
+  test('handles rejected pipe close promises without unhandled rejection', async () => {
+    const [client] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const protocolError = deferred<unknown>()
+    let rejectClosed!: (reason?: unknown) => void
+    const closed = new Promise<{ code?: number; reason?: string }>((_resolve, reject) => {
+      rejectClosed = reject
+    })
+
+    const engine = createClientEngine({
+      requiresAuth: false,
+      reconnectDelayMs: () => 1000,
+      createPipe: () => ({ pipe: client, closed }),
+      onProtocolError: protocolError.resolve,
+    })
+
+    engine.connect()
+    await waitUntil(() => engine.isConnected(), 'engine connect')
+    rejectClosed(new Error('close failed'))
+
+    const error = await withTimeout(protocolError.promise, 'close rejection')
+    expect(error).toBeInstanceOf(Error)
+    expect(engine.isConnected()).toBe(false)
+    engine.disconnect()
   })
 
   test('authenticates and flushes buffered subscriptions over a Pipe', async () => {
@@ -103,15 +180,8 @@ describe('ClientEngine', () => {
     engine.subscribe('sub1', 'listTodos', {}, invalidated.resolve)
     engine.connect()
 
-    await withTimeout(
-      new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (received.some((message) => message.type === 'subscribe' && message.id === 'sub1')) {
-            clearInterval(check)
-            resolve()
-          }
-        }, 10)
-      }),
+    await waitUntil(
+      () => received.some((message) => message.type === 'subscribe' && message.id === 'sub1'),
       'subscribe flush',
     )
 
@@ -133,17 +203,7 @@ describe('ClientEngine', () => {
     })
 
     engine.connect()
-    await withTimeout(
-      new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (engine.isConnected()) {
-            clearInterval(check)
-            resolve()
-          }
-        }, 10)
-      }),
-      'engine connect',
-    )
+    await waitUntil(() => engine.isConnected(), 'engine connect')
     engine.subscribe('sub1', 'listTodos', {}, invalidated.resolve)
 
     await server.send({ type: 'subscribed', id: 'sub1' })
@@ -171,28 +231,14 @@ describe('ClientEngine', () => {
       invalidations++
     })
 
-    await withTimeout(
-      new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (received.some((message) => message.type === 'subscribe')) {
-            clearInterval(check)
-            resolve()
-          }
-        }, 10)
-      }),
+    await waitUntil(
+      () => received.some((message) => message.type === 'subscribe'),
       'subscribed before unsubscribe',
     )
 
     engine.unsubscribe('sub1')
-    await withTimeout(
-      new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (received.some((message) => message.type === 'unsubscribe' && message.id === 'sub1')) {
-            clearInterval(check)
-            resolve()
-          }
-        }, 10)
-      }),
+    await waitUntil(
+      () => received.some((message) => message.type === 'unsubscribe' && message.id === 'sub1'),
       'unsubscribe send',
     )
 
