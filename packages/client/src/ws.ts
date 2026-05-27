@@ -63,7 +63,12 @@ export interface WsManagerConfig {
 export interface WsManager {
   connect(): void
   disconnect(): void
-  subscribe(id: string, path: string, args: unknown, onInvalidate: InvalidateHandler): void
+  subscribe(
+    id: string,
+    path: string,
+    args: Record<string, unknown>,
+    onInvalidate: InvalidateHandler,
+  ): void
   unsubscribe(id: string): void
   isConnected(): boolean
 }
@@ -172,10 +177,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     connect: () => engine.connect(),
     disconnect: () => engine.disconnect(),
     subscribe(id, path, args, onInvalidate) {
-      // The legacy `WsManager.subscribe` typed `args` as `unknown` to keep
-      // hook callers from needing to assert. The engine narrows to a record
-      // per `SubscribeMessage`; coerce here at the boundary.
-      engine.subscribe(id, path, args as Record<string, unknown>, onInvalidate)
+      engine.subscribe(id, path, args, onInvalidate)
     },
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),

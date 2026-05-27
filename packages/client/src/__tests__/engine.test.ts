@@ -368,4 +368,70 @@ describe('createEngine', () => {
     expect(createdAndClosed).toBe(true)
     expect(engine.isConnected()).toBe(false)
   })
+
+  test('requiresAuth:false with getToken set sends no auth frame', async () => {
+    // Spec contract: requiresAuth:false suppresses the auth handshake even
+    // when getToken is provided (trusted transports — server has no
+    // resolveContext). The first frame must be a subscribe, not an auth.
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => 'tkn',
+      requiresAuth: false,
+    })
+    engine.connect()
+    engine.subscribe('s1', 'q', {}, () => {})
+
+    await settle()
+    const server = harness.server()
+    expect(server.received[0]).toEqual({ type: 'subscribe', id: 's1', path: 'q', args: {} })
+    expect(server.received.some((f) => f.type === 'auth')).toBe(false)
+    engine.disconnect()
+  })
+
+  test('authFailed latch blocks manual connect() after 4001', async () => {
+    // Spec: close 4001 → do NOT reconnect. Manual connect() calls while the
+    // latch is set must also be no-ops, not just the auto-reconnect timer.
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => null,
+    })
+    engine.connect()
+    await settle()
+    expect(harness.pairCount()).toBe(1)
+
+    harness.closeActive(4001)
+    await settle()
+
+    // Manual reconnect attempt — must be blocked by the authFailed latch.
+    engine.connect()
+    await settle()
+    expect(harness.pairCount()).toBe(1)
+    engine.disconnect()
+  })
+
+  test('disconnect() resets authFailed, enabling re-login reconnect', async () => {
+    // engine.ts documents: "Reset so a later connect() (e.g., after re-login)
+    // can try again." Verify the full sequence: 4001 → disconnect() → connect()
+    // opens a new pipe.
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => null,
+    })
+    engine.connect()
+    await settle()
+    expect(harness.pairCount()).toBe(1)
+
+    harness.closeActive(4001)
+    await settle()
+
+    // disconnect() clears authFailed; connect() should now open a new pipe.
+    engine.disconnect()
+    engine.connect()
+    await settle()
+    expect(harness.pairCount()).toBe(2)
+    engine.disconnect()
+  })
 })

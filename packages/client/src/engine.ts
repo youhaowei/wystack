@@ -235,44 +235,53 @@ export function createEngine(config: EngineConfig): Engine {
     if (pipe !== null) return
     const generation = ++connectGeneration
 
-    const tokenPromise: Promise<string | null> = requiresAuth
-      ? Promise.resolve().then(async () => (await getToken?.()) ?? null)
-      : Promise.resolve(null)
+    // Sequence: resolve the token first, then open the pipe. This ordering
+    // guarantees that if `getToken` throws or rejects, no pipe has been
+    // created yet — there is nothing to leak. Reversing the order
+    // (Promise.all over both concurrently) creates a resource-leak window:
+    // if `createPipe` resolves with a live socket and `getToken` then
+    // rejects, Promise.all rejects with no reference to the already-open
+    // pipe, abandoning it with no close() call.
+    const run = async (): Promise<void> => {
+      const token: string | null = requiresAuth ? ((await getToken?.()) ?? null) : null
 
-    Promise.all([Promise.resolve().then(createPipe), tokenPromise])
-      .then(([opened, token]) => {
-        if (generation !== connectGeneration || authFailed) {
-          opened.close()
-          return
-        }
+      if (generation !== connectGeneration || authFailed) return
 
-        pipe = opened
-        connected = true
-        // Don't reset reconnectAttempt here — wait until a message arrives
-        // (handleMessage). Prevents a "server opens then closes immediately"
-        // pattern from collapsing the backoff.
-        authenticated = !requiresAuth
+      const opened = await createPipe()
 
-        pipeMessageUnsub = opened.onMessage(handleMessage)
-        pipeCloseUnsub = opened.onClose((info) => handleClose(info, generation))
+      if (generation !== connectGeneration || authFailed) {
+        opened.close()
+        return
+      }
 
-        if (requiresAuth) {
-          // `token: null` (not undefined) — the wire frame must always carry
-          // the field. The server's anonymous-path (`resolveContext` against
-          // upgrade headers) needs an explicit null sentinel.
-          opened.send({ type: 'auth', token: token ?? null })
-          authAckTimer = setTimeout(() => {
-            authAckTimer = null
-            failAuthAck(generation)
-          }, authAckTimeoutMs)
-        } else {
-          sendSubscriptions()
-        }
-      })
-      .catch(() => {
-        if (generation !== connectGeneration) return
-        scheduleReconnect()
-      })
+      pipe = opened
+      connected = true
+      // Don't reset reconnectAttempt here — wait until a message arrives
+      // (handleMessage). Prevents a "server opens then closes immediately"
+      // pattern from collapsing the backoff.
+      authenticated = !requiresAuth
+
+      pipeMessageUnsub = opened.onMessage(handleMessage)
+      pipeCloseUnsub = opened.onClose((info) => handleClose(info, generation))
+
+      if (requiresAuth) {
+        // `token: null` (not undefined) — the wire frame must always carry
+        // the field. The server's anonymous-path (`resolveContext` against
+        // upgrade headers) needs an explicit null sentinel.
+        opened.send({ type: 'auth', token: token ?? null })
+        authAckTimer = setTimeout(() => {
+          authAckTimer = null
+          failAuthAck(generation)
+        }, authAckTimeoutMs)
+      } else {
+        sendSubscriptions()
+      }
+    }
+
+    run().catch(() => {
+      if (generation !== connectGeneration) return
+      scheduleReconnect()
+    })
   }
 
   function disconnect() {
