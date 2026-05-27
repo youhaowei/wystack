@@ -77,6 +77,49 @@ describe('createLoopbackPair — delivery', () => {
     expect(r1).toEqual(['hi'])
     expect(r2).toEqual(['hi'])
   })
+
+  test('a throwing handler does not block other handlers in the same fan-out', async () => {
+    const [a, b] = createLoopbackPair()
+    const received: string[] = []
+    const captured: unknown[] = []
+
+    // Swap out the global queueMicrotask for the duration of this test so we
+    // can capture errors re-thrown from within the fan-out's inner
+    // queueMicrotask without them surfacing as unhandled rejections that
+    // Bun's test runner would treat as a test failure.
+    const originalQueueMicrotask = globalThis.queueMicrotask
+    globalThis.queueMicrotask = (cb: () => void): void => {
+      try {
+        cb()
+      } catch (err) {
+        captured.push(err)
+      }
+    }
+    try {
+      b.onMessage(() => {
+        throw new Error('boom')
+      })
+      b.onMessage((msg) => {
+        received.push(`handler2:${msg as string}`)
+      })
+      b.onMessage((msg) => {
+        received.push(`handler3:${msg as string}`)
+      })
+
+      a.send('hi')
+
+      // Flush the microtask queue. The handler throw schedules its own
+      // microtask; give the queue an extra tick to drain before we assert.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+      expect(received).toEqual(['handler2:hi', 'handler3:hi'])
+      // Prove the error surfaced independently rather than being swallowed.
+      expect(captured).toHaveLength(1)
+      expect((captured[0] as Error).message).toBe('boom')
+    } finally {
+      globalThis.queueMicrotask = originalQueueMicrotask
+    }
+  })
 })
 
 // ─── Identity ────────────────────────────────────────────────────────────────

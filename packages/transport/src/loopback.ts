@@ -77,7 +77,14 @@ function makePipe<In, Out>(self: LoopbackEnd<In, Out>): Pipe<In, Out> {
         for (const handler of recipients) {
           // Only deliver if the handler is still subscribed. A handler that
           // unsubscribed between scheduling and running should not fire.
-          if (partner.handlers.has(handler)) handler(message)
+          if (!partner.handlers.has(handler)) continue
+          try {
+            handler(message)
+          } catch (error) {
+            queueMicrotask(() => {
+              throw error
+            })
+          }
         }
       })
     },
