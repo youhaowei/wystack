@@ -12,3 +12,7 @@ plugins/
 storybook-static
 build/
 .claude/
+
+# Spike-only artifacts (this branch only — not for main)
+SPIKE-EVAL.md
+SPIKE-BENCH/

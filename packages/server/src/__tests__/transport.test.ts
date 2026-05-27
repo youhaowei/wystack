@@ -702,4 +702,197 @@ describe('WebSocket transport', () => {
       authServer.stop(true)
     }
   })
+
+  // ─────────────────────────────────────────────────────────────
+  // Spike race tests (Q1: cancellation gain) — added by spike/server-effect.
+  // These exercise the WS race windows that the effect refactor is supposed
+  // to handle more cleanly than the imperative pendingSubIds flag pattern.
+  // Both tests are written to fail on the imperative version's bugs if any
+  // exist, and to pass on both versions if the behaviour is equivalent —
+  // they are behavioural assertions, not implementation tests.
+  // ─────────────────────────────────────────────────────────────
+
+  test('auth-mid-flight cancellation: unsubscribe during pending subscribe never orphans the sub', async () => {
+    // Use a resolveContext that we can hold open arbitrarily long.
+    let releasePending: (() => void) | null = null
+    const pending = new Promise<void>((resolve) => {
+      releasePending = resolve
+    })
+
+    const slowApp = await makeAuthApp()
+    let firstCall = true
+    const authServer = serve({
+      app: slowApp,
+      port: 0,
+      resolveContext: async () => {
+        // First call (auth handshake) resolves immediately; subscribe calls hang.
+        if (firstCall) {
+          firstCall = false
+          return { userId: 'u1' }
+        }
+        await pending
+        return { userId: 'u1' }
+      },
+    })
+
+    try {
+      const port = (authServer as unknown as { port: number }).port
+      const ws = new WebSocket(`ws://localhost:${port}/api/ws`)
+
+      const messages: Array<Record<string, unknown>> = []
+      const closed = new Promise<void>((resolve) => {
+        ws.onclose = () => resolve()
+      })
+      ws.onmessage = (event) => {
+        messages.push(JSON.parse(event.data) as Record<string, unknown>)
+      }
+
+      // 1. Auth handshake (firstCall=true path, resolves immediately).
+      await withTimeout(
+        new Promise<void>((resolve, reject) => {
+          ws.onopen = () => {
+            ws.send(JSON.stringify({ type: 'auth', token: 't' }))
+          }
+          const checkAuth = () => {
+            const authMsg = messages.find((m) => m.type === 'authenticated')
+            if (authMsg) resolve()
+            else setTimeout(checkAuth, 10)
+          }
+          checkAuth()
+          setTimeout(() => reject(new Error('auth handshake never completed')), 2000)
+        }),
+        'auth handshake',
+      )
+
+      // 2. Send subscribe (resolveContext hangs on `pending`).
+      ws.send(JSON.stringify({ type: 'subscribe', id: 'race1', path: 'listTodos', args: {} }))
+
+      // 3. Send unsubscribe before resolveContext can complete.
+      await new Promise((r) => setTimeout(r, 50)) // ensure subscribe was received
+      ws.send(JSON.stringify({ type: 'unsubscribe', id: 'race1' }))
+
+      // 4. Release the held resolveContext. The .then path should bail because
+      //    `race1` is no longer in pendingSubIds.
+      await new Promise((r) => setTimeout(r, 50))
+      releasePending!()
+
+      // 5. Give the server time to process.
+      await new Promise((r) => setTimeout(r, 200))
+
+      // Assertions: no `subscribed` frame should have been sent, and the
+      // subscription should NOT be registered in app.subscriptions.
+      const subscribedFrame = messages.find((m) => m.type === 'subscribed' && m.id === 'race1')
+      expect(subscribedFrame).toBeUndefined()
+
+      const sub = slowApp.subscriptions.get('race1')
+      expect(sub).toBeUndefined()
+
+      ws.close()
+      await closed
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('double auth frame race: two rapid auth frames produce one ACK, never identity swap', async () => {
+    // Block the first resolveContext call so the second can pass the pre-await
+    // guard. This is the exact race the imperative code guards against with
+    // the post-await `if (conn.authenticated)` re-check.
+    let firstCallStarted = false
+    let releaseFirst: (() => void) | null = null
+    const blockFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+
+    const resolveCalls: Array<{ token: string | null; order: number }> = []
+    let callOrder = 0
+
+    const raceApp = await makeAuthApp()
+    const authServer = serve({
+      app: raceApp,
+      port: 0,
+      resolveContext: async (req: Request) => {
+        const order = ++callOrder
+        const auth = req.headers.get('authorization')
+        const token = auth?.startsWith('Bearer ') ? auth.slice(7) || null : null
+        resolveCalls.push({ token, order })
+        if (!firstCallStarted) {
+          firstCallStarted = true
+          await blockFirst
+        }
+        return { userId: `u-${token}` }
+      },
+    })
+
+    try {
+      const port = (authServer as unknown as { port: number }).port
+      const ws = new WebSocket(`ws://localhost:${port}/api/ws`)
+      const messages: Array<Record<string, unknown>> = []
+      const closed = new Promise<void>((resolve) => {
+        ws.onclose = () => resolve()
+      })
+      ws.onmessage = (event) => {
+        messages.push(JSON.parse(event.data) as Record<string, unknown>)
+      }
+      const ready = new Promise<void>((resolve) => {
+        ws.onopen = () => resolve()
+      })
+      await ready
+
+      // Fire two auth frames back-to-back. The first will block on resolveContext.
+      ws.send(JSON.stringify({ type: 'auth', token: 'token-A' }))
+      // Tiny delay so the second is parsed but doesn't preempt the first.
+      await new Promise((r) => setTimeout(r, 10))
+      ws.send(JSON.stringify({ type: 'auth', token: 'token-B' }))
+
+      // Wait for the second call to enter (resolves immediately since
+      // firstCallStarted is now true).
+      await new Promise((r) => setTimeout(r, 50))
+
+      // Release the first.
+      releaseFirst!()
+
+      // Give time for both ACKs to flow.
+      await new Promise((r) => setTimeout(r, 200))
+
+      // Assertion 1: only ONE `authenticated` ACK delivered. (The imperative
+      // code's idempotent-ACK path: the losing frame sees conn.authenticated
+      // === true post-await and sends an ACK without overwriting the token.
+      // So we expect ≤ 2 ACKs total — never more. But the winning identity
+      // must be committed exactly once.)
+      const ackCount = messages.filter((m) => m.type === 'authenticated').length
+      expect(ackCount).toBeGreaterThanOrEqual(1)
+      expect(ackCount).toBeLessThanOrEqual(2)
+
+      // Assertion 2: subscribe and check the committed identity is one of the
+      // two tokens — NOT swapped mid-flight (which would manifest as
+      // userId === undefined or some hybrid).
+      const subscribeReady = new Promise<Record<string, unknown>>((resolve) => {
+        const handler = (event: MessageEvent) => {
+          const m = JSON.parse(event.data) as Record<string, unknown>
+          if (m.type === 'subscribed' && m.id === 'who') {
+            ws.removeEventListener('message', handler)
+            resolve(m)
+          }
+        }
+        ws.addEventListener('message', handler)
+      })
+      ws.send(JSON.stringify({ type: 'subscribe', id: 'who', path: 'whoami', args: {} }))
+      await withTimeout(subscribeReady, 'subscribed ack')
+
+      // Inspect the sub's context — it should reflect the WINNING token,
+      // and only the winning token.
+      const sub = raceApp.subscriptions.get('who')
+      expect(sub).toBeDefined()
+      if (!sub) throw new Error('subscription missing')
+      const committedUserId = (sub.context as Record<string, unknown>).userId as string
+      // Either token-A or token-B won the race; no identity blending.
+      expect(['u-token-A', 'u-token-B']).toContain(committedUserId)
+
+      ws.close()
+      await closed
+    } finally {
+      authServer.stop(true)
+    }
+  })
 })

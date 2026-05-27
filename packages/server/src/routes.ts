@@ -32,10 +32,12 @@
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
  */
+import { Effect } from 'effect'
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
+import { handleAuthFrameE, handleSubscribeE, type Connection, type HandlerDeps } from './handlers'
 
 /**
  * Per-connection state, keyed by the platform socket (`ws.raw`). Hono creates
@@ -49,35 +51,8 @@ import { ValidationError } from './validation'
  * (see `resolveSubContext`) so adapters get a unique Request per call, avoiding
  * shared-mutation and identity-keyed deduplication hazards.
  */
-interface Connection {
-  authenticated: boolean
-  /**
-   * Captured once from the client's auth frame and reused by every subsequent
-   * `resolveSubContext` call for the lifetime of this connection. If the JWT
-   * expires mid-session, new subscriptions present the stale token to
-   * `resolveContext` and fail; the client must reconnect to supply a fresh
-   * one. The `getToken` callback is invoked per-connect, so
-   * disconnect()+connect() on the client is the supported rotation path.
-   */
-  token: string | null
-  upgradeRequest: Request
-  timeout: ReturnType<typeof setTimeout> | null
-  subIds: Set<string>
-  /**
-   * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
-   * `unsubscribe` arriving mid-await cancel the pending registration so the
-   * resolved subscription doesn't orphan itself in `app.subscriptions`.
-   *
-   * known-debt: this is flag-check cancellation, not signal-plumbing. The
-   * adapter's `resolveContext` keeps running to completion even after
-   * cancellation — we bail at the `.then` boundary. Wasted work for expensive
-   * adapters (external auth service, DB session lookup). Upgrading to
-   * `AbortSignal` on the `Request` passed to `resolveContext` would let
-   * adapters opt into cancellation. Deferred until an adapter proposal makes
-   * the cost measurable. Search: `kb search "AbortSignal resolveContext"`.
-   */
-  pendingSubIds: Set<string>
-}
+// Connection moved to handlers.ts (alongside the effect-shaped handlers that
+// own its lifecycle). The token/pendingSubIds doc lives there now.
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -217,151 +192,14 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     rawToConnection.delete(keyOf(ws))
   }
 
-  /**
-   * Handle an inbound `{type:"auth", token}` frame. Two paths:
-   *
-   *   1. Unauthenticated → run resolveContext, then ACK or close 4001.
-   *      The onOpen 4002 timer is still running; a hung resolveContext
-   *      trips it, closing the socket (resolveContext completes into a
-   *      dead socket — harmless).
-   *   2. Already authenticated (no-auth server OR repeat frame) →
-   *      idempotent ACK so a token-configured client does not hang. This path
-   *      never adopts the token; no-auth transports rely on connection trust,
-   *      not WS credentials.
-   */
-  async function handleAuthFrame(
-    msg: Record<string, unknown>,
-    ws: WSContext,
-    conn: Connection,
-    rawSocket: object,
-  ): Promise<void> {
-    if (conn.authenticated) {
-      safeSend(ws, { type: 'authenticated' })
-      return
-    }
-
-    const rawToken = msg.token
-    // Parse the token locally — do NOT write conn.token yet. Two concurrent
-    // auth frames can both pass the pre-await authenticated===false check.
-    // Writing conn.token here would let the slower frame overwrite the faster
-    // frame's token before resolveSubContext reads it, causing the winning
-    // frame to authenticate under a different identity. Commit only after
-    // confirming we won the race below.
-    const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-
-    try {
-      await resolveSubContext(rawSocket, token)
-      if (!rawToConnection.has(rawSocket)) return
-      // Re-check after await: Bun dispatches onMessage without awaiting the
-      // previous handler, so two rapid auth frames can both pass the pre-await
-      // guard. The slower frame finds conn.authenticated already true and sends
-      // an idempotent ACK — it must NOT overwrite conn.token (that would swap
-      // the winning identity's token under live subscriptions).
-      if (conn.authenticated) {
-        safeSend(ws, { type: 'authenticated' })
-        return
-      }
-      // Won the race — commit token and mark authenticated.
-      conn.token = token
-      if (conn.timeout) clearTimeout(conn.timeout)
-      conn.timeout = null
-      conn.authenticated = true
-      try {
-        ws.send(JSON.stringify({ type: 'authenticated' }))
-      } catch {
-        // Auth succeeded but the transport died before we could ack. This is
-        // a network flake, not an auth failure — close 4002 so the client
-        // retries with backoff rather than latching authFailed and giving up.
-        ws.close(4002, 'ack send failed')
-      }
-    } catch (err) {
-      // TODO: replace with @wystack/log once server logging lands.
-      // Log message only — not the full error — to avoid leaking token/header
-      // values that resolveContext implementations may embed in thrown errors.
-      console.warn('[wystack/server] WS auth failed:', errorMessage(err))
-      // Guard conn.authenticated: if the concurrent winning frame already
-      // succeeded, don't tear down an authenticated connection with 4001.
-      if (rawToConnection.has(rawSocket) && !conn.authenticated) ws.close(4001, 'auth failed')
-    }
-  }
-
-  /**
-   * Handle an inbound `{type:"subscribe", id, path, args}` frame. Uses
-   * `conn.pendingSubIds` so an `unsubscribe` arriving during the
-   * `resolveContext` await cleanly cancels the registration, rather than
-   * orphaning the sub in `app.subscriptions`. A hung adapter has no timer
-   * here — cancellation arrives via client unsubscribe or socket close
-   * (both drop the id from `pendingSubIds` and the `.then` bails).
-   */
-  async function handleSubscribe(
-    msg: Record<string, unknown>,
-    ws: WSContext,
-    conn: Connection,
-    rawSocket: object,
-  ): Promise<void> {
-    // Runtime narrowing: `id` is used as a Map key and `path` as a function
-    // registry lookup. Non-string values (object, number) would bypass
-    // `pendingSubIds` reference-identity guards and silently orphan the sub.
-    if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-      safeSend(ws, {
-        type: 'error',
-        id: typeof msg.id === 'string' ? msg.id : undefined,
-        error: 'invalid subscribe message',
-      })
-      return
-    }
-    const id = msg.id
-    const path = msg.path
-    const args = (msg.args ?? {}) as Record<string, unknown>
-    const fn = app.functions.get(path)
-    if (!fn || fn.type !== 'query') {
-      safeSend(ws, { type: 'error', id, error: `Unknown query: ${path}` })
-      return
-    }
-
-    conn.pendingSubIds.add(id)
-
-    // Resolve context PER subscription — Spec Decision:
-    // "Context resolved at subscription time, preserved for re-queries"
-    let context: Record<string, unknown>
-    try {
-      context = await resolveSubContext(rawSocket, conn.token)
-    } catch (err) {
-      conn.pendingSubIds.delete(id)
-      safeSend(ws, { type: 'error', id, error: errorMessage(err) })
-      return
-    }
-
-    // Unsubscribe may have arrived during the await — it dropped `id` from
-    // pendingSubIds. Bail before running the query.
-    if (!conn.pendingSubIds.has(id)) return
-
-    app
-      .call(path, args, context)
-      .then(({ tablesRead }) => {
-        // Guard: socket closed, OR unsubscribe arrived during the query.
-        if (!rawToConnection.has(rawSocket) || !conn.pendingSubIds.has(id)) return
-        conn.pendingSubIds.delete(id)
-        app.subscriptions.add({
-          id,
-          functionPath: path,
-          args,
-          context,
-          tablesWatched: tablesRead,
-        })
-        addSub(id, ws)
-        safeSend(ws, { type: 'subscribed', id })
-      })
-      .catch((err: unknown) => {
-        conn.pendingSubIds.delete(id)
-        const payload: Record<string, unknown> = {
-          type: 'error',
-          id,
-          error: errorMessage(err),
-        }
-        if (err instanceof ValidationError) payload.issues = err.issues
-        safeSend(ws, payload)
-      })
+  // Effect-shaped handlers live in handlers.ts (see SPIKE-EVAL.md Slice 1).
+  // They close over the shared map / helpers via the HandlerDeps record.
+  const handlerDeps: HandlerDeps = {
+    app,
+    resolveSubContext,
+    addSub,
+    rawToConnection,
+    safeSend,
   }
 
   // --- WebSocket (registered before /:fn to avoid param catch) ---
@@ -411,7 +249,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           // Auth-required servers run the full handshake; no-auth servers reply
           // with a compatibility ACK and ignore any supplied token.
           if (msg.type === 'auth') {
-            await handleAuthFrame(msg, ws, conn, rawSocket)
+            await Effect.runPromise(
+              handleAuthFrameE(handlerDeps, msg, ws, conn, rawSocket).pipe(
+                Effect.catchAll(() => Effect.void),
+              ),
+            )
             return
           }
 
@@ -426,7 +268,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
             // Filed: TASK-490 — scope subscription IDs per-socket to prevent cross-socket collision
             if (msg.type === 'subscribe') {
-              await handleSubscribe(msg, ws, conn, rawSocket)
+              await Effect.runPromise(handleSubscribeE(handlerDeps, msg, ws, conn, rawSocket))
               return
             }
 
