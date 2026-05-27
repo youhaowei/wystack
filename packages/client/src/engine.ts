@@ -262,6 +262,7 @@ export function createEngine(config: EngineConfig): Engine {
       const opened = await createPipe()
 
       if (generation !== connectGeneration || authFailed) {
+        opened.ready?.catch(() => {})
         opened.close()
         return
       }
