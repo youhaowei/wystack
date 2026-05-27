@@ -1,21 +1,30 @@
 /**
- * WebSocket Manager — manages connection lifecycle, exponential backoff
- * reconnection, subscription tracking, and invalidation dispatch.
+ * WebSocket adapter — bridges a browser `WebSocket` to the neutral
+ * {@link createEngine} engine. Owns parsing the wire (via
+ * `parseServerMessage` from `@wystack/transport`), encoding outbound frames,
+ * and surfacing close codes to the engine's reconnect policy.
  *
- * Protocol (matches @wystack/server):
- *   Client → Server: { type: 'auth', token }              (first frame when requiresAuth is true; token may be null for cookie/proxy auth)
+ * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`) is
+ * preserved for backward compatibility with existing consumers (`client.ts`,
+ * `hooks.ts`, app code). It is a thin layer over the engine and will be
+ * relocated when the dedicated browser-transport task (T3b) lands.
+ *
+ * Wire protocol (mirrors `@wystack/server`):
+ *   Client → Server: { type: 'auth', token }
  *   Client → Server: { type: 'subscribe', id, path, args }
  *   Client → Server: { type: 'unsubscribe', id }
- *   Server → Client: { type: 'authenticated' }            (ack when WS auth is enabled)
+ *   Server → Client: { type: 'authenticated' }
  *   Server → Client: { type: 'subscribed', id }
  *   Server → Client: { type: 'invalidate', id }
- *   Server → Client: { type: 'error', id?, error }
+ *   Server → Client: { type: 'error', id?, error, issues? }
  *
  * Close codes:
- *   4001 — auth failed / missing / protocol violation → latch authFailed, do NOT reconnect
- *   4002 — transient (auth-frame timeout, ack-send transport flake, ack-receive timeout)
- *          → reconnect per normal exponential backoff
+ *   4001 — auth failed / protocol violation → latch authFailed, no reconnect
+ *   4002 — transient (timeout, flake) → reconnect per exponential backoff
  */
+import type { ServerMessage, ClientMessage, Pipe } from '@wystack/transport'
+import { parseServerMessage } from '@wystack/transport'
+import { createEngine, type Engine, type EnginePipe, type CloseInfo } from './engine'
 
 type InvalidateHandler = () => void
 
@@ -59,207 +68,116 @@ export interface WsManager {
   isConnected(): boolean
 }
 
-export function createWsManager(config: WsManagerConfig): WsManager {
-  const { url, getToken } = config
-  const requiresAuth = config.requiresAuth ?? getToken !== undefined
-  // Fail fast only when WS auth is enabled and the server never sends
-  // `{type:"authenticated"}`. No-auth transports start usable immediately.
-  const authAckTimeoutMs = config.authAckTimeoutMs ?? 10_000
-  let ws: WebSocket | null = null
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  let authAckTimer: ReturnType<typeof setTimeout> | null = null
-  let reconnectAttempt = 0
-  const maxReconnectDelay = 30000
-  const handlers = new Map<string, InvalidateHandler>()
-  const activeSubs = new Map<string, { path: string; args: unknown }>()
-  let connected = false
-  let authenticated = false
-  let authFailed = false
-  // `connect()` awaits `getToken()` before constructing the WebSocket. A
-  // monotonic generation counter lets each attempt self-identify: disconnect()
-  // and subsequent connect() calls both increment the counter, so a stale
-  // `.then` or `.catch` can detect it's no longer the active attempt and bail
-  // without racing on a shared boolean.
-  let connectGeneration = 0
+/**
+ * Build an {@link EnginePipe} from a fresh `WebSocket` connection. Encodes
+ * `ClientMessage` to JSON on send, parses `ServerMessage` from JSON on
+ * receive (malformed frames are dropped — they cannot be acted on), and
+ * surfaces the native close `code` to the engine via `onClose`.
+ *
+ * Returned eagerly — the engine treats the pipe as live the moment it has
+ * the reference. Frames sent before the socket reaches `OPEN` are queued
+ * by buffering them in a small array; once `onopen` fires, the buffer is
+ * flushed. This matches the prior `ws.ts` behavior, where the auth frame
+ * was sent inside `onopen`.
+ */
+function createWebSocketPipe(url: string): EnginePipe {
+  const socket = new WebSocket(url)
+  const messageHandlers = new Set<(msg: ServerMessage) => void>()
+  const closeHandlers = new Set<(info: CloseInfo) => void>()
+  const outboundBuffer: ClientMessage[] = []
+  let opened = false
+  let closed = false
 
-  function clearAuthAckTimer() {
-    if (authAckTimer) {
-      clearTimeout(authAckTimer)
-      authAckTimer = null
-    }
+  socket.onopen = () => {
+    opened = true
+    for (const msg of outboundBuffer) socket.send(JSON.stringify(msg))
+    outboundBuffer.length = 0
   }
 
-  function scheduleReconnect() {
-    if (authFailed) return
-    if (reconnectTimer) return
-    const base = 1000 * 2 ** Math.min(reconnectAttempt, 5)
-    const jitter = base * (0.5 + Math.random() * 0.5)
-    const delay = Math.min(jitter, maxReconnectDelay)
-    reconnectAttempt++
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null
-      connect()
-    }, delay)
+  socket.onmessage = (event) => {
+    const data = typeof event.data === 'string' ? event.data : ''
+    const parsed = parseServerMessage(data)
+    if (parsed === null) return
+    for (const handler of Array.from(messageHandlers)) handler(parsed)
   }
 
-  function sendSubscriptions() {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !authenticated) return
-    for (const [id, sub] of activeSubs) {
-      ws.send(JSON.stringify({ type: 'subscribe', id, path: sub.path, args: sub.args }))
-    }
+  socket.onclose = (event) => {
+    if (closed) return
+    closed = true
+    // Native CloseEvent.code is 1000 for a clean close, 1006 for an abnormal
+    // close, or one of our app-level codes (4001/4002). All are surfaced
+    // verbatim so the engine policy lives in one place.
+    const info: CloseInfo = { code: event.code }
+    for (const handler of Array.from(closeHandlers)) handler(info)
   }
 
-  function connect() {
-    if (authFailed) return
-    if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
-    const generation = ++connectGeneration
-
-    // Only invoke getToken when auth is actually required. If requiresAuth is
-    // false (explicit override or no getToken), skip the token fetch entirely
-    // so a slow or throwing getToken can't block or crash a no-auth connection.
-    const tokenPromise = requiresAuth
-      ? Promise.resolve().then(() => getToken?.())
-      : Promise.resolve(null)
-    tokenPromise
-      .then((token) => {
-        if (generation !== connectGeneration) return
-        if (authFailed) return
-        if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return
-
-        try {
-          ws = new WebSocket(url)
-        } catch {
-          scheduleReconnect()
-          return
-        }
-
-        // Capture a local reference so stale callbacks (authAckTimer, onclose,
-        // onmessage, onerror) cannot accidentally act on a socket created by a
-        // later connect() call.
-        const socket = ws
-        authenticated = !requiresAuth
-
-        socket.onopen = () => {
-          connected = true
-          // Do not reset reconnectAttempt here — wait until the server sends
-          // a message. Prevents tight reconnect loops when the server opens
-          // then closes without any response (e.g., auth-required server +
-          // no-token client → 4002 timeout loop).
-          if (requiresAuth) {
-            // Send `token: null` explicitly (not undefined) so the wire frame
-            // always carries the field. `undefined` would serialize as absent,
-            // leaving the server's `token: null` path (anonymous / cookie auth)
-            // untested from this code path. `null` is the correct sentinel for
-            // "no bearer token; use upgrade-request headers (cookies, proxy)".
-            socket.send(JSON.stringify({ type: 'auth', token: token ?? null }))
-            // Wait for {type:"authenticated"} ack before replaying subscriptions.
-            // If no ack arrives, close 4002 (transient/retry) so normal backoff
-            // applies. Real auth rejections arrive as an explicit server-side
-            // 4001 and latch authFailed in onclose — not here.
-            authAckTimer = setTimeout(() => {
-              authAckTimer = null
-              socket.close(4002, 'auth ack timeout')
-            }, authAckTimeoutMs)
-          } else {
-            sendSubscriptions()
-          }
-        }
-
-        socket.onmessage = (event) => {
-          // Any server message proves the connection is actually useful.
-          reconnectAttempt = 0
-          try {
-            const msg = JSON.parse(event.data)
-            if (msg.type === 'authenticated') {
-              // Idempotent guard: if a duplicate ACK arrives (e.g., from a
-              // concurrent server-side auth race), don't replay subscriptions.
-              if (authenticated) return
-              authenticated = true
-              clearAuthAckTimer()
-              sendSubscriptions()
-              return
-            }
-            if (msg.type === 'invalidate' && msg.id) {
-              handlers.get(msg.id)?.()
-            }
-            if (msg.type === 'subscribed' && msg.id) {
-              config.onSubscribed?.(msg.id)
-            }
-          } catch (err) {
-            if (process.env.NODE_ENV !== 'production') {
-              console.warn('[wystack/ws] Failed to parse message:', err)
-            }
-          }
-        }
-
-        socket.onclose = (event) => {
-          connected = false
-          authenticated = false
-          clearAuthAckTimer()
-          if (event.code === 4001 || authFailed) {
-            authFailed = true
-            // Fire all invalidation callbacks so consumers refetch via HTTP.
-            // If HTTP auth also fails on the same token, TanStack Query
-            // surfaces the error. If HTTP succeeds, data is fresh but
-            // real-time updates stay off until disconnect() + reconnect()
-            // with a new token.
-            for (const handler of handlers.values()) handler()
-            return
-          }
-          scheduleReconnect()
-        }
-
-        socket.onerror = () => {
-          // onclose will fire after this
-        }
-      })
-      .catch(() => {
-        if (generation !== connectGeneration) return
-        scheduleReconnect()
-      })
+  socket.onerror = () => {
+    // onclose follows; no separate signal needed.
   }
 
-  function disconnect() {
-    connectGeneration++
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer)
-      reconnectTimer = null
-    }
-    clearAuthAckTimer()
-    connected = false
-    authenticated = false
-    // Reset authFailed so a later connect() (e.g., after re-login) can try again.
-    authFailed = false
-    if (ws) {
-      ws.onclose = null
-      ws.close()
-      ws = null
-    }
-  }
-
-  function subscribe(id: string, path: string, args: unknown, onInvalidate: InvalidateHandler) {
-    handlers.set(id, onInvalidate)
-    activeSubs.set(id, { path, args })
-    if (ws?.readyState === WebSocket.OPEN && authenticated) {
-      ws.send(JSON.stringify({ type: 'subscribe', id, path, args }))
-    }
-    // Otherwise: replayed on (re)connect via sendSubscriptions()
-  }
-
-  function unsubscribe(id: string) {
-    handlers.delete(id)
-    activeSubs.delete(id)
-    if (ws?.readyState === WebSocket.OPEN && authenticated) {
-      ws.send(JSON.stringify({ type: 'unsubscribe', id }))
-    }
-    // If not sent to server yet, removing from activeSubs is enough.
+  const pipe: Pipe<ServerMessage, ClientMessage> = {
+    id: url,
+    send(message: ClientMessage): void {
+      if (closed) return
+      if (opened) {
+        socket.send(JSON.stringify(message))
+      } else {
+        outboundBuffer.push(message)
+      }
+    },
+    onMessage(handler: (msg: ServerMessage) => void): () => void {
+      messageHandlers.add(handler)
+      return () => {
+        messageHandlers.delete(handler)
+      }
+    },
+    close(): void {
+      if (closed) return
+      // Mark closed locally first so a subsequent close() callback from the
+      // socket itself doesn't re-fire onClose handlers.
+      closed = true
+      // Drop the onclose listener so the engine doesn't receive a phantom
+      // close event for its own request.
+      socket.onclose = null
+      socket.close()
+    },
   }
 
   return {
-    connect,
-    disconnect,
-    subscribe,
-    unsubscribe,
-    isConnected: () => connected,
+    ...pipe,
+    onClose(handler: (info: CloseInfo) => void): () => void {
+      closeHandlers.add(handler)
+      return () => {
+        closeHandlers.delete(handler)
+      }
+    },
+  }
+}
+
+/**
+ * Thin shim over {@link createEngine} for browser WebSocket transport.
+ * Preserved as the public client surface; the engine is the new home for
+ * lifecycle / auth / subscription logic.
+ */
+export function createWsManager(config: WsManagerConfig): WsManager {
+  const engine: Engine = createEngine({
+    createPipe: () => createWebSocketPipe(config.url),
+    getToken: config.getToken,
+    requiresAuth: config.requiresAuth,
+    authAckTimeoutMs: config.authAckTimeoutMs,
+    onSubscribed: config.onSubscribed,
+  })
+
+  return {
+    connect: () => engine.connect(),
+    disconnect: () => engine.disconnect(),
+    subscribe(id, path, args, onInvalidate) {
+      // The legacy `WsManager.subscribe` typed `args` as `unknown` to keep
+      // hook callers from needing to assert. The engine narrows to a record
+      // per `SubscribeMessage`; coerce here at the boundary.
+      engine.subscribe(id, path, args as Record<string, unknown>, onInvalidate)
+    },
+    unsubscribe: (id) => engine.unsubscribe(id),
+    isConnected: () => engine.isConnected(),
   }
 }
