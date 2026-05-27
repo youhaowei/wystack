@@ -87,7 +87,7 @@ export function useQuery<TArgs, TReturn>(
 
     const subId = nextSubId()
 
-    client.ws.subscribe(subId, path, stableArgs, () => {
+    client.ws.subscribe(subId, path, stableArgs as Record<string, unknown>, () => {
       queryClient.invalidateQueries({ queryKey })
     })
 
