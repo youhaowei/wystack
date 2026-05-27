@@ -25,8 +25,15 @@ export { createApi } from './api'
 // Low-level client (advanced)
 export { createClient } from './client'
 export { WyStackProvider, useWyStackClient } from './provider'
+export { createClientEngine } from './engine'
 export { createWsManager } from './ws'
 
 export type { WyStackClient } from './client'
+export type {
+  ClientEngine,
+  ClientEngineConfig,
+  ClientEnginePipe,
+  ClientEngineCloseEvent,
+} from './engine'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { WyStackClientConfig } from './types'
