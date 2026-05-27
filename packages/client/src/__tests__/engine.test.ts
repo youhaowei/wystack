@@ -365,6 +365,58 @@ describe('createEngine', () => {
     expect(engine.isConnected()).toBe(false)
   })
 
+  test('connect is single-flight while pipe is opening', async () => {
+    const ready = deferred<EnginePipe>()
+    let createCalls = 0
+    const engine = createEngine({
+      createPipe: () => {
+        createCalls++
+        return ready.promise
+      },
+    })
+
+    engine.connect()
+    engine.connect()
+    await settle()
+
+    expect(createCalls).toBe(1)
+
+    const harness = makeServerSide()
+    ready.resolve(harness.createPipe())
+    await settle()
+
+    expect(engine.isConnected()).toBe(true)
+    engine.disconnect()
+  })
+
+  test('rejected async send closes active pipe', async () => {
+    const closeHandlers = new Set<(info: CloseInfo) => void>()
+    const pipe: EnginePipe = {
+      id: 'rejecting',
+      send: () => Promise.reject(new Error('send failed')),
+      onMessage: () => () => {},
+      close: () => {},
+      onClose(handler) {
+        closeHandlers.add(handler)
+        return () => {
+          closeHandlers.delete(handler)
+        }
+      },
+    }
+    const engine = createEngine({ createPipe: () => pipe })
+
+    engine.connect()
+    await settle()
+    expect(engine.isConnected()).toBe(true)
+
+    engine.subscribe('s1', 'listTodos', {}, () => {})
+    await settle()
+
+    expect(engine.isConnected()).toBe(false)
+    expect(closeHandlers.size).toBe(0)
+    engine.disconnect()
+  })
+
   test('pending pipe readiness does not report connected', async () => {
     const harness = makeServerSide()
     const ready = deferred<void>()

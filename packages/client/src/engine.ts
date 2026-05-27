@@ -116,6 +116,7 @@ export function createEngine(config: EngineConfig): Engine {
   const activeSubs = new Map<string, { path: string; args: Record<string, unknown> }>()
 
   let connected = false
+  let connecting = false
   let authenticated = false
   let authFailed = false
 
@@ -158,8 +159,16 @@ export function createEngine(config: EngineConfig): Engine {
   function sendSubscriptions() {
     if (pipe === null || !authenticated) return
     for (const [id, sub] of activeSubs) {
-      pipe.send({ type: 'subscribe', id, path: sub.path, args: sub.args })
+      safeSend({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
     }
+  }
+
+  function safeSend(message: ClientMessage, generation: number) {
+    const target = pipe
+    if (target === null) return
+    void Promise.resolve(target.send(message)).catch(() => {
+      handleClose({ code: 1006 }, generation)
+    })
   }
 
   function handleMessage(msg: ServerMessage) {
@@ -234,7 +243,8 @@ export function createEngine(config: EngineConfig): Engine {
 
   function connect() {
     if (authFailed) return
-    if (pipe !== null) return
+    if (pipe !== null || connecting) return
+    connecting = true
     const generation = ++connectGeneration
 
     // Sequence: resolve the token first, then open the pipe. This ordering
@@ -284,7 +294,7 @@ export function createEngine(config: EngineConfig): Engine {
         // `token: null` (not undefined) — the wire frame must always carry
         // the field. The server's anonymous-path (`resolveContext` against
         // upgrade headers) needs an explicit null sentinel.
-        opened.send({ type: 'auth', token: token ?? null })
+        safeSend({ type: 'auth', token: token ?? null }, generation)
         authAckTimer = setTimeout(() => {
           authAckTimer = null
           failAuthAck(generation)
@@ -294,14 +304,19 @@ export function createEngine(config: EngineConfig): Engine {
       }
     }
 
-    run().catch(() => {
-      if (generation !== connectGeneration) return
-      scheduleReconnect()
-    })
+    run()
+      .catch(() => {
+        if (generation !== connectGeneration) return
+        scheduleReconnect()
+      })
+      .finally(() => {
+        if (generation === connectGeneration) connecting = false
+      })
   }
 
   function disconnect() {
     connectGeneration++
+    connecting = false
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -328,7 +343,7 @@ export function createEngine(config: EngineConfig): Engine {
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
-      pipe.send({ type: 'subscribe', id, path, args })
+      safeSend({ type: 'subscribe', id, path, args }, connectGeneration)
     }
     // Otherwise replayed on (re)connect via sendSubscriptions().
   }
@@ -337,7 +352,7 @@ export function createEngine(config: EngineConfig): Engine {
     handlers.delete(id)
     activeSubs.delete(id)
     if (pipe !== null && authenticated) {
-      pipe.send({ type: 'unsubscribe', id })
+      safeSend({ type: 'unsubscribe', id }, connectGeneration)
     }
     // If never sent, removing from activeSubs is sufficient.
   }
