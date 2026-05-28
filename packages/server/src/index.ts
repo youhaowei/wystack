@@ -6,6 +6,7 @@ export { createWyStack } from './create'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
+export { attachEngine, createDispatch, Session } from './engine'
 
 export type {
   QueryDef,
@@ -20,3 +21,13 @@ export type {
 export type { WyStackApp } from './create'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'
+export type {
+  AttachEngineOptions,
+  EngineHandle,
+  CloseReason,
+  ResolveContext,
+  AuthOutcome,
+  SessionOptions,
+  Dispatch,
+  DispatchResult,
+} from './engine'

@@ -8,7 +8,8 @@
 //
 // Active vs reserved:
 //   - The active discriminated unions (ClientMessage / ServerMessage) cover
-//     every message kind sent on the wire today.
+//     every message kind sent on the wire today, including the RPC pair
+//     (`call` / `result`) added by the Engine extraction (Spec ADR #9, #12).
 //   - `NextMessage` and `ResyncMessage` are typed but excluded from the active
 //     unions. They are reserved for the post-v0.2 incremental push profile
 //     (Spec ADR #10 — signal-first reactive delivery). Defining them here lets
@@ -61,7 +62,21 @@ export interface UnsubscribeMessage {
   id: string
 }
 
-export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage
+/**
+ * RPC call over message transports (IPC, loopback). One unified kind for both
+ * queries and mutations — the server's function registry resolves which `path`
+ * is (Spec ADR #9). HTTP keeps REST verbs; this kind is for transports that
+ * have no verb to carry intent. The connection's token is captured at `auth`
+ * time and reused, so there is no `token` field here.
+ */
+export interface CallMessage {
+  type: 'call'
+  id: string
+  path: string
+  args: Record<string, unknown>
+}
+
+export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage | CallMessage
 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
@@ -110,11 +125,33 @@ export interface ErrorMessage {
   issues?: unknown[]
 }
 
+/**
+ * Response to a `call` message. `data` is the function's return value (the
+ * registry resolved query vs mutation; the wire does not distinguish). Errors
+ * surface as an `ErrorMessage` carrying the same `id`, not a `result`.
+ */
+export interface ResultMessage {
+  type: 'result'
+  id: string
+  data: unknown
+}
+
 export type ServerMessage =
   | AuthenticatedMessage
   | SubscribedMessage
   | InvalidateMessage
+  | ResultMessage
   | ErrorMessage
+
+// ─── Error codes ──────────────────────────────────────────────────────────
+
+/**
+ * Sentinel `error` string returned to any `subscribe` on a server that has not
+ * wired the reactive tier (Spec ADR #12 — RPC always-on, reactive opt-in). The
+ * v0.2 capability-discovery floor: a client learns the tier is absent from this
+ * error rather than from wire-protocol version negotiation (deferred).
+ */
+export const REACTIVITY_NOT_ENABLED = 'REACTIVITY_NOT_ENABLED'
 
 // ─── Reserved (post-v0.2 push profile — NOT in active unions) ────────────────
 
@@ -200,6 +237,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       if (typeof msg.id !== 'string') return null
       return { type: 'unsubscribe', id: msg.id }
     }
+    case 'call': {
+      if (typeof msg.id !== 'string') return null
+      if (typeof msg.path !== 'string') return null
+      if (!isPlainObject(msg.args)) return null
+      return { type: 'call', id: msg.id, path: msg.path, args: msg.args }
+    }
     default:
       return null
   }
@@ -225,6 +268,12 @@ export function parseServerMessage(data: string): ServerMessage | null {
     case 'invalidate': {
       if (typeof msg.id !== 'string') return null
       return { type: 'invalidate', id: msg.id }
+    }
+    case 'result': {
+      // `data` is `unknown` by design — the function's return value carries no
+      // wire-level shape contract. Only `id` is structurally required.
+      if (typeof msg.id !== 'string') return null
+      return { type: 'result', id: msg.id, data: msg.data }
     }
     case 'error': {
       if (typeof msg.error !== 'string') return null
