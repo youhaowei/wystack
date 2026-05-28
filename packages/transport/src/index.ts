@@ -24,11 +24,13 @@ export { wrapTypedPipe } from './typed'
 export type {
   // Active client → server
   AuthMessage,
+  CallMessage,
   SubscribeMessage,
   UnsubscribeMessage,
   ClientMessage,
   // Active server → client
   AuthenticatedMessage,
+  ResultMessage,
   SubscribedMessage,
   InvalidateMessage,
   ErrorMessage,
@@ -37,4 +39,4 @@ export type {
   NextMessage,
   ResyncMessage,
 } from './protocol'
-export { parseClientMessage, parseServerMessage } from './protocol'
+export { parseClientMessage, parseServerMessage, REACTIVITY_NOT_ENABLED } from './protocol'

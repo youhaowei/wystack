@@ -3,9 +3,11 @@ import {
   parseClientMessage,
   parseServerMessage,
   type AuthMessage,
+  type CallMessage,
   type SubscribeMessage,
   type UnsubscribeMessage,
   type AuthenticatedMessage,
+  type ResultMessage,
   type SubscribedMessage,
   type InvalidateMessage,
   type ErrorMessage,
@@ -22,16 +24,18 @@ import {
 
 const _typeChecks = (): void => {
   const a: AuthMessage = { type: 'auth', token: null }
+  const c: CallMessage = { type: 'call', id: 'x', path: 'p', args: {} }
   const s: SubscribeMessage = { type: 'subscribe', id: 'x', path: 'p', args: {} }
   const u: UnsubscribeMessage = { type: 'unsubscribe', id: 'x' }
-  const _client: ClientMessage[] = [a, s, u]
+  const _client: ClientMessage[] = [a, c, s, u]
   void _client
 
   const ack: AuthenticatedMessage = { type: 'authenticated' }
+  const result: ResultMessage = { type: 'result', id: 'x', data: null }
   const sub: SubscribedMessage = { type: 'subscribed', id: 'x' }
   const inv: InvalidateMessage = { type: 'invalidate', id: 'x' }
   const err: ErrorMessage = { type: 'error', error: 'boom' }
-  const _server: ServerMessage[] = [ack, sub, inv, err]
+  const _server: ServerMessage[] = [ack, result, sub, inv, err]
   void _server
 
   // Reserved kinds: typed but NOT in active unions. The next two lines
@@ -71,6 +75,7 @@ describe('parseClientMessage — envelope rejection', () => {
     expect(parseClientMessage(JSON.stringify({ type: 'resync', id: 'x' }))).toBeNull()
     // Server-side type values must NOT round-trip through the client parser.
     expect(parseClientMessage(JSON.stringify({ type: 'authenticated' }))).toBeNull()
+    expect(parseClientMessage(JSON.stringify({ type: 'result', id: 'x', data: null }))).toBeNull()
     expect(parseClientMessage(JSON.stringify({ type: 'subscribed', id: 'x' }))).toBeNull()
   })
 })
@@ -150,6 +155,34 @@ describe('parseClientMessage — subscribe', () => {
   })
 })
 
+describe('parseClientMessage — call', () => {
+  test('accepts a full call', () => {
+    const got = parseClientMessage(
+      JSON.stringify({ type: 'call', id: 'call1', path: 'users.list', args: { limit: 10 } }),
+    )
+    expect(got).toEqual({
+      type: 'call',
+      id: 'call1',
+      path: 'users.list',
+      args: { limit: 10 },
+    })
+  })
+  test('rejects invalid call shape', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', path: 'p', args: {} }))).toBeNull()
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 1, path: 'p', args: {} })),
+    ).toBeNull()
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'x', args: {} }))).toBeNull()
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'x', path: 1, args: {} })),
+    ).toBeNull()
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'x', path: 'p' }))).toBeNull()
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'x', path: 'p', args: [] })),
+    ).toBeNull()
+  })
+})
+
 describe('parseClientMessage — unsubscribe', () => {
   test('accepts a valid unsubscribe', () => {
     const got = parseClientMessage(JSON.stringify({ type: 'unsubscribe', id: 'sub1' }))
@@ -185,6 +218,9 @@ describe('parseServerMessage — envelope rejection', () => {
     expect(
       parseServerMessage(JSON.stringify({ type: 'subscribe', id: 'x', path: 'p', args: {} })),
     ).toBeNull()
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'call', id: 'x', path: 'p', args: {} })),
+    ).toBeNull()
     // Reserved kinds are NOT in the active union.
     expect(parseServerMessage(JSON.stringify({ type: 'next', id: 'x', version: 1 }))).toBeNull()
     expect(parseServerMessage(JSON.stringify({ type: 'resync', id: 'x' }))).toBeNull()
@@ -205,6 +241,21 @@ describe('parseServerMessage — authenticated', () => {
     expect(parseServerMessage(JSON.stringify({ type: 'authenticated', extra: 'x' }))).toEqual({
       type: 'authenticated',
     })
+  })
+})
+
+describe('parseServerMessage — result', () => {
+  test('accepts a result with data', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'call1', data: [] }))).toEqual({
+      type: 'result',
+      id: 'call1',
+      data: [],
+    })
+  })
+  test('rejects missing id or data', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', data: [] }))).toBeNull()
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 1, data: [] }))).toBeNull()
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'call1' }))).toBeNull()
   })
 })
 

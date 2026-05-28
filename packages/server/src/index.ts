@@ -4,6 +4,7 @@
 export { query, mutation } from './functions'
 export { createWyStack } from './create'
 export { createRoutes } from './routes'
+export { attachEngine, createDispatch, buildAuthRequest, createSession } from './engine'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
 
@@ -18,5 +19,6 @@ export type {
   WyStackServer,
 } from './types'
 export type { WyStackApp } from './create'
+export type { EngineOptions, DispatchFn, DispatchResult, Session, SessionOptions } from './engine'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'

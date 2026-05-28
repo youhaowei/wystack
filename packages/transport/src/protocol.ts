@@ -61,7 +61,19 @@ export interface UnsubscribeMessage {
   id: string
 }
 
-export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage
+/**
+ * Unified RPC verb (query or mutation). `path` is the function registry key;
+ * `args` is the function input. The connection's resolved context from `auth`
+ * is applied server-side — there is no `token` field on this message.
+ */
+export interface CallMessage {
+  type: 'call'
+  id: string
+  path: string
+  args: Record<string, unknown>
+}
+
+export type ClientMessage = AuthMessage | CallMessage | SubscribeMessage | UnsubscribeMessage
 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
@@ -71,6 +83,16 @@ export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage
  */
 export interface AuthenticatedMessage {
   type: 'authenticated'
+}
+
+/**
+ * RPC success. `data` is the handler return value. Delivered in response to a
+ * `call` frame with the same `id`.
+ */
+export interface ResultMessage {
+  type: 'result'
+  id: string
+  data: unknown
 }
 
 /**
@@ -112,9 +134,13 @@ export interface ErrorMessage {
 
 export type ServerMessage =
   | AuthenticatedMessage
+  | ResultMessage
   | SubscribedMessage
   | InvalidateMessage
   | ErrorMessage
+
+/** Typed error when `subscribe` arrives but the reactive tier is not wired. */
+export const REACTIVITY_NOT_ENABLED = 'REACTIVITY_NOT_ENABLED'
 
 // ─── Reserved (post-v0.2 push profile — NOT in active unions) ────────────────
 
@@ -200,6 +226,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       if (typeof msg.id !== 'string') return null
       return { type: 'unsubscribe', id: msg.id }
     }
+    case 'call': {
+      if (typeof msg.id !== 'string') return null
+      if (typeof msg.path !== 'string') return null
+      if (!isPlainObject(msg.args)) return null
+      return { type: 'call', id: msg.id, path: msg.path, args: msg.args }
+    }
     default:
       return null
   }
@@ -217,6 +249,11 @@ export function parseServerMessage(data: string): ServerMessage | null {
   switch (msg.type) {
     case 'authenticated': {
       return { type: 'authenticated' }
+    }
+    case 'result': {
+      if (typeof msg.id !== 'string') return null
+      if (!('data' in msg)) return null
+      return { type: 'result', id: msg.id, data: msg.data }
     }
     case 'subscribed': {
       if (typeof msg.id !== 'string') return null
