@@ -62,7 +62,11 @@ function errorMessage(err: unknown): string {
 
 function safeSend(pipe: Pipe, payload: unknown): void {
   try {
-    pipe.send(JSON.stringify(payload))
+    const result = pipe.send(JSON.stringify(payload))
+    if (result instanceof Promise)
+      result.catch(() => {
+        pipe.close()
+      })
   } catch {
     /* pipe closed */
   }
@@ -130,7 +134,11 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       state.timeout = null
       state.authenticated = true
       try {
-        pipe.send(JSON.stringify({ type: 'authenticated' }))
+        const ack = pipe.send(JSON.stringify({ type: 'authenticated' }))
+        if (ack instanceof Promise)
+          ack.catch(() => {
+            pipe.close()
+          })
       } catch {
         pipe.close()
       }
