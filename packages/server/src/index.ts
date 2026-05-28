@@ -4,6 +4,7 @@
 export { query, mutation } from './functions'
 export { createWyStack } from './create'
 export { createRoutes } from './routes'
+export { attachEngine, createDispatch, buildAuthRequest } from './engine'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
 

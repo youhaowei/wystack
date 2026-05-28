@@ -35,7 +35,10 @@
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { WyStackApp } from './create'
+import { buildAuthRequest } from './engine/session'
 import { ValidationError } from './validation'
+
+export { buildAuthRequest }
 
 /**
  * Per-connection state, keyed by the platform socket (`ws.raw`). Hono creates
@@ -112,19 +115,6 @@ function safeSend(ws: WSContext, payload: unknown): void {
  * identity that leaked into the upgrade via cookie proxy, reverse proxy, or
  * stale query handoff. Exported for direct unit testing of this invariant.
  */
-export function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
-  const headers = new Headers(upgradeRequest.headers)
-  if (token !== null && token.length > 0) {
-    headers.set('authorization', `Bearer ${token}`)
-  } else {
-    headers.delete('authorization')
-  }
-  return new Request(upgradeRequest.url, {
-    method: upgradeRequest.method,
-    headers,
-  })
-}
-
 /**
  * Parse a client WS frame as a plain object. Rejects non-object JSON
  * (`null`, arrays, primitives) and non-string `type` up front so downstream

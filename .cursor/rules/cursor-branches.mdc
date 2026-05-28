@@ -1,0 +1,25 @@
+---
+description: Branch naming when Cursor agent creates or checks out task branches
+alwaysApply: true
+---
+
+# Cursor agent branches
+
+When **you** (the Cursor agent) create or switch to a task/feature branch in this repo, prefix the branch name with `cursor/`.
+
+## Pattern
+
+```
+cursor/<task-id>-<short-slug>
+```
+
+Examples:
+
+- `cursor/task-638-server-engine` (TASK-638 / YW-56)
+- `cursor/yw-56-server-engine` (Linear ID + slug)
+
+## Rules
+
+- Use `cursor/` only for branches **you** create or operate on in Cursor — not for human/Graphite stacks (`feat/`, `fix/`, `chore/`, etc. in `workspace.md` still apply to the user's workflow).
+- Reuse an existing `cursor/task-{id}-*` branch when resuming the same work item.
+- Do not rename the user's non-`cursor/` branches unless they ask.

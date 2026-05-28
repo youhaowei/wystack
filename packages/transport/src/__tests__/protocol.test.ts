@@ -3,9 +3,11 @@ import {
   parseClientMessage,
   parseServerMessage,
   type AuthMessage,
+  type CallMessage,
   type SubscribeMessage,
   type UnsubscribeMessage,
   type AuthenticatedMessage,
+  type ResultMessage,
   type SubscribedMessage,
   type InvalidateMessage,
   type ErrorMessage,
@@ -22,16 +24,18 @@ import {
 
 const _typeChecks = (): void => {
   const a: AuthMessage = { type: 'auth', token: null }
+  const c: CallMessage = { type: 'call', id: 'x', path: 'p', args: {} }
   const s: SubscribeMessage = { type: 'subscribe', id: 'x', path: 'p', args: {} }
   const u: UnsubscribeMessage = { type: 'unsubscribe', id: 'x' }
-  const _client: ClientMessage[] = [a, s, u]
+  const _client: ClientMessage[] = [a, c, s, u]
   void _client
 
   const ack: AuthenticatedMessage = { type: 'authenticated' }
+  const res: ResultMessage = { type: 'result', id: 'x', data: { ok: true } }
   const sub: SubscribedMessage = { type: 'subscribed', id: 'x' }
   const inv: InvalidateMessage = { type: 'invalidate', id: 'x' }
   const err: ErrorMessage = { type: 'error', error: 'boom' }
-  const _server: ServerMessage[] = [ack, sub, inv, err]
+  const _server: ServerMessage[] = [ack, res, sub, inv, err]
   void _server
 
   // Reserved kinds: typed but NOT in active unions. The next two lines
@@ -163,6 +167,23 @@ describe('parseClientMessage — unsubscribe', () => {
   })
 })
 
+describe('parseClientMessage — call', () => {
+  test('accepts a valid call', () => {
+    const got = parseClientMessage(
+      JSON.stringify({ type: 'call', id: 'c1', path: 'users.list', args: { n: 1 } }),
+    )
+    expect(got).toEqual({ type: 'call', id: 'c1', path: 'users.list', args: { n: 1 } })
+  })
+  test('rejects missing id', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', path: 'p', args: {} })),
+    ).toBeNull()
+  })
+  test('rejects missing args object', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'c1', path: 'p' }))).toBeNull()
+  })
+})
+
 // ─── parseServerMessage: envelope rejection ──────────────────────────────────
 
 describe('parseServerMessage — envelope rejection', () => {
@@ -192,6 +213,24 @@ describe('parseServerMessage — envelope rejection', () => {
 })
 
 // ─── parseServerMessage: per-kind ────────────────────────────────────────────
+
+describe('parseServerMessage — result', () => {
+  test('accepts a valid result', () => {
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: { ok: true } })),
+    ).toEqual({ type: 'result', id: 'c1', data: { ok: true } })
+  })
+  test('accepts null data', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: null }))).toEqual({
+      type: 'result',
+      id: 'c1',
+      data: null,
+    })
+  })
+  test('rejects missing data field', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'c1' }))).toBeNull()
+  })
+})
 
 describe('parseServerMessage — authenticated', () => {
   test('accepts an authenticated ack', () => {
