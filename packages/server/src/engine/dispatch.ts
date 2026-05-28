@@ -9,7 +9,6 @@
 // Dispatch does not rebuild them — it reads them at call time.
 
 import type { WyStackApp } from '../create'
-import { ValidationError } from '../validation'
 
 export interface DispatchResult {
   result: unknown
@@ -25,5 +24,3 @@ export async function dispatch(
 ): Promise<DispatchResult> {
   return app.call(path, args, context)
 }
-
-export { ValidationError }

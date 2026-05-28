@@ -49,6 +49,8 @@ export interface Engine {
     attachOpts: AttachOptions & {
       onSubAdded?: (id: string) => void
       onSubRemoved?: (id: string) => void
+      /** Called when a `call` mutation writes tables; caller handles invalidation. */
+      onMutation?: (tablesWritten: Set<string>) => void
     },
   ): () => void
 
@@ -70,7 +72,7 @@ export function createEngine(app: WyStackApp, opts: EngineOptions = {}): Engine 
 
   return {
     attach(pipe, attachOpts) {
-      const { upgradeRequest, onSubAdded, onSubRemoved } = attachOpts
+      const { upgradeRequest, onSubAdded, onSubRemoved, onMutation } = attachOpts
       return createSession(app, {
         pipe,
         upgradeRequest,
@@ -79,6 +81,7 @@ export function createEngine(app: WyStackApp, opts: EngineOptions = {}): Engine 
         subscriptions,
         onSubAdded: onSubAdded ?? (() => {}),
         onSubRemoved: onSubRemoved ?? (() => {}),
+        onMutation,
       })
     },
 

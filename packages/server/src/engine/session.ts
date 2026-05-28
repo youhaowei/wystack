@@ -37,6 +37,13 @@ export interface SessionOptions {
   subscriptions: SubscriptionStore | null
   onSubAdded: (id: string) => void
   onSubRemoved: (id: string) => void
+  /**
+   * Called after a `call` frame dispatches a mutation with at least one written
+   * table. The caller (e.g. the WS routes adapter) uses this to fan-out
+   * invalidation frames to affected subscribers, mirroring the HTTP mutation
+   * path. If omitted, mutation writes are not invalidated on this Pipe.
+   */
+  onMutation?: (tablesWritten: Set<string>) => void
 }
 
 interface SessionState {
@@ -276,8 +283,9 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       const callPath = msg.path
       const callArgs = (msg.args ?? {}) as Record<string, unknown>
       dispatch(app, callPath, callArgs, state.context ?? {})
-        .then(({ result }) => {
+        .then(({ result, tablesWritten }) => {
           safeSend(pipe, { type: 'result', id: callId, data: result })
+          if (tablesWritten.size > 0) opts.onMutation?.(tablesWritten)
         })
         .catch((err: unknown) => {
           const payload: Record<string, unknown> = {
@@ -285,7 +293,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
             id: callId,
             error: errorMessage(err),
           }
-          if (err instanceof ValidationError) payload.issues = (err as ValidationError).issues
+          if (err instanceof ValidationError) payload.issues = err.issues
           safeSend(pipe, payload)
         })
       return
