@@ -232,6 +232,47 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       })
   }
 
+  async function handleCall(msg: Record<string, unknown>): Promise<void> {
+    if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
+      safeSend({
+        type: 'error',
+        id: typeof msg.id === 'string' ? msg.id : undefined,
+        error: 'invalid call message',
+      })
+      return
+    }
+    const callId = msg.id
+    const callPath = msg.path
+    const callArgs = (msg.args ?? {}) as Record<string, unknown>
+
+    // Re-resolve auth context per call so token revocation is observed,
+    // matching the per-subscribe re-resolution in handleSubscribe.
+    let context: Record<string, unknown>
+    try {
+      context = await resolveSubContext(state.token)
+    } catch (err) {
+      safeSend({ type: 'error', id: callId, error: errorMessage(err) })
+      return
+    }
+
+    if (state.closed) return
+
+    dispatch(app, callPath, callArgs, context)
+      .then(({ result, tablesWritten }) => {
+        safeSend({ type: 'result', id: callId, data: result })
+        if (tablesWritten.size > 0) opts.onMutation?.(tablesWritten)
+      })
+      .catch((err: unknown) => {
+        const payload: Record<string, unknown> = {
+          type: 'error',
+          id: callId,
+          error: errorMessage(err),
+        }
+        if (err instanceof ValidationError) payload.issues = err.issues
+        safeSend(payload)
+      })
+  }
+
   function handleUnsubscribe(msg: Record<string, unknown>): void {
     if (typeof msg.id !== 'string') {
       safeSend({ type: 'error', error: 'invalid unsubscribe message' })
@@ -299,31 +340,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     }
 
     if (msg.type === 'call') {
-      if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-        safeSend({
-          type: 'error',
-          id: typeof msg.id === 'string' ? msg.id : undefined,
-          error: 'invalid call message',
-        })
-        return
-      }
-      const callId = msg.id
-      const callPath = msg.path
-      const callArgs = (msg.args ?? {}) as Record<string, unknown>
-      dispatch(app, callPath, callArgs, state.context ?? {})
-        .then(({ result, tablesWritten }) => {
-          safeSend({ type: 'result', id: callId, data: result })
-          if (tablesWritten.size > 0) opts.onMutation?.(tablesWritten)
-        })
-        .catch((err: unknown) => {
-          const payload: Record<string, unknown> = {
-            type: 'error',
-            id: callId,
-            error: errorMessage(err),
-          }
-          if (err instanceof ValidationError) payload.issues = err.issues
-          safeSend(payload)
-        })
+      void handleCall(msg)
       return
     }
 
