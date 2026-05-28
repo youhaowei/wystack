@@ -117,7 +117,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
           closeSession()
         })
     } catch {
-      /* pipe already closed */
+      closeSession()
     }
   }
 
