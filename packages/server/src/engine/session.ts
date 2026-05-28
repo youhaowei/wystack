@@ -60,18 +60,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-function safeSend(pipe: Pipe, payload: unknown): void {
-  try {
-    const result = pipe.send(JSON.stringify(payload))
-    if (result instanceof Promise)
-      result.catch(() => {
-        pipe.close()
-      })
-  } catch {
-    /* pipe closed */
-  }
-}
-
 export function createSession(app: WyStackApp, opts: SessionOptions): () => void {
   const { pipe, upgradeRequest, authTimeoutMs } = opts
   const userResolveContext = opts.resolveContext
@@ -82,11 +70,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     authenticated: !requiresAuth,
     token: null,
     context: null,
-    timeout: requiresAuth
-      ? setTimeout(() => {
-          pipe.close()
-        }, authTimeoutMs)
-      : null,
+    timeout: null,
     subIds: new Set(),
     pendingSubIds: new Set(),
     closed: false,
@@ -107,6 +91,31 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     state.pendingSubIds.clear()
   }
 
+  /** Close the pipe and run teardown so subscriptions are cleaned up. */
+  function closeSession(): void {
+    teardown()
+    pipe.close()
+  }
+
+  /** Send a JSON frame, closing the session (not just the pipe) on failure. */
+  function safeSend(payload: unknown): void {
+    try {
+      const result = pipe.send(JSON.stringify(payload))
+      if (result instanceof Promise)
+        result.catch(() => {
+          closeSession()
+        })
+    } catch {
+      /* pipe already closed */
+    }
+  }
+
+  if (requiresAuth) {
+    state.timeout = setTimeout(() => {
+      closeSession()
+    }, authTimeoutMs)
+  }
+
   async function resolveSubContext(token: string | null): Promise<Record<string, unknown>> {
     const req = buildAuthRequest(upgradeRequest, token)
     return (await resolveContext(req)) ?? {}
@@ -114,7 +123,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
   async function handleAuth(msg: Record<string, unknown>): Promise<void> {
     if (state.authenticated) {
-      safeSend(pipe, { type: 'authenticated' })
+      safeSend({ type: 'authenticated' })
       return
     }
 
@@ -125,7 +134,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       const resolvedContext = await resolveSubContext(token)
       if (state.closed) return
       if (state.authenticated) {
-        safeSend(pipe, { type: 'authenticated' })
+        safeSend({ type: 'authenticated' })
         return
       }
       state.token = token
@@ -137,20 +146,20 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
         const ack = pipe.send(JSON.stringify({ type: 'authenticated' }))
         if (ack instanceof Promise)
           ack.catch(() => {
-            pipe.close()
+            closeSession()
           })
       } catch {
-        pipe.close()
+        closeSession()
       }
     } catch (err) {
       console.warn('[wystack/server] session auth failed:', errorMessage(err))
-      if (!state.closed && !state.authenticated) pipe.close()
+      if (!state.closed && !state.authenticated) closeSession()
     }
   }
 
   async function handleSubscribe(msg: Record<string, unknown>): Promise<void> {
     if (!opts.subscriptions) {
-      safeSend(pipe, {
+      safeSend({
         type: 'error',
         id: typeof msg.id === 'string' ? msg.id : undefined,
         error: 'REACTIVITY_NOT_ENABLED',
@@ -159,7 +168,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     }
 
     if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-      safeSend(pipe, {
+      safeSend({
         type: 'error',
         id: typeof msg.id === 'string' ? msg.id : undefined,
         error: 'invalid subscribe message',
@@ -173,13 +182,13 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
     // Guard: reject a subscribe whose ID is already owned by another session.
     if (opts.subscriptions?.get(id) && !state.subIds.has(id)) {
-      safeSend(pipe, { type: 'error', id, error: 'subscription id already in use' })
+      safeSend({ type: 'error', id, error: 'subscription id already in use' })
       return
     }
 
     const fn = app.functions.get(path)
     if (!fn || fn.type !== 'query') {
-      safeSend(pipe, { type: 'error', id, error: `Unknown query: ${path}` })
+      safeSend({ type: 'error', id, error: `Unknown query: ${path}` })
       return
     }
 
@@ -190,7 +199,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       context = await resolveSubContext(state.token)
     } catch (err) {
       state.pendingSubIds.delete(id)
-      safeSend(pipe, { type: 'error', id, error: errorMessage(err) })
+      safeSend({ type: 'error', id, error: errorMessage(err) })
       return
     }
 
@@ -209,7 +218,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
         })
         state.subIds.add(id)
         opts.onSubAdded(id)
-        safeSend(pipe, { type: 'subscribed', id })
+        safeSend({ type: 'subscribed', id })
       })
       .catch((err: unknown) => {
         state.pendingSubIds.delete(id)
@@ -219,19 +228,19 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
           error: errorMessage(err),
         }
         if (err instanceof ValidationError) payload.issues = err.issues
-        safeSend(pipe, payload)
+        safeSend(payload)
       })
   }
 
   function handleUnsubscribe(msg: Record<string, unknown>): void {
     if (typeof msg.id !== 'string') {
-      safeSend(pipe, { type: 'error', error: 'invalid unsubscribe message' })
+      safeSend({ type: 'error', error: 'invalid unsubscribe message' })
       return
     }
     const subId = msg.id
     // Guard: only cancel/remove subscriptions owned by this session.
     if (!state.subIds.has(subId) && !state.pendingSubIds.has(subId)) {
-      safeSend(pipe, { type: 'error', id: subId, error: 'unknown subscription id' })
+      safeSend({ type: 'error', id: subId, error: 'unknown subscription id' })
       return
     }
     state.pendingSubIds.delete(subId)
@@ -265,7 +274,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
         pipe.close()
         return
       }
-      safeSend(pipe, { type: 'error', error: 'invalid message' })
+      safeSend({ type: 'error', error: 'invalid message' })
       return
     }
 
@@ -291,7 +300,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
     if (msg.type === 'call') {
       if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-        safeSend(pipe, {
+        safeSend({
           type: 'error',
           id: typeof msg.id === 'string' ? msg.id : undefined,
           error: 'invalid call message',
@@ -303,7 +312,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       const callArgs = (msg.args ?? {}) as Record<string, unknown>
       dispatch(app, callPath, callArgs, state.context ?? {})
         .then(({ result, tablesWritten }) => {
-          safeSend(pipe, { type: 'result', id: callId, data: result })
+          safeSend({ type: 'result', id: callId, data: result })
           if (tablesWritten.size > 0) opts.onMutation?.(tablesWritten)
         })
         .catch((err: unknown) => {
@@ -313,13 +322,13 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
             error: errorMessage(err),
           }
           if (err instanceof ValidationError) payload.issues = err.issues
-          safeSend(pipe, payload)
+          safeSend(payload)
         })
       return
     }
 
     // Unknown type post-auth.
-    safeSend(pipe, {
+    safeSend({
       type: 'error',
       id: typeof msg.id === 'string' ? msg.id : undefined,
       error: `unknown message type: ${String(msg.type)}`,
