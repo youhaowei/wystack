@@ -170,6 +170,13 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     const id = msg.id
     const path = msg.path
     const args = (msg.args ?? {}) as Record<string, unknown>
+
+    // Guard: reject a subscribe whose ID is already owned by another session.
+    if (opts.subscriptions?.get(id) && !state.subIds.has(id)) {
+      safeSend(pipe, { type: 'error', id, error: 'subscription id already in use' })
+      return
+    }
+
     const fn = app.functions.get(path)
     if (!fn || fn.type !== 'query') {
       safeSend(pipe, { type: 'error', id, error: `Unknown query: ${path}` })
@@ -222,10 +229,14 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
       return
     }
     const subId = msg.id
+    // Guard: only cancel/remove subscriptions owned by this session.
+    if (!state.subIds.has(subId) && !state.pendingSubIds.has(subId)) {
+      safeSend(pipe, { type: 'error', id: subId, error: 'unknown subscription id' })
+      return
+    }
     state.pendingSubIds.delete(subId)
-    const sub = opts.subscriptions?.get(subId)
-    if (sub) {
-      opts.subscriptions!.remove(subId)
+    if (state.subIds.has(subId)) {
+      opts.subscriptions?.remove(subId)
       state.subIds.delete(subId)
       opts.onSubRemoved(subId)
     }

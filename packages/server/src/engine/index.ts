@@ -7,9 +7,11 @@
 //   const engine = createEngine(app, {
 //     resolveContext, authTimeoutMs, subscriptions: app.subscriptions
 //   })
-//   const detach = engine.attach(pipe, { upgradeRequest })
-//   // later, on mutation completion:
-//   await engine.invalidate(tablesWritten, (id) => sessionThatHasId?.pipe)
+//   const detach = engine.attach(pipe, {
+//     upgradeRequest,
+//     onSubAdded, onSubRemoved,       // caller tracks sub→pipe mapping
+//     onMutation: (tables) => { ... } // caller fans out invalidation frames
+//   })
 //
 // The caller (e.g. routes.ts) tracks which pipe holds which sub IDs via the
 // onSubAdded / onSubRemoved callbacks, then routes invalidation frames itself.
