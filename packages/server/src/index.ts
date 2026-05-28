@@ -6,6 +6,7 @@ export { createWyStack } from './create'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
+export { createEngine } from './engine/index'
 
 export type {
   QueryDef,
@@ -20,3 +21,4 @@ export type {
 export type { WyStackApp } from './create'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'
+export type { Engine, EngineOptions, AttachOptions, SubscriptionStore } from './engine/index'
