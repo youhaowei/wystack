@@ -53,6 +53,12 @@ export interface Engine {
       onSubRemoved?: (id: string) => void
       /** Called when a `call` mutation writes tables; caller handles invalidation. */
       onMutation?: (tablesWritten: Set<string>) => void
+      /**
+       * Called when the session self-closes (auth failure, timeout, send
+       * error). Wire to the transport's own close event so teardown fires on
+       * external disconnects too — `Pipe` has no built-in onClose hook.
+       */
+      onClose?: () => void
     },
   ): () => void
 
@@ -74,7 +80,7 @@ export function createEngine(app: WyStackApp, opts: EngineOptions = {}): Engine 
 
   return {
     attach(pipe, attachOpts) {
-      const { upgradeRequest, onSubAdded, onSubRemoved, onMutation } = attachOpts
+      const { upgradeRequest, onSubAdded, onSubRemoved, onMutation, onClose } = attachOpts
       return createSession(app, {
         pipe,
         upgradeRequest,
@@ -84,6 +90,7 @@ export function createEngine(app: WyStackApp, opts: EngineOptions = {}): Engine 
         onSubAdded: onSubAdded ?? (() => {}),
         onSubRemoved: onSubRemoved ?? (() => {}),
         onMutation,
+        onClose,
       })
     },
 

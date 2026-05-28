@@ -44,6 +44,16 @@ export interface SessionOptions {
    * path. If omitted, mutation writes are not invalidated on this Pipe.
    */
   onMutation?: (tablesWritten: Set<string>) => void
+  /**
+   * Called when the session tears itself down (auth failure, auth timeout,
+   * send error). Wire this to the transport's own close event so teardown
+   * also fires when the remote end closes the pipe externally — `Pipe` has
+   * no built-in onClose hook, so the caller must bridge the gap.
+   *
+   * Example: in a Hono WS adapter, pass `onClose: detach` in the `onClose`
+   * WebSocket callback so subscriptions are removed on client disconnect.
+   */
+  onClose?: () => void
 }
 
 interface SessionState {
@@ -89,6 +99,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     }
     state.subIds.clear()
     state.pendingSubIds.clear()
+    opts.onClose?.()
   }
 
   /** Close the pipe and run teardown so subscriptions are cleaned up. */
