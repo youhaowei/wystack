@@ -13,4 +13,5 @@ storybook-static
 build/
 .claude/
 .wystack/
+.wystack/
 .wystack.json
