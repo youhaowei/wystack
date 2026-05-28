@@ -326,7 +326,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
     if (msg === null) {
       if (!state.authenticated) {
-        pipe.close()
+        closeSession()
         return
       }
       safeSend({ type: 'error', error: 'invalid message' })
@@ -339,7 +339,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     }
 
     if (!state.authenticated) {
-      pipe.close()
+      closeSession()
       return
     }
 
