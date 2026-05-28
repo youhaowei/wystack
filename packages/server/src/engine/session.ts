@@ -22,7 +22,7 @@
 // original routes.ts implementation.
 
 import type { Pipe } from '@wystack/transport'
-import { buildAuthRequest } from '../routes'
+import { buildAuthRequest } from './auth-request'
 import type { WyStackApp } from '../create'
 import { dispatch } from './dispatch'
 import { ValidationError } from '../validation'
@@ -42,6 +42,7 @@ export interface SessionOptions {
 interface SessionState {
   authenticated: boolean
   token: string | null
+  context: Record<string, unknown> | null
   timeout: ReturnType<typeof setTimeout> | null
   subIds: Set<string>
   pendingSubIds: Set<string>
@@ -69,6 +70,7 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
   const state: SessionState = {
     authenticated: !requiresAuth,
     token: null,
+    context: null,
     timeout: requiresAuth
       ? setTimeout(() => {
           pipe.close()
@@ -109,13 +111,14 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
     const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
 
     try {
-      await resolveSubContext(token)
+      const resolvedContext = await resolveSubContext(token)
       if (state.closed) return
       if (state.authenticated) {
         safeSend(pipe, { type: 'authenticated' })
         return
       }
       state.token = token
+      state.context = resolvedContext
       if (state.timeout) clearTimeout(state.timeout)
       state.timeout = null
       state.authenticated = true
@@ -257,6 +260,34 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
     if (msg.type === 'unsubscribe') {
       handleUnsubscribe(msg)
+      return
+    }
+
+    if (msg.type === 'call') {
+      if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
+        safeSend(pipe, {
+          type: 'error',
+          id: typeof msg.id === 'string' ? msg.id : undefined,
+          error: 'invalid call message',
+        })
+        return
+      }
+      const callId = msg.id
+      const callPath = msg.path
+      const callArgs = (msg.args ?? {}) as Record<string, unknown>
+      dispatch(app, callPath, callArgs, state.context ?? {})
+        .then(({ result }) => {
+          safeSend(pipe, { type: 'result', id: callId, data: result })
+        })
+        .catch((err: unknown) => {
+          const payload: Record<string, unknown> = {
+            type: 'error',
+            id: callId,
+            error: errorMessage(err),
+          }
+          if (err instanceof ValidationError) payload.issues = (err as ValidationError).issues
+          safeSend(pipe, payload)
+        })
       return
     }
 

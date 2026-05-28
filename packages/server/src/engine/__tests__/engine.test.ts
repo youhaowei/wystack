@@ -133,10 +133,41 @@ describe('Engine — no-auth (trusted transport)', () => {
     engine.attach(serverPipe, { upgradeRequest: SYNTHETIC_REQUEST })
 
     const reply = nextMessage(clientPipe)
-    sendJson(clientPipe, { type: 'call', id: 'r1', path: 'listTodos', args: {} })
+    sendJson(clientPipe, { type: 'foo', id: 'r1' })
     const msg = await reply
 
     expect(msg.type).toBe('error')
+
+    clientPipe.close()
+  })
+
+  test('call/result RPC round-trip over Pipe', async () => {
+    const engine = createEngine(app)
+    const [clientPipe, serverPipe] = createLoopbackPair()
+    engine.attach(serverPipe, { upgradeRequest: SYNTHETIC_REQUEST })
+
+    const reply = nextMessage(clientPipe)
+    sendJson(clientPipe, { type: 'call', id: 'rpc1', path: 'listTodos', args: {} })
+    const msg = await reply
+
+    expect(msg.type).toBe('result')
+    expect(msg.id).toBe('rpc1')
+    expect(Array.isArray(msg.data)).toBe(true)
+
+    clientPipe.close()
+  })
+
+  test('call to unknown path returns error frame with id', async () => {
+    const engine = createEngine(app)
+    const [clientPipe, serverPipe] = createLoopbackPair()
+    engine.attach(serverPipe, { upgradeRequest: SYNTHETIC_REQUEST })
+
+    const reply = nextMessage(clientPipe)
+    sendJson(clientPipe, { type: 'call', id: 'rpc2', path: 'doesNotExist', args: {} })
+    const msg = await reply
+
+    expect(msg.type).toBe('error')
+    expect(msg.id).toBe('rpc2')
 
     clientPipe.close()
   })
