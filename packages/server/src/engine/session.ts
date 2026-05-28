@@ -270,8 +270,11 @@ export function createSession(app: WyStackApp, opts: SessionOptions): () => void
 
     dispatch(app, callPath, callArgs, context)
       .then(({ result, tablesWritten }) => {
-        safeSend({ type: 'result', id: callId, data: result })
+        // Notify caller of written tables *before* sending the result frame so
+        // that a client reading after the RPC ack observes already-invalidated
+        // subscriptions — matching the HTTP POST path (invalidate → response).
         if (tablesWritten.size > 0) opts.onMutation?.(tablesWritten)
+        safeSend({ type: 'result', id: callId, data: result })
       })
       .catch((err: unknown) => {
         const payload: Record<string, unknown> = {

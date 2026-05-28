@@ -434,6 +434,28 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               return
             }
 
+            if (msg.type === 'call') {
+              if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
+                safeSend(ws, {
+                  type: 'error',
+                  id: typeof msg.id === 'string' ? msg.id : undefined,
+                  error: 'invalid call message',
+                })
+                return
+              }
+              const callId = msg.id
+              const callPath = msg.path
+              const callArgs = (msg.args ?? {}) as Record<string, unknown>
+              const callContext = await resolveSubContext(rawSocket, conn.token)
+              const callResult = await app.call(callPath, callArgs, callContext)
+              // Invalidate before responding — mirrors the HTTP POST path.
+              if (callResult.tablesWritten.size > 0) {
+                await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
+              }
+              safeSend(ws, { type: 'result', id: callId, data: callResult.result })
+              return
+            }
+
             // Unknown type post-auth. Help devs during protocol evolution.
             safeSend(ws, {
               type: 'error',
