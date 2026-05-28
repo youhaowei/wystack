@@ -52,16 +52,28 @@ export interface SubscribeMessage {
 }
 
 /**
- * Cancel a subscription (active or in-flight). The server tolerates unknown
- * IDs silently — they may refer to a sub that was already torn down on the
- * server side.
+ * Cancel a subscription (active or in-flight). The server returns an error
+ * frame for IDs not owned by this session.
  */
 export interface UnsubscribeMessage {
   type: 'unsubscribe'
   id: string
 }
 
-export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage
+/**
+ * Single-shot RPC call (ADR #9 — RPC tier). Always-on regardless of whether
+ * the reactive tier is enabled. The server dispatches `path` with `args` and
+ * the session's resolved context, then responds with a `ResultMessage` (on
+ * success) or `ErrorMessage` (on failure), both carrying the same `id`.
+ */
+export interface CallMessage {
+  type: 'call'
+  id: string
+  path: string
+  args: Record<string, unknown>
+}
+
+export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage | CallMessage
 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
@@ -110,11 +122,23 @@ export interface ErrorMessage {
   issues?: unknown[]
 }
 
+/**
+ * Response to a `CallMessage`. Carries the serialisable return value of the
+ * dispatched function. On failure the server sends an `ErrorMessage` with the
+ * same `id` instead.
+ */
+export interface ResultMessage {
+  type: 'result'
+  id: string
+  data: unknown
+}
+
 export type ServerMessage =
   | AuthenticatedMessage
   | SubscribedMessage
   | InvalidateMessage
   | ErrorMessage
+  | ResultMessage
 
 // ─── Reserved (post-v0.2 push profile — NOT in active unions) ────────────────
 
@@ -200,6 +224,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       if (typeof msg.id !== 'string') return null
       return { type: 'unsubscribe', id: msg.id }
     }
+    case 'call': {
+      if (typeof msg.id !== 'string') return null
+      if (typeof msg.path !== 'string') return null
+      if (!isPlainObject(msg.args)) return null
+      return { type: 'call', id: msg.id, path: msg.path, args: msg.args }
+    }
     default:
       return null
   }
@@ -237,6 +267,11 @@ export function parseServerMessage(data: string): ServerMessage | null {
       if (typeof msg.id === 'string') out.id = msg.id
       if (Array.isArray(msg.issues)) out.issues = msg.issues
       return out
+    }
+    case 'result': {
+      if (typeof msg.id !== 'string') return null
+      // `data` is the serialisable function return value — any shape is valid.
+      return { type: 'result', id: msg.id, data: msg.data }
     }
     default:
       return null

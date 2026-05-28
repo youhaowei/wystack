@@ -26,12 +26,14 @@ export type {
   AuthMessage,
   SubscribeMessage,
   UnsubscribeMessage,
+  CallMessage,
   ClientMessage,
   // Active server → client
   AuthenticatedMessage,
   SubscribedMessage,
   InvalidateMessage,
   ErrorMessage,
+  ResultMessage,
   ServerMessage,
   // Reserved post-v0.2
   NextMessage,

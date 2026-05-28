@@ -5,10 +5,12 @@ import {
   type AuthMessage,
   type SubscribeMessage,
   type UnsubscribeMessage,
+  type CallMessage,
   type AuthenticatedMessage,
   type SubscribedMessage,
   type InvalidateMessage,
   type ErrorMessage,
+  type ResultMessage,
   type ClientMessage,
   type ServerMessage,
   type NextMessage,
@@ -24,14 +26,16 @@ const _typeChecks = (): void => {
   const a: AuthMessage = { type: 'auth', token: null }
   const s: SubscribeMessage = { type: 'subscribe', id: 'x', path: 'p', args: {} }
   const u: UnsubscribeMessage = { type: 'unsubscribe', id: 'x' }
-  const _client: ClientMessage[] = [a, s, u]
+  const c: CallMessage = { type: 'call', id: 'r1', path: 'fn', args: {} }
+  const _client: ClientMessage[] = [a, s, u, c]
   void _client
 
   const ack: AuthenticatedMessage = { type: 'authenticated' }
   const sub: SubscribedMessage = { type: 'subscribed', id: 'x' }
   const inv: InvalidateMessage = { type: 'invalidate', id: 'x' }
   const err: ErrorMessage = { type: 'error', error: 'boom' }
-  const _server: ServerMessage[] = [ack, sub, inv, err]
+  const res: ResultMessage = { type: 'result', id: 'r1', data: [] }
+  const _server: ServerMessage[] = [ack, sub, inv, err, res]
   void _server
 
   // Reserved kinds: typed but NOT in active unions. The next two lines
@@ -284,5 +288,59 @@ describe('parseServerMessage — error', () => {
     expect(
       parseServerMessage(JSON.stringify({ type: 'error', error: 'boom', issues: 'oops' })),
     ).toBeNull()
+  })
+})
+
+// ─── parseClientMessage: call ─────────────────────────────────────────────────
+
+describe('parseClientMessage — call', () => {
+  test('accepts a full call', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'r1', path: 'fn', args: { x: 1 } })),
+    ).toEqual({ type: 'call', id: 'r1', path: 'fn', args: { x: 1 } })
+  })
+  test('accepts empty args object', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'r1', path: 'fn', args: {} })),
+    ).toEqual({ type: 'call', id: 'r1', path: 'fn', args: {} })
+  })
+  test('rejects missing id', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', path: 'fn', args: {} }))).toBeNull()
+  })
+  test('rejects missing path', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'r1', args: {} }))).toBeNull()
+  })
+  test('rejects missing args', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'r1', path: 'fn' }))).toBeNull()
+  })
+  test('rejects non-object args', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'r1', path: 'fn', args: 'bad' })),
+    ).toBeNull()
+  })
+})
+
+// ─── parseServerMessage: result ──────────────────────────────────────────────
+
+describe('parseServerMessage — result', () => {
+  test('accepts a result with array data', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'r1', data: [] }))).toEqual({
+      type: 'result',
+      id: 'r1',
+      data: [],
+    })
+  })
+  test('accepts a result with null data', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'r1', data: null }))).toEqual({
+      type: 'result',
+      id: 'r1',
+      data: null,
+    })
+  })
+  test('rejects missing id', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', data: [] }))).toBeNull()
+  })
+  test('rejects non-string id', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 1, data: [] }))).toBeNull()
   })
 })
