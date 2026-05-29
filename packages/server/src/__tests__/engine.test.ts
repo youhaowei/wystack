@@ -31,7 +31,7 @@ import {
 } from '@wystack/transport'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
-import { attachEngine, type AttachEngineOptions } from '../engine'
+import { attachEngine, createReactiveTier, type AttachEngineOptions } from '../engine'
 
 const schema = defineSchema({
   todos: { id: int.primaryKey(), title: text, done: boolean },
@@ -427,6 +427,28 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
     await flush()
 
     expect(h.received).toEqual([])
+  })
+
+  test('reactive server invalidates subscriptions after call mutation writes', async () => {
+    const app = await makeApp()
+    const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const received: ServerMessage[] = []
+    clientPipe.onMessage((m) => received.push(m))
+
+    attachEngine(serverPipe, { app, reactive: createReactiveTier(app) })
+
+    clientPipe.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => received.some((m) => m.type === 'subscribed'), 'subscribed')
+
+    clientPipe.send({ type: 'call', id: 'm1', path: 'addTodo', args: { title: 'milk' } })
+    await until(
+      () =>
+        received.some((m) => m.type === 'invalidate') && received.some((m) => m.type === 'result'),
+      'invalidate and result',
+    )
+
+    expect(received).toContainEqual({ type: 'invalidate', id: 's1' })
+    expect(received.some((m) => m.type === 'result' && m.id === 'm1')).toBe(true)
   })
 
   test('post-auth malformed frame → error frame, connection stays open', async () => {

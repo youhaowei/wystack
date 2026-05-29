@@ -221,10 +221,12 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
     if (closed) return
     try {
-      // Message-level RPC drops `tablesWritten`; Hono HTTP mutations feed the
-      // reactive tier after dispatch. A `call` returns only the result.
-      const { result } = await dispatch(msg.path, msg.args, context)
+      const { result, tablesWritten } = await dispatch(msg.path, msg.args, context)
       if (closed) return
+      if (reactive !== undefined && tablesWritten.size > 0) {
+        await reactive.invalidate(tablesWritten)
+        if (closed) return
+      }
       send({ type: 'result', id: msg.id, data: result })
     } catch (err) {
       if (closed) return
