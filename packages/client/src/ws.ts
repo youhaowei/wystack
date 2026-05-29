@@ -2,12 +2,13 @@
  * WebSocket adapter shim — public surface for the browser WS transport.
  *
  * The `createWebSocketPipe` browser transport adapter has been relocated to
- * `./transport/websocket` (T3b). This module re-exports it alongside the
- * `createWsManager` convenience wrapper so existing consumers (`client.ts`,
- * `hooks.ts`, app code) continue to work unchanged.
+ * `./transport/websocket` (T3b) and is exported from the package root
+ * (`@wystack/client`). This module wraps it in the `createWsManager`
+ * convenience surface so existing consumers (`client.ts`, `hooks.ts`, app
+ * code) continue to work unchanged.
  *
- * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`,
- * `createWebSocketPipe`) is stable — import from `@wystack/client`.
+ * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`) is
+ * stable — import from `@wystack/client`.
  *
  * Close codes (handled by the engine, surfaced through the adapter):
  *   4001 — auth failed / protocol violation → latch authFailed, no reconnect
@@ -15,8 +16,6 @@
  */
 import { createEngine, type Engine } from './engine'
 import { createWebSocketPipe } from './transport/websocket'
-
-export { createWebSocketPipe } from './transport/websocket'
 
 type InvalidateHandler = () => void
 
