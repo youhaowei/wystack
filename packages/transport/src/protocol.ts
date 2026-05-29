@@ -19,12 +19,22 @@
 // end in `Message` (AuthMessage, SubscribeMessage, ...) but that suffix is not
 // part of the wire — only the `type` value is.
 //
-// Parsers are manual discriminated-union parses with no runtime deps. They
-// mirror the shape rejection done by the existing server-side parser at
-// `packages/server/src/routes.ts:130` (non-object → null, missing/non-string
-// `type` → null) and additionally enforce per-kind required fields. Unknown
-// `type` values, missing required fields, and wrong field types all return
-// `null` — callers pick the close code or error-frame policy.
+// Two parse layers, manual and dependency-free:
+//   - `parseEnvelope` is the LENIENT shape gate — it mirrors the server's
+//     pre-dispatch parser at `routes.ts:135` exactly (non-object → null,
+//     missing/non-string `type` → null) and stops there. Server adapters route
+//     on `type` first, then validate payload fields per-handler — the shipped
+//     server's `auth` token coercion and `args ?? {}` defaulting live in the
+//     handlers, not the parser.
+//   - `parseClientMessage` / `parseServerMessage` are STRICTER than the shipped
+//     server: on top of the envelope they enforce per-kind required fields,
+//     INCLUDING ones the shipped handlers tolerate — a missing or non-string
+//     `token` on `auth`, and a missing/non-object `args` on `subscribe`/`call`.
+//     Those are deliberate tightenings, safe because the typed client always
+//     sends well-formed frames. Callers that need shipped-server leniency (the
+//     engine's auth path) route through `parseEnvelope` + handler coercion, not
+//     the strict parser. Unknown `type`, missing required fields, and wrong
+//     field types all return `null`.
 
 // ─── Client → Server (active) ────────────────────────────────────────────────
 
@@ -182,12 +192,27 @@ export interface ResyncMessage {
 // ─── Parsers (manual, no runtime deps) ───────────────────────────────────────
 
 /**
- * Shared shape check: parse JSON, require a plain object with a `string`
- * `type` field. Returns the unknown-keyed record for per-kind narrowing,
- * or `null` for any structural rejection. Mirrors the existing server
- * parser at `packages/server/src/routes.ts:130`.
+ * A frame that passed the lenient envelope check: a plain object with a
+ * `string` `type`. Other fields are unknown-keyed for per-kind narrowing. This
+ * is the shape `parseEnvelope` guarantees — the discriminant is known, payload
+ * fields are not yet validated.
  */
-function parseEnvelope(data: string): Record<string, unknown> | null {
+export type Envelope = { type: string } & Record<string, unknown>
+
+/**
+ * Lenient shape check: parse JSON, require a plain object with a `string`
+ * `type` field. Returns the envelope for per-kind narrowing, or `null` for any
+ * structural rejection. Mirrors the server's pre-dispatch parser at
+ * `routes.ts:135`.
+ *
+ * This is the LENIENT counterpart to `parseClientMessage`: it gates only the
+ * frame `type` and leaves payload-field validation to the caller. Server
+ * adapters route on `type` first (e.g. `auth` token coercion is the Session's
+ * job, not the parser's — gating it strictly would reject frames the shipped
+ * server accepts), then strict-parse the payload of post-auth frames. Exported
+ * so the engine performs the same envelope-then-strict split routes.ts does.
+ */
+export function parseEnvelope(data: string): Envelope | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(data)
@@ -197,7 +222,7 @@ function parseEnvelope(data: string): Record<string, unknown> | null {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
   const msg = parsed as Record<string, unknown>
   if (typeof msg.type !== 'string') return null
-  return msg
+  return msg as Envelope
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

@@ -13,6 +13,7 @@
 
 import {
   parseClientMessage,
+  parseEnvelope,
   REACTIVITY_NOT_ENABLED,
   type ClientMessage,
   type ServerMessage,
@@ -68,9 +69,17 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
   let closed = false
   const send = (msg: ServerMessage): void => {
-    // Outbound frames race against unrelated closes; swallow the post-close throw.
+    // Outbound frames race against unrelated closes; swallow the post-close
+    // failure. `Pipe.send` is `void | Promise<void>` (sync loopback today, async
+    // WS/IPC next), so guard BOTH a synchronous throw and a rejected promise —
+    // a bare `try/catch` would let an async rejection escape as unhandled. A
+    // conformant pipe is a silent no-op after close, so this rarely fires; it is
+    // the safety net for adapters that reject instead. The one ack that needs
+    // the failure observed (the committing handshake ack) does not use this
+    // helper — it awaits `pipe.send` directly to close `transient` on failure.
     try {
-      void pipe.send(msg)
+      const r = pipe.send(msg)
+      if (r instanceof Promise) r.catch(() => {})
     } catch {
       /* pipe closed */
     }
@@ -91,8 +100,8 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     ? setTimeout(() => closeWith('transient'), authTimeoutMs)
     : null
 
-  async function handleAuth(token: string | null): Promise<void> {
-    const outcome = await session.handleAuth(token)
+  async function handleAuth(rawToken: unknown): Promise<void> {
+    const outcome = await session.handleAuth(rawToken)
     if (closed) return
     if (outcome.kind === 'close') {
       // TODO: replace with @wystack/log once server logging lands. Log only that
@@ -149,12 +158,22 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   function handleMessage(raw: unknown): void {
     if (closed) return
     const data = typeof raw === 'string' ? raw : JSON.stringify(raw)
-    const msg = parseClientMessage(data)
 
-    if (msg === null) {
-      // Invalid shape: unparseable, null, array, primitive, unknown `type`, or a
-      // missing/mistyped required field. Pre-auth → protocol violation, close
-      // terminal. Post-auth → connection-level error frame, stay open.
+    // Lenient envelope parse FIRST — mirrors routes.ts, which gates frames on a
+    // local envelope check (JSON → plain object → string `type`) and validates
+    // payload fields per-handler. This is deliberately NOT the strict
+    // `parseClientMessage`: routing `auth` through the strict parser would reject
+    // a missing or non-string `token` as a malformed frame and terminally close
+    // a client the shipped server authenticates as anonymous (it coerces such
+    // tokens to null in `Session.handleAuth`). Auth-frame token leniency is the
+    // Session's job, not the parser's — so the envelope check decides only the
+    // frame `type`, and `handleAuth` does the routes.ts-equivalent coercion.
+    const envelope = parseEnvelope(data)
+
+    if (envelope === null) {
+      // Unparseable, null, array, primitive, or non-string `type`. Pre-auth →
+      // protocol violation, close terminal. Post-auth → connection-level error
+      // frame, stay open. Parity with routes.ts:397.
       if (!session.authenticated) {
         closeWith('auth-failed')
         return
@@ -164,8 +183,10 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
 
     // `auth` is the only frame allowed across the unauthenticated boundary.
-    if (msg.type === 'auth') {
-      void handleAuth(msg.token)
+    // Hand the raw token to the Session, which coerces missing/empty/non-string
+    // to null (anonymous) exactly as routes.ts does.
+    if (envelope.type === 'auth') {
+      void handleAuth(envelope.token)
       return
     }
 
@@ -174,7 +195,20 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       return
     }
 
+    // Post-auth: strict-parse the payload. The typed client always sends
+    // well-formed `call`/`subscribe`/`unsubscribe` frames; a malformed one
+    // post-auth gets an error frame and the connection stays open.
+    const msg = parseClientMessage(data)
+    if (msg === null) {
+      send({ type: 'error', error: 'invalid message' })
+      return
+    }
+
     switch (msg.type) {
+      case 'auth':
+        // Already handled above via the envelope; unreachable here. A repeat
+        // auth frame post-auth is routed by the envelope branch, not this one.
+        return
       case 'call':
         void handleCall(msg)
         return

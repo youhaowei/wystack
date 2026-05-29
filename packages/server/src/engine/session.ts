@@ -124,9 +124,11 @@ export class Session {
 
   /**
    * Resolve a fresh context for a request on this connection, layering the
-   * connection's captured token onto a freshly built synthetic Request. Used
-   * by the Engine per `subscribe` (reactive tier, YW-62). The Bearer/anonymous
-   * invariants live in `buildAuthRequest`.
+   * connection's captured token onto a freshly built synthetic Request. Called
+   * per request — RPC `call` today (the reactive `subscribe` path lands in
+   * YW-62, which reuses this same method). The Bearer/anonymous invariants live
+   * in `buildAuthRequest`. The `Sub` in the name is "sub-context", not
+   * "subscribe" — it mirrors the shipped `routes.ts:resolveSubContext`.
    */
   async resolveSubContext(): Promise<Record<string, unknown>> {
     const req = buildAuthRequest(this.baseRequest, this.token)

@@ -39,5 +39,12 @@ export type {
   // Reserved post-v0.2
   NextMessage,
   ResyncMessage,
+  // Envelope (lenient shape gate)
+  Envelope,
 } from './protocol'
-export { parseClientMessage, parseServerMessage, REACTIVITY_NOT_ENABLED } from './protocol'
+export {
+  parseClientMessage,
+  parseServerMessage,
+  parseEnvelope,
+  REACTIVITY_NOT_ENABLED,
+} from './protocol'

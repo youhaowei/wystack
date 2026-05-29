@@ -221,6 +221,64 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(seen).toEqual([{ auth: 'Bearer tok123' }])
   })
 
+  // Parity regression: routes.ts uses a LENIENT envelope parse then coerces a
+  // missing / non-string / empty token to null (anonymous). The engine must do
+  // the same — NOT route the auth frame through the strict transport parser,
+  // which would reject these shapes and terminally close a client routes.ts
+  // authenticates. Each case below would have closed `auth-failed` before the
+  // envelope-then-coerce fix.
+  test('auth frame with a MISSING token coerces to anonymous (not terminal close)', async () => {
+    const seen: { auth: string | null }[] = []
+    const base = new Request('wystack://pipe', { headers: { authorization: 'Bearer leaked' } })
+    const h = await harness({
+      baseRequest: base,
+      resolveContext: async (req) => {
+        seen.push({ auth: req.headers.get('authorization') })
+        return {}
+      },
+    })
+    // No `token` field at all — a plausible anonymous client.
+    h.send({ type: 'auth' } as unknown as ClientMessage)
+    await until(() => h.received.length > 0, 'authenticated')
+    expect(seen).toEqual([{ auth: null }]) // stripped → anonymous
+    expect(h.received).toEqual([{ type: 'authenticated' }])
+    expect(h.closeReasons).toEqual([]) // NOT terminally closed
+  })
+
+  test('auth frame with a NON-STRING token coerces to anonymous (not terminal close)', async () => {
+    const seen: { auth: string | null }[] = []
+    const h = await harness({
+      resolveContext: async (req) => {
+        seen.push({ auth: req.headers.get('authorization') })
+        return {}
+      },
+    })
+    h.send({ type: 'auth', token: 123 } as unknown as ClientMessage)
+    await until(() => h.received.length > 0, 'authenticated')
+    expect(seen).toEqual([{ auth: null }])
+    expect(h.received).toEqual([{ type: 'authenticated' }])
+    expect(h.closeReasons).toEqual([])
+  })
+
+  test('auth frame with an EMPTY-STRING token coerces to anonymous (strips Authorization)', async () => {
+    // The sole non-null string that must coerce to anonymous — guards the
+    // `.length > 0` predicate against a `token != null ? Bearer : strip` refactor
+    // that would leak an empty `Bearer ` header.
+    const seen: { auth: string | null }[] = []
+    const base = new Request('wystack://pipe', { headers: { authorization: 'Bearer leaked' } })
+    const h = await harness({
+      baseRequest: base,
+      resolveContext: async (req) => {
+        seen.push({ auth: req.headers.get('authorization') })
+        return {}
+      },
+    })
+    h.send({ type: 'auth', token: '' })
+    await until(() => h.received.length > 0, 'authenticated')
+    expect(seen).toEqual([{ auth: null }]) // empty string → stripped, not `Bearer `
+    expect(h.received).toEqual([{ type: 'authenticated' }])
+  })
+
   test('no-auth server: an auth frame gets an idempotent ACK without adopting a token', async () => {
     const h = await harness() // no resolveContext → starts authenticated
     h.send({ type: 'auth', token: 'ignored' })
