@@ -665,16 +665,18 @@ describe('WsManager', () => {
       expect(authTokens).toContain('user_2')
       expect(ws.isConnected()).toBe(true)
 
+      const invalidated = withTimeout(
+        invalidatedAfterReconnect.promise,
+        'invalidate after reconnect',
+      )
       await mutateUntilInvalidated(
         `http://localhost:${authServer.port}`,
         'After browser reconnect',
-        invalidatedAfterReconnect.promise,
+        invalidated,
         { Authorization: 'Bearer user_2' },
       )
-      await withTimeout(invalidatedAfterReconnect.promise, 'invalidate after reconnect')
+      await invalidated
       expect(invalidateCount).toBe(1)
-
-      ws.disconnect()
     } finally {
       ws?.disconnect()
       ;(global as { WebSocket: typeof WebSocket }).WebSocket = RealWebSocket
