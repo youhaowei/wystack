@@ -318,6 +318,29 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(h.handle.session.token).toBe('A')
   })
 
+  test('valid-then-invalid auth race: loser must NOT close the authenticated connection', async () => {
+    // Frame A carries a valid token, frame B an invalid one. Both pass the
+    // pre-await gate; A authenticates first, then B's resolveContext rejects.
+    // B's failure path must re-check `authenticated` and idempotent-ACK rather
+    // than tear down A's live connection (regression: catch returned auth-failed
+    // unconditionally). Parity with routes.ts:284.
+    const h = await harness({
+      resolveContext: async (req) => {
+        if (req.headers.get('authorization') === 'Bearer good') return { userId: 'u1' }
+        throw new Error('invalid token')
+      },
+    })
+    h.send({ type: 'auth', token: 'good' })
+    h.send({ type: 'auth', token: 'bad' })
+    await until(() => h.received.filter((m) => m.type === 'authenticated').length >= 2, 'two acks')
+
+    // Two ACKs (winner + idempotent loser), token stays the winner's, NOT closed.
+    expect(h.received.filter((m) => m.type === 'authenticated').length).toBe(2)
+    expect(h.handle.session.token).toBe('good')
+    expect(h.closeReasons).toEqual([])
+    expect(h.handle.session.authenticated).toBe(true)
+  })
+
   test('malformed first frame pre-auth → terminal close', async () => {
     const h = await harness({ resolveContext: async () => ({}) })
     // Send a structurally invalid frame (unknown type) before authenticating.
@@ -326,6 +349,16 @@ describe('Engine — auth handshake parity (AC #2)', () => {
 
     expect(h.closeReasons).toEqual(['auth-failed'])
     expect(h.received).toEqual([])
+  })
+
+  test('non-serializable frame (BigInt) is treated as invalid, not a crash', async () => {
+    // JSON.stringify throws on a BigInt; the handler must route it through the
+    // invalid-frame path (terminal close pre-auth) rather than throw out of the
+    // inbound callback. Pre-auth here → auth-failed.
+    const h = await harness({ resolveContext: async () => ({}) })
+    h.send({ type: 'call', id: 'c1', n: 1n } as unknown as ClientMessage)
+    await flush()
+    expect(h.closeReasons).toEqual(['auth-failed'])
   })
 
   test('non-auth first frame pre-auth → terminal close', async () => {
@@ -404,6 +437,15 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
     expect(h.received).toEqual([{ type: 'error', error: 'invalid message' }])
     expect(h.closeReasons).toEqual([]) // not closed
   })
+
+  test('post-auth non-serializable frame (BigInt) → error frame, stays open (no crash)', async () => {
+    const h = await harness() // authenticated (no-auth server)
+    h.send({ type: 'call', id: 'c1', n: 1n } as unknown as ClientMessage)
+    await flush()
+
+    expect(h.received).toEqual([{ type: 'error', error: 'invalid message' }])
+    expect(h.closeReasons).toEqual([])
+  })
 })
 
 describe('Engine — teardown', () => {
@@ -415,5 +457,35 @@ describe('Engine — teardown', () => {
     h.send({ type: 'call', id: 'c1', path: 'listTodos', args: {} })
     await flush()
     expect(h.received).toEqual([])
+  })
+
+  test('engine-initiated close (timeout) unsubscribes the inbound handler', async () => {
+    // Regression: closeWith used to skip unsubscribe (only detach called it),
+    // leaking the onMessage handler on timeout/auth-failed/ack-failure paths.
+    const app = await makeApp()
+    let liveHandlers = 0
+    let pipeClosed = false
+    const trackingPipe = {
+      id: 'tracking',
+      send: () => {},
+      onMessage: (_h: (m: unknown) => void) => {
+        liveHandlers += 1
+        return () => {
+          liveHandlers -= 1
+        }
+      },
+      close: () => {
+        pipeClosed = true
+      },
+    }
+    attachEngine(trackingPipe, {
+      app,
+      resolveContext: async () => ({}), // requires auth → arms the handshake timer
+      authTimeoutMs: 10,
+    })
+    expect(liveHandlers).toBe(1)
+    await new Promise((r) => setTimeout(r, 30)) // trip the timeout → closeWith('transient')
+    expect(liveHandlers).toBe(0) // handler was unsubscribed by the close path
+    expect(pipeClosed).toBe(true)
   })
 })

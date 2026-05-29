@@ -68,6 +68,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   const session = new Session(opts)
 
   let closed = false
+  // Set when the inbound handler is registered (below). Held in a mutable ref so
+  // every close path can unsubscribe it, not just `detach`.
+  let unsubscribe: (() => void) | null = null
   const send = (msg: ServerMessage): void => {
     // Outbound frames race against unrelated closes; swallow the post-close
     // failure. `Pipe.send` is `void | Promise<void>` (sync loopback today, async
@@ -85,11 +88,21 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
   }
 
-  /** Close once: fire the adapter's reason hook, then close the pipe. */
-  const closeWith = (reason: CloseReason): void => {
+  // Shared teardown: flip the closed guard, disarm the handshake timer, and drop
+  // the inbound handler. Both close paths (engine-initiated `closeWith` and
+  // caller-initiated `detach`) run this so a leaked `onMessage` handler never
+  // outlives the connection. Idempotent via the `closed` guard.
+  const teardown = (): void => {
     if (closed) return
     closed = true
     if (timeout !== null) clearTimeout(timeout)
+    unsubscribe?.()
+  }
+
+  /** Close once: tear down, fire the adapter's reason hook, then close the pipe. */
+  const closeWith = (reason: CloseReason): void => {
+    if (closed) return
+    teardown()
     onClose?.(reason)
     void pipe.close()
   }
@@ -157,7 +170,22 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
   function handleMessage(raw: unknown): void {
     if (closed) return
-    const data = typeof raw === 'string' ? raw : JSON.stringify(raw)
+
+    // A non-string frame (structured-clone IPC payload, etc.) is serialized for
+    // the parser. `JSON.stringify` can throw on a BigInt or circular value — a
+    // malformed frame must route through the invalid-frame path, not crash the
+    // inbound callback. `stringify` can also return `undefined` (e.g. a bare
+    // function); treat that as malformed too.
+    let data: string | null
+    if (typeof raw === 'string') {
+      data = raw
+    } else {
+      try {
+        data = JSON.stringify(raw) ?? null
+      } catch {
+        data = null
+      }
+    }
 
     // Lenient envelope parse FIRST — mirrors routes.ts, which gates frames on a
     // local envelope check (JSON → plain object → string `type`) and validates
@@ -168,7 +196,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     // tokens to null in `Session.handleAuth`). Auth-frame token leniency is the
     // Session's job, not the parser's — so the envelope check decides only the
     // frame `type`, and `handleAuth` does the routes.ts-equivalent coercion.
-    const envelope = parseEnvelope(data)
+    const envelope = data === null ? null : parseEnvelope(data)
 
     if (envelope === null) {
       // Unparseable, null, array, primitive, or non-string `type`. Pre-auth →
@@ -197,8 +225,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
     // Post-auth: strict-parse the payload. The typed client always sends
     // well-formed `call`/`subscribe`/`unsubscribe` frames; a malformed one
-    // post-auth gets an error frame and the connection stays open.
-    const msg = parseClientMessage(data)
+    // post-auth gets an error frame and the connection stays open. `data` is
+    // non-null here — `envelope !== null` implies it parsed from a string.
+    const msg = parseClientMessage(data as string)
     if (msg === null) {
       send({ type: 'error', error: 'invalid message' })
       return
@@ -223,15 +252,13 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
   }
 
-  const unsubscribe = pipe.onMessage(handleMessage)
+  unsubscribe = pipe.onMessage(handleMessage)
 
   return {
     session,
     detach() {
       if (closed) return
-      closed = true
-      if (timeout !== null) clearTimeout(timeout)
-      unsubscribe()
+      teardown()
       void pipe.close()
     },
   }

@@ -164,8 +164,17 @@ export class Session {
       const req = buildAuthRequest(this.baseRequest, token)
       await this.resolveContext(req)
     } catch {
-      // Auth failed — terminal. The Engine logs (with the message only, to
-      // avoid leaking token/header values embedded in thrown errors) and closes.
+      // Auth failed. Re-check after the await BEFORE closing: a concurrent frame
+      // (e.g. a valid token immediately followed by an invalid one) may have
+      // authenticated the connection while this resolve was rejecting. Tearing
+      // it down with `auth-failed` here would close a live, authenticated
+      // connection. The loser instead sends an idempotent ACK. Parity with
+      // routes.ts:284 (`if (... && !conn.authenticated) ws.close(4001)`).
+      if (this.authenticated) {
+        return { kind: 'authenticated', committed: false }
+      }
+      // Genuinely failed — terminal. The Engine logs the message only (never the
+      // token/header values that may be embedded in the thrown error) and closes.
       return { kind: 'close', reason: 'auth-failed' }
     }
 
