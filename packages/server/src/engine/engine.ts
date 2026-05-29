@@ -286,10 +286,10 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   }
 
   function handleUnsubscribe(msg: Extract<ClientMessage, { type: 'unsubscribe' }>): void {
+    const wasActive = subIds.delete(msg.id)
     pendingSubIds.delete(msg.id)
-    if (!reactive) return
+    if (!reactive || !wasActive) return
     reactive.remove(msg.id)
-    subIds.delete(msg.id)
   }
 
   function handleMessage(raw: unknown): void {

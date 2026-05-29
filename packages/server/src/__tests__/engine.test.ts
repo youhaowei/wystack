@@ -451,6 +451,29 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
     expect(received.some((m) => m.type === 'result' && m.id === 'm1')).toBe(true)
   })
 
+  test('pending unsubscribe cancels without removing an unregistered subscription', async () => {
+    const app = await makeApp()
+    const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const added: string[] = []
+    const removed: string[] = []
+
+    attachEngine(serverPipe, {
+      app,
+      reactive: {
+        add: (sub) => added.push(sub.id),
+        remove: (id) => removed.push(id),
+        invalidate: async () => {},
+      },
+    })
+
+    clientPipe.send({ type: 'subscribe', id: 'pending', path: 'listTodos', args: {} })
+    clientPipe.send({ type: 'unsubscribe', id: 'pending' })
+    await flush()
+
+    expect(added).toEqual([])
+    expect(removed).toEqual([])
+  })
+
   test('post-auth malformed frame → error frame, connection stays open', async () => {
     const h = await harness() // authenticated (no-auth server)
     h.send({ type: 'whatever' } as unknown as ClientMessage)
