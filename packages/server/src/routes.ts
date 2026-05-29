@@ -51,12 +51,12 @@ export { buildAuthRequest } from './engine'
  * only the reactive-tier bookkeeping lives here now.
  *
  * `handle`    — the EngineHandle returned by `attachEngine` for this connection.
- * `pipe`      — the Pipe adapter backed by this WS. Inbound frames not handled
- *               by routes.ts (auth, call) are forwarded via `engineInbound`.
  * `engineInbound` — the single inbound handler the engine registered on the
- *               pipe's synthetic `onMessage`. Routes.ts calls it directly for
+ *               Pipe's synthetic `onMessage`. Routes.ts calls it directly for
  *               frames it does not handle (auth, call, malformed, unknown-type),
  *               preserving the engine's protocol policy without a real Pipe.
+ *               `null` once the engine has detached (post-close), so the call
+ *               site must null-check before invoking.
  * `subIds`    — IDs of active subscriptions on this socket (for cleanup on close).
  * `pendingSubIds` — IDs of in-flight subscribes (see `handleSubscribe`).
  *
@@ -66,7 +66,7 @@ export { buildAuthRequest } from './engine'
  */
 interface Connection {
   handle: ReturnType<typeof attachEngine>
-  engineInbound: (message: unknown) => void
+  engineInbound: ((message: unknown) => void) | null
   subIds: Set<string>
   /**
    * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
@@ -83,6 +83,11 @@ interface Connection {
    */
   pendingSubIds: Set<string>
 }
+
+// Monotonic source for per-connection Pipe ids. `ws.raw` is a stable identity
+// key but stringifies to "[object Object]", so it cannot serve as the Pipe
+// contract's "stable per-connection identifier for diagnostics and correlation."
+let nextConnectionId = 0
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -254,14 +259,16 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           let pipeClosed = false
 
           const pipe: Pipe = {
-            id: String(rawSocket),
+            id: `ws-${++nextConnectionId}`,
             send(message: unknown): void {
+              // Post-close: silent no-op, per the Pipe contract. While the
+              // socket is live a `ws.send` throw is a real transport failure —
+              // it MUST propagate. The engine swallows it for fire-and-forget
+              // frames via its own `send` helper, but `await`s this directly for
+              // the committing `authenticated` ack so it can close `transient`
+              // (4002) on failure rather than strand the client on its ack timer.
               if (pipeClosed) return
-              try {
-                ws.send(JSON.stringify(message))
-              } catch {
-                /* socket closed */
-              }
+              ws.send(JSON.stringify(message))
             },
             onMessage(handler: (message: unknown) => void): () => void {
               // The engine calls this exactly once to register its inbound handler.
@@ -311,8 +318,11 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
           rawToConnection.set(rawSocket, {
             handle,
+            // A getter so the connection always sees the engine's current
+            // handler — `null` after detach, a function while attached. The
+            // call site in `onMessage` null-checks before invoking.
             get engineInbound() {
-              return engineInbound as (message: unknown) => void
+              return engineInbound
             },
             subIds: new Set(),
             pendingSubIds: new Set(),
