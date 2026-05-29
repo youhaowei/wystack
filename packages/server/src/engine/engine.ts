@@ -7,9 +7,9 @@
 // drive it next (YW-57, T5/T6), each supplying its own close-code mapping.
 //
 // Tier model (Spec ADR #12): the RPC tier (`call` → `result`) is always on. The
-// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in; this Engine
-// does not wire it, so any `subscribe` gets `error{REACTIVITY_NOT_ENABLED}`.
-// YW-62 adds the SubscriptionStore + invalidation ports behind this seam.
+// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in; transports
+// pass a ReactiveTier when they support subscriptions, otherwise `subscribe`
+// gets `error{REACTIVITY_NOT_ENABLED}`.
 
 import {
   parseClientMessage,
@@ -26,6 +26,12 @@ import { Session, type CloseReason, type SessionOptions } from './session'
 
 export interface AttachEngineOptions extends SessionOptions {
   app: WyStackApp
+  /**
+   * Optional reactive tier shared by adapters that support subscriptions.
+   * Omitted transports stay RPC-only and answer `subscribe` with
+   * REACTIVITY_NOT_ENABLED.
+   */
+  reactive?: ReactiveTier
   /**
    * Max ms to wait for the client's first `auth` frame after the connection
    * opens. Only armed when `resolveContext` is configured. A timeout closes the
@@ -48,8 +54,79 @@ export interface EngineHandle {
   detach(): void
 }
 
+interface ReactiveSubscription {
+  id: string
+  functionPath: string
+  args: Record<string, unknown>
+  context: Record<string, unknown>
+  tablesWatched: Set<string>
+  pipe: Pipe<unknown, ServerMessage>
+}
+
+export interface ReactiveTier {
+  add(sub: ReactiveSubscription): void
+  remove(id: string): void
+  invalidate(writtenTables: Set<string>): Promise<void>
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+function safeSend(pipe: Pipe<unknown, ServerMessage>, msg: ServerMessage): void {
+  try {
+    const r = pipe.send(msg)
+    if (r instanceof Promise) r.catch(() => {})
+  } catch {
+    /* pipe closed */
+  }
+}
+
+/**
+ * Reactive subscription registry shared by an app's WS connections and HTTP
+ * mutation dispatch. Keeps subscription state out of Hono routes while
+ * preserving the v0.2 signal-only invalidation behavior.
+ */
+export function createReactiveTier(app: WyStackApp): ReactiveTier {
+  const subToPipe = new Map<string, Pipe<unknown, ServerMessage>>()
+
+  return {
+    add(sub) {
+      app.subscriptions.add({
+        id: sub.id,
+        functionPath: sub.functionPath,
+        args: sub.args,
+        context: sub.context,
+        tablesWatched: sub.tablesWatched,
+      })
+      subToPipe.set(sub.id, sub.pipe)
+    },
+
+    remove(id) {
+      app.subscriptions.remove(id)
+      subToPipe.delete(id)
+    },
+
+    async invalidate(writtenTables) {
+      const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
+
+      await Promise.allSettled(
+        affected.map(async (sub) => {
+          const pipe = subToPipe.get(sub.id)
+          if (!pipe) return
+
+          try {
+            const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
+            sub.tablesWatched = tablesRead
+          } catch {
+            // Keep existing table watches; the client refetch surfaces the error.
+          }
+
+          safeSend(pipe, { type: 'invalidate', id: sub.id })
+        }),
+      )
+    },
+  }
 }
 
 /**
@@ -63,30 +140,17 @@ function errorMessage(err: unknown): string {
  * with the shipped `routes.ts` pre/post-auth split.
  */
 export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandle {
-  const { app, authTimeoutMs = 10_000, onClose } = opts
+  const { app, authTimeoutMs = 10_000, onClose, reactive } = opts
   const dispatch: Dispatch = createDispatch(app)
   const session = new Session(opts)
 
   let closed = false
+  const subIds = new Set<string>()
+  const pendingSubIds = new Set<string>()
   // Set when the inbound handler is registered (below). Held in a mutable ref so
   // every close path can unsubscribe it, not just `detach`.
   let unsubscribe: (() => void) | null = null
-  const send = (msg: ServerMessage): void => {
-    // Outbound frames race against unrelated closes; swallow the post-close
-    // failure. `Pipe.send` is `void | Promise<void>` (sync loopback today, async
-    // WS/IPC next), so guard BOTH a synchronous throw and a rejected promise —
-    // a bare `try/catch` would let an async rejection escape as unhandled. A
-    // conformant pipe is a silent no-op after close, so this rarely fires; it is
-    // the safety net for adapters that reject instead. The one ack that needs
-    // the failure observed (the committing handshake ack) does not use this
-    // helper — it awaits `pipe.send` directly to close `transient` on failure.
-    try {
-      const r = pipe.send(msg)
-      if (r instanceof Promise) r.catch(() => {})
-    } catch {
-      /* pipe closed */
-    }
-  }
+  const send = (msg: ServerMessage): void => safeSend(pipe, msg)
 
   // Shared teardown: flip the closed guard, disarm the handshake timer, and drop
   // the inbound handler. Both close paths (engine-initiated `closeWith` and
@@ -96,6 +160,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     if (closed) return
     closed = true
     if (timeout !== null) clearTimeout(timeout)
+    pendingSubIds.clear()
+    for (const id of subIds) reactive?.remove(id)
+    subIds.clear()
     unsubscribe?.()
   }
 
@@ -154,9 +221,8 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
     if (closed) return
     try {
-      // RPC drops `tablesWritten`: a `call` to a mutation produces it, but the
-      // reactive tier (the SubscriptionStore that would consume it) is not wired
-      // here. Invalidation lands in YW-62. RPC returns only the result.
+      // Message-level RPC drops `tablesWritten`; Hono HTTP mutations feed the
+      // reactive tier after dispatch. A `call` returns only the result.
       const { result } = await dispatch(msg.path, msg.args, context)
       if (closed) return
       send({ type: 'result', id: msg.id, data: result })
@@ -166,6 +232,62 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       if (err instanceof ValidationError) payload.issues = err.issues
       send(payload)
     }
+  }
+
+  async function handleSubscribe(
+    msg: Extract<ClientMessage, { type: 'subscribe' }>,
+  ): Promise<void> {
+    if (reactive === undefined) {
+      send({ type: 'error', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+      return
+    }
+
+    const fn = app.functions.get(msg.path)
+    if (!fn || fn.type !== 'query') {
+      send({ type: 'error', id: msg.id, error: `Unknown query: ${msg.path}` })
+      return
+    }
+
+    pendingSubIds.add(msg.id)
+
+    let context: Record<string, unknown>
+    try {
+      context = await session.resolveSubContext()
+    } catch (err) {
+      pendingSubIds.delete(msg.id)
+      send({ type: 'error', id: msg.id, error: errorMessage(err) })
+      return
+    }
+
+    if (closed || !pendingSubIds.has(msg.id)) return
+
+    try {
+      const { tablesRead } = await dispatch(msg.path, msg.args, context)
+      if (closed || !pendingSubIds.has(msg.id)) return
+      pendingSubIds.delete(msg.id)
+      reactive.add({
+        id: msg.id,
+        functionPath: msg.path,
+        args: msg.args,
+        context,
+        tablesWatched: tablesRead,
+        pipe,
+      })
+      subIds.add(msg.id)
+      send({ type: 'subscribed', id: msg.id })
+    } catch (err) {
+      pendingSubIds.delete(msg.id)
+      const payload: ServerMessage = { type: 'error', id: msg.id, error: errorMessage(err) }
+      if (err instanceof ValidationError) payload.issues = err.issues
+      send(payload)
+    }
+  }
+
+  function handleUnsubscribe(msg: Extract<ClientMessage, { type: 'unsubscribe' }>): void {
+    pendingSubIds.delete(msg.id)
+    if (!reactive) return
+    reactive.remove(msg.id)
+    subIds.delete(msg.id)
   }
 
   function handleMessage(raw: unknown): void {
@@ -242,12 +364,10 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         void handleCall(msg)
         return
       case 'subscribe':
-        // Reactive tier not wired (Spec ADR #12). The capability-discovery floor.
-        send({ type: 'error', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+        void handleSubscribe(msg)
         return
       case 'unsubscribe':
-        // No reactive tier means no subscription to cancel — tolerate silently,
-        // matching the shipped server's unknown-id tolerance.
+        handleUnsubscribe(msg)
         return
     }
   }
