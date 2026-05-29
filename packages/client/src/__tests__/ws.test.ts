@@ -611,19 +611,19 @@ describe('WsManager', () => {
       },
     })
 
+    let ws: ReturnType<typeof createWsManager> | null = null
     const sockets: WebSocket[] = []
     const RealWebSocket = global.WebSocket
-    class TrackingWebSocket extends RealWebSocket {
-      constructor(url: string | URL, protocols?: string | string[]) {
-        super(url, protocols)
-        sockets.push(this)
-      }
-    }
-    ;(global as { WebSocket: typeof WebSocket }).WebSocket =
-      TrackingWebSocket as unknown as typeof WebSocket
-
-    let ws: ReturnType<typeof createWsManager> | null = null
     try {
+      class TrackingWebSocket extends RealWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          super(url, protocols)
+          sockets.push(this)
+        }
+      }
+      ;(global as { WebSocket: typeof WebSocket }).WebSocket =
+        TrackingWebSocket as unknown as typeof WebSocket
+
       let tokenCalls = 0
       let subscribedCount = 0
       const firstSubscribed = deferred<void>()
