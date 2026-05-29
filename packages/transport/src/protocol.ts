@@ -8,7 +8,8 @@
 //
 // Active vs reserved:
 //   - The active discriminated unions (ClientMessage / ServerMessage) cover
-//     every message kind sent on the wire today.
+//     every message kind sent on the wire today, including the RPC pair
+//     (`call` / `result`) added by the Engine extraction (Spec ADR #9, #12).
 //   - `NextMessage` and `ResyncMessage` are typed but excluded from the active
 //     unions. They are reserved for the post-v0.2 incremental push profile
 //     (Spec ADR #10 — signal-first reactive delivery). Defining them here lets
@@ -18,12 +19,22 @@
 // end in `Message` (AuthMessage, SubscribeMessage, ...) but that suffix is not
 // part of the wire — only the `type` value is.
 //
-// Parsers are manual discriminated-union parses with no runtime deps. They
-// mirror the shape rejection done by the existing server-side parser at
-// `packages/server/src/routes.ts:130` (non-object → null, missing/non-string
-// `type` → null) and additionally enforce per-kind required fields. Unknown
-// `type` values, missing required fields, and wrong field types all return
-// `null` — callers pick the close code or error-frame policy.
+// Two parse layers, manual and dependency-free:
+//   - `parseEnvelope` is the LENIENT shape gate — it mirrors the server's
+//     pre-dispatch parser at `routes.ts:135` exactly (non-object → null,
+//     missing/non-string `type` → null) and stops there. Server adapters route
+//     on `type` first, then validate payload fields per-handler — the shipped
+//     server's `auth` token coercion and `args ?? {}` defaulting live in the
+//     handlers, not the parser.
+//   - `parseClientMessage` / `parseServerMessage` are STRICTER than the shipped
+//     server: on top of the envelope they enforce per-kind required fields,
+//     INCLUDING ones the shipped handlers tolerate — a missing or non-string
+//     `token` on `auth`, and a missing/non-object `args` on `subscribe`/`call`.
+//     Those are deliberate tightenings, safe because the typed client always
+//     sends well-formed frames. Callers that need shipped-server leniency (the
+//     engine's auth path) route through `parseEnvelope` + handler coercion, not
+//     the strict parser. Unknown `type`, missing required fields, and wrong
+//     field types all return `null`.
 
 // ─── Client → Server (active) ────────────────────────────────────────────────
 
@@ -61,7 +72,21 @@ export interface UnsubscribeMessage {
   id: string
 }
 
-export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage
+/**
+ * RPC call over message transports (IPC, loopback). One unified kind for both
+ * queries and mutations — the server's function registry resolves which `path`
+ * is (Spec ADR #9). HTTP keeps REST verbs; this kind is for transports that
+ * have no verb to carry intent. The connection's token is captured at `auth`
+ * time and reused, so there is no `token` field here.
+ */
+export interface CallMessage {
+  type: 'call'
+  id: string
+  path: string
+  args: Record<string, unknown>
+}
+
+export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage | CallMessage
 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
@@ -110,11 +135,33 @@ export interface ErrorMessage {
   issues?: unknown[]
 }
 
+/**
+ * Response to a `call` message. `data` is the function's return value (the
+ * registry resolved query vs mutation; the wire does not distinguish). Errors
+ * surface as an `ErrorMessage` carrying the same `id`, not a `result`.
+ */
+export interface ResultMessage {
+  type: 'result'
+  id: string
+  data: unknown
+}
+
 export type ServerMessage =
   | AuthenticatedMessage
   | SubscribedMessage
   | InvalidateMessage
+  | ResultMessage
   | ErrorMessage
+
+// ─── Error codes ──────────────────────────────────────────────────────────
+
+/**
+ * Sentinel `error` string returned to any `subscribe` on a server that has not
+ * wired the reactive tier (Spec ADR #12 — RPC always-on, reactive opt-in). The
+ * v0.2 capability-discovery floor: a client learns the tier is absent from this
+ * error rather than from wire-protocol version negotiation (deferred).
+ */
+export const REACTIVITY_NOT_ENABLED = 'REACTIVITY_NOT_ENABLED'
 
 // ─── Reserved (post-v0.2 push profile — NOT in active unions) ────────────────
 
@@ -145,12 +192,27 @@ export interface ResyncMessage {
 // ─── Parsers (manual, no runtime deps) ───────────────────────────────────────
 
 /**
- * Shared shape check: parse JSON, require a plain object with a `string`
- * `type` field. Returns the unknown-keyed record for per-kind narrowing,
- * or `null` for any structural rejection. Mirrors the existing server
- * parser at `packages/server/src/routes.ts:130`.
+ * A frame that passed the lenient envelope check: a plain object with a
+ * `string` `type`. Other fields are unknown-keyed for per-kind narrowing. This
+ * is the shape `parseEnvelope` guarantees — the discriminant is known, payload
+ * fields are not yet validated.
  */
-function parseEnvelope(data: string): Record<string, unknown> | null {
+export type Envelope = { type: string } & Record<string, unknown>
+
+/**
+ * Lenient shape check: parse JSON, require a plain object with a `string`
+ * `type` field. Returns the envelope for per-kind narrowing, or `null` for any
+ * structural rejection. Mirrors the server's pre-dispatch parser at
+ * `routes.ts:135`.
+ *
+ * This is the LENIENT counterpart to `parseClientMessage`: it gates only the
+ * frame `type` and leaves payload-field validation to the caller. Server
+ * adapters route on `type` first (e.g. `auth` token coercion is the Session's
+ * job, not the parser's — gating it strictly would reject frames the shipped
+ * server accepts), then strict-parse the payload of post-auth frames. Exported
+ * so the engine performs the same envelope-then-strict split routes.ts does.
+ */
+export function parseEnvelope(data: string): Envelope | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(data)
@@ -160,7 +222,7 @@ function parseEnvelope(data: string): Record<string, unknown> | null {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
   const msg = parsed as Record<string, unknown>
   if (typeof msg.type !== 'string') return null
-  return msg
+  return msg as Envelope
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -200,6 +262,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       if (typeof msg.id !== 'string') return null
       return { type: 'unsubscribe', id: msg.id }
     }
+    case 'call': {
+      if (typeof msg.id !== 'string') return null
+      if (typeof msg.path !== 'string') return null
+      if (!isPlainObject(msg.args)) return null
+      return { type: 'call', id: msg.id, path: msg.path, args: msg.args }
+    }
     default:
       return null
   }
@@ -225,6 +293,12 @@ export function parseServerMessage(data: string): ServerMessage | null {
     case 'invalidate': {
       if (typeof msg.id !== 'string') return null
       return { type: 'invalidate', id: msg.id }
+    }
+    case 'result': {
+      // `data` is `unknown` by design — the function's return value carries no
+      // wire-level shape contract. Only `id` is structurally required.
+      if (typeof msg.id !== 'string') return null
+      return { type: 'result', id: msg.id, data: msg.data }
     }
     case 'error': {
       if (typeof msg.error !== 'string') return null

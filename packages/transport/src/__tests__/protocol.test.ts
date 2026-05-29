@@ -2,12 +2,16 @@ import { describe, test, expect } from 'bun:test'
 import {
   parseClientMessage,
   parseServerMessage,
+  parseEnvelope,
+  REACTIVITY_NOT_ENABLED,
   type AuthMessage,
   type SubscribeMessage,
   type UnsubscribeMessage,
+  type CallMessage,
   type AuthenticatedMessage,
   type SubscribedMessage,
   type InvalidateMessage,
+  type ResultMessage,
   type ErrorMessage,
   type ClientMessage,
   type ServerMessage,
@@ -24,14 +28,16 @@ const _typeChecks = (): void => {
   const a: AuthMessage = { type: 'auth', token: null }
   const s: SubscribeMessage = { type: 'subscribe', id: 'x', path: 'p', args: {} }
   const u: UnsubscribeMessage = { type: 'unsubscribe', id: 'x' }
-  const _client: ClientMessage[] = [a, s, u]
+  const c: CallMessage = { type: 'call', id: 'x', path: 'p', args: {} }
+  const _client: ClientMessage[] = [a, s, u, c]
   void _client
 
   const ack: AuthenticatedMessage = { type: 'authenticated' }
   const sub: SubscribedMessage = { type: 'subscribed', id: 'x' }
   const inv: InvalidateMessage = { type: 'invalidate', id: 'x' }
+  const res: ResultMessage = { type: 'result', id: 'x', data: { ok: true } }
   const err: ErrorMessage = { type: 'error', error: 'boom' }
-  const _server: ServerMessage[] = [ack, sub, inv, err]
+  const _server: ServerMessage[] = [ack, sub, inv, res, err]
   void _server
 
   // Reserved kinds: typed but NOT in active unions. The next two lines
@@ -163,6 +169,32 @@ describe('parseClientMessage — unsubscribe', () => {
   })
 })
 
+describe('parseClientMessage — call', () => {
+  test('accepts a full call', () => {
+    const got = parseClientMessage(
+      JSON.stringify({ type: 'call', id: 'c1', path: 'users.get', args: { id: 7 } }),
+    )
+    expect(got).toEqual({ type: 'call', id: 'c1', path: 'users.get', args: { id: 7 } })
+  })
+  test('accepts an empty args object', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'c1', path: 'p', args: {} })),
+    ).toEqual({ type: 'call', id: 'c1', path: 'p', args: {} })
+  })
+  test('rejects missing id', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', path: 'p', args: {} }))).toBeNull()
+  })
+  test('rejects missing path', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'c1', args: {} }))).toBeNull()
+  })
+  test('rejects missing or non-object args', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'call', id: 'c1', path: 'p' }))).toBeNull()
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'call', id: 'c1', path: 'p', args: 1 })),
+    ).toBeNull()
+  })
+})
+
 // ─── parseServerMessage: envelope rejection ──────────────────────────────────
 
 describe('parseServerMessage — envelope rejection', () => {
@@ -284,5 +316,74 @@ describe('parseServerMessage — error', () => {
     expect(
       parseServerMessage(JSON.stringify({ type: 'error', error: 'boom', issues: 'oops' })),
     ).toBeNull()
+  })
+})
+
+describe('parseServerMessage — result', () => {
+  test('accepts a result with object data', () => {
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: { ok: true } })),
+    ).toEqual({ type: 'result', id: 'c1', data: { ok: true } })
+  })
+  test('accepts a result with null / primitive / array data (data is unknown)', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: null }))).toEqual({
+      type: 'result',
+      id: 'c1',
+      data: null,
+    })
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: 42 }))).toEqual({
+      type: 'result',
+      id: 'c1',
+      data: 42,
+    })
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 'c1', data: [1, 2] }))).toEqual({
+      type: 'result',
+      id: 'c1',
+      data: [1, 2],
+    })
+  })
+  test('accepts a result with absent data (undefined)', () => {
+    const got = parseServerMessage(JSON.stringify({ type: 'result', id: 'c1' }))
+    expect(got).toEqual({ type: 'result', id: 'c1', data: undefined })
+  })
+  test('rejects missing id', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', data: 1 }))).toBeNull()
+  })
+  test('rejects non-string id', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'result', id: 1, data: 1 }))).toBeNull()
+  })
+})
+
+// ─── parseEnvelope: lenient shape gate ───────────────────────────────────────
+
+describe('parseEnvelope', () => {
+  test('accepts any plain object with a string type, leaving payload unvalidated', () => {
+    // Lenient: a missing/non-string token on `auth` and missing `args` on
+    // `subscribe` pass — payload validation is the caller's job. This is what
+    // lets the server engine coerce an auth token the routes.ts way instead of
+    // terminally rejecting the frame (the strict parser would reject these).
+    expect(parseEnvelope(JSON.stringify({ type: 'auth' }))).toEqual({ type: 'auth' })
+    expect(parseEnvelope(JSON.stringify({ type: 'auth', token: 123 }))).toEqual({
+      type: 'auth',
+      token: 123,
+    })
+    expect(parseEnvelope(JSON.stringify({ type: 'anything', foo: 1 }))).toEqual({
+      type: 'anything',
+      foo: 1,
+    })
+  })
+  test('rejects the same envelope failures as the strict parsers', () => {
+    expect(parseEnvelope('not json')).toBeNull()
+    expect(parseEnvelope('null')).toBeNull()
+    expect(parseEnvelope('42')).toBeNull()
+    expect(parseEnvelope('[]')).toBeNull()
+    expect(parseEnvelope('{}')).toBeNull() // missing type
+    expect(parseEnvelope(JSON.stringify({ type: 1 }))).toBeNull() // non-string type
+  })
+})
+
+describe('REACTIVITY_NOT_ENABLED', () => {
+  test('is the stable error-code string', () => {
+    expect(REACTIVITY_NOT_ENABLED).toBe('REACTIVITY_NOT_ENABLED')
   })
 })
