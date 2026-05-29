@@ -597,6 +597,91 @@ describe('WsManager', () => {
     }
   })
 
+  test('browser WebSocket transient close reconnects and re-runs auth', async () => {
+    const app = await makeAuthApp()
+    const authTokens: string[] = []
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (!token) throw new Error('Unauthorized')
+        authTokens.push(token)
+        return { userId: token }
+      },
+    })
+
+    const sockets: WebSocket[] = []
+    const RealWebSocket = global.WebSocket
+    class TrackingWebSocket extends RealWebSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols)
+        sockets.push(this)
+      }
+    }
+    ;(global as { WebSocket: typeof WebSocket }).WebSocket =
+      TrackingWebSocket as unknown as typeof WebSocket
+
+    let ws: ReturnType<typeof createWsManager> | null = null
+    try {
+      let tokenCalls = 0
+      let subscribedCount = 0
+      const firstSubscribed = deferred<void>()
+      const secondSubscribed = deferred<void>()
+      ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getToken: () => {
+          tokenCalls++
+          return `user_${tokenCalls}`
+        },
+        onSubscribed: (id) => {
+          if (id !== 'sub1') return
+          subscribedCount++
+          if (subscribedCount === 1) firstSubscribed.resolve()
+          if (subscribedCount === 2) secondSubscribed.resolve()
+        },
+      })
+
+      ws.connect()
+
+      let invalidateCount = 0
+      const invalidatedAfterReconnect = deferred<void>()
+      ws.subscribe('sub1', 'listTodos', {}, () => {
+        invalidateCount++
+        if (invalidateCount === 1) invalidatedAfterReconnect.resolve()
+      })
+
+      await withTimeout(firstSubscribed.promise, 'initial authenticated subscribe')
+      expect(tokenCalls).toBe(1)
+      expect(authTokens).toContain('user_1')
+      expect(sockets.length).toBe(1)
+
+      sockets[0]?.close(4002, 'transient drop')
+
+      await waitUntil(() => sockets.length >= 2, 'browser socket reconnect')
+      await withTimeout(secondSubscribed.promise, 'resubscribe after reconnect')
+
+      expect(tokenCalls).toBe(2)
+      expect(authTokens).toContain('user_2')
+      expect(ws.isConnected()).toBe(true)
+
+      await mutateUntilInvalidated(
+        `http://localhost:${authServer.port}`,
+        'After browser reconnect',
+        invalidatedAfterReconnect.promise,
+        { Authorization: 'Bearer user_2' },
+      )
+      await withTimeout(invalidatedAfterReconnect.promise, 'invalidate after reconnect')
+      expect(invalidateCount).toBe(1)
+
+      ws.disconnect()
+    } finally {
+      ws?.disconnect()
+      ;(global as { WebSocket: typeof WebSocket }).WebSocket = RealWebSocket
+      authServer.stop(true)
+    }
+  })
+
   test('requiresAuth:false against auth-required server closes 4001 and stops retrying', async () => {
     // Mismatched contract: client thinks WS is trusted, server requires auth.
     // First subscribe frame arrives unauthenticated → server closes 4001 →

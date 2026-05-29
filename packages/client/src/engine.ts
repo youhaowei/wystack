@@ -6,11 +6,10 @@
 //   - Subscription registry (replay on (re)connect, invalidation dispatch)
 //
 // Driven by a `Pipe<ServerMessage, ClientMessage>` factory — never imports a
-// concrete transport. The WebSocket-backed factory lives in `ws.ts` (until the
-// T3b adapter relocates it). Call/result correlation is intentionally out of
-// scope: the transport package does not ship `call` / `result` wire kinds yet
-// (Spec ADR #9 — they ride above the engine via `@tanstack/*` for v0.2; a
-// neutral correlator lands when the wire does).
+// concrete transport. The WebSocket-backed factory lives in `ws.ts`. Call/result
+// correlation is intentionally out of scope: the transport package does not ship
+// `call` / `result` wire kinds yet (Spec ADR #9 — they ride above the engine via
+// `@tanstack/*` for v0.2; a neutral correlator lands when the wire does).
 //
 // Reconnect semantics mirror the previous `ws.ts`:
 //   - close-code 4001 → latch `authFailed`, fire invalidations to nudge HTTP

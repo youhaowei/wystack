@@ -5,9 +5,9 @@
  * and surfacing close codes to the engine's reconnect policy.
  *
  * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`) is
- * preserved for backward compatibility with existing consumers (`client.ts`,
- * `hooks.ts`, app code). It is a thin layer over the engine and will be
- * relocated when the dedicated browser-transport task (T3b) lands.
+ * preserved for existing consumers (`client.ts`, `hooks.ts`, app code).
+ * It is now the browser WebSocket transport adapter: this file owns the
+ * concrete socket and the engine owns lifecycle/auth/subscription policy.
  *
  * Wire protocol (mirrors `@wystack/server`):
  *   Client → Server: { type: 'auth', token }
