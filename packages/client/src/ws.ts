@@ -1,30 +1,21 @@
 /**
- * WebSocket adapter — bridges a browser `WebSocket` to the neutral
- * {@link createEngine} engine. Owns parsing the wire (via
- * `parseServerMessage` from `@wystack/transport`), encoding outbound frames,
- * and surfacing close codes to the engine's reconnect policy.
+ * WebSocket adapter shim — public surface for the browser WS transport.
+ *
+ * The `createWebSocketPipe` browser transport adapter has been relocated to
+ * `./transport/websocket` (T3b) and is exported from the package root
+ * (`@wystack/client`). This module wraps it in the `createWsManager`
+ * convenience surface so existing consumers (`client.ts`, `hooks.ts`, app
+ * code) continue to work unchanged.
  *
  * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`) is
- * preserved for backward compatibility with existing consumers (`client.ts`,
- * `hooks.ts`, app code). It is a thin layer over the engine and will be
- * relocated when the dedicated browser-transport task (T3b) lands.
+ * stable — import from `@wystack/client`.
  *
- * Wire protocol (mirrors `@wystack/server`):
- *   Client → Server: { type: 'auth', token }
- *   Client → Server: { type: 'subscribe', id, path, args }
- *   Client → Server: { type: 'unsubscribe', id }
- *   Server → Client: { type: 'authenticated' }
- *   Server → Client: { type: 'subscribed', id }
- *   Server → Client: { type: 'invalidate', id }
- *   Server → Client: { type: 'error', id?, error, issues? }
- *
- * Close codes:
+ * Close codes (handled by the engine, surfaced through the adapter):
  *   4001 — auth failed / protocol violation → latch authFailed, no reconnect
  *   4002 — transient (timeout, flake) → reconnect per exponential backoff
  */
-import type { ServerMessage, ClientMessage, Pipe } from '@wystack/transport'
-import { parseServerMessage } from '@wystack/transport'
-import { createEngine, type Engine, type EnginePipe, type CloseInfo } from './engine'
+import { createEngine, type Engine } from './engine'
+import { createWebSocketPipe } from './transport/websocket'
 
 type InvalidateHandler = () => void
 
@@ -74,105 +65,10 @@ export interface WsManager {
 }
 
 /**
- * Build an {@link EnginePipe} from a fresh `WebSocket` connection. Encodes
- * `ClientMessage` to JSON on send, parses `ServerMessage` from JSON on
- * receive (malformed frames are dropped — they cannot be acted on), and
- * surfaces the native close `code` to the engine via `onClose`.
- *
- * Returned eagerly — the engine treats the pipe as live the moment it has
- * the reference. Frames sent before the socket reaches `OPEN` are queued
- * by buffering them in a small array; once `onopen` fires, the buffer is
- * flushed. This matches the prior `ws.ts` behavior, where the auth frame
- * was sent inside `onopen`.
- */
-function createWebSocketPipe(url: string): EnginePipe {
-  const socket = new WebSocket(url)
-  const messageHandlers = new Set<(msg: ServerMessage) => void>()
-  const closeHandlers = new Set<(info: CloseInfo) => void>()
-  const outboundBuffer: ClientMessage[] = []
-  let resolveReady!: () => void
-  let rejectReady!: (error: Error) => void
-  const ready = new Promise<void>((resolve, reject) => {
-    resolveReady = resolve
-    rejectReady = reject
-  })
-  let opened = false
-  let closed = false
-
-  socket.onopen = () => {
-    opened = true
-    resolveReady()
-    for (const msg of outboundBuffer) socket.send(JSON.stringify(msg))
-    outboundBuffer.length = 0
-  }
-
-  socket.onmessage = (event) => {
-    const data = typeof event.data === 'string' ? event.data : ''
-    const parsed = parseServerMessage(data)
-    if (parsed === null) return
-    for (const handler of Array.from(messageHandlers)) handler(parsed)
-  }
-
-  socket.onclose = (event) => {
-    if (closed) return
-    closed = true
-    // Native CloseEvent.code is 1000 for a clean close, 1006 for an abnormal
-    // close, or one of our app-level codes (4001/4002). All are surfaced
-    // verbatim so the engine policy lives in one place.
-    const info: CloseInfo = { code: event.code }
-    if (!opened) rejectReady(new Error(`WebSocket closed before open (${event.code})`))
-    for (const handler of Array.from(closeHandlers)) handler(info)
-  }
-
-  socket.onerror = () => {
-    // onclose follows; no separate signal needed.
-  }
-
-  const pipe: Pipe<ServerMessage, ClientMessage> = {
-    id: url,
-    send(message: ClientMessage): void {
-      if (closed) return
-      if (opened) {
-        socket.send(JSON.stringify(message))
-      } else {
-        outboundBuffer.push(message)
-      }
-    },
-    onMessage(handler: (msg: ServerMessage) => void): () => void {
-      messageHandlers.add(handler)
-      return () => {
-        messageHandlers.delete(handler)
-      }
-    },
-    close(): void {
-      if (closed) return
-      // Mark closed locally first so a subsequent close() callback from the
-      // socket itself doesn't re-fire onClose handlers.
-      closed = true
-      if (!opened) rejectReady(new Error('WebSocket closed before open'))
-      // Drop the onclose listener so the engine doesn't receive a phantom
-      // close event for its own request.
-      socket.onclose = null
-      socket.close()
-    },
-  }
-
-  return {
-    ...pipe,
-    ready,
-    onClose(handler: (info: CloseInfo) => void): () => void {
-      closeHandlers.add(handler)
-      return () => {
-        closeHandlers.delete(handler)
-      }
-    },
-  }
-}
-
-/**
  * Thin shim over {@link createEngine} for browser WebSocket transport.
- * Preserved as the public client surface; the engine is the new home for
- * lifecycle / auth / subscription logic.
+ * Preserved as the public client surface; the engine owns lifecycle / auth /
+ * subscription logic, while the adapter ({@link createWebSocketPipe}) owns
+ * the wire encoding and close-code surfacing.
  */
 export function createWsManager(config: WsManagerConfig): WsManager {
   const engine: Engine = createEngine({

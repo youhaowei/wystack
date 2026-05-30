@@ -26,6 +26,8 @@ export { createApi } from './api'
 export { createClient } from './client'
 export { WyStackProvider, useWyStackClient } from './provider'
 export { createWsManager } from './ws'
+// Browser WebSocket transport adapter (relocated to ./transport/websocket)
+export { createWebSocketPipe } from './transport/websocket'
 export { createEngine } from './engine'
 
 export type { WyStackClient } from './client'
