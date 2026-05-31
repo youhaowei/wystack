@@ -104,8 +104,8 @@ interface LoopbackHarness {
   ipcRenderer: FakeIpcRenderer
   /** All `s2c` frames the renderer received (server → client). */
   clientReceived: unknown[]
-  /** Fire the webContents `destroyed` / reload lifecycle event. */
-  fireLifecycle(event: 'destroyed' | 'did-finish-load'): void
+  /** Fire the webContents `destroyed` backstop event. */
+  fireLifecycle(event: 'destroyed'): void
 }
 
 /**
@@ -132,12 +132,12 @@ function makeLoopback(): LoopbackHarness {
         for (const l of Array.from(s2cListeners)) l(undefined, message)
       })
     },
-    on(event: 'destroyed' | 'did-finish-load', listener: () => void) {
+    on(event: 'destroyed', listener: () => void) {
       if (!lifecycleListeners.has(event)) lifecycleListeners.set(event, new Set())
       lifecycleListeners.get(event)!.add(listener)
       return webContents
     },
-    removeListener(event: 'destroyed' | 'did-finish-load', listener: () => void) {
+    removeListener(event: 'destroyed', listener: () => void) {
       lifecycleListeners.get(event)?.delete(listener)
       return webContents
     },

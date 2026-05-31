@@ -25,16 +25,23 @@ export interface IpcMainEventLike {
   readonly sender: WebContentsLike
 }
 
-/** Minimal interface for Electron's WebContents, capturing only what the adapter uses. */
+/**
+ * Minimal interface for Electron's WebContents, capturing only what the adapter
+ * uses. Only the `destroyed` event is listened to — a backstop for a page that
+ * died without sending `__close`. Per the IPC transport contract (model A),
+ * `did-finish-load` is deliberately NOT a lifecycle signal (it fires on initial
+ * load too, so reacting to it tears down freshly-connected engines); reload is
+ * detected via a repeat `__connect` instead.
+ */
 export interface WebContentsLike {
   /** Stable numeric id for this WebContents; used as the connection key. */
   readonly id: number
   /** Send a structured-clone message to the renderer on the given channel. */
   send(channel: string, message: unknown): void
-  /** Listen for a lifecycle event. */
-  on(event: 'destroyed' | 'did-finish-load', listener: () => void): this
-  /** Remove a lifecycle listener. */
-  removeListener(event: 'destroyed' | 'did-finish-load', listener: () => void): this
+  /** Listen for the `destroyed` lifecycle event (backstop teardown). */
+  on(event: 'destroyed', listener: () => void): this
+  /** Remove the `destroyed` listener. */
+  removeListener(event: 'destroyed', listener: () => void): this
   /** Optional — guards `send` against use after destruction in real Electron. */
   isDestroyed?(): boolean
 }
@@ -92,7 +99,6 @@ interface Connection {
   handle: EngineHandle
   webContents: WebContentsLike
   destroyedListener: () => void
-  reloadListener: () => void
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +139,12 @@ class PipeImpl implements Pipe<unknown, unknown> {
    * Close the pipe. By default sends a `{ type: '__close' }` control frame to
    * the renderer so the client adapter can synthesize its onClose lifecycle.
    *
-   * `suppressEcho` skips that outbound frame — used on the reload
-   * (`did-finish-load`) teardown path, where the webContents is still alive but
-   * now hosts the freshly-loaded renderer: echoing `__close` there would close
-   * the NEW page before it connects.
+   * `suppressEcho` skips that outbound frame. It is set on the paths where the
+   * old connection's renderer must NOT receive a close:
+   *   - reload-replace: a repeat `__connect` from a known `wc.id` means the page
+   *     re-ran its JS; the new page must not get a close for the dead connection.
+   *   - `destroyed`: the page is gone — nothing to send to.
+   *   - engine-initiated close: the engine handles the wire close itself.
    */
   close(suppressEcho = false): void {
     if (this._closed) return
@@ -181,12 +189,15 @@ class PipeImpl implements Pipe<unknown, unknown> {
  * Attach the WyStack engine to Electron's IPC transport.
  *
  * Binds `ipcMain.on('wystack:c2s', …)` and creates one `Pipe` per
- * `webContents.id`, calling `attachEngine(pipe, …)` on the first frame
- * from each renderer. The `__connect`/`__close` control frames are filtered
- * at this boundary — never forwarded into the engine.
+ * `webContents.id`, calling `attachEngine(pipe, …)` on `__connect`. The
+ * connection lifecycle is driven entirely by the client's `__connect`/`__close`
+ * control frames (model A) — a repeat `__connect` from a known `wc.id` silently
+ * replaces (reload); `destroyed` is the only `webContents` event listened to
+ * (backstop). The control frames are filtered here — never forwarded into the
+ * engine.
  *
  * Returns a `detach()` that removes the shared ipcMain listener and tears
- * down all active connections.
+ * down all active connections (echoing `__close` to each still-live renderer).
  */
 export function attachElectronTransport(opts: AttachElectronTransportOptions): { detach(): void } {
   const { app, ipcMain, resolveContext, authTimeoutMs, onClose } = opts
@@ -195,63 +206,87 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
   const connections = new Map<number, Connection>()
 
   /**
-   * Tear down a single connection by webContents id. Removes lifecycle listeners,
-   * clears the map entry, marks the pipe closed, and detaches the engine.
-   * Idempotent: no-op when no connection exists for the id.
+   * Tear down a single connection by webContents id. Removes the `destroyed`
+   * listener, clears the map entry, marks the pipe closed, and detaches the
+   * engine. Idempotent: no-op when no connection exists for the id.
    *
-   * Runs on EVERY close path — client `__close`, `destroyed` / reload lifecycle
-   * events, AND engine-initiated close (auth timeout / failed auth) routed
-   * through the per-connection `onClose` below. Clearing the map on engine close
-   * is load-bearing: otherwise a stale entry blocks the next `__connect` from
-   * the same webContents.id, permanently deadening that window.
+   * Reached from EVERY close path via a single function (contract robustness
+   * invariant): explicit client `__close`, the `destroyed` backstop,
+   * reload-replace, engine-initiated `onClose`, and top-level `detach`. Clearing
+   * the map on every path is load-bearing — a stale entry blocks the next
+   * `__connect` from the same webContents.id and permanently deadens that window.
    *
-   * `suppressEcho` skips the outbound `__close` frame. Set on the reload
-   * (`did-finish-load`) path: the webContents is alive but now hosts the new
-   * renderer, so an echo would close the freshly-loaded page before it connects.
+   * `suppressEcho` skips the outbound `__close` frame. It is `true` on the
+   * reload-replace, `destroyed`, and engine-initiated paths (see `close()`).
    */
   function teardown(wcId: number, suppressEcho = false): void {
     const conn = connections.get(wcId)
     if (!conn) return
     connections.delete(wcId)
-    // Remove lifecycle listeners before calling detach/close so the listeners
-    // themselves cannot re-enter teardown.
+    // Remove the destroyed listener before close/detach so it cannot re-enter
+    // teardown for this (already-removed) connection.
     conn.webContents.removeListener('destroyed', conn.destroyedListener)
-    conn.webContents.removeListener('did-finish-load', conn.reloadListener)
-    // Mark the pipe closed BEFORE calling detach so pipe.close() skips the
-    // webContents.send (destroyed webContents would throw in real Electron).
+    // Mark the pipe closed BEFORE detaching so pipe.close() skips the
+    // webContents.send (a destroyed webContents would throw in real Electron).
     conn.pipe.close(suppressEcho)
     conn.handle.detach()
   }
 
-  /** Build a new connection for a webContents that has not been seen before. */
+  /**
+   * Build a new connection for a webContents. Per the contract robustness
+   * invariant, the map entry is inserted BEFORE the `destroyed` listener is
+   * registered, so a `destroyed` firing mid-setup finds the entry to tear down.
+   * `attachEngine` runs first (its handle is needed); if it throws synchronously
+   * no listener has been registered yet, so nothing leaks.
+   */
   function connect(wc: WebContentsLike): Connection {
     const pipe = new PipeImpl(wc.id, wc)
-
-    // Lifecycle teardown listeners — registered once, removed in teardown().
-    // The reload path suppresses the __close echo (live webContents, new page).
-    const destroyedListener = () => teardown(wc.id)
-    const reloadListener = () => teardown(wc.id, true)
-    wc.on('destroyed', destroyedListener)
-    wc.on('did-finish-load', reloadListener)
 
     const handle = attachEngine(pipe, {
       app,
       resolveContext,
       authTimeoutMs,
-      // Engine-initiated close (auth timeout / failed auth frame on an
-      // auth-required transport) lands here. Forward the reason to the user's
-      // onClose, THEN tear down so the map entry is cleared — without this, the
-      // engine's own pipe.close() leaves the connections map orphaned and the
-      // window cannot reconnect. teardown() is idempotent and the engine has
-      // already flipped its closed guard, so the detach() inside is a safe no-op.
+      // Engine-initiated close (auth timeout / failed auth on an auth-required
+      // transport) lands here. Tear down FIRST (clearing the map so a later
+      // `__connect` from the same wc.id builds fresh), THEN invoke the consumer
+      // callback — so a throwing consumer onClose cannot leave a stale map
+      // entry. suppressEcho: the engine already drives the wire close itself.
+      // teardown is idempotent and the engine has flipped its closed guard
+      // before calling this, so the detach() inside is a safe no-op.
+      //
+      // The consumer callback runs inside the engine's `closeWith`, which does
+      // NOT guard it: `teardown() → onClose?.(reason) → void pipe.close()`. A
+      // throw here would (a) skip the engine's own `pipe.close()`, corrupting
+      // its close path, and (b) on the auth-timeout path escape an unguarded
+      // `setTimeout` and crash the Electron main process. Neither is fixable
+      // from the adapter without touching the engine (off-limits). Contain it:
+      // teardown already ran (map is clean — the invariant holds), so we log and
+      // drop the consumer's throw. A buggy close handler must not kill the app.
       onClose: (reason) => {
-        onClose?.(reason)
-        teardown(wc.id)
+        teardown(wc.id, true)
+        if (onClose === undefined) return
+        try {
+          onClose(reason)
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('[wystack/server] electron onClose threw', err)
+        }
       },
     })
 
-    const conn: Connection = { pipe, handle, webContents: wc, destroyedListener, reloadListener }
+    const destroyedListener = () => teardown(wc.id, true)
+    const conn: Connection = { pipe, handle, webContents: wc, destroyedListener }
+    // Map insert BEFORE listener registration (robustness invariant).
     connections.set(wc.id, conn)
+    try {
+      wc.on('destroyed', destroyedListener)
+    } catch (err) {
+      // Listener registration failed — don't leave a half-built entry.
+      connections.delete(wc.id)
+      void pipe.close(true)
+      handle.detach()
+      throw err
+    }
     return conn
   }
 
@@ -263,13 +298,19 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
     // Filter control frames — never forward into the engine.
     if (isControlFrame(message)) {
       if (message.type === '__connect') {
-        // First frame from this renderer — open the connection.
-        if (!connections.has(wcId)) {
-          connect(wc)
+        // Reload-replace rule (model A): a repeat `__connect` from a known
+        // wc.id means the renderer re-ran its JS (reload). Silently replace —
+        // tear the old connection down WITHOUT echoing `__close` to the new
+        // page — then build fresh. A first-time `__connect` just builds.
+        if (connections.has(wcId)) {
+          teardown(wcId, true)
         }
+        connect(wc)
         return
       }
       if (message.type === '__close') {
+        // Explicit client-initiated close — echo `__close` so the client's
+        // EnginePipe.onClose fires (the client is still live and expects it).
         teardown(wcId)
         return
       }
