@@ -480,7 +480,6 @@ describe('Electron adapter — multi-renderer isolation (AC #8)', () => {
     const ipcMain = makeFakeIpcMain()
     const wc1 = makeFakeWebContents(1)
     const wc2 = makeFakeWebContents(2)
-    const closedFor: number[] = []
 
     attachElectronTransport({
       app,
@@ -524,8 +523,6 @@ describe('Electron adapter — multi-renderer isolation (AC #8)', () => {
       id: 'safe',
       data: [],
     })
-
-    void closedFor
   })
 })
 
