@@ -129,17 +129,26 @@ class PipeImpl implements Pipe<unknown, unknown> {
     }
   }
 
-  close(): void {
+  /**
+   * Close the pipe. By default sends a `{ type: '__close' }` control frame to
+   * the renderer so the client adapter can synthesize its onClose lifecycle.
+   *
+   * `suppressEcho` skips that outbound frame — used on the reload
+   * (`did-finish-load`) teardown path, where the webContents is still alive but
+   * now hosts the freshly-loaded renderer: echoing `__close` there would close
+   * the NEW page before it connects.
+   */
+  close(suppressEcho = false): void {
     if (this._closed) return
     this._closed = true
-    // Send the __close control frame to the renderer before clearing handlers
-    // so the client adapter can synthesize its onClose lifecycle.
-    try {
-      if (!this._webContents.isDestroyed?.()) {
-        this._webContents.send(S2C, { type: '__close' })
+    if (!suppressEcho) {
+      try {
+        if (!this._webContents.isDestroyed?.()) {
+          this._webContents.send(S2C, { type: '__close' })
+        }
+      } catch {
+        /* webContents may already be gone */
       }
-    } catch {
-      /* webContents may already be gone */
     }
     this._handlers.clear()
   }
@@ -187,10 +196,20 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
 
   /**
    * Tear down a single connection by webContents id. Removes lifecycle listeners,
-   * marks the pipe closed (suppressing any outbound send), and detaches the engine.
+   * clears the map entry, marks the pipe closed, and detaches the engine.
    * Idempotent: no-op when no connection exists for the id.
+   *
+   * Runs on EVERY close path — client `__close`, `destroyed` / reload lifecycle
+   * events, AND engine-initiated close (auth timeout / failed auth) routed
+   * through the per-connection `onClose` below. Clearing the map on engine close
+   * is load-bearing: otherwise a stale entry blocks the next `__connect` from
+   * the same webContents.id, permanently deadening that window.
+   *
+   * `suppressEcho` skips the outbound `__close` frame. Set on the reload
+   * (`did-finish-load`) path: the webContents is alive but now hosts the new
+   * renderer, so an echo would close the freshly-loaded page before it connects.
    */
-  function teardown(wcId: number): void {
+  function teardown(wcId: number, suppressEcho = false): void {
     const conn = connections.get(wcId)
     if (!conn) return
     connections.delete(wcId)
@@ -200,7 +219,7 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
     conn.webContents.removeListener('did-finish-load', conn.reloadListener)
     // Mark the pipe closed BEFORE calling detach so pipe.close() skips the
     // webContents.send (destroyed webContents would throw in real Electron).
-    conn.pipe.close()
+    conn.pipe.close(suppressEcho)
     conn.handle.detach()
   }
 
@@ -209,8 +228,9 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
     const pipe = new PipeImpl(wc.id, wc)
 
     // Lifecycle teardown listeners — registered once, removed in teardown().
+    // The reload path suppresses the __close echo (live webContents, new page).
     const destroyedListener = () => teardown(wc.id)
-    const reloadListener = () => teardown(wc.id)
+    const reloadListener = () => teardown(wc.id, true)
     wc.on('destroyed', destroyedListener)
     wc.on('did-finish-load', reloadListener)
 
@@ -218,7 +238,16 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
       app,
       resolveContext,
       authTimeoutMs,
-      onClose,
+      // Engine-initiated close (auth timeout / failed auth frame on an
+      // auth-required transport) lands here. Forward the reason to the user's
+      // onClose, THEN tear down so the map entry is cleared — without this, the
+      // engine's own pipe.close() leaves the connections map orphaned and the
+      // window cannot reconnect. teardown() is idempotent and the engine has
+      // already flipped its closed guard, so the detach() inside is a safe no-op.
+      onClose: (reason) => {
+        onClose?.(reason)
+        teardown(wc.id)
+      },
     })
 
     const conn: Connection = { pipe, handle, webContents: wc, destroyedListener, reloadListener }

@@ -152,7 +152,11 @@ function makeFakeIpcMain(): IpcMainLike & {
  * Returns helpers to send c2s frames and inspect s2c output.
  */
 async function harness(
-  opts: { resolveContext?: (req: Request) => Promise<Record<string, unknown>>; wcId?: number } = {},
+  opts: {
+    resolveContext?: (req: Request) => Promise<Record<string, unknown>>
+    wcId?: number
+    authTimeoutMs?: number
+  } = {},
 ) {
   const app = await makeApp()
   const ipcMain = makeFakeIpcMain()
@@ -164,6 +168,7 @@ async function harness(
     app,
     ipcMain,
     resolveContext: opts.resolveContext,
+    authTimeoutMs: opts.authTimeoutMs,
     onClose: (reason) => closedReasons.push(reason),
   })
 
@@ -535,5 +540,159 @@ describe('Electron adapter — multi-renderer isolation (AC #8)', () => {
     })
 
     void closedFor
+  })
+})
+
+// Helpers for the regression suites below.
+function hasResult(received: unknown[], id: string): boolean {
+  return received.some(
+    (m: unknown) =>
+      (m as { type: string; id?: string }).type === 'result' && (m as { id: string }).id === id,
+  )
+}
+function findResult(received: unknown[], id: string): unknown {
+  return received.find(
+    (m: unknown) =>
+      (m as { type: string; id?: string }).type === 'result' && (m as { id: string }).id === id,
+  )
+}
+function hasAuthenticated(received: unknown[]): boolean {
+  return received.some((m: unknown) => (m as { type: string }).type === 'authenticated')
+}
+
+// ---------------------------------------------------------------------------
+// Regression: engine-initiated close must clear the connections map
+// (Codex P2 — engine-closed connections leak the map)
+// ---------------------------------------------------------------------------
+
+describe('Electron adapter — engine-initiated close clears the map (regression)', () => {
+  test('auth timeout closes the engine → next __connect creates a fresh connection', async () => {
+    // An auth-required transport that never receives an auth frame: the engine
+    // closes the pipe on the handshake timeout (engine-initiated, NOT via the
+    // adapter's __close/lifecycle paths). Before the fix, the connections map
+    // entry was never cleared, so the next __connect from the same
+    // webContents.id hit `connections.has(wcId)` and returned early — the window
+    // was permanently dead. After the fix, the engine's onClose tears down +
+    // clears the map, so a fresh __connect rebuilds the engine.
+    const h = await harness({ resolveContext: async () => ({ userId: 'u1' }), authTimeoutMs: 10 })
+
+    h.send({ type: '__connect' })
+    // Never send auth — wait for the engine's handshake timeout to fire.
+    await until(() => h.closedReasons.includes('transient'), 'engine timeout close')
+
+    // The engine closed the connection. Now reconnect from the SAME webContents.
+    // Sequence matters: await the `authenticated` ACK before sending the call,
+    // or the call arrives pre-auth and the engine closes again.
+    h.send({ type: '__connect' })
+    h.send({ type: 'auth', token: 'good' })
+    await until(() => hasAuthenticated(h.wc.received), 'reconnect authenticated')
+
+    h.send({ type: 'call', id: 'after', path: 'whoami', args: {} })
+    await until(() => hasResult(h.wc.received, 'after'), 'post-reconnect result')
+
+    // A fresh engine processed the new call — proving the map entry was cleared.
+    expect(findResult(h.wc.received, 'after')).toEqual({
+      type: 'result',
+      id: 'after',
+      data: { userId: 'u1' },
+    })
+  })
+
+  test('failed auth frame closes the engine → next __connect creates a fresh connection', async () => {
+    // A bad token closes the connection auth-failed (engine-initiated). The map
+    // must clear so the same webContents can reconnect with a good token.
+    const h = await harness({
+      resolveContext: async (req) => {
+        if (req.headers.get('authorization') === 'Bearer good') return { userId: 'u1' }
+        throw new Error('bad token')
+      },
+    })
+
+    h.send({ type: '__connect' })
+    h.send({ type: 'auth', token: 'bad' })
+    await until(() => h.closedReasons.includes('auth-failed'), 'auth-failed close')
+
+    // Reconnect from the SAME webContents with a good token. Await the ACK
+    // before the call so it doesn't arrive pre-auth on the fresh connection.
+    h.send({ type: '__connect' })
+    h.send({ type: 'auth', token: 'good' })
+    await until(() => hasAuthenticated(h.wc.received), 'recovery authenticated')
+
+    h.send({ type: 'call', id: 'recover', path: 'whoami', args: {} })
+    await until(() => hasResult(h.wc.received, 'recover'), 'post-recovery result')
+
+    expect(findResult(h.wc.received, 'recover')).toEqual({
+      type: 'result',
+      id: 'recover',
+      data: { userId: 'u1' },
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Regression: reload (did-finish-load) must NOT echo a stale __close to the
+// now-new page (Codex P2 — reload echoes stale __close)
+// ---------------------------------------------------------------------------
+
+describe('Electron adapter — reload suppresses __close echo (regression)', () => {
+  test('did-finish-load tears down the old engine but sends NO __close to the live webContents', async () => {
+    // On reload the webContents is still alive and now hosts the freshly-loaded
+    // renderer. Sending {type:'__close'} to it would close the NEW page before
+    // it connects. The reload teardown path must suppress that echo.
+    const h = await harness()
+    h.send({ type: '__connect' })
+    h.send({ type: 'call', id: 'pre', path: 'listTodos', args: {} })
+    await until(() => h.wc.received.length > 0, 'pre-reload result')
+
+    const beforeReload = h.wc.received.length
+
+    // Fire a reload — the old connection tears down.
+    h.wc._fireEvent('did-finish-load')
+    await flush()
+
+    // No __close frame may have been sent after the reload teardown...
+    const afterReloadMsgs = h.wc.received.slice(beforeReload)
+    expect(
+      afterReloadMsgs.find((m: unknown) => (m as { type?: string }).type === '__close'),
+    ).toBeUndefined()
+    // ...and none anywhere in the stream for this reload.
+    expect(
+      h.wc.received.filter((m: unknown) => (m as { type?: string }).type === '__close'),
+    ).toEqual([])
+  })
+
+  test('client __close (NOT reload) DOES echo __close — echo suppression is reload-specific', async () => {
+    // Guards against an over-broad fix that suppresses the echo on every
+    // teardown. A genuine client-initiated __close must still echo so the
+    // client adapter can synthesize its onClose lifecycle.
+    const h = await harness()
+    h.send({ type: '__connect' })
+    h.send({ type: '__close' })
+    await flush()
+
+    expect(h.wc.received).toContainEqual({ type: '__close' })
+  })
+
+  test('reload tears down the old engine and the fresh post-reload connection works', async () => {
+    // Behavioral teardown proof: after did-finish-load the old engine handle is
+    // detached and the map cleared. A subsequent __connect opens a FRESH engine
+    // (reload semantics) — confirm a call on it works, with no stale __close.
+    const h = await harness()
+    h.send({ type: '__connect' })
+    h.send({ type: 'call', id: 'pre', path: 'listTodos', args: {} })
+    await until(() => h.wc.received.length > 0, 'pre-reload result')
+
+    h.wc._fireEvent('did-finish-load')
+    await flush()
+
+    // New renderer (post-reload) connects fresh and works.
+    h.send({ type: '__connect' })
+    h.send({ type: 'call', id: 'fresh', path: 'listTodos', args: {} })
+    await until(() => hasResult(h.wc.received, 'fresh'), 'fresh result')
+    expect(findResult(h.wc.received, 'fresh')).toEqual({ type: 'result', id: 'fresh', data: [] })
+    // And no __close was ever echoed across the reload.
+    expect(
+      h.wc.received.filter((m: unknown) => (m as { type?: string }).type === '__close'),
+    ).toEqual([])
   })
 })
