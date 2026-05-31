@@ -21,6 +21,11 @@
       "bun": "./src/serve-node.ts",
       "import": "./dist/serve-node.js"
     },
+    "./electron": {
+      "types": "./dist/electron.d.ts",
+      "bun": "./src/electron.ts",
+      "import": "./dist/electron.js"
+    },
     "./routes": {
       "types": "./dist/routes.d.ts",
       "bun": "./src/routes.ts",
