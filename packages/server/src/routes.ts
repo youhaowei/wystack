@@ -34,34 +34,39 @@
  */
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
+import type { Pipe } from '@wystack/transport'
+import { parseEnvelope } from '@wystack/transport'
+import { attachEngine, type AttachEngineOptions } from './engine'
+import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
 
+// Re-export buildAuthRequest from Session so external consumers that import it
+// from routes.ts (e.g. transport.test.ts) still resolve cleanly.
+export { buildAuthRequest } from './engine'
+
 /**
- * Per-connection state, keyed by the platform socket (`ws.raw`). Hono creates
- * a new `WSContext` per event callback, so its identity is not stable — the
- * raw socket object is. Map<object, …> (rather than Map<unknown, …>) prevents
- * primitive keys from accidentally compiling.
+ * Per-connection subscription state, keyed by the platform socket (`ws.raw`).
+ * Auth and RPC state has moved into the engine's Session (`handle.session`);
+ * only the reactive-tier bookkeeping lives here now.
  *
- * `upgradeRequest` is the original HTTP upgrade Request — captured once so
- * `resolveContext` can see cookies, forwarded headers, URL, and origin. A
- * fresh `Request` with the Bearer header layered on is built per subscribe
- * (see `resolveSubContext`) so adapters get a unique Request per call, avoiding
- * shared-mutation and identity-keyed deduplication hazards.
+ * `handle`    — the EngineHandle returned by `attachEngine` for this connection.
+ * `engineInbound` — the single inbound handler the engine registered on the
+ *               Pipe's synthetic `onMessage`. Routes.ts calls it directly for
+ *               frames it does not handle (auth, call, malformed, unknown-type),
+ *               preserving the engine's protocol policy without a real Pipe.
+ *               `null` once the engine has detached (post-close), so the call
+ *               site must null-check before invoking.
+ * `subIds`    — IDs of active subscriptions on this socket (for cleanup on close).
+ * `pendingSubIds` — IDs of in-flight subscribes (see `handleSubscribe`).
+ *
+ * GOTCHA: Hono creates a new `WSContext` per event callback, so its identity is
+ * not stable — the raw socket object is. `Map<object, …>` rather than
+ * `Map<unknown, …>` prevents primitive keys from accidentally compiling.
  */
 interface Connection {
-  authenticated: boolean
-  /**
-   * Captured once from the client's auth frame and reused by every subsequent
-   * `resolveSubContext` call for the lifetime of this connection. If the JWT
-   * expires mid-session, new subscriptions present the stale token to
-   * `resolveContext` and fail; the client must reconnect to supply a fresh
-   * one. The `getToken` callback is invoked per-connect, so
-   * disconnect()+connect() on the client is the supported rotation path.
-   */
-  token: string | null
-  upgradeRequest: Request
-  timeout: ReturnType<typeof setTimeout> | null
+  handle: ReturnType<typeof attachEngine>
+  engineInbound: ((message: unknown) => void) | null
   subIds: Set<string>
   /**
    * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
@@ -79,6 +84,11 @@ interface Connection {
   pendingSubIds: Set<string>
 }
 
+// Monotonic source for per-connection Pipe ids. `ws.raw` is a stable identity
+// key but stringifies to "[object Object]", so it cannot serve as the Pipe
+// contract's "stable per-connection identifier for diagnostics and correlation."
+let nextConnectionId = 0
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
@@ -87,12 +97,6 @@ function errorMessage(err: unknown): string {
  * Send JSON over a WS, swallowing the post-close throw. Outbound frames
  * race against unrelated closes; collapsing the try/catch at the call
  * site keeps handler logic linear.
- *
- * One outbound frame deliberately does NOT use this helper: the
- * `authenticated` ack in `handleAuthFrame` uses raw `ws.send` so it can
- * catch the post-close throw and close 4002 (transient — auth succeeded
- * but transport died). Using `safeSend` there would silently drop the
- * ack and leave the client stuck waiting on its ack timer.
  */
 function safeSend(ws: WSContext, payload: unknown): void {
   try {
@@ -100,49 +104,6 @@ function safeSend(ws: WSContext, payload: unknown): void {
   } catch {
     /* socket closed */
   }
-}
-
-/**
- * Build the synthetic `Request` passed to `resolveContext` for a WS subscribe.
- *
- * When `token` is a non-empty string, layers `Authorization: Bearer ${token}`
- * over the upgrade request's headers. When `token` is `null` (anonymous),
- * strips any inherited Authorization header so the WS auth frame is the sole
- * identity source — prevents a null-token client from silently inheriting an
- * identity that leaked into the upgrade via cookie proxy, reverse proxy, or
- * stale query handoff. Exported for direct unit testing of this invariant.
- */
-export function buildAuthRequest(upgradeRequest: Request, token: string | null): Request {
-  const headers = new Headers(upgradeRequest.headers)
-  if (token !== null && token.length > 0) {
-    headers.set('authorization', `Bearer ${token}`)
-  } else {
-    headers.delete('authorization')
-  }
-  return new Request(upgradeRequest.url, {
-    method: upgradeRequest.method,
-    headers,
-  })
-}
-
-/**
- * Parse a client WS frame as a plain object. Rejects non-object JSON
- * (`null`, arrays, primitives) and non-string `type` up front so downstream
- * dispatch never faces a TypeError from `msg.type` on a null body or routes
- * on a numeric `type`. Returns null for any invalid shape — caller picks
- * the close code (pre-auth 4001 vs post-auth error frame).
- */
-function parseClientMessage(data: string): Record<string, unknown> | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(data)
-  } catch {
-    return null
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
-  const msg = parsed as Record<string, unknown>
-  if (typeof msg.type !== 'string') return null
-  return msg
 }
 
 export interface RouteOptions {
@@ -159,18 +120,12 @@ export interface RouteOptions {
 
 export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSocket) {
   const { app, prefix = '/api' } = opts
-  const userResolveContext = opts.resolveContext
-  const requiresAuth = userResolveContext !== undefined
-  const resolveContext = userResolveContext ?? (async () => ({}))
+  const resolveContext = opts.resolveContext
   const authTimeoutMs = opts.authTimeoutMs ?? 10_000
 
   const hono = new Hono()
 
-  // Per-connection state (see Connection doc at module scope).
-  // URL-leak prevention is a client-side contract: the WyStack client never
-  // appends `?token=...` to the WS URL. If a custom client does, the server
-  // can't redact it from upgradeRequest — adapters will see it. Server-side
-  // enforcement would require parsing every upgrade URL and is out of scope.
+  // Per-connection reactive-tier state, keyed by the platform socket.
   const rawToConnection = new Map<object, Connection>()
   // sub ID → WSContext, for invalidation dispatch.
   const subToWs = new Map<string, WSContext>()
@@ -179,18 +134,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   // socket object (Bun ServerWebSocket, etc.). Single cast site so if Hono
   // ever tightens the type, there's one place to update.
   const keyOf = (ws: WSContext): object => ws.raw as object
-
-  async function resolveSubContext(
-    rawSocket: object,
-    token: string | null,
-  ): Promise<Record<string, unknown>> {
-    const conn = rawToConnection.get(rawSocket)
-    if (!conn) throw new Error('connection not registered')
-    // Build a fresh Request per call so adapters see a unique identity and
-    // don't accumulate mutations across subscriptions on the same connection.
-    const req = buildAuthRequest(conn.upgradeRequest, token)
-    return (await resolveContext(req)) ?? {}
-  }
 
   function addSub(id: string, ws: WSContext): void {
     subToWs.set(id, ws)
@@ -207,7 +150,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   function removeAllForSocket(ws: WSContext): void {
     const conn = rawToConnection.get(keyOf(ws))
     if (!conn) return
-    if (conn.timeout) clearTimeout(conn.timeout)
     for (const id of conn.subIds) {
       app.subscriptions.remove(id)
       subToWs.delete(id)
@@ -215,74 +157,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     // Drop pending-subscribe IDs so any in-flight resolveContext/.then bails.
     conn.pendingSubIds.clear()
     rawToConnection.delete(keyOf(ws))
-  }
-
-  /**
-   * Handle an inbound `{type:"auth", token}` frame. Two paths:
-   *
-   *   1. Unauthenticated → run resolveContext, then ACK or close 4001.
-   *      The onOpen 4002 timer is still running; a hung resolveContext
-   *      trips it, closing the socket (resolveContext completes into a
-   *      dead socket — harmless).
-   *   2. Already authenticated (no-auth server OR repeat frame) →
-   *      idempotent ACK so a token-configured client does not hang. This path
-   *      never adopts the token; no-auth transports rely on connection trust,
-   *      not WS credentials.
-   */
-  async function handleAuthFrame(
-    msg: Record<string, unknown>,
-    ws: WSContext,
-    conn: Connection,
-    rawSocket: object,
-  ): Promise<void> {
-    if (conn.authenticated) {
-      safeSend(ws, { type: 'authenticated' })
-      return
-    }
-
-    const rawToken = msg.token
-    // Parse the token locally — do NOT write conn.token yet. Two concurrent
-    // auth frames can both pass the pre-await authenticated===false check.
-    // Writing conn.token here would let the slower frame overwrite the faster
-    // frame's token before resolveSubContext reads it, causing the winning
-    // frame to authenticate under a different identity. Commit only after
-    // confirming we won the race below.
-    const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-
-    try {
-      await resolveSubContext(rawSocket, token)
-      if (!rawToConnection.has(rawSocket)) return
-      // Re-check after await: Bun dispatches onMessage without awaiting the
-      // previous handler, so two rapid auth frames can both pass the pre-await
-      // guard. The slower frame finds conn.authenticated already true and sends
-      // an idempotent ACK — it must NOT overwrite conn.token (that would swap
-      // the winning identity's token under live subscriptions).
-      if (conn.authenticated) {
-        safeSend(ws, { type: 'authenticated' })
-        return
-      }
-      // Won the race — commit token and mark authenticated.
-      conn.token = token
-      if (conn.timeout) clearTimeout(conn.timeout)
-      conn.timeout = null
-      conn.authenticated = true
-      try {
-        ws.send(JSON.stringify({ type: 'authenticated' }))
-      } catch {
-        // Auth succeeded but the transport died before we could ack. This is
-        // a network flake, not an auth failure — close 4002 so the client
-        // retries with backoff rather than latching authFailed and giving up.
-        ws.close(4002, 'ack send failed')
-      }
-    } catch (err) {
-      // TODO: replace with @wystack/log once server logging lands.
-      // Log message only — not the full error — to avoid leaking token/header
-      // values that resolveContext implementations may embed in thrown errors.
-      console.warn('[wystack/server] WS auth failed:', errorMessage(err))
-      // Guard conn.authenticated: if the concurrent winning frame already
-      // succeeded, don't tear down an authenticated connection with 4001.
-      if (rawToConnection.has(rawSocket) && !conn.authenticated) ws.close(4001, 'auth failed')
-    }
   }
 
   /**
@@ -325,7 +199,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     // "Context resolved at subscription time, preserved for re-queries"
     let context: Record<string, unknown>
     try {
-      context = await resolveSubContext(rawSocket, conn.token)
+      context = await conn.handle.session.resolveSubContext()
     } catch (err) {
       conn.pendingSubIds.delete(id)
       safeSend(ws, { type: 'error', id, error: errorMessage(err) })
@@ -370,16 +244,86 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     upgradeWebSocket((c) => {
       // Capture the original HTTP upgrade Request (cookies, headers, URL).
       const upgradeRequest = c.req.raw
+
       return {
         onOpen(_evt, ws) {
-          const timeout = requiresAuth
-            ? setTimeout(() => ws.close(4002, 'auth timeout'), authTimeoutMs)
-            : null
-          rawToConnection.set(keyOf(ws), {
-            authenticated: !requiresAuth,
-            token: null,
-            upgradeRequest,
-            timeout,
+          const rawSocket = keyOf(ws)
+
+          // Build a minimal Pipe wrapping this Hono WS. The engine uses
+          // `pipe.send` for outbound frames (authenticated, result, error).
+          // `pipe.onMessage` is only used by the engine to register its inbound
+          // handler — routes.ts calls that handler directly rather than routing
+          // all frames through the Pipe abstraction, so that subscribe/unsubscribe
+          // can be intercepted here first (reactive tier stays in routes.ts).
+          let engineInbound: ((message: unknown) => void) | null = null
+          let pipeClosed = false
+
+          const pipe: Pipe = {
+            id: `ws-${++nextConnectionId}`,
+            send(message: unknown): void {
+              // Post-close: silent no-op, per the Pipe contract. While the
+              // socket is live a `ws.send` throw is a real transport failure —
+              // it MUST propagate. The engine swallows it for fire-and-forget
+              // frames via its own `send` helper, but `await`s this directly for
+              // the committing `authenticated` ack so it can close `transient`
+              // (4002) on failure rather than strand the client on its ack timer.
+              if (pipeClosed) return
+              ws.send(JSON.stringify(message))
+            },
+            onMessage(handler: (message: unknown) => void): () => void {
+              // The engine calls this exactly once to register its inbound handler.
+              engineInbound = handler
+              return () => {
+                if (engineInbound === handler) engineInbound = null
+              }
+            },
+            close(): void {
+              if (pipeClosed) return
+              pipeClosed = true
+              // ws.close() is idempotent in Hono; call with no code to let the
+              // engine's onClose hook set the code first (see mapCloseCode below).
+              try {
+                ws.close()
+              } catch {
+                /* already closed */
+              }
+            },
+          }
+
+          /**
+           * Map a transport-neutral CloseReason to a WS close code.
+           *   auth-failed → 4001 (client does not retry)
+           *   transient   → 4002 (client retries with backoff)
+           * Called by the engine before it calls pipe.close().
+           */
+          function mapCloseCode(reason: CloseReason): void {
+            const code = reason === 'auth-failed' ? 4001 : 4002
+            try {
+              ws.close(code, reason)
+            } catch {
+              /* socket closed */
+            }
+            pipeClosed = true
+          }
+
+          const engineOpts: AttachEngineOptions = {
+            app,
+            resolveContext,
+            authTimeoutMs,
+            baseRequest: upgradeRequest,
+            onClose: mapCloseCode,
+          }
+
+          const handle = attachEngine(pipe, engineOpts)
+
+          rawToConnection.set(rawSocket, {
+            handle,
+            // A getter so the connection always sees the engine's current
+            // handler — `null` after detach, a function while attached. The
+            // call site in `onMessage` null-checks before invoking.
+            get engineInbound() {
+              return engineInbound
+            },
             subIds: new Set(),
             pendingSubIds: new Set(),
           })
@@ -389,53 +333,33 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           const rawSocket = keyOf(ws)
           const conn = rawToConnection.get(rawSocket)
           if (!conn) {
+            // No connection state — engine never ran onOpen for this socket.
+            // Rare race; close 4001 (protocol violation).
             ws.close(4001, 'no connection state')
             return
           }
 
-          const msg = parseClientMessage(String(event.data))
-          if (msg === null) {
-            // Invalid shape: unparseable JSON, `null`, array, primitive, or
-            // non-string `type`. Pre-auth a malformed first frame is a
-            // protocol violation (close 4001 — AC #2 / PRD edge case).
-            // Post-auth send an error frame and stay open.
-            if (!conn.authenticated) {
-              ws.close(4001, 'invalid first message')
-              return
-            }
-            safeSend(ws, { type: 'error', error: 'invalid message' })
-            return
-          }
+          const raw = String(event.data)
 
-          // `auth` is the only message type allowed to cross the unauth boundary.
-          // Auth-required servers run the full handshake; no-auth servers reply
-          // with a compatibility ACK and ignore any supplied token.
-          if (msg.type === 'auth') {
-            await handleAuthFrame(msg, ws, conn, rawSocket)
-            return
-          }
+          // Lenient envelope parse to decide routing. If unparseable, forward to
+          // the engine (which handles pre/post-auth malformed-frame policy).
+          const envelope = parseEnvelope(raw)
 
-          if (!conn.authenticated) {
-            ws.close(4001, 'first message must be auth')
-            return
-          }
-
-          let msgId: string | undefined
-          try {
-            msgId = msg.id as string | undefined
-
-            // Filed: TASK-490 — scope subscription IDs per-socket to prevent cross-socket collision
-            if (msg.type === 'subscribe') {
-              await handleSubscribe(msg, ws, conn, rawSocket)
+          // Reactive-tier frames (subscribe / unsubscribe) are handled here when
+          // the connection is authenticated. Everything else — auth, call, unknown
+          // type, and ALL pre-auth frames — goes to the engine.
+          if (envelope !== null && conn.handle.session.authenticated) {
+            if (envelope.type === 'subscribe') {
+              await handleSubscribe(envelope as Record<string, unknown>, ws, conn, rawSocket)
               return
             }
 
-            if (msg.type === 'unsubscribe') {
-              if (typeof msg.id !== 'string') {
+            if (envelope.type === 'unsubscribe') {
+              if (typeof envelope.id !== 'string') {
                 safeSend(ws, { type: 'error', error: 'invalid unsubscribe message' })
                 return
               }
-              const subId = msg.id
+              const subId = envelope.id
               // Cancel a pending (in-flight) subscribe before it finishes, so
               // the .then() that registers it sees "not pending" and bails.
               conn.pendingSubIds.delete(subId)
@@ -443,22 +367,23 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
               if (sub) removeSub(subId, ws)
               return
             }
-
-            // Unknown type post-auth. Help devs during protocol evolution.
-            safeSend(ws, {
-              type: 'error',
-              id: typeof msg.id === 'string' ? msg.id : undefined,
-              error: `unknown message type: ${String(msg.type)}`,
-            })
-          } catch (err: unknown) {
-            const payload: Record<string, unknown> = { type: 'error', error: errorMessage(err) }
-            if (err instanceof ValidationError) payload.issues = err.issues
-            if (msgId) payload.id = msgId
-            safeSend(ws, payload)
           }
+
+          // Forward to the engine's inbound handler. The engine owns:
+          //   - auth frames (both before and after auth, including idempotent ACK)
+          //   - call frames
+          //   - malformed / unparseable frames (pre-auth 4001, post-auth error)
+          //   - unknown-type frames post-auth (error frame)
+          //   - pre-auth non-auth frames (4001)
+          const handler = conn.engineInbound
+          if (handler) handler(raw)
         },
 
         onClose(_evt, ws) {
+          // Engine teardown: detach cleans up its inbound handler and session.
+          const conn = rawToConnection.get(keyOf(ws))
+          if (conn) conn.handle.detach()
+          // Reactive-tier cleanup: remove all subscriptions for this socket.
           removeAllForSocket(ws)
         },
       }
@@ -478,9 +403,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return c.json({ error: `${functionPath} is a mutation — use POST` }, 405)
     }
 
+    const httpResolveContext = resolveContext ?? (async () => ({}))
     let context: Record<string, unknown>
     try {
-      context = await resolveContext(c.req.raw)
+      context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
       return c.json({ error: errorMessage(err) }, 401)
     }
@@ -519,9 +445,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return c.json({ error: `${functionPath} is a query — use GET` }, 405)
     }
 
+    const httpResolveContext = resolveContext ?? (async () => ({}))
     let context: Record<string, unknown>
     try {
-      context = await resolveContext(c.req.raw)
+      context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
       return c.json({ error: errorMessage(err) }, 401)
     }
