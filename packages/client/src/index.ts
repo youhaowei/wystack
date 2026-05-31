@@ -28,9 +28,12 @@ export { WyStackProvider, useWyStackClient } from './provider'
 export { createWsManager } from './ws'
 // Browser WebSocket transport adapter (relocated to ./transport/websocket)
 export { createWebSocketPipe } from './transport/websocket'
+// Electron IPC transport adapter (T6)
+export { createElectronPipe, createIpcManager } from './transport/electron'
 export { createEngine } from './engine'
 
 export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'
+export type { IpcManager, IpcManagerConfig, IpcRendererLike } from './transport/electron'
 export type { WyStackClientConfig } from './types'
 export type { Engine, EngineConfig, EnginePipe, PipeFactory, CloseInfo } from './engine'
