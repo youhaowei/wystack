@@ -74,11 +74,7 @@ type CloseFrame = { type: '__close' }
  *   - `close()` sends `{ type: "__close" }` on `wystack:c2s`, removes the
  *     listener, and marks the pipe closed. Idempotent.
  */
-export function createElectronPipe({
-  ipcRenderer,
-}: {
-  ipcRenderer: IpcRendererLike
-}): EnginePipe {
+export function createElectronPipe({ ipcRenderer }: { ipcRenderer: IpcRendererLike }): EnginePipe {
   const messageHandlers = new Set<(msg: ServerMessage) => void>()
   const closeHandlers = new Set<(info: CloseInfo) => void>()
   let closed = false
@@ -192,12 +188,7 @@ export interface IpcManagerConfig {
 export interface IpcManager {
   connect(): void
   disconnect(): void
-  subscribe(
-    id: string,
-    path: string,
-    args: Record<string, unknown>,
-    onInvalidate: () => void,
-  ): void
+  subscribe(id: string, path: string, args: Record<string, unknown>, onInvalidate: () => void): void
   unsubscribe(id: string): void
   isConnected(): boolean
 }
