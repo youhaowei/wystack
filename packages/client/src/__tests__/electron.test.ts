@@ -2,8 +2,13 @@
  * Tests for @wystack/client/electron — fake ipcRenderer, no real Electron.
  *
  * Coverage:
- *   - Pipe level: __connect sent on construction, call sent on c2s, inbound
- *     result/invalidate on s2c reaches engine, __close fires onClose(1000).
+ *   - Pipe level: __connect deferred to a microtask (first c2s frame), call
+ *     sent on c2s, inbound result/invalidate on s2c reaches engine, __close
+ *     fires onClose(1000).
+ *   - Regression (Major): a __close delivered immediately after createPipe,
+ *     before the engine attaches handlers, still reaches onClose.
+ *   - Regression (P2): an unserializable inbound frame (BigInt / cyclic) is
+ *     dropped silently and dispatch keeps working.
  *   - Engine level: createEngine({ createPipe: createElectronPipe }) →
  *     subscribe → invalidate round-trip (no auth, starts authenticated per
  *     IPC trusted-transport convention).
@@ -23,6 +28,8 @@ interface FakeIpc extends IpcRendererLike {
   on(channel: string, listener: (event: unknown, ...args: unknown[]) => void): this
   removeListener(channel: string, listener: (...args: unknown[]) => void): this
   emit(channel: string, payload: unknown): void
+  /** Register a synchronous hook fired whenever the adapter sends on a channel. */
+  onSend(hook: (channel: string, payload: unknown) => void): void
   sent: Array<[string, unknown]>
 }
 
@@ -31,10 +38,14 @@ interface FakeIpc extends IpcRendererLike {
  *
  * - `emit(channel, payload)` — deliver a message as if the main process sent it
  *   on `channel`. Used to simulate inbound `s2c` frames.
+ * - `onSend(hook)` — fire synchronously inside `send`, so a test can make the
+ *   fake auto-reply on `s2c` the instant the adapter writes to `c2s` (used to
+ *   reproduce the immediate-reply race deterministically).
  * - `sent` — array of `[channel, payload]` pairs sent by the adapter.
  */
 function makeFakeIpc(): FakeIpc {
   const listeners = new Map<string, Set<Listener>>()
+  const sendHooks = new Set<(channel: string, payload: unknown) => void>()
   const sent: Array<[string, unknown]> = []
 
   const ipc: FakeIpc = {
@@ -42,6 +53,7 @@ function makeFakeIpc(): FakeIpc {
 
     send(channel: string, ...args: unknown[]): void {
       sent.push([channel, args[0]])
+      for (const hook of Array.from(sendHooks)) hook(channel, args[0])
     },
 
     on(channel: string, listener: Listener): FakeIpc {
@@ -66,6 +78,10 @@ function makeFakeIpc(): FakeIpc {
       for (const listener of Array.from(set)) {
         listener(/*event=*/ {}, payload)
       }
+    },
+
+    onSend(hook: (channel: string, payload: unknown) => void): void {
+      sendHooks.add(hook)
     },
   }
 
@@ -101,12 +117,27 @@ function deferred<T = void>() {
   return { promise, resolve }
 }
 
+/** Find the first frame of a given `type` sent on a c2s channel. */
+function findSent(ipc: FakeIpc, type: string): [string, unknown] | undefined {
+  return ipc.sent.find(
+    ([, payload]) =>
+      payload !== null &&
+      typeof payload === 'object' &&
+      (payload as Record<string, unknown>).type === type,
+  )
+}
+
 // ─── Pipe-level tests ─────────────────────────────────────────────────────────
 
 describe('createElectronPipe', () => {
-  test('sends __connect on construction', () => {
+  test('defers __connect to a microtask, then it is the first c2s frame', async () => {
     const ipc = makeFakeIpc()
     createElectronPipe({ ipcRenderer: ipc })
+
+    // Not sent synchronously on construction.
+    expect(ipc.sent.length).toBe(0)
+
+    await settle()
 
     expect(ipc.sent.length).toBeGreaterThanOrEqual(1)
     expect(ipc.sent[0]).toEqual(['wystack:c2s', { type: '__connect' }])
@@ -118,8 +149,7 @@ describe('createElectronPipe', () => {
 
     pipe.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
 
-    // sent[0] is __connect; sent[1] is the subscribe frame
-    expect(ipc.sent[1]).toEqual([
+    expect(findSent(ipc, 'subscribe')).toEqual([
       'wystack:c2s',
       { type: 'subscribe', id: 's1', path: 'listTodos', args: {} },
     ])
@@ -177,6 +207,21 @@ describe('createElectronPipe', () => {
     expect(received).toEqual([])
   })
 
+  test('inbound __connect on s2c is filtered, not forwarded to onMessage', async () => {
+    const ipc = makeFakeIpc()
+    const pipe = createElectronPipe({ ipcRenderer: ipc })
+
+    const received: unknown[] = []
+    pipe.onMessage((msg) => received.push(msg))
+
+    // __connect is a c2s control frame; if it ever arrives on s2c it must be
+    // dropped at the boundary, never parsed or forwarded.
+    ipc.emit('wystack:s2c', { type: '__connect' })
+    await settle()
+
+    expect(received).toEqual([])
+  })
+
   test('close() sends __close on c2s and is idempotent', () => {
     const ipc = makeFakeIpc()
     const pipe = createElectronPipe({ ipcRenderer: ipc })
@@ -194,15 +239,31 @@ describe('createElectronPipe', () => {
     expect(closeFrames.length).toBe(1)
   })
 
-  test('send() is a silent no-op after close()', () => {
+  test('send() is a silent no-op after close()', async () => {
     const ipc = makeFakeIpc()
     const pipe = createElectronPipe({ ipcRenderer: ipc })
 
+    // Let the deferred __connect flush so it does not muddy the count.
+    await settle()
     const countBefore = ipc.sent.length
+
     pipe.close()
     pipe.send({ type: 'subscribe', id: 's2', path: 'q', args: {} })
 
-    expect(ipc.sent.length).toBe(countBefore + 1) // only the __close frame, no subscribe
+    // Only the __close frame should have been added, no subscribe.
+    expect(ipc.sent.length).toBe(countBefore + 1)
+    expect(findSent(ipc, 'subscribe')).toBeUndefined()
+  })
+
+  test('close() before the deferred __connect suppresses __connect', async () => {
+    const ipc = makeFakeIpc()
+    const pipe = createElectronPipe({ ipcRenderer: ipc })
+
+    // Close synchronously, before the microtask flushes __connect.
+    pipe.close()
+    await settle()
+
+    expect(findSent(ipc, '__connect')).toBeUndefined()
   })
 
   test('onMessage unsubscribe removes handler', async () => {
@@ -237,6 +298,49 @@ describe('createElectronPipe', () => {
 
     expect(received).toEqual([])
   })
+
+  // ── Regression (P2): unserializable inbound frame must not throw ───────────
+
+  test('unserializable inbound frame (BigInt) is dropped, dispatch keeps working', async () => {
+    const ipc = makeFakeIpc()
+    const pipe = createElectronPipe({ ipcRenderer: ipc })
+
+    const received: unknown[] = []
+    pipe.onMessage((msg) => received.push(msg))
+
+    // BigInt cannot be JSON.stringify'd → guarded stringify must drop it, not
+    // throw. emit() would propagate a throw out of the listener, failing the
+    // test if the guard were missing.
+    expect(() => {
+      ipc.emit('wystack:s2c', { type: 'result', id: 'x', data: 10n })
+    }).not.toThrow()
+
+    // A subsequent valid frame still dispatches — the listener wasn't poisoned.
+    ipc.emit('wystack:s2c', { type: 'invalidate', id: 's1' })
+    await settle()
+
+    expect(received).toEqual([{ type: 'invalidate', id: 's1' }])
+  })
+
+  test('unserializable inbound frame (cyclic) is dropped, dispatch keeps working', async () => {
+    const ipc = makeFakeIpc()
+    const pipe = createElectronPipe({ ipcRenderer: ipc })
+
+    const received: unknown[] = []
+    pipe.onMessage((msg) => received.push(msg))
+
+    const cyclic: Record<string, unknown> = { type: 'result', id: 'y' }
+    cyclic.self = cyclic // JSON.stringify throws on a cyclic structure
+
+    expect(() => {
+      ipc.emit('wystack:s2c', cyclic)
+    }).not.toThrow()
+
+    ipc.emit('wystack:s2c', { type: 'invalidate', id: 's2' })
+    await settle()
+
+    expect(received).toEqual([{ type: 'invalidate', id: 's2' }])
+  })
 })
 
 // ─── Engine-level integration test ────────────────────────────────────────────
@@ -257,12 +361,7 @@ describe('createEngine with ElectronPipe', () => {
     await settle()
 
     // Engine should have sent subscribe on c2s (after __connect)
-    const subscribeFrame = ipc.sent.find(
-      ([, payload]) =>
-        payload !== null &&
-        typeof payload === 'object' &&
-        (payload as Record<string, unknown>).type === 'subscribe',
-    )
+    const subscribeFrame = findSent(ipc, 'subscribe')
     expect(subscribeFrame).toBeDefined()
     expect(subscribeFrame![1]).toEqual({
       type: 'subscribe',
@@ -290,6 +389,42 @@ describe('createEngine with ElectronPipe', () => {
     await settle()
 
     const code = await withTimeout(closeFired.promise, '__close fires onClose')
+    expect(code).toBe(1000)
+  })
+
+  // ── Regression (Major): __connect startup race ─────────────────────────────
+
+  test('immediate __close reply (before handlers attach) still reaches onClose', async () => {
+    // Reproduces the dropped-close race: the engine attaches onMessage/onClose
+    // *after* createPipe() returns. If __connect were sent synchronously inside
+    // the constructor, the server's immediate __close reply would arrive while
+    // closeHandlers is still empty and be lost. The microtask deferral fixes
+    // this — the fake auto-replies __close the instant it sees __connect on
+    // c2s, and the handler (attached after construction, like the engine does)
+    // must still observe it.
+    const ipc = makeFakeIpc()
+
+    ipc.onSend((channel, payload) => {
+      if (
+        channel === 'wystack:c2s' &&
+        payload !== null &&
+        typeof payload === 'object' &&
+        (payload as Record<string, unknown>).type === '__connect'
+      ) {
+        // Synchronously bounce a clean close back on s2c.
+        ipc.emit('wystack:s2c', { type: '__close' })
+      }
+    })
+
+    const pipe = createElectronPipe({ ipcRenderer: ipc })
+
+    // Attach onClose AFTER construction — exactly the engine's ordering.
+    const closeFired = deferred<number>()
+    pipe.onClose((info) => closeFired.resolve(info.code))
+
+    await settle()
+
+    const code = await withTimeout(closeFired.promise, 'immediate __close reaches onClose')
     expect(code).toBe(1000)
   })
 })
@@ -341,12 +476,7 @@ describe('createIpcManager', () => {
     manager.unsubscribe('m2')
     await settle()
 
-    const unsubFrame = ipc.sent.find(
-      ([, payload]) =>
-        payload !== null &&
-        typeof payload === 'object' &&
-        (payload as Record<string, unknown>).type === 'unsubscribe',
-    )
+    const unsubFrame = findSent(ipc, 'unsubscribe')
     expect(unsubFrame).toBeDefined()
     expect(unsubFrame![1]).toEqual({ type: 'unsubscribe', id: 'm2' })
 
