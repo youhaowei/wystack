@@ -120,10 +120,7 @@ function makeFakeIpcMain(): IpcMainLike & {
   emit(channel: string, event: IpcMainEventLike, message: unknown): void
   listenerCount(channel: string): number
 } {
-  const listeners: Map<
-    string,
-    Set<(event: IpcMainEventLike, message: unknown) => void>
-  > = new Map()
+  const listeners: Map<string, Set<(event: IpcMainEventLike, message: unknown) => void>> = new Map()
 
   return {
     on(channel, listener) {
@@ -154,7 +151,9 @@ function makeFakeIpcMain(): IpcMainLike & {
  * Wire a single renderer (fake WebContents) to the transport adapter.
  * Returns helpers to send c2s frames and inspect s2c output.
  */
-async function harness(opts: { resolveContext?: (req: Request) => Promise<Record<string, unknown>>; wcId?: number } = {}) {
+async function harness(
+  opts: { resolveContext?: (req: Request) => Promise<Record<string, unknown>>; wcId?: number } = {},
+) {
   const app = await makeApp()
   const ipcMain = makeFakeIpcMain()
   const wc = makeFakeWebContents(opts.wcId ?? 1)
@@ -369,13 +368,17 @@ describe('Electron adapter — webContents lifecycle teardown (AC #5)', () => {
     await until(
       () =>
         h.wc.received.some(
-          (m: unknown) => (m as { type: string; id?: string }).type === 'result' && (m as { id: string }).id === 'post',
+          (m: unknown) =>
+            (m as { type: string; id?: string }).type === 'result' &&
+            (m as { id: string }).id === 'post',
         ),
       'post-reload result',
     )
     expect(
       h.wc.received.find(
-        (m: unknown) => (m as { type: string; id?: string }).type === 'result' && (m as { id: string }).id === 'post',
+        (m: unknown) =>
+          (m as { type: string; id?: string }).type === 'result' &&
+          (m as { id: string }).id === 'post',
       ),
     ).toEqual({ type: 'result', id: 'post', data: [] })
   })
@@ -399,9 +402,17 @@ describe('Electron adapter — Pipe identity (AC #6)', () => {
     attachElectronTransport({ app, ipcMain })
 
     // Send from renderer 1.
-    ipcMain.emit('wystack:c2s', { sender: wc1 }, { type: 'call', id: 'r1', path: 'listTodos', args: {} })
+    ipcMain.emit(
+      'wystack:c2s',
+      { sender: wc1 },
+      { type: 'call', id: 'r1', path: 'listTodos', args: {} },
+    )
     // Send from renderer 2.
-    ipcMain.emit('wystack:c2s', { sender: wc2 }, { type: 'call', id: 'r2', path: 'listTodos', args: {} })
+    ipcMain.emit(
+      'wystack:c2s',
+      { sender: wc2 },
+      { type: 'call', id: 'r2', path: 'listTodos', args: {} },
+    )
 
     await until(() => wc1.received.length > 0 && wc2.received.length > 0, 'both results')
 
@@ -445,8 +456,16 @@ describe('Electron adapter — top-level detach (AC #7)', () => {
     await flush()
 
     // After detach, sending on either renderer produces no response.
-    ipcMain.emit('wystack:c2s', { sender: wc1 }, { type: 'call', id: 'x', path: 'listTodos', args: {} })
-    ipcMain.emit('wystack:c2s', { sender: wc2 }, { type: 'call', id: 'y', path: 'listTodos', args: {} })
+    ipcMain.emit(
+      'wystack:c2s',
+      { sender: wc1 },
+      { type: 'call', id: 'x', path: 'listTodos', args: {} },
+    )
+    ipcMain.emit(
+      'wystack:c2s',
+      { sender: wc2 },
+      { type: 'call', id: 'y', path: 'listTodos', args: {} },
+    )
     await flush()
 
     expect(wc1.received.find((m: unknown) => (m as { id?: string }).id === 'x')).toBeUndefined()
@@ -488,7 +507,10 @@ describe('Electron adapter — multi-renderer isolation (AC #8)', () => {
     // wc1 opens + authenticates.
     ipcMain.emit('wystack:c2s', { sender: wc1 }, { type: '__connect' })
     ipcMain.emit('wystack:c2s', { sender: wc1 }, { type: 'auth', token: 'good' })
-    await until(() => wc1.received.some((m: unknown) => (m as { type: string }).type === 'authenticated'), 'wc1 auth')
+    await until(
+      () => wc1.received.some((m: unknown) => (m as { type: string }).type === 'authenticated'),
+      'wc1 auth',
+    )
 
     // wc2 opens + sends bad token → auth-failed on wc2.
     ipcMain.emit('wystack:c2s', { sender: wc2 }, { type: '__connect' })
@@ -496,8 +518,15 @@ describe('Electron adapter — multi-renderer isolation (AC #8)', () => {
     await flush()
 
     // wc1 should still respond.
-    ipcMain.emit('wystack:c2s', { sender: wc1 }, { type: 'call', id: 'safe', path: 'listTodos', args: {} })
-    await until(() => wc1.received.some((m: unknown) => (m as { id?: string }).id === 'safe'), 'wc1 call')
+    ipcMain.emit(
+      'wystack:c2s',
+      { sender: wc1 },
+      { type: 'call', id: 'safe', path: 'listTodos', args: {} },
+    )
+    await until(
+      () => wc1.received.some((m: unknown) => (m as { id?: string }).id === 'safe'),
+      'wc1 call',
+    )
 
     expect(wc1.received.find((m: unknown) => (m as { id?: string }).id === 'safe')).toEqual({
       type: 'result',
