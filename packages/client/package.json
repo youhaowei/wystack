@@ -10,6 +10,11 @@
       "types": "./dist/index.d.ts",
       "bun": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./electron": {
+      "types": "./dist/transport/electron.d.ts",
+      "bun": "./src/transport/electron.ts",
+      "import": "./dist/transport/electron.js"
     }
   },
   "scripts": {
