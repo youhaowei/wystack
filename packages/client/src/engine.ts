@@ -504,12 +504,15 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    // Engine-owned id namespace. The `\0` prefix is reserved: it cannot collide
-    // with a caller-supplied subscription id (callers pass human/query-key ids,
-    // never a NUL-prefixed string), so the shared `error`/`result` id lookup in
-    // handleMessage can never mis-route a subscription error onto a pending call.
-    // See the `result`/`error` cases in handleMessage.
-    const id = `\0call-${(++callSeq).toString(36)}`
+    // Engine-owned id namespace. The `call:` prefix is reserved: a colon never
+    // appears in a caller-supplied subscription id (callers pass query-key-derived
+    // ids), so the `error`-frame id lookup in handleMessage can never mis-route a
+    // subscription error onto a pending call. The server echoes `error` frames
+    // with the offending id for BOTH a failed call and a failed subscribe, and the
+    // wire doesn't tag which — the reserved prefix is what keeps the two id spaces
+    // disjoint client-side. (Tagging error origin at the wire would remove the need
+    // for any prefix; that's a protocol change, tracked separately.)
+    const id = `call:${(++callSeq).toString(36)}`
     const target = pipe
     // Snapshot the generation NOW (mirrors sendOrClose's param): the async
     // rejection leg below must close the generation this call rode on, never a
