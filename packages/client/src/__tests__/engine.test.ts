@@ -778,4 +778,73 @@ describe('engine.call — call/result correlation', () => {
     expect(await withTimeout(result, 'result after connection-level error')).toBe('ok')
     engine.disconnect()
   })
+
+  test('synchronous send throw rejects the call without corrupting engine state', async () => {
+    // Regression (Codex P2): the WS adapter encodes the frame inside `send`
+    // (e.g. `JSON.stringify(message)`), which throws SYNCHRONOUSLY on a BigInt
+    // or cyclic arg. `safeSend` only catches async rejections, so the throw
+    // escapes the call() executor. The promise must reject, and call() must
+    // delete the pending entry it just added (the no-leak guarantee lives in
+    // that `pendingCalls.delete(id)` — verified by reading the diff, since the
+    // map is private). This test verifies the two observable consequences: the
+    // call rejects with the encode error, and the engine stays fully usable.
+    //
+    // Hand-rolled pipe: the next `call` send throws once, later sends succeed.
+    const sent: ClientMessage[] = []
+    // Set (not a single `let`) so TS doesn't narrow the handler to `null` at
+    // the call sites — mirrors the close-handler pattern elsewhere in this file.
+    const messageHandlers = new Set<(msg: ServerMessage) => void>()
+    const deliver = (msg: ServerMessage) => {
+      for (const h of Array.from(messageHandlers)) h(msg)
+    }
+    let throwNextSend = false
+    const pipe: EnginePipe = {
+      id: 'sync-throw',
+      send(message: ClientMessage) {
+        if (throwNextSend && message.type === 'call') {
+          throwNextSend = false
+          // Emulate the adapter's encode step blowing up synchronously.
+          throw new TypeError('Do not know how to serialize a BigInt')
+        }
+        sent.push(message)
+      },
+      onMessage(handler: (msg: ServerMessage) => void) {
+        messageHandlers.add(handler)
+        return () => {
+          messageHandlers.delete(handler)
+        }
+      },
+      close: () => {},
+      onClose: () => () => {},
+    }
+    const engine = createEngine({ createPipe: () => pipe })
+    engine.connect()
+    await settle()
+    expect(engine.isConnected()).toBe(true)
+
+    // First call: send throws synchronously → promise rejects with the error.
+    throwNextSend = true
+    const failed = engine.call('path.bigint', {})
+    await expect(failed).rejects.toThrow('Do not know how to serialize a BigInt')
+
+    // A stray `result` for the failed call's id (`call-1`) is an unknown/stale
+    // id: a no-op. No crash; the rejected promise stays rejected.
+    deliver({ type: 'result', id: 'call-1', data: 'stray' })
+    await settle()
+
+    // The engine stays fully usable after a sync throw: the next call resolves
+    // end-to-end. Its id is `call-2` (the seq advanced past the failed call),
+    // so ids are never reused.
+    const ok = engine.call('path.ok', {})
+    await settle()
+    const callFrame = sent.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('call-2')
+    deliver({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(ok, 'second call after sync throw')).toBe('ok')
+
+    engine.disconnect()
+  })
 })

@@ -476,7 +476,19 @@ export function createEngine(config: EngineConfig): Engine {
     const id = `call-${(++callSeq).toString(36)}`
     return new Promise<unknown>((resolve, reject) => {
       pendingCalls.set(id, { resolve, reject })
-      safeSend({ type: 'call', id, path, args }, connectGeneration)
+      try {
+        safeSend({ type: 'call', id, path, args }, connectGeneration)
+      } catch (err) {
+        // The transport can throw SYNCHRONOUSLY while encoding the frame — e.g.
+        // a WS adapter's `JSON.stringify(message)` chokes on a BigInt or cyclic
+        // arg. `safeSend` only catches async rejections (a rejected send
+        // promise), so a sync throw escapes here. Remove the entry we just added
+        // before rejecting, or it leaks an unreachable resolver in the map for
+        // the lifetime of a long-lived manager. A later stray result/error for
+        // this id is then a no-op (the entry is gone).
+        pendingCalls.delete(id)
+        reject(err)
+      }
     })
   }
 
