@@ -234,6 +234,24 @@ export function createEngine(config: EngineConfig): Engine {
   }
 
   /**
+   * Tear down after a *send-side* failure (sync encode throw or async write
+   * rejection). Unlike a transport-emitted close event — which `handleClose`
+   * handles reactively, assuming the socket is already dead — a send failure
+   * leaves the underlying socket OPEN. So we close the captured target before
+   * synthesizing the close, or it leaks: `handleClose` detaches listeners and
+   * nulls `pipe` but never calls `close()`, so a still-open socket would linger
+   * while `scheduleReconnect` opens a second connection.
+   *
+   * `target` is captured at the call site (not read from `pipe`) for the same
+   * reason `generation` is: by the time an async rejection settles, `pipe` may
+   * point at a newer connection that must not be closed.
+   */
+  function closeAfterSendFailure(target: Pipe, generation: number) {
+    target.close()
+    handleClose({ code: 1006 }, generation)
+  }
+
+  /**
    * Close the connection if a send's returned promise rejects asynchronously —
    * a real write failure on a live carrier (transport death). Both `sendOrClose`
    * and `call()` route their async-rejection leg here so the generation is
@@ -241,9 +259,9 @@ export function createEngine(config: EngineConfig): Engine {
    * a stale rejection from a superseded pipe must close THAT generation, never a
    * newer one. Taking `generation` as a parameter makes the snapshot structural.
    */
-  function closeOnSendRejection(sent: unknown, generation: number) {
+  function closeOnSendRejection(target: Pipe, sent: unknown, generation: number) {
     void Promise.resolve(sent).catch(() => {
-      handleClose({ code: 1006 }, generation)
+      closeAfterSendFailure(target, generation)
     })
   }
 
@@ -266,9 +284,9 @@ export function createEngine(config: EngineConfig): Engine {
     const target = pipe
     if (target === null) return
     try {
-      closeOnSendRejection(target.send(message), generation)
+      closeOnSendRejection(target, target.send(message), generation)
     } catch {
-      handleClose({ code: 1006 }, generation)
+      closeAfterSendFailure(target, generation)
     }
   }
 
@@ -527,7 +545,7 @@ export function createEngine(config: EngineConfig): Engine {
       // leave the connection healthy. An async send rejection IS transport death:
       // route it through closeOnSendRejection (shared with sendOrClose).
       try {
-        closeOnSendRejection(target.send({ type: 'call', id, path, args }), generation)
+        closeOnSendRejection(target, target.send({ type: 'call', id, path, args }), generation)
       } catch (err) {
         pendingCalls.delete(id)
         reject(err)

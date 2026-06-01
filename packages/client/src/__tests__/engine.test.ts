@@ -391,11 +391,14 @@ describe('createEngine', () => {
 
   test('rejected async send closes active pipe', async () => {
     const closeHandlers = new Set<(info: CloseInfo) => void>()
+    let socketClosed = 0
     const pipe: EnginePipe = {
       id: 'rejecting',
       send: () => Promise.reject(new Error('send failed')),
       onMessage: () => () => {},
-      close: () => {},
+      close: () => {
+        socketClosed++
+      },
       onClose(handler) {
         closeHandlers.add(handler)
         return () => {
@@ -414,6 +417,9 @@ describe('createEngine', () => {
 
     expect(engine.isConnected()).toBe(false)
     expect(closeHandlers.size).toBe(0)
+    // Async write failure leaves the socket open just like the sync throw —
+    // the engine must close the captured socket itself (Codex P2).
+    expect(socketClosed).toBe(1)
     engine.disconnect()
   })
 
@@ -908,6 +914,7 @@ describe('engine.call — call/result correlation', () => {
     // out of subscribe()/the connect chain. Before hardening, only call() guarded
     // sync throws; subscribe/unsubscribe/auth rode the bare async-only wrapper.
     const closeHandlers = new Set<(info: CloseInfo) => void>()
+    let socketClosed = 0
     const pipe: EnginePipe = {
       id: 'sync-throw-sub',
       send(message: ClientMessage) {
@@ -917,7 +924,9 @@ describe('engine.call — call/result correlation', () => {
         }
       },
       onMessage: () => () => {},
-      close: () => {},
+      close: () => {
+        socketClosed++
+      },
       onClose(handler) {
         closeHandlers.add(handler)
         return () => {
@@ -937,6 +946,10 @@ describe('engine.call — call/result correlation', () => {
 
     // The connection was torn down (handleClose ran), not left in a half state.
     expect(engine.isConnected()).toBe(false)
+    // The captured socket was actively closed (Codex P2): a synthesized close
+    // has no real close event behind it, so the engine must close the socket
+    // itself or it leaks open while scheduleReconnect opens a second.
+    expect(socketClosed).toBe(1)
     engine.disconnect()
   })
 })
