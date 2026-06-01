@@ -62,6 +62,17 @@ export interface WsManager {
   ): void
   unsubscribe(id: string): void
   isConnected(): boolean
+  /**
+   * RPC call over the WebSocket pipe — correlates by id, resolves with
+   * result.data. Additive: does not change existing connect/subscribe/etc
+   * signatures (YW-97 / T3d).
+   *
+   * Note: The primary HTTP query path in `client.ts` (`query()`) is unchanged
+   * and remains the default for web/WS consumers. This `call` surface enables
+   * pipe-based RPC for consumers that already hold a WsManager and need to
+   * route imperative calls over the same connection.
+   */
+  call(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 /**
@@ -87,5 +98,6 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     },
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),
+    call: (path, args) => engine.call(path, args),
   }
 }

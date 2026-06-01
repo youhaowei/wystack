@@ -30,7 +30,7 @@ export { createWsManager } from './ws'
 export { createWebSocketPipe } from './transport/websocket'
 // Electron IPC transport adapter (T6)
 export { createElectronPipe, createIpcManager } from './transport/electron'
-export { createEngine } from './engine'
+export { createEngine, CallNotReadyError } from './engine'
 
 export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'

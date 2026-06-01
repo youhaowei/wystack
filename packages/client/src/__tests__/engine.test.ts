@@ -8,7 +8,7 @@ import {
   type ServerMessage,
   type Pipe,
 } from '@wystack/transport'
-import { createEngine, type EnginePipe, type CloseInfo } from '../engine'
+import { createEngine, CallNotReadyError, type EnginePipe, type CloseInfo } from '../engine'
 
 /**
  * Wrap a base `Pipe` into the engine's `EnginePipe` shape, exposing a manual
@@ -525,6 +525,257 @@ describe('createEngine', () => {
     engine.connect()
     await settle()
     expect(harness.pairCount()).toBe(2)
+    engine.disconnect()
+  })
+})
+
+// ─── Call / result correlation (YW-97 / T3d) ─────────────────────────────────
+
+describe('engine.call — call/result correlation', () => {
+  test('call→result: loopback round-trip resolves with data', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('users.list', {})
+    await settle()
+
+    // Server sees the call frame.
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.path).toBe('users.list')
+    expect(callFrame!.args).toEqual({})
+
+    // Server replies with the matching result.
+    server.send({ type: 'result', id: callFrame!.id, data: [{ id: 1 }] })
+    await settle()
+
+    await withTimeout(result, 'call round-trip')
+    expect(await result).toEqual([{ id: 1 }])
+    engine.disconnect()
+  })
+
+  test('concurrent calls correlate by id — no cross-talk', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const resultA = engine.call('path.a', {})
+    const resultB = engine.call('path.b', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrames = server.received.filter((f) => f.type === 'call') as Extract<
+      ClientMessage,
+      { type: 'call' }
+    >[]
+    expect(callFrames).toHaveLength(2)
+
+    const frameA = callFrames.find((f) => f.path === 'path.a')!
+    const frameB = callFrames.find((f) => f.path === 'path.b')!
+    expect(frameA).toBeDefined()
+    expect(frameB).toBeDefined()
+    expect(frameA.id).not.toBe(frameB.id)
+
+    // Reply in REVERSE ORDER to prove there's no positional assumption.
+    server.send({ type: 'result', id: frameB.id, data: 'b-data' })
+    server.send({ type: 'result', id: frameA.id, data: 'a-data' })
+    await settle()
+
+    expect(await withTimeout(resultA, 'resultA')).toBe('a-data')
+    expect(await withTimeout(resultB, 'resultB')).toBe('b-data')
+    engine.disconnect()
+  })
+
+  test('error frame with matching id rejects the call', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.fail', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    server.send({ type: 'error', id: callFrame!.id, error: 'not found' })
+    await settle()
+
+    await expect(result).rejects.toThrow('not found')
+    engine.disconnect()
+  })
+
+  test('error frame with issues attaches them to the rejection', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.validate', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    const issues = [{ message: 'Required', path: ['name'] }]
+    server.send({ type: 'error', id: callFrame!.id, error: 'validation failed', issues })
+    await settle()
+
+    let caught: unknown
+    await result.catch((e) => {
+      caught = e
+    })
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe('validation failed')
+    expect((caught as Error & { issues?: unknown[] }).issues).toEqual(issues)
+    engine.disconnect()
+  })
+
+  test('pipe close rejects all pending calls (no hangs)', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    // Close the pipe before the server replies — engine must reject pending.
+    harness.closeActive(1006)
+    await settle()
+
+    await expect(result).rejects.toThrow('pipe closed')
+    engine.disconnect()
+  })
+
+  test('disconnect rejects all pending calls immediately', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    engine.disconnect()
+    await settle()
+
+    await expect(result).rejects.toThrow('disconnected')
+  })
+
+  test('reconnect after close does not resolve stale calls', async () => {
+    // Scenario: call in gen-1 → close → reconnect (gen-2) → server sends
+    // result with gen-1 id → must NOT resolve (call was already rejected).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    // Close — call is rejected with 'pipe closed'.
+    harness.closeActive(1006)
+    await settle()
+
+    await expect(result).rejects.toThrow('pipe closed')
+
+    // Wait for reconnect to open a new pipe.
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+    await settle()
+
+    // Now the (stale) server delivers a result for the old id on the new pipe.
+    // Engine's pending map was cleared on close — this must be a silent no-op.
+    harness.server().send({ type: 'result', id: callFrame!.id, data: 'stale' })
+    await settle()
+
+    // The previously-rejected promise is already settled; it stays rejected.
+    // (No assertion needed beyond the rejects.toThrow above, but we verify
+    // isConnected to confirm gen-2 is live and not corrupted by the stale frame.)
+    expect(engine.isConnected()).toBe(true)
+    engine.disconnect()
+  }, 10_000)
+
+  test('call() rejects immediately when not connected', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    // connect() not called yet
+
+    await expect(engine.call('path', {})).rejects.toBeInstanceOf(CallNotReadyError)
+  })
+
+  test('call() rejects immediately when auth handshake is pending', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => 'tkn',
+    })
+    engine.connect()
+    await settle()
+    // Connected but not yet authenticated (server hasn't sent `authenticated`).
+    expect(engine.isConnected()).toBe(true)
+
+    await expect(engine.call('path', {})).rejects.toBeInstanceOf(CallNotReadyError)
+    engine.disconnect()
+  })
+
+  test('connection-level error frame (no id) does not reject any pending call', async () => {
+    // An `error` frame without an `id` is a connection-level signal. It should
+    // leave pending calls intact (they're still waiting for a result or a close).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path', {})
+    await settle()
+
+    const server = harness.server()
+    // Send a connection-level error (no id).
+    server.send({ type: 'error', error: 'server error' })
+    await settle()
+
+    // Call must still be pending — not resolved, not rejected yet.
+    let settled = false
+    void result.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await settle()
+    expect(settled).toBe(false)
+
+    // Now resolve it properly.
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    await settle()
+
+    expect(await withTimeout(result, 'result after connection-level error')).toBe('ok')
     engine.disconnect()
   })
 })
