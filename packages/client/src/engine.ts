@@ -229,16 +229,47 @@ export function createEngine(config: EngineConfig): Engine {
   function sendSubscriptions() {
     if (pipe === null || !authenticated) return
     for (const [id, sub] of activeSubs) {
-      safeSend({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
+      sendOrClose({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
     }
   }
 
-  function safeSend(message: ClientMessage, generation: number) {
-    const target = pipe
-    if (target === null) return
-    void Promise.resolve(target.send(message)).catch(() => {
+  /**
+   * Close the connection if a send's returned promise rejects asynchronously —
+   * a real write failure on a live carrier (transport death). Both `sendOrClose`
+   * and `call()` route their async-rejection leg here so the generation is
+   * *required* to be snapshotted at the call site (not read live at catch time):
+   * a stale rejection from a superseded pipe must close THAT generation, never a
+   * newer one. Taking `generation` as a parameter makes the snapshot structural.
+   */
+  function closeOnSendRejection(sent: unknown, generation: number) {
+    void Promise.resolve(sent).catch(() => {
       handleClose({ code: 1006 }, generation)
     })
+  }
+
+  /**
+   * Send a fire-and-forget control-plane frame (auth / subscribe / unsubscribe).
+   * On ANY send failure — a synchronous encode throw OR an async send rejection —
+   * the frame is unrecoverable and the connection is torn down (`handleClose`
+   * with 1006) so the reconnect machinery takes over.
+   *
+   * NOT used by `call()`: a correlated RPC treats a synchronous encode throw as
+   * bad caller args (reject that one call, keep the connection alive), which is a
+   * different policy. `call()` does its own `target.send` + try/catch — see there.
+   *
+   * The synchronous try/catch matters: the transport encodes the frame inside
+   * `send` (e.g. the WS adapter's `JSON.stringify(message)`), which throws
+   * synchronously on a BigInt or cyclic arg. Wrapping only the returned promise
+   * (`Promise.resolve(target.send(...))`) would let that sync throw escape.
+   */
+  function sendOrClose(message: ClientMessage, generation: number) {
+    const target = pipe
+    if (target === null) return
+    try {
+      closeOnSendRejection(target.send(message), generation)
+    } catch {
+      handleClose({ code: 1006 }, generation)
+    }
   }
 
   function handleMessage(msg: ServerMessage) {
@@ -398,7 +429,7 @@ export function createEngine(config: EngineConfig): Engine {
         // `token: null` (not undefined) — the wire frame must always carry
         // the field. The server's anonymous-path (`resolveContext` against
         // upgrade headers) needs an explicit null sentinel.
-        safeSend({ type: 'auth', token: token ?? null }, generation)
+        sendOrClose({ type: 'auth', token: token ?? null }, generation)
         authAckTimer = setTimeout(() => {
           authAckTimer = null
           failAuthAck(generation)
@@ -449,7 +480,7 @@ export function createEngine(config: EngineConfig): Engine {
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
-      safeSend({ type: 'subscribe', id, path, args }, connectGeneration)
+      sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
     }
     // Otherwise replayed on (re)connect via sendSubscriptions().
   }
@@ -458,7 +489,7 @@ export function createEngine(config: EngineConfig): Engine {
     handlers.delete(id)
     activeSubs.delete(id)
     if (pipe !== null && authenticated) {
-      safeSend({ type: 'unsubscribe', id }, connectGeneration)
+      sendOrClose({ type: 'unsubscribe', id }, connectGeneration)
     }
     // If never sent, removing from activeSubs is sufficient.
   }
@@ -473,19 +504,28 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    const id = `call-${(++callSeq).toString(36)}`
+    // Engine-owned id namespace. The `\0` prefix is reserved: it cannot collide
+    // with a caller-supplied subscription id (callers pass human/query-key ids,
+    // never a NUL-prefixed string), so the shared `error`/`result` id lookup in
+    // handleMessage can never mis-route a subscription error onto a pending call.
+    // See the `result`/`error` cases in handleMessage.
+    const id = `\0call-${(++callSeq).toString(36)}`
+    const target = pipe
+    // Snapshot the generation NOW (mirrors sendOrClose's param): the async
+    // rejection leg below must close the generation this call rode on, never a
+    // newer one a reconnect may have installed by the time the promise settles.
+    const generation = connectGeneration
     return new Promise<unknown>((resolve, reject) => {
       pendingCalls.set(id, { resolve, reject })
+      // call() does NOT use sendOrClose: a correlated RPC must NOT tear down the
+      // connection on a bad arg. A synchronous encode throw (BigInt/cyclic arg in
+      // `JSON.stringify`) is bad caller input, not transport death — reject THIS
+      // call, delete its pending entry (or it leaks an unreachable resolver), and
+      // leave the connection healthy. An async send rejection IS transport death:
+      // route it through closeOnSendRejection (shared with sendOrClose).
       try {
-        safeSend({ type: 'call', id, path, args }, connectGeneration)
+        closeOnSendRejection(target.send({ type: 'call', id, path, args }), generation)
       } catch (err) {
-        // The transport can throw SYNCHRONOUSLY while encoding the frame — e.g.
-        // a WS adapter's `JSON.stringify(message)` chokes on a BigInt or cyclic
-        // arg. `safeSend` only catches async rejections (a rejected send
-        // promise), so a sync throw escapes here. Remove the entry we just added
-        // before rejecting, or it leaks an unreachable resolver in the map for
-        // the lifetime of a long-lived manager. A later stray result/error for
-        // this id is then a no-op (the entry is gone).
         pendingCalls.delete(id)
         reject(err)
       }

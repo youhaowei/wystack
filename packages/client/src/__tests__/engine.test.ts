@@ -827,24 +827,115 @@ describe('engine.call — call/result correlation', () => {
     const failed = engine.call('path.bigint', {})
     await expect(failed).rejects.toThrow('Do not know how to serialize a BigInt')
 
-    // A stray `result` for the failed call's id (`call-1`) is an unknown/stale
+    // A stray `result` for the failed call's id (`\0call-1`) is an unknown/stale
     // id: a no-op. No crash; the rejected promise stays rejected.
-    deliver({ type: 'result', id: 'call-1', data: 'stray' })
+    deliver({ type: 'result', id: '\0call-1', data: 'stray' })
     await settle()
 
     // The engine stays fully usable after a sync throw: the next call resolves
-    // end-to-end. Its id is `call-2` (the seq advanced past the failed call),
-    // so ids are never reused.
+    // end-to-end. Its id is `\0call-2` (the seq advanced past the failed call),
+    // so ids are never reused. The `\0` prefix is the engine-reserved namespace.
     const ok = engine.call('path.ok', {})
     await settle()
     const callFrame = sent.find((f) => f.type === 'call') as
       | Extract<ClientMessage, { type: 'call' }>
       | undefined
     expect(callFrame).toBeDefined()
-    expect(callFrame!.id).toBe('call-2')
+    expect(callFrame!.id).toBe('\0call-2')
     deliver({ type: 'result', id: callFrame!.id, data: 'ok' })
     expect(await withTimeout(ok, 'second call after sync throw')).toBe('ok')
 
+    engine.disconnect()
+  })
+
+  test('subscription error never mis-rejects a pending call (reserved id namespace)', async () => {
+    // Regression (Codex P2): the `error` handler looks up pendingCalls by msg.id,
+    // a keyspace shared with caller-supplied subscription ids. Before the fix, a
+    // subscription error whose id matched a generated call id (the engine used a
+    // bare `call-N` format) would mis-reject the in-flight RPC. The engine now
+    // mints call ids in a reserved `\0`-prefixed namespace that no normal caller
+    // sub id occupies, so the two keyspaces can never overlap.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    // A normal subscription whose id looks exactly like the OLD call-id format —
+    // the worst case under the previous bare scheme.
+    engine.subscribe('call-1', 'some.sub', {}, () => {})
+
+    // An in-flight call. Its id is reserved (`\0call-N`), disjoint from `call-1`.
+    const result = engine.call('the.call', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('\0call-1') // reserved namespace, not `call-1`
+
+    // Server sends an error for the SUBSCRIPTION (`call-1`). The pending call
+    // (`\0call-1`) must NOT be rejected by it — different keyspace.
+    server.send({ type: 'error', id: 'call-1', error: 'subscription failed' })
+    await settle()
+
+    // Prove the call is still live: not settled by the subscription error.
+    let settled = false
+    void result.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await settle()
+    expect(settled).toBe(false)
+
+    // The call's real result resolves it normally.
+    server.send({ type: 'result', id: callFrame!.id, data: 'call-data' })
+    await settle()
+    expect(await withTimeout(result, 'reserved-namespace call')).toBe('call-data')
+
+    engine.disconnect()
+  })
+
+  test('control-frame sync send throw closes the connection (does not escape subscribe)', async () => {
+    // Regression (CodeRabbit): sendOrClose must catch a SYNCHRONOUS encode throw
+    // from the transport and route it through handleClose — not let it propagate
+    // out of subscribe()/the connect chain. Before hardening, only call() guarded
+    // sync throws; subscribe/unsubscribe/auth rode the bare async-only wrapper.
+    const closeHandlers = new Set<(info: CloseInfo) => void>()
+    const pipe: EnginePipe = {
+      id: 'sync-throw-sub',
+      send(message: ClientMessage) {
+        if (message.type === 'subscribe') {
+          // Emulate the adapter's encode step throwing synchronously.
+          throw new TypeError('Do not know how to serialize a BigInt')
+        }
+      },
+      onMessage: () => () => {},
+      close: () => {},
+      onClose(handler) {
+        closeHandlers.add(handler)
+        return () => {
+          closeHandlers.delete(handler)
+        }
+      },
+    }
+    const engine = createEngine({ createPipe: () => pipe })
+    engine.connect()
+    await settle()
+    expect(engine.isConnected()).toBe(true)
+
+    // subscribe() must NOT throw — the sync encode failure is absorbed by
+    // sendOrClose, which closes the connection instead.
+    expect(() => engine.subscribe('s1', 'listTodos', {}, () => {})).not.toThrow()
+    await settle()
+
+    // The connection was torn down (handleClose ran), not left in a half state.
+    expect(engine.isConnected()).toBe(false)
     engine.disconnect()
   })
 })
