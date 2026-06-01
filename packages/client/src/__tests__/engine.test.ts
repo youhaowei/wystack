@@ -8,7 +8,13 @@ import {
   type ServerMessage,
   type Pipe,
 } from '@wystack/transport'
-import { createEngine, type EnginePipe, type CloseInfo } from '../engine'
+import {
+  createEngine,
+  CallNotReadyError,
+  ReservedSubscriptionIdError,
+  type EnginePipe,
+  type CloseInfo,
+} from '../engine'
 
 /**
  * Wrap a base `Pipe` into the engine's `EnginePipe` shape, exposing a manual
@@ -391,11 +397,14 @@ describe('createEngine', () => {
 
   test('rejected async send closes active pipe', async () => {
     const closeHandlers = new Set<(info: CloseInfo) => void>()
+    let socketClosed = 0
     const pipe: EnginePipe = {
       id: 'rejecting',
       send: () => Promise.reject(new Error('send failed')),
       onMessage: () => () => {},
-      close: () => {},
+      close: () => {
+        socketClosed++
+      },
       onClose(handler) {
         closeHandlers.add(handler)
         return () => {
@@ -414,6 +423,9 @@ describe('createEngine', () => {
 
     expect(engine.isConnected()).toBe(false)
     expect(closeHandlers.size).toBe(0)
+    // Async write failure leaves the socket open just like the sync throw —
+    // the engine must close the captured socket itself (Codex P2).
+    expect(socketClosed).toBe(1)
     engine.disconnect()
   })
 
@@ -525,6 +537,444 @@ describe('createEngine', () => {
     engine.connect()
     await settle()
     expect(harness.pairCount()).toBe(2)
+    engine.disconnect()
+  })
+})
+
+// ─── Call / result correlation (YW-97 / T3d) ─────────────────────────────────
+
+describe('engine.call — call/result correlation', () => {
+  test('call→result: loopback round-trip resolves with data', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('users.list', {})
+    await settle()
+
+    // Server sees the call frame.
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.path).toBe('users.list')
+    expect(callFrame!.args).toEqual({})
+
+    // Server replies with the matching result.
+    server.send({ type: 'result', id: callFrame!.id, data: [{ id: 1 }] })
+    await settle()
+
+    await withTimeout(result, 'call round-trip')
+    expect(await result).toEqual([{ id: 1 }])
+    engine.disconnect()
+  })
+
+  test('concurrent calls correlate by id — no cross-talk', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const resultA = engine.call('path.a', {})
+    const resultB = engine.call('path.b', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrames = server.received.filter((f) => f.type === 'call') as Extract<
+      ClientMessage,
+      { type: 'call' }
+    >[]
+    expect(callFrames).toHaveLength(2)
+
+    const frameA = callFrames.find((f) => f.path === 'path.a')!
+    const frameB = callFrames.find((f) => f.path === 'path.b')!
+    expect(frameA).toBeDefined()
+    expect(frameB).toBeDefined()
+    expect(frameA.id).not.toBe(frameB.id)
+
+    // Reply in REVERSE ORDER to prove there's no positional assumption.
+    server.send({ type: 'result', id: frameB.id, data: 'b-data' })
+    server.send({ type: 'result', id: frameA.id, data: 'a-data' })
+    await settle()
+
+    expect(await withTimeout(resultA, 'resultA')).toBe('a-data')
+    expect(await withTimeout(resultB, 'resultB')).toBe('b-data')
+    engine.disconnect()
+  })
+
+  test('error frame with matching id rejects the call', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.fail', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    server.send({ type: 'error', id: callFrame!.id, error: 'not found' })
+    await settle()
+
+    await expect(result).rejects.toThrow('not found')
+    engine.disconnect()
+  })
+
+  test('error frame with issues attaches them to the rejection', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.validate', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    const issues = [{ message: 'Required', path: ['name'] }]
+    server.send({ type: 'error', id: callFrame!.id, error: 'validation failed', issues })
+    await settle()
+
+    let caught: unknown
+    await result.catch((e) => {
+      caught = e
+    })
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe('validation failed')
+    expect((caught as Error & { issues?: unknown[] }).issues).toEqual(issues)
+    engine.disconnect()
+  })
+
+  test('pipe close rejects all pending calls (no hangs)', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    // Close the pipe before the server replies — engine must reject pending.
+    harness.closeActive(1006)
+    await settle()
+
+    await expect(result).rejects.toThrow('pipe closed')
+    engine.disconnect()
+  })
+
+  test('disconnect rejects all pending calls immediately', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    engine.disconnect()
+    await settle()
+
+    await expect(result).rejects.toThrow('disconnected')
+  })
+
+  test('reconnect after close does not resolve stale calls', async () => {
+    // Scenario: call in gen-1 → close → reconnect (gen-2) → server sends
+    // result with gen-1 id → must NOT resolve (call was already rejected).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('slow.path', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    // Close — call is rejected with 'pipe closed'.
+    harness.closeActive(1006)
+    await settle()
+
+    await expect(result).rejects.toThrow('pipe closed')
+
+    // Wait for reconnect to open a new pipe.
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+    await settle()
+
+    // Now the (stale) server delivers a result for the old id on the new pipe.
+    // Engine's pending map was cleared on close — this must be a silent no-op.
+    harness.server().send({ type: 'result', id: callFrame!.id, data: 'stale' })
+    await settle()
+
+    // The previously-rejected promise is already settled; it stays rejected.
+    // (No assertion needed beyond the rejects.toThrow above, but we verify
+    // isConnected to confirm gen-2 is live and not corrupted by the stale frame.)
+    expect(engine.isConnected()).toBe(true)
+    engine.disconnect()
+  }, 10_000)
+
+  test('call() rejects immediately when not connected', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    // connect() not called yet
+
+    await expect(engine.call('path', {})).rejects.toBeInstanceOf(CallNotReadyError)
+  })
+
+  test('call() rejects immediately when auth handshake is pending', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => 'tkn',
+    })
+    engine.connect()
+    await settle()
+    // Connected but not yet authenticated (server hasn't sent `authenticated`).
+    expect(engine.isConnected()).toBe(true)
+
+    await expect(engine.call('path', {})).rejects.toBeInstanceOf(CallNotReadyError)
+    engine.disconnect()
+  })
+
+  test('connection-level error frame (no id) does not reject any pending call', async () => {
+    // An `error` frame without an `id` is a connection-level signal. It should
+    // leave pending calls intact (they're still waiting for a result or a close).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path', {})
+    await settle()
+
+    const server = harness.server()
+    // Send a connection-level error (no id).
+    server.send({ type: 'error', error: 'server error' })
+    await settle()
+
+    // Call must still be pending — not resolved, not rejected yet.
+    let settled = false
+    void result.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await settle()
+    expect(settled).toBe(false)
+
+    // Now resolve it properly.
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    await settle()
+
+    expect(await withTimeout(result, 'result after connection-level error')).toBe('ok')
+    engine.disconnect()
+  })
+
+  test('synchronous send throw rejects the call without corrupting engine state', async () => {
+    // Regression (Codex P2): the WS adapter encodes the frame inside `send`
+    // (e.g. `JSON.stringify(message)`), which throws SYNCHRONOUSLY on a BigInt
+    // or cyclic arg. `safeSend` only catches async rejections, so the throw
+    // escapes the call() executor. The promise must reject, and call() must
+    // delete the pending entry it just added (the no-leak guarantee lives in
+    // that `pendingCalls.delete(id)` — verified by reading the diff, since the
+    // map is private). This test verifies the two observable consequences: the
+    // call rejects with the encode error, and the engine stays fully usable.
+    //
+    // Hand-rolled pipe: the next `call` send throws once, later sends succeed.
+    const sent: ClientMessage[] = []
+    // Set (not a single `let`) so TS doesn't narrow the handler to `null` at
+    // the call sites — mirrors the close-handler pattern elsewhere in this file.
+    const messageHandlers = new Set<(msg: ServerMessage) => void>()
+    const deliver = (msg: ServerMessage) => {
+      for (const h of Array.from(messageHandlers)) h(msg)
+    }
+    let throwNextSend = false
+    const pipe: EnginePipe = {
+      id: 'sync-throw',
+      send(message: ClientMessage) {
+        if (throwNextSend && message.type === 'call') {
+          throwNextSend = false
+          // Emulate the adapter's encode step blowing up synchronously.
+          throw new TypeError('Do not know how to serialize a BigInt')
+        }
+        sent.push(message)
+      },
+      onMessage(handler: (msg: ServerMessage) => void) {
+        messageHandlers.add(handler)
+        return () => {
+          messageHandlers.delete(handler)
+        }
+      },
+      close: () => {},
+      onClose: () => () => {},
+    }
+    const engine = createEngine({ createPipe: () => pipe })
+    engine.connect()
+    await settle()
+    expect(engine.isConnected()).toBe(true)
+
+    // First call: send throws synchronously → promise rejects with the error.
+    throwNextSend = true
+    const failed = engine.call('path.bigint', {})
+    await expect(failed).rejects.toThrow('Do not know how to serialize a BigInt')
+
+    // A stray `result` for the failed call's id (`call:1`) is an unknown/stale
+    // id: a no-op. No crash; the rejected promise stays rejected.
+    deliver({ type: 'result', id: 'call:1', data: 'stray' })
+    await settle()
+
+    // The engine stays fully usable after a sync throw: the next call resolves
+    // end-to-end. Its id is `call:2` (the seq advanced past the failed call),
+    // so ids are never reused. The `call:` prefix is the engine-reserved namespace.
+    const ok = engine.call('path.ok', {})
+    await settle()
+    const callFrame = sent.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('call:2')
+    deliver({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(ok, 'second call after sync throw')).toBe('ok')
+
+    engine.disconnect()
+  })
+
+  test('subscription error never mis-rejects a pending call (reserved id namespace)', async () => {
+    // Regression (Codex P2): the `error` handler looks up pendingCalls by msg.id,
+    // a keyspace shared with caller-supplied subscription ids. Before the fix, a
+    // subscription error whose id matched a generated call id (the engine used a
+    // bare `call-N` format) would mis-reject the in-flight RPC. The engine now
+    // mints call ids in a reserved `call:`-prefixed namespace that no normal
+    // caller sub id occupies (a colon never appears in a query-key-derived id),
+    // so the two keyspaces can never overlap.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    // A subscription whose id is the closest a caller can plausibly get to the
+    // reserved format — the worst case the prefix must still keep disjoint.
+    engine.subscribe('call-1', 'some.sub', {}, () => {})
+
+    // An in-flight call. Its id is reserved (`call:N`), disjoint from `call-1`.
+    const result = engine.call('the.call', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('call:1') // reserved namespace, not `call-1`
+
+    // Server sends an error for the SUBSCRIPTION (`call-1`). The pending call
+    // (`call:1`) must NOT be rejected by it — different keyspace.
+    server.send({ type: 'error', id: 'call-1', error: 'subscription failed' })
+    await settle()
+
+    // Prove the call is still live: not settled by the subscription error.
+    let settled = false
+    void result.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await settle()
+    expect(settled).toBe(false)
+
+    // The call's real result resolves it normally.
+    server.send({ type: 'result', id: callFrame!.id, data: 'call-data' })
+    await settle()
+    expect(await withTimeout(result, 'reserved-namespace call')).toBe('call-data')
+
+    engine.disconnect()
+  })
+
+  test('subscribe() rejects a reserved call-id-prefixed id (enforces the invariant)', async () => {
+    // Codex P2 follow-up: the reserved namespace only stays disjoint if subscribe()
+    // refuses ids in it. Without this guard the disjointness was a convention, not
+    // an invariant — a caller could subscribe with `call:1` and have a subscription
+    // error mis-reject an in-flight RPC. subscribe() now throws on the prefix.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    expect(() => engine.subscribe('call:1', 'some.sub', {}, () => {})).toThrow(
+      ReservedSubscriptionIdError,
+    )
+    // A non-reserved id (even the lookalike `call-1`) is still accepted.
+    expect(() => engine.subscribe('call-1', 'some.sub', {}, () => {})).not.toThrow()
+
+    engine.disconnect()
+  })
+
+  test('control-frame sync send throw closes the connection (does not escape subscribe)', async () => {
+    // Regression (CodeRabbit): sendOrClose must catch a SYNCHRONOUS encode throw
+    // from the transport and route it through handleClose — not let it propagate
+    // out of subscribe()/the connect chain. Before hardening, only call() guarded
+    // sync throws; subscribe/unsubscribe/auth rode the bare async-only wrapper.
+    const closeHandlers = new Set<(info: CloseInfo) => void>()
+    let socketClosed = 0
+    const pipe: EnginePipe = {
+      id: 'sync-throw-sub',
+      send(message: ClientMessage) {
+        if (message.type === 'subscribe') {
+          // Emulate the adapter's encode step throwing synchronously.
+          throw new TypeError('Do not know how to serialize a BigInt')
+        }
+      },
+      onMessage: () => () => {},
+      close: () => {
+        socketClosed++
+      },
+      onClose(handler) {
+        closeHandlers.add(handler)
+        return () => {
+          closeHandlers.delete(handler)
+        }
+      },
+    }
+    const engine = createEngine({ createPipe: () => pipe })
+    engine.connect()
+    await settle()
+    expect(engine.isConnected()).toBe(true)
+
+    // subscribe() must NOT throw — the sync encode failure is absorbed by
+    // sendOrClose, which closes the connection instead.
+    expect(() => engine.subscribe('s1', 'listTodos', {}, () => {})).not.toThrow()
+    await settle()
+
+    // The connection was torn down (handleClose ran), not left in a half state.
+    expect(engine.isConnected()).toBe(false)
+    // The captured socket was actively closed (Codex P2): a synthesized close
+    // has no real close event behind it, so the engine must close the socket
+    // itself or it leaks open while scheduleReconnect opens a second.
+    expect(socketClosed).toBe(1)
     engine.disconnect()
   })
 })

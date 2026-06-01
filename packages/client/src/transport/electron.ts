@@ -222,7 +222,8 @@ export interface IpcManagerConfig {
  *
  * Mirrors {@link createWsManager} in `ws.ts` — same connect/disconnect/
  * subscribe/unsubscribe/isConnected surface, backed by `ipcRenderer` instead
- * of a WebSocket.
+ * of a WebSocket. `call` is additive: delegates to engine.call for RPC over
+ * the IPC pipe (YW-97 / T3d).
  */
 export interface IpcManager {
   connect(): void
@@ -230,6 +231,8 @@ export interface IpcManager {
   subscribe(id: string, path: string, args: Record<string, unknown>, onInvalidate: () => void): void
   unsubscribe(id: string): void
   isConnected(): boolean
+  /** RPC call over the IPC pipe — correlates by id, resolves with result.data. */
+  call(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 export function createIpcManager(config: IpcManagerConfig): IpcManager {
@@ -249,5 +252,6 @@ export function createIpcManager(config: IpcManagerConfig): IpcManager {
     },
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),
+    call: (path, args) => engine.call(path, args),
   }
 }

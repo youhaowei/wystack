@@ -4,13 +4,13 @@
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
 //   - Subscription registry (replay on (re)connect, invalidation dispatch)
+//   - Call/result correlation (Spec ADR #9, YW-97 / T3d): engine.call() sends a
+//     `call` frame, registers a pending entry keyed by id, and resolves/rejects
+//     it when the matching `result` or `error` frame arrives from the server.
 //
 // Driven by a `Pipe<ServerMessage, ClientMessage>` factory — never imports a
 // concrete transport. The WebSocket-backed factory lives in `ws.ts` (until the
-// T3b adapter relocates it). Call/result correlation is intentionally out of
-// scope: the transport package does not ship `call` / `result` wire kinds yet
-// (Spec ADR #9 — they ride above the engine via `@tanstack/*` for v0.2; a
-// neutral correlator lands when the wire does).
+// T3b adapter relocates it).
 //
 // Reconnect semantics mirror the previous `ws.ts`:
 //   - close-code 4001 → latch `authFailed`, fire invalidations to nudge HTTP
@@ -19,6 +19,18 @@
 //     at 30s, [50%, 100%) of base jitter).
 //   - `connectGeneration` invalidates stale async callbacks (token fetch,
 //     pipe open) when a newer `connect()` or `disconnect()` has happened.
+//
+// Call correlation + generation discipline:
+//   - Pending calls are stored in `pendingCalls` keyed by id.
+//   - On pipe close (`handleClose`) or explicit `disconnect()`, ALL pending
+//     calls are rejected immediately (no hangs). See `rejectAllPending`.
+//   - `handleClose` is already generation-gated (ownGeneration guard), so a
+//     stale close from a previous generation cannot reject current-generation
+//     pending calls.
+//   - A `call()` issued when the pipe is not live (not connected, or auth
+//     pending on a requiresAuth transport) is rejected immediately with a clear
+//     error — buffering-until-connected is deferred (future work; one-shot
+//     RPC retry semantics are non-trivial).
 
 import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
 
@@ -94,10 +106,71 @@ export interface Engine {
   ): void
   unsubscribe(id: string): void
   isConnected(): boolean
+  /**
+   * Send a `call` frame and return a Promise that resolves with the server's
+   * `result.data`, or rejects on a matching `error` frame, pipe close, or
+   * disconnect.
+   *
+   * Requires an open, authenticated pipe (or no-auth pipe that is connected).
+   * Rejects immediately with `CallNotReadyError` if the pipe is not live — no
+   * buffering (future work: queue-until-ready for long-lived IPC connections).
+   *
+   * The id is engine-internal and monotonically unique within the instance;
+   * callers supply only `path` and `args`.
+   */
+  call(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 const MAX_RECONNECT_DELAY_MS = 30_000
 const DEFAULT_AUTH_ACK_TIMEOUT_MS = 10_000
+
+/**
+ * Thrown (as a rejection) when `engine.call()` is invoked but the pipe is
+ * not ready to accept frames. This covers:
+ *   - Not connected yet (connect() not called, or still in the async open chain)
+ *   - Auth pending (requiresAuth transport that hasn't received `authenticated`)
+ *   - Disconnected or closed
+ *
+ * Buffering until ready is future work; the immediate-reject keeps the
+ * pending-calls map from accumulating entries that can never be drained.
+ */
+export class CallNotReadyError extends Error {
+  constructor(reason: string) {
+    super(`engine.call: not ready — ${reason}`)
+    this.name = 'CallNotReadyError'
+  }
+}
+
+/**
+ * The engine-reserved prefix for generated call ids. A colon never appears in a
+ * caller-supplied subscription id (callers pass query-key-derived ids), so this
+ * prefix keeps the call-id and subscription-id keyspaces disjoint in the shared
+ * `pendingCalls` lookup — an `error` frame's id can never mis-route a
+ * subscription error onto a pending call. `subscribe()` enforces the reservation
+ * (see ReservedSubscriptionIdError) so the disjointness is an invariant, not a
+ * convention the comment merely asserts.
+ */
+const CALL_ID_PREFIX = 'call:'
+
+/**
+ * Thrown by `subscribe()` when a caller passes an id in the engine-reserved
+ * call-id namespace (`call:`-prefixed). Allowing it would let a subscription
+ * error reject an unrelated in-flight RPC sharing the same id.
+ */
+export class ReservedSubscriptionIdError extends Error {
+  constructor(id: string) {
+    super(
+      `engine.subscribe: id "${id}" uses the reserved "${CALL_ID_PREFIX}" prefix — ` +
+        'that namespace belongs to engine-generated call ids',
+    )
+    this.name = 'ReservedSubscriptionIdError'
+  }
+}
+
+interface PendingCall {
+  resolve: (data: unknown) => void
+  reject: (err: unknown) => void
+}
 
 export function createEngine(config: EngineConfig): Engine {
   const { createPipe, getToken, onSubscribed } = config
@@ -115,6 +188,13 @@ export function createEngine(config: EngineConfig): Engine {
   const handlers = new Map<string, InvalidateHandler>()
   const activeSubs = new Map<string, { path: string; args: Record<string, unknown> }>()
 
+  // Pending call correlator: id → {resolve, reject}. Entries are added by
+  // call() and removed by the matching `result` or `error` frame, or by
+  // rejectAllPending() on close/disconnect.
+  const pendingCalls = new Map<string, PendingCall>()
+  // Monotonic call-id sequence — collision-free within this engine instance.
+  let callSeq = 0
+
   let connected = false
   let connecting = false
   let authenticated = false
@@ -130,6 +210,22 @@ export function createEngine(config: EngineConfig): Engine {
       clearTimeout(authAckTimer)
       authAckTimer = null
     }
+  }
+
+  /**
+   * Reject every entry in `pendingCalls` with `reason` and clear the map.
+   * Must be called from every path that closes or invalidates the current
+   * connection — `handleClose` and `disconnect` — so callers of `call()` never
+   * hang waiting for a result that will never arrive.
+   *
+   * Called AFTER the ownGeneration guard in `handleClose`, so a stale close
+   * from a previous generation never touches current-generation pending calls.
+   */
+  function rejectAllPending(reason: Error) {
+    if (pendingCalls.size === 0) return
+    const snapshot = Array.from(pendingCalls.values())
+    pendingCalls.clear()
+    for (const entry of snapshot) entry.reject(reason)
   }
 
   function detachPipe() {
@@ -159,16 +255,65 @@ export function createEngine(config: EngineConfig): Engine {
   function sendSubscriptions() {
     if (pipe === null || !authenticated) return
     for (const [id, sub] of activeSubs) {
-      safeSend({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
+      sendOrClose({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
     }
   }
 
-  function safeSend(message: ClientMessage, generation: number) {
+  /**
+   * Tear down after a *send-side* failure (sync encode throw or async write
+   * rejection). Unlike a transport-emitted close event — which `handleClose`
+   * handles reactively, assuming the socket is already dead — a send failure
+   * leaves the underlying socket OPEN. So we close the captured target before
+   * synthesizing the close, or it leaks: `handleClose` detaches listeners and
+   * nulls `pipe` but never calls `close()`, so a still-open socket would linger
+   * while `scheduleReconnect` opens a second connection.
+   *
+   * `target` is captured at the call site (not read from `pipe`) for the same
+   * reason `generation` is: by the time an async rejection settles, `pipe` may
+   * point at a newer connection that must not be closed.
+   */
+  function closeAfterSendFailure(target: Pipe, generation: number) {
+    target.close()
+    handleClose({ code: 1006 }, generation)
+  }
+
+  /**
+   * Close the connection if a send's returned promise rejects asynchronously —
+   * a real write failure on a live carrier (transport death). Both `sendOrClose`
+   * and `call()` route their async-rejection leg here so the generation is
+   * *required* to be snapshotted at the call site (not read live at catch time):
+   * a stale rejection from a superseded pipe must close THAT generation, never a
+   * newer one. Taking `generation` as a parameter makes the snapshot structural.
+   */
+  function closeOnSendRejection(target: Pipe, sent: unknown, generation: number) {
+    void Promise.resolve(sent).catch(() => {
+      closeAfterSendFailure(target, generation)
+    })
+  }
+
+  /**
+   * Send a fire-and-forget control-plane frame (auth / subscribe / unsubscribe).
+   * On ANY send failure — a synchronous encode throw OR an async send rejection —
+   * the frame is unrecoverable and the connection is torn down (`handleClose`
+   * with 1006) so the reconnect machinery takes over.
+   *
+   * NOT used by `call()`: a correlated RPC treats a synchronous encode throw as
+   * bad caller args (reject that one call, keep the connection alive), which is a
+   * different policy. `call()` does its own `target.send` + try/catch — see there.
+   *
+   * The synchronous try/catch matters: the transport encodes the frame inside
+   * `send` (e.g. the WS adapter's `JSON.stringify(message)`), which throws
+   * synchronously on a BigInt or cyclic arg. Wrapping only the returned promise
+   * (`Promise.resolve(target.send(...))`) would let that sync throw escape.
+   */
+  function sendOrClose(message: ClientMessage, generation: number) {
     const target = pipe
     if (target === null) return
-    void Promise.resolve(target.send(message)).catch(() => {
-      handleClose({ code: 1006 }, generation)
-    })
+    try {
+      closeOnSendRejection(target, target.send(message), generation)
+    } catch {
+      closeAfterSendFailure(target, generation)
+    }
   }
 
   function handleMessage(msg: ServerMessage) {
@@ -195,9 +340,36 @@ export function createEngine(config: EngineConfig): Engine {
         handlers.get(msg.id)?.()
         return
       }
+      case 'result': {
+        // Correlate by id and resolve the pending call.
+        const pending = pendingCalls.get(msg.id)
+        if (pending !== undefined) {
+          pendingCalls.delete(msg.id)
+          pending.resolve(msg.data)
+        }
+        // Unknown id: the call may have been rejected already (close/disconnect
+        // raced the result). Drop silently.
+        return
+      }
       case 'error': {
-        // Per-sub errors surface on the next subscribe attempt; connection-
-        // level errors arrive paired with a close and are handled there.
+        // If `id` matches a pending call, reject that call specifically.
+        // Otherwise this is a connection-level error — keep current behavior
+        // (no-op; connection-level errors arrive paired with a close event
+        // which triggers handleClose / scheduleReconnect).
+        if (msg.id !== undefined) {
+          const pending = pendingCalls.get(msg.id)
+          if (pending !== undefined) {
+            pendingCalls.delete(msg.id)
+            const err = new Error(msg.error)
+            // Attach Zod validation issues if present, for consumers that care.
+            if (msg.issues !== undefined) {
+              ;(err as Error & { issues?: unknown[] }).issues = msg.issues
+            }
+            pending.reject(err)
+          }
+        }
+        // Connection-level errors (no id, or id not in pending): ignored here;
+        // the accompanying close event handles reconnect.
         return
       }
     }
@@ -214,6 +386,12 @@ export function createEngine(config: EngineConfig): Engine {
     connected = false
     authenticated = false
     clearAuthAckTimer()
+
+    // Reject all pending calls for this generation. Safe here because the
+    // ownGeneration guard above guarantees we're closing the active connection,
+    // not a stale one — so these are current-generation pending calls, not
+    // calls from a newer connect that should remain live.
+    rejectAllPending(new Error('pipe closed'))
 
     if (info.code === 4001) {
       authFailed = true
@@ -295,7 +473,7 @@ export function createEngine(config: EngineConfig): Engine {
         // `token: null` (not undefined) — the wire frame must always carry
         // the field. The server's anonymous-path (`resolveContext` against
         // upgrade headers) needs an explicit null sentinel.
-        safeSend({ type: 'auth', token: token ?? null }, generation)
+        sendOrClose({ type: 'auth', token: token ?? null }, generation)
         authAckTimer = setTimeout(() => {
           authAckTimer = null
           failAuthAck(generation)
@@ -327,6 +505,8 @@ export function createEngine(config: EngineConfig): Engine {
     authenticated = false
     // Reset so a later connect() (e.g., after re-login) can try again.
     authFailed = false
+    // Reject all pending calls immediately — disconnect means no result is coming.
+    rejectAllPending(new Error('disconnected'))
     const target = pipe
     pipe = null
     if (target !== null) {
@@ -341,10 +521,14 @@ export function createEngine(config: EngineConfig): Engine {
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
   ) {
+    // Enforce the reserved namespace: a caller-supplied id must not collide with
+    // the engine's generated call ids, or a subscription error could reject an
+    // in-flight RPC sharing that id in the pendingCalls lookup.
+    if (id.startsWith(CALL_ID_PREFIX)) throw new ReservedSubscriptionIdError(id)
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
-      safeSend({ type: 'subscribe', id, path, args }, connectGeneration)
+      sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
     }
     // Otherwise replayed on (re)connect via sendSubscriptions().
   }
@@ -353,9 +537,48 @@ export function createEngine(config: EngineConfig): Engine {
     handlers.delete(id)
     activeSubs.delete(id)
     if (pipe !== null && authenticated) {
-      safeSend({ type: 'unsubscribe', id }, connectGeneration)
+      sendOrClose({ type: 'unsubscribe', id }, connectGeneration)
     }
     // If never sent, removing from activeSubs is sufficient.
+  }
+
+  function call(path: string, args: Record<string, unknown>): Promise<unknown> {
+    // Require a live, authenticated (or no-auth) pipe. Reject immediately if
+    // not ready — no buffering (future work: queue-until-ready, see module doc).
+    if (pipe === null || !connected) {
+      return Promise.reject(new CallNotReadyError('not connected'))
+    }
+    if (requiresAuth && !authenticated) {
+      return Promise.reject(new CallNotReadyError('auth handshake pending'))
+    }
+
+    // Mint an id in the engine-reserved namespace (see CALL_ID_PREFIX). The
+    // server echoes `error` frames with the offending id for BOTH a failed call
+    // and a failed subscribe, and the wire doesn't tag which — the reserved
+    // prefix, enforced by subscribe(), is what keeps the two id spaces disjoint
+    // client-side. (Tagging error origin at the wire would remove the need for
+    // any prefix; that's a protocol change, tracked separately.)
+    const id = `${CALL_ID_PREFIX}${(++callSeq).toString(36)}`
+    const target = pipe
+    // Snapshot the generation NOW (mirrors sendOrClose's param): the async
+    // rejection leg below must close the generation this call rode on, never a
+    // newer one a reconnect may have installed by the time the promise settles.
+    const generation = connectGeneration
+    return new Promise<unknown>((resolve, reject) => {
+      pendingCalls.set(id, { resolve, reject })
+      // call() does NOT use sendOrClose: a correlated RPC must NOT tear down the
+      // connection on a bad arg. A synchronous encode throw (BigInt/cyclic arg in
+      // `JSON.stringify`) is bad caller input, not transport death — reject THIS
+      // call, delete its pending entry (or it leaks an unreachable resolver), and
+      // leave the connection healthy. An async send rejection IS transport death:
+      // route it through closeOnSendRejection (shared with sendOrClose).
+      try {
+        closeOnSendRejection(target, target.send({ type: 'call', id, path, args }), generation)
+      } catch (err) {
+        pendingCalls.delete(id)
+        reject(err)
+      }
+    })
   }
 
   return {
@@ -364,5 +587,6 @@ export function createEngine(config: EngineConfig): Engine {
     subscribe,
     unsubscribe,
     isConnected: () => connected,
+    call,
   }
 }
