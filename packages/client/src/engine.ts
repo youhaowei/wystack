@@ -141,6 +141,32 @@ export class CallNotReadyError extends Error {
   }
 }
 
+/**
+ * The engine-reserved prefix for generated call ids. A colon never appears in a
+ * caller-supplied subscription id (callers pass query-key-derived ids), so this
+ * prefix keeps the call-id and subscription-id keyspaces disjoint in the shared
+ * `pendingCalls` lookup — an `error` frame's id can never mis-route a
+ * subscription error onto a pending call. `subscribe()` enforces the reservation
+ * (see ReservedSubscriptionIdError) so the disjointness is an invariant, not a
+ * convention the comment merely asserts.
+ */
+const CALL_ID_PREFIX = 'call:'
+
+/**
+ * Thrown by `subscribe()` when a caller passes an id in the engine-reserved
+ * call-id namespace (`call:`-prefixed). Allowing it would let a subscription
+ * error reject an unrelated in-flight RPC sharing the same id.
+ */
+export class ReservedSubscriptionIdError extends Error {
+  constructor(id: string) {
+    super(
+      `engine.subscribe: id "${id}" uses the reserved "${CALL_ID_PREFIX}" prefix — ` +
+        'that namespace belongs to engine-generated call ids',
+    )
+    this.name = 'ReservedSubscriptionIdError'
+  }
+}
+
 interface PendingCall {
   resolve: (data: unknown) => void
   reject: (err: unknown) => void
@@ -495,6 +521,10 @@ export function createEngine(config: EngineConfig): Engine {
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
   ) {
+    // Enforce the reserved namespace: a caller-supplied id must not collide with
+    // the engine's generated call ids, or a subscription error could reject an
+    // in-flight RPC sharing that id in the pendingCalls lookup.
+    if (id.startsWith(CALL_ID_PREFIX)) throw new ReservedSubscriptionIdError(id)
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
@@ -522,15 +552,13 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    // Engine-owned id namespace. The `call:` prefix is reserved: a colon never
-    // appears in a caller-supplied subscription id (callers pass query-key-derived
-    // ids), so the `error`-frame id lookup in handleMessage can never mis-route a
-    // subscription error onto a pending call. The server echoes `error` frames
-    // with the offending id for BOTH a failed call and a failed subscribe, and the
-    // wire doesn't tag which — the reserved prefix is what keeps the two id spaces
-    // disjoint client-side. (Tagging error origin at the wire would remove the need
-    // for any prefix; that's a protocol change, tracked separately.)
-    const id = `call:${(++callSeq).toString(36)}`
+    // Mint an id in the engine-reserved namespace (see CALL_ID_PREFIX). The
+    // server echoes `error` frames with the offending id for BOTH a failed call
+    // and a failed subscribe, and the wire doesn't tag which — the reserved
+    // prefix, enforced by subscribe(), is what keeps the two id spaces disjoint
+    // client-side. (Tagging error origin at the wire would remove the need for
+    // any prefix; that's a protocol change, tracked separately.)
+    const id = `${CALL_ID_PREFIX}${(++callSeq).toString(36)}`
     const target = pipe
     // Snapshot the generation NOW (mirrors sendOrClose's param): the async
     // rejection leg below must close the generation this call rode on, never a

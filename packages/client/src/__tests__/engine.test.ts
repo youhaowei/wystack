@@ -8,7 +8,13 @@ import {
   type ServerMessage,
   type Pipe,
 } from '@wystack/transport'
-import { createEngine, CallNotReadyError, type EnginePipe, type CloseInfo } from '../engine'
+import {
+  createEngine,
+  CallNotReadyError,
+  ReservedSubscriptionIdError,
+  type EnginePipe,
+  type CloseInfo,
+} from '../engine'
 
 /**
  * Wrap a base `Pipe` into the engine's `EnginePipe` shape, exposing a manual
@@ -904,6 +910,25 @@ describe('engine.call — call/result correlation', () => {
     server.send({ type: 'result', id: callFrame!.id, data: 'call-data' })
     await settle()
     expect(await withTimeout(result, 'reserved-namespace call')).toBe('call-data')
+
+    engine.disconnect()
+  })
+
+  test('subscribe() rejects a reserved call-id-prefixed id (enforces the invariant)', async () => {
+    // Codex P2 follow-up: the reserved namespace only stays disjoint if subscribe()
+    // refuses ids in it. Without this guard the disjointness was a convention, not
+    // an invariant — a caller could subscribe with `call:1` and have a subscription
+    // error mis-reject an in-flight RPC. subscribe() now throws on the prefix.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    expect(() => engine.subscribe('call:1', 'some.sub', {}, () => {})).toThrow(
+      ReservedSubscriptionIdError,
+    )
+    // A non-reserved id (even the lookalike `call-1`) is still accepted.
+    expect(() => engine.subscribe('call-1', 'some.sub', {}, () => {})).not.toThrow()
 
     engine.disconnect()
   })
