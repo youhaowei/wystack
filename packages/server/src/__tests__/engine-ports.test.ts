@@ -28,6 +28,20 @@ describe('SubscriptionStore', () => {
     expect(sent).toEqual([{ type: 'invalidate', id: 'sub1' }])
   })
 
+  test('add replaces an existing entry with the same subscription id', () => {
+    const store = createInMemorySubscriptionStore()
+    const sent: unknown[] = []
+    store.add(entry({ functionPath: 'oldQuery', send: (payload) => sent.push(['old', payload]) }))
+    store.add(entry({ functionPath: 'newQuery', send: (payload) => sent.push(['new', payload]) }))
+
+    const sub = store.get('sub1')
+    expect(sub?.functionPath).toBe('newQuery')
+
+    sub?.send({ type: 'invalidate', id: 'sub1' })
+    expect(sent).toEqual([['new', { type: 'invalidate', id: 'sub1' }]])
+    expect(store.size()).toBe(1)
+  })
+
   test('remove subscription entries', () => {
     const store = createInMemorySubscriptionStore()
     store.add(entry())
@@ -111,5 +125,22 @@ describe('InvalidationSource', () => {
 
     expect(first).toEqual([['handler-local', 'todos']])
     expect(second).toEqual([['todos']])
+  })
+
+  test('emit snapshots handlers and isolates handler failures', () => {
+    const { source, emit } = createDispatchInvalidationSource()
+    const seen: string[] = []
+    source.onInvalidation(() => {
+      seen.push('first')
+      source.onInvalidation(() => seen.push('late'))
+      throw new Error('subscriber failed')
+    })
+    source.onInvalidation(() => seen.push('second'))
+
+    emit(new Set(['todos']))
+    expect(seen).toEqual(['first', 'second'])
+
+    emit(new Set(['todos']))
+    expect(seen).toEqual(['first', 'second', 'first', 'second', 'late'])
   })
 })

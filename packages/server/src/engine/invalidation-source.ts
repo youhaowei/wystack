@@ -40,8 +40,12 @@ export function createDispatchInvalidationSource(): DispatchInvalidationSource {
     },
 
     emit(tablesWritten) {
-      for (const handler of handlers) {
-        handler(new Set(tablesWritten))
+      for (const handler of [...handlers]) {
+        try {
+          handler(new Set(tablesWritten))
+        } catch {
+          // Keep one subscriber failure from starving the rest of the fan-out.
+        }
       }
     },
   }

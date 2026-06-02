@@ -29,6 +29,11 @@ export interface SubscriptionEntry {
 }
 
 export interface SubscriptionStore {
+  /**
+   * Register or replace an entry by id. Replacement is intentional: callers own
+   * subscription ids and may re-register the same id during reconnect or
+   * resubscribe flows without requiring a separate remove.
+   */
   add(entry: SubscriptionEntry): void
   remove(id: string): void
   get(id: string): SubscriptionEntry | undefined
