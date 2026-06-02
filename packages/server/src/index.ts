@@ -6,11 +6,14 @@ export { createWyStack } from './create'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
-// Engine: only `attachEngine` is a consumer entry point. `Session`,
-// `createDispatch`, and the internal types stay in the intra-package
-// `./engine` barrel for the adapters YW-57 builds on top — not the public
-// surface, so YW-57/62 refactors don't become breaking changes.
-export { attachEngine } from './engine'
+// Engine: `attachEngine` is the consumer entry point. Reactive port types and
+// in-process factories are public so external adapters can implement the same
+// serialization contract without importing transport internals.
+export {
+  attachEngine,
+  createInMemorySubscriptionStore,
+  createDispatchInvalidationSource,
+} from './engine'
 
 export type {
   QueryDef,
@@ -25,7 +28,17 @@ export type {
 export type { WyStackApp } from './create'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'
-// Public engine surface = what `attachEngine`'s signature transitively needs.
-// `ResolveContext`, `AuthOutcome`, `Dispatch`, `DispatchResult` are internal —
-// they live in `./engine` for intra-package adapters, not on the npm surface.
-export type { AttachEngineOptions, EngineHandle, CloseReason, Session } from './engine'
+// Public engine types expose attach options plus reactive port contracts.
+// `ResolveContext`, `AuthOutcome`, `Dispatch`, and `DispatchResult` stay in
+// `./engine` for intra-package adapters, not on the npm surface.
+export type {
+  AttachEngineOptions,
+  EngineHandle,
+  CloseReason,
+  Session,
+  SubscriptionEntry,
+  SubscriptionStore,
+  InvalidationHandler,
+  InvalidationSource,
+  DispatchInvalidationSource,
+} from './engine'
