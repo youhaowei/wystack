@@ -75,6 +75,21 @@ describe('SubscriptionStore', () => {
     expect(store.getAffected(new Set(['posts']))).toEqual([])
   })
 
+  test('getAffected returns empty for an empty written table set', () => {
+    const store = createInMemorySubscriptionStore()
+    store.add(entry({ tablesWatched: new Set(['todos']) }))
+
+    expect(store.getAffected(new Set())).toEqual([])
+  })
+
+  test('getAffected excludes entries with no watched tables', () => {
+    const store = createInMemorySubscriptionStore()
+    store.add(entry({ id: 'sub1', tablesWatched: new Set() }))
+    store.add(entry({ id: 'sub2', tablesWatched: new Set(['todos']) }))
+
+    expect(store.getAffected(new Set(['todos'])).map((sub) => sub.id)).toEqual(['sub2'])
+  })
+
   test('size and clear', () => {
     const store = createInMemorySubscriptionStore()
     store.add(entry({ id: 'sub1' }))
@@ -147,9 +162,17 @@ describe('InvalidationSource', () => {
   test('emit isolates asynchronous handler rejections', async () => {
     const { source, emit } = createDispatchInvalidationSource()
     const seen: string[] = []
-    source.onInvalidation(async () => {
+    let rejectionAbsorbed = false
+    const rejected = Promise.reject(new Error('async subscriber failed'))
+    const originalCatch = rejected.catch.bind(rejected)
+    rejected.catch = ((onRejected) => {
+      rejectionAbsorbed = true
+      return originalCatch(onRejected)
+    }) as typeof rejected.catch
+
+    source.onInvalidation(() => {
       seen.push('first')
-      throw new Error('async subscriber failed')
+      return rejected
     })
     source.onInvalidation(() => seen.push('second'))
 
@@ -157,5 +180,6 @@ describe('InvalidationSource', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(seen).toEqual(['first', 'second'])
+    expect(rejectionAbsorbed).toBe(true)
   })
 })
