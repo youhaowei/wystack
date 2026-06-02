@@ -143,4 +143,19 @@ describe('InvalidationSource', () => {
     emit(new Set(['todos']))
     expect(seen).toEqual(['first', 'second', 'first', 'second', 'late'])
   })
+
+  test('emit isolates asynchronous handler rejections', async () => {
+    const { source, emit } = createDispatchInvalidationSource()
+    const seen: string[] = []
+    source.onInvalidation(async () => {
+      seen.push('first')
+      throw new Error('async subscriber failed')
+    })
+    source.onInvalidation(() => seen.push('second'))
+
+    emit(new Set(['todos']))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(seen).toEqual(['first', 'second'])
+  })
 })

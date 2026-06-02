@@ -15,7 +15,7 @@
  * response semantics belong to the implementation that wires the source.
  */
 
-export type InvalidationHandler = (tablesWritten: Set<string>) => void
+export type InvalidationHandler = (tablesWritten: Set<string>) => void | Promise<void>
 
 export interface InvalidationSource {
   onInvalidation(handler: InvalidationHandler): () => void
@@ -42,7 +42,8 @@ export function createDispatchInvalidationSource(): DispatchInvalidationSource {
     emit(tablesWritten) {
       for (const handler of [...handlers]) {
         try {
-          handler(new Set(tablesWritten))
+          const result = handler(new Set(tablesWritten))
+          if (result instanceof Promise) result.catch(() => {})
         } catch {
           // Keep one subscriber failure from starving the rest of the fan-out.
         }
