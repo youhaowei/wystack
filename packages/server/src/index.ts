@@ -8,7 +8,7 @@ export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
 // Engine: `attachEngine` is the consumer entry point. Reactive port types and
 // in-process factories are public so external adapters can implement the same
-// serialization contract without importing transport internals.
+// transport-neutral contracts without importing transport internals.
 export {
   attachEngine,
   createInMemorySubscriptionStore,
