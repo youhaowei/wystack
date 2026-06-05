@@ -7,9 +7,11 @@
 // drive it next (YW-57, T5/T6), each supplying its own close-code mapping.
 //
 // Tier model (Spec ADR #12): the RPC tier (`call` → `result`) is always on. The
-// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in; this Engine
-// does not wire it, so any `subscribe` gets `error{REACTIVITY_NOT_ENABLED}`.
-// YW-62 adds the SubscriptionStore + invalidation ports behind this seam.
+// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in. When BOTH
+// `subscriptionStore` AND `publishInvalidation` are provided, subscribe/unsubscribe
+// are handled per-connection and mutations emit invalidations. When either is
+// absent, subscribe → error{REACTIVITY_NOT_ENABLED} and unsubscribe is tolerated
+// silently (capability discovery floor).
 
 import {
   parseClientMessage,
@@ -23,6 +25,7 @@ import type { WyStackApp } from '../create'
 import { ValidationError } from '../validation'
 import { createDispatch, type Dispatch } from './dispatch'
 import { Session, type CloseReason, type SessionOptions } from './session'
+import type { SubscriptionStore } from './subscription-store'
 
 export interface AttachEngineOptions extends SessionOptions {
   app: WyStackApp
@@ -40,6 +43,22 @@ export interface AttachEngineOptions extends SessionOptions {
    * Engine always also calls `pipe.close()` after this hook.
    */
   onClose?: (reason: CloseReason) => void
+  /**
+   * Shared subscription registry for the reactive tier. Must be the same
+   * instance across all connections on a server so `getAffected` queries the
+   * full live set. Supply alongside `publishInvalidation` to enable the
+   * reactive tier; omit either to keep today's RPC-only behaviour.
+   */
+  subscriptionStore?: SubscriptionStore
+  /**
+   * Emit a write-event into the shared invalidation channel. Called after each
+   * mutation with the set of tables written. This is the producer side of
+   * `DispatchInvalidationSource.emit` — callers own the source and register the
+   * router (e.g. `createInvalidationRouter`) once before attaching connections.
+   *
+   * Supply alongside `subscriptionStore` to enable the reactive tier.
+   */
+  publishInvalidation?: (tables: Set<string>) => void
 }
 
 /** Handle to a running Engine attachment. `detach` tears it down idempotently. */
@@ -63,9 +82,12 @@ function errorMessage(err: unknown): string {
  * with the shipped `routes.ts` pre/post-auth split.
  */
 export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandle {
-  const { app, authTimeoutMs = 10_000, onClose } = opts
+  const { app, authTimeoutMs = 10_000, onClose, subscriptionStore, publishInvalidation } = opts
   const dispatch: Dispatch = createDispatch(app)
   const session = new Session(opts)
+
+  // Reactive tier is enabled only when BOTH ports are wired.
+  const reactiveEnabled = subscriptionStore !== undefined && publishInvalidation !== undefined
 
   let closed = false
   // Set when the inbound handler is registered (below). Held in a mutable ref so
@@ -88,15 +110,38 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
   }
 
-  // Shared teardown: flip the closed guard, disarm the handshake timer, and drop
-  // the inbound handler. Both close paths (engine-initiated `closeWith` and
-  // caller-initiated `detach`) run this so a leaked `onMessage` handler never
-  // outlives the connection. Idempotent via the `closed` guard.
+  // --- Reactive tier: per-connection subscription bookkeeping ---
+  //
+  // `mySubIds`     — IDs of subscriptions registered by this connection. Used
+  //                  during teardown to remove only this connection's entries.
+  // `pendingSubIds`— IDs of in-flight subscribes (resolveSubContext / app.call
+  //                  in progress). An `unsubscribe` arriving mid-await drops the
+  //                  id from here; the `.then` bail-path then skips registration.
+  //                  known-debt: flag-check cancellation, not AbortSignal. The
+  //                  underlying context resolution keeps running to completion;
+  //                  we bail at the .then boundary. See YW-63 known-debt note.
+  const mySubIds = new Set<string>()
+  const pendingSubIds = new Set<string>()
+
+  // Shared teardown: flip the closed guard, disarm the handshake timer, drop
+  // the inbound handler, and (when reactive is enabled) remove this connection's
+  // subscriptions from the shared store. Both close paths (engine-initiated
+  // `closeWith` and caller-initiated `detach`) run this so a leaked `onMessage`
+  // handler never outlives the connection. Idempotent via the `closed` guard.
   const teardown = (): void => {
     if (closed) return
     closed = true
     if (timeout !== null) clearTimeout(timeout)
     unsubscribe?.()
+    // Reactive cleanup: remove all subscriptions owned by this connection.
+    // Drop pendingSubIds so any in-flight .then bail-checks see "not pending".
+    if (reactiveEnabled) {
+      pendingSubIds.clear()
+      for (const id of mySubIds) {
+        subscriptionStore!.remove(id)
+      }
+      mySubIds.clear()
+    }
   }
 
   /** Close once: tear down, fire the adapter's reason hook, then close the pipe. */
@@ -154,17 +199,105 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
     if (closed) return
     try {
-      // RPC drops `tablesWritten`: a `call` to a mutation produces it, but the
-      // reactive tier (the SubscriptionStore that would consume it) is not wired
-      // here. Invalidation lands in YW-62. RPC returns only the result.
-      const { result } = await dispatch(msg.path, msg.args, context)
+      const { result, tablesWritten } = await dispatch(msg.path, msg.args, context)
       if (closed) return
+      // When the reactive tier is wired, emit the write-set to fan out
+      // invalidations to any affected subscriptions. Fire-and-forget: the router
+      // (createInvalidationRouter) handles per-entry re-queries and delivery.
+      if (reactiveEnabled && tablesWritten.size > 0) {
+        publishInvalidation!(tablesWritten)
+      }
       send({ type: 'result', id: msg.id, data: result })
     } catch (err) {
       if (closed) return
       const payload: ServerMessage = { type: 'error', id: msg.id, error: errorMessage(err) }
       if (err instanceof ValidationError) payload.issues = err.issues
       send(payload)
+    }
+  }
+
+  // --- Reactive tier handlers (only called when reactiveEnabled) ---
+
+  /**
+   * Handle a `subscribe` frame. Follows the routes.ts pattern:
+   *   1. Resolve context per-subscription (spec: "subscription-time context").
+   *   2. Run the query via app.call to get initial tablesRead.
+   *   3. Register the entry in the shared SubscriptionStore with `entry.send`
+   *      pointing at this connection's post-close-safe `send` helper.
+   *   4. ACK with `{ type: 'subscribed', id }`.
+   *
+   * `pendingSubIds` guards mid-await cancellation: an `unsubscribe` arriving
+   * during steps 1–2 drops the id; the `.then` bail-check then skips step 3.
+   */
+  async function handleSubscribe(
+    msg: Extract<ClientMessage, { type: 'subscribe' }>,
+  ): Promise<void> {
+    const id = msg.id
+    const path = msg.path
+    const args = (msg.args ?? {}) as Record<string, unknown>
+
+    const fn = app.functions.get(path)
+    if (!fn || fn.type !== 'query') {
+      send({ type: 'error', id, error: `Unknown query: ${path}` })
+      return
+    }
+
+    pendingSubIds.add(id)
+
+    // Resolve context PER subscription — spec: "Context resolved at
+    // subscription time, preserved for re-queries". Never call resolveSubContext
+    // again for this sub; the re-query uses entry.context.
+    let context: Record<string, unknown>
+    try {
+      context = await session.resolveSubContext()
+    } catch (err) {
+      pendingSubIds.delete(id)
+      send({ type: 'error', id, error: errorMessage(err) })
+      return
+    }
+
+    // Unsubscribe may have arrived during the context-resolve await.
+    if (!pendingSubIds.has(id)) return
+
+    try {
+      const { tablesRead } = await app.call(path, args, context)
+      // Guard: connection closed, OR unsubscribe arrived during app.call.
+      if (closed || !pendingSubIds.has(id)) return
+      pendingSubIds.delete(id)
+
+      // Register in the shared store. `send` is the post-close-safe helper
+      // already defined in this closure — it swallows post-close sends.
+      subscriptionStore!.add({
+        id,
+        functionPath: path,
+        args,
+        context,
+        tablesWatched: tablesRead,
+        send: (payload: unknown) => send(payload as ServerMessage),
+      })
+      mySubIds.add(id)
+      send({ type: 'subscribed', id })
+    } catch (err) {
+      pendingSubIds.delete(id)
+      const payload: ServerMessage = { type: 'error', id, error: errorMessage(err) }
+      if (err instanceof ValidationError) payload.issues = err.issues
+      send(payload)
+    }
+  }
+
+  /**
+   * Handle an `unsubscribe` frame. Cancels in-flight subscribes (removes from
+   * pendingSubIds so the .then bail-path sees "not pending") and removes any
+   * committed entry from the shared store.
+   */
+  function handleUnsubscribe(msg: Extract<ClientMessage, { type: 'unsubscribe' }>): void {
+    const id = msg.id
+    // Cancel a pending (in-flight) subscribe before it finishes.
+    pendingSubIds.delete(id)
+    // Remove a committed subscription from the shared store.
+    if (mySubIds.has(id)) {
+      subscriptionStore!.remove(id)
+      mySubIds.delete(id)
     }
   }
 
@@ -242,12 +375,20 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         void handleCall(msg)
         return
       case 'subscribe':
-        // Reactive tier not wired (Spec ADR #12). The capability-discovery floor.
-        send({ type: 'error', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+        if (!reactiveEnabled) {
+          // Reactive tier not wired (Spec ADR #12). The capability-discovery floor.
+          send({ type: 'error', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+          return
+        }
+        void handleSubscribe(msg)
         return
       case 'unsubscribe':
-        // No reactive tier means no subscription to cancel — tolerate silently,
-        // matching the shipped server's unknown-id tolerance.
+        if (!reactiveEnabled) {
+          // No reactive tier means no subscription to cancel — tolerate silently,
+          // matching the shipped server's unknown-id tolerance.
+          return
+        }
+        handleUnsubscribe(msg)
         return
     }
   }

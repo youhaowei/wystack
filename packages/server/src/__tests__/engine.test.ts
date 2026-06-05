@@ -31,7 +31,13 @@ import {
 } from '@wystack/transport'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
-import { attachEngine, type AttachEngineOptions } from '../engine'
+import {
+  attachEngine,
+  type AttachEngineOptions,
+  createInMemorySubscriptionStore,
+  createDispatchInvalidationSource,
+  createInvalidationRouter,
+} from '../engine'
 
 const schema = defineSchema({
   todos: { id: int.primaryKey(), title: text, done: boolean },
@@ -445,6 +451,254 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
 
     expect(h.received).toEqual([{ type: 'error', error: 'invalid message' }])
     expect(h.closeReasons).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reactive-tier harness helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a shared (store, source) pair plus the single router, then attach
+ * one or more engine connections to the same store. Returns per-connection
+ * send/received controls plus the shared emit handle for triggering
+ * invalidations from "outside" (simulating a mutation on another connection).
+ */
+function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
+  const subscriptionStore = createInMemorySubscriptionStore()
+  const { source: invalidationSource, emit: publishInvalidation } =
+    createDispatchInvalidationSource()
+
+  // Single router — NOT per-connection.
+  createInvalidationRouter({
+    source: invalidationSource,
+    store: subscriptionStore,
+    recompute: async (entry) => {
+      const { tablesRead } = await app.call(
+        entry.functionPath,
+        entry.args,
+        entry.context as Record<string, unknown>,
+      )
+      return { tablesRead }
+    },
+  })
+
+  return { subscriptionStore, publishInvalidation }
+}
+
+/**
+ * Wire a single reactive-enabled loopback connection. Returns the same shape
+ * as `harness` plus the shared `publishInvalidation` for driving invalidations
+ * from a test.
+ */
+async function reactiveHarness(opts?: Partial<AttachEngineOptions>) {
+  const app = await makeApp()
+  const { subscriptionStore, publishInvalidation } = makeReactiveShared(app)
+
+  const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+  const received: ServerMessage[] = []
+  clientPipe.onMessage((m) => received.push(m))
+
+  const closeReasons: string[] = []
+  const handle = attachEngine(serverPipe, {
+    app,
+    subscriptionStore,
+    publishInvalidation,
+    onClose: (reason) => closeReasons.push(reason),
+    ...opts,
+  })
+
+  return {
+    app,
+    handle,
+    received,
+    closeReasons,
+    subscriptionStore,
+    publishInvalidation,
+    send: (msg: ClientMessage) => clientPipe.send(msg),
+    detach: () => handle.detach(),
+  }
+}
+
+describe('Engine — reactive tier enabled (AC #3 ext)', () => {
+  test('subscribe → subscribed ack when reactive tier is wired', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'subscribed')
+
+    const ack = h.received.find((m) => m.type === 'subscribed')
+    expect(ack).toBeDefined()
+    expect(ack && 'id' in ack && ack.id).toBe('s1')
+    expect(h.subscriptionStore.size()).toBe(1)
+  })
+
+  test('subscribe to unknown query → error frame (not a crash)', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'nonExistent', args: {} })
+    await until(() => h.received.length > 0, 'error')
+
+    const err = h.received.find((m) => m.type === 'error')
+    expect(err).toBeDefined()
+    expect(err && 'id' in err && err.id).toBe('s1')
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('mutation → subscribed connection receives invalidate frame', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'subscribed')
+
+    h.send({ type: 'call', id: 'c1', path: 'addTodo', args: { title: 'test' } })
+    await until(() => h.received.some((m) => m.type === 'invalidate'), 'invalidate')
+
+    const inv = h.received.find((m) => m.type === 'invalidate')
+    expect(inv).toBeDefined()
+    expect(inv && 'id' in inv && inv.id).toBe('s1')
+  })
+
+  test('unsubscribe removes entry from store and stops future invalidations', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'subscribed')
+    expect(h.subscriptionStore.size()).toBe(1)
+
+    h.send({ type: 'unsubscribe', id: 's1' })
+    await flush()
+    expect(h.subscriptionStore.size()).toBe(0)
+
+    const countBefore = h.received.length
+    h.send({ type: 'call', id: 'c1', path: 'addTodo', args: { title: 'test' } })
+    await until(() => h.received.some((m) => m.type === 'result'), 'result after unsub')
+    await flush()
+
+    // No invalidate frame should have arrived after unsubscribe.
+    const newFrames = h.received.slice(countBefore)
+    expect(newFrames.every((m) => m.type !== 'invalidate')).toBe(true)
+  })
+
+  test('detach removes all subscriptions and stops future invalidations', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'subscribed')
+    expect(h.subscriptionStore.size()).toBe(1)
+
+    h.detach()
+    await flush()
+
+    expect(h.subscriptionStore.size()).toBe(0)
+
+    // Emit an invalidation after detach — no frames should land on the client.
+    const countBefore = h.received.length
+    h.publishInvalidation(new Set(['todos']))
+    await flush()
+    expect(h.received.length).toBe(countBefore)
+  })
+
+  test('in-flight subscribe cancelled by unsubscribe: no orphan entry in store', async () => {
+    // Simulate an unsubscribe arriving during the per-subscription context-resolve await.
+    // Auth resolves immediately; the subscribe-time resolve is blocked until we control it.
+    let callCount = 0
+    let resolveSubscribeContext!: () => void
+    const subscribeContextPending = new Promise<void>((r) => {
+      resolveSubscribeContext = r
+    })
+
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) {
+          // Second call is from subscribe — block here.
+          await subscribeContextPending
+        }
+        return {}
+      },
+    })
+
+    // Auth first (first resolveContext call — resolves immediately).
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    // Subscribe — this triggers a second resolveContext that blocks.
+    h.send({ type: 'subscribe', id: 'cancel-me', path: 'listTodos', args: {} })
+    // Wait a tick so the subscribe handler enters the awaiting state.
+    await new Promise((r) => setTimeout(r, 5))
+
+    // Unsubscribe while context is blocked in resolveContext.
+    h.send({ type: 'unsubscribe', id: 'cancel-me' })
+    await flush()
+
+    // Unblock the pending context resolve — the subscribe handler should see
+    // pendingSubIds.has(id) === false and bail before registering in the store.
+    resolveSubscribeContext()
+    await flush()
+
+    // No subscribed ack, no orphan entry.
+    expect(h.received.filter((m) => m.type === 'subscribed')).toHaveLength(0)
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('two connections on shared store: mutation delivers exactly one invalidate per connection', async () => {
+    const app = await makeApp()
+    const { subscriptionStore, publishInvalidation } = makeReactiveShared(app)
+
+    // Create two separate loopback connections against the shared store.
+    function makeConn() {
+      const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+      const received: ServerMessage[] = []
+      clientPipe.onMessage((m) => received.push(m))
+      attachEngine(serverPipe, { app, subscriptionStore, publishInvalidation })
+      return { received, send: (msg: ClientMessage) => clientPipe.send(msg) }
+    }
+
+    const connA = makeConn()
+    const connB = makeConn()
+
+    // Subscribe both with distinct sub IDs to avoid store-key collision.
+    connA.send({ type: 'subscribe', id: 'sub-a', path: 'listTodos', args: {} })
+    connB.send({ type: 'subscribe', id: 'sub-b', path: 'listTodos', args: {} })
+
+    await until(
+      () =>
+        connA.received.some((m) => m.type === 'subscribed') &&
+        connB.received.some((m) => m.type === 'subscribed'),
+      'both subscribed',
+    )
+    expect(subscriptionStore.size()).toBe(2)
+
+    // Emit an invalidation (simulating a mutation).
+    publishInvalidation(new Set(['todos']))
+
+    await until(
+      () =>
+        connA.received.some((m) => m.type === 'invalidate') &&
+        connB.received.some((m) => m.type === 'invalidate'),
+      'both invalidated',
+    )
+
+    // Each connection must receive exactly ONE invalidate frame — not two (no double-fan).
+    const aInvalidates = connA.received.filter((m) => m.type === 'invalidate')
+    const bInvalidates = connB.received.filter((m) => m.type === 'invalidate')
+    expect(aInvalidates).toHaveLength(1)
+    expect(bInvalidates).toHaveLength(1)
+    expect(aInvalidates[0] && 'id' in aInvalidates[0] && aInvalidates[0].id).toBe('sub-a')
+    expect(bInvalidates[0] && 'id' in bInvalidates[0] && bInvalidates[0].id).toBe('sub-b')
+  })
+
+  test('capability gate: subscribe without reactive ports → REACTIVITY_NOT_ENABLED', async () => {
+    // Verify that the pre-existing AC #3 behaviour is unchanged when ports are absent.
+    const h = await harness() // no subscriptionStore / publishInvalidation
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await flush()
+
+    expect(h.received).toEqual([{ type: 'error', id: 's1', error: REACTIVITY_NOT_ENABLED }])
+  })
+
+  test('capability gate: unsubscribe without reactive ports → tolerated silently', async () => {
+    const h = await harness()
+    h.send({ type: 'unsubscribe', id: 's1' })
+    await flush()
+
+    expect(h.received).toEqual([])
   })
 })
 

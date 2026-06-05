@@ -22,3 +22,5 @@ export type {
   InvalidationHandler,
   InvalidationSource,
 } from './invalidation-source'
+export { createInvalidationRouter } from './invalidation-router'
+export type { InvalidationRouterOptions } from './invalidation-router'
