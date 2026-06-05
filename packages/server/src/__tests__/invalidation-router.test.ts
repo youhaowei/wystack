@@ -29,9 +29,16 @@ function makeEntry(
   }
 }
 
-/** Flush a few macrotask ticks — for asserting completions or non-events. */
-function flush(): Promise<void> {
-  return new Promise((r) => setTimeout(r, 30))
+/**
+ * Drain pending microtasks deterministically — for asserting completions or
+ * non-events. The router's per-sub chains are entirely microtask-based (Promise
+ * `.then`/`.finally`), and every `recompute` here is pure-async (no real timers
+ * or IO), so a fixed number of microtask hops settles every chain with no
+ * wall-clock dependency. Over-provisioned (25 ≫ the few hops a 2-deep chain
+ * needs) so under-counting — the only failure mode — never happens.
+ */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 25; i++) await Promise.resolve()
 }
 
 describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
