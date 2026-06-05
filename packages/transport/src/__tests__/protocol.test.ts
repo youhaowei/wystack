@@ -317,6 +317,30 @@ describe('parseServerMessage — error', () => {
       parseServerMessage(JSON.stringify({ type: 'error', error: 'boom', issues: 'oops' })),
     ).toBeNull()
   })
+  test('accepts kind:call and threads it through', () => {
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'error', kind: 'call', id: 'c1', error: 'oops' })),
+    ).toEqual({ type: 'error', kind: 'call', id: 'c1', error: 'oops' })
+  })
+  test('accepts kind:subscription and threads it through', () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: 'error', kind: 'subscription', id: 's1', error: 'oops' }),
+      ),
+    ).toEqual({ type: 'error', kind: 'subscription', id: 's1', error: 'oops' })
+  })
+  test('omits kind when it was absent on the wire (backward-compat)', () => {
+    const got = parseServerMessage(JSON.stringify({ type: 'error', id: 'c1', error: 'boom' }))
+    expect(got).not.toBeNull()
+    expect(Object.hasOwn(got as object, 'kind')).toBe(false)
+  })
+  test('rejects an unrecognized kind value', () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: 'error', kind: 'unknown', id: 'c1', error: 'boom' }),
+      ),
+    ).toBeNull()
+  })
 })
 
 describe('parseServerMessage — result', () => {

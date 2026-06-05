@@ -215,7 +215,9 @@ describe('Electron adapter — RPC round-trips (AC #1)', () => {
     h.send({ type: 'call', id: 'c3', path: 'nope', args: {} })
     await until(() => h.wc.received.length > 0, 'error')
 
-    expect(h.wc.received).toEqual([{ type: 'error', id: 'c3', error: 'Unknown function: nope' }])
+    expect(h.wc.received).toEqual([
+      { type: 'error', kind: 'call', id: 'c3', error: 'Unknown function: nope' },
+    ])
   })
 
   test('handler throw → error frame', async () => {
@@ -224,7 +226,7 @@ describe('Electron adapter — RPC round-trips (AC #1)', () => {
     h.send({ type: 'call', id: 'c4', path: 'boom', args: {} })
     await until(() => h.wc.received.length > 0, 'error')
 
-    expect(h.wc.received).toEqual([{ type: 'error', id: 'c4', error: 'kaboom' }])
+    expect(h.wc.received).toEqual([{ type: 'error', kind: 'call', id: 'c4', error: 'kaboom' }])
   })
 
   test('call to a mutation returns a result', async () => {

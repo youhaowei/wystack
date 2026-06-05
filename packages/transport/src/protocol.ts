@@ -123,6 +123,15 @@ export interface InvalidateMessage {
  * specific in-flight request (subscribe/unsubscribe), absent for
  * connection-level errors (malformed frame, unknown type, etc.).
  *
+ * `kind` tags the origin of a request-scoped error so the client can
+ * route it correctly without inspecting the `id` string:
+ *   - `'call'`         — a `call` frame's handler failed or could not run.
+ *   - `'subscription'` — a `subscribe` frame was rejected.
+ *   - absent           — connection-level error (no `id`), or an older
+ *                        server that has not yet set the discriminant
+ *                        (backward-compatible: treat as `'call'` when `id`
+ *                        is present).
+ *
  * `issues` carries Zod validation issues when the server's
  * `ValidationError` surfaces — typed as `unknown[]` here to keep the
  * protocol package free of a Zod dependency. T2b can thread the
@@ -131,6 +140,7 @@ export interface InvalidateMessage {
 export interface ErrorMessage {
   type: 'error'
   id?: string
+  kind?: 'call' | 'subscription'
   error: string
   issues?: unknown[]
 }
@@ -304,11 +314,14 @@ export function parseServerMessage(data: string): ServerMessage | null {
       if (typeof msg.error !== 'string') return null
       // `id` is optional. If present, must be a string. Missing is fine.
       if (msg.id !== undefined && typeof msg.id !== 'string') return null
+      // `kind` is optional. If present, must be 'call' or 'subscription'.
+      if (msg.kind !== undefined && msg.kind !== 'call' && msg.kind !== 'subscription') return null
       // `issues` is optional. If present, must be an array. Element shape is
       // intentionally `unknown` here (see ErrorMessage doc).
       if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
       const out: ErrorMessage = { type: 'error', error: msg.error }
       if (typeof msg.id === 'string') out.id = msg.id
+      if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
       if (Array.isArray(msg.issues)) out.issues = msg.issues
       return out
     }

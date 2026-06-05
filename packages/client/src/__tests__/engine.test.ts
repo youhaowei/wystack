@@ -8,13 +8,7 @@ import {
   type ServerMessage,
   type Pipe,
 } from '@wystack/transport'
-import {
-  createEngine,
-  CallNotReadyError,
-  ReservedSubscriptionIdError,
-  type EnginePipe,
-  type CloseInfo,
-} from '../engine'
+import { createEngine, CallNotReadyError, type EnginePipe, type CloseInfo } from '../engine'
 
 /**
  * Wrap a base `Pipe` into the engine's `EnginePipe` shape, exposing a manual
@@ -839,45 +833,43 @@ describe('engine.call — call/result correlation', () => {
     const failed = engine.call('path.bigint', {})
     await expect(failed).rejects.toThrow('Do not know how to serialize a BigInt')
 
-    // A stray `result` for the failed call's id (`call:1`) is an unknown/stale
+    // A stray `result` for the failed call's id (`1`) is an unknown/stale
     // id: a no-op. No crash; the rejected promise stays rejected.
-    deliver({ type: 'result', id: 'call:1', data: 'stray' })
+    deliver({ type: 'result', id: '1', data: 'stray' })
     await settle()
 
     // The engine stays fully usable after a sync throw: the next call resolves
-    // end-to-end. Its id is `call:2` (the seq advanced past the failed call),
-    // so ids are never reused. The `call:` prefix is the engine-reserved namespace.
+    // end-to-end. Its id is `2` (the seq advanced past the failed call),
+    // so ids are never reused.
     const ok = engine.call('path.ok', {})
     await settle()
     const callFrame = sent.find((f) => f.type === 'call') as
       | Extract<ClientMessage, { type: 'call' }>
       | undefined
     expect(callFrame).toBeDefined()
-    expect(callFrame!.id).toBe('call:2')
+    expect(callFrame!.id).toBe('2')
     deliver({ type: 'result', id: callFrame!.id, data: 'ok' })
     expect(await withTimeout(ok, 'second call after sync throw')).toBe('ok')
 
     engine.disconnect()
   })
 
-  test('subscription error never mis-rejects a pending call (reserved id namespace)', async () => {
-    // Regression (Codex P2): the `error` handler looks up pendingCalls by msg.id,
-    // a keyspace shared with caller-supplied subscription ids. Before the fix, a
-    // subscription error whose id matched a generated call id (the engine used a
-    // bare `call-N` format) would mis-reject the in-flight RPC. The engine now
-    // mints call ids in a reserved `call:`-prefixed namespace that no normal
-    // caller sub id occupies (a colon never appears in a query-key-derived id),
-    // so the two keyspaces can never overlap.
+  test('subscription error (kind:subscription) never mis-rejects a pending call — same id (YW-99)', async () => {
+    // Spec contract (YW-99): the `error` frame carries a `kind` discriminant.
+    // `kind: 'subscription'` must NOT touch pendingCalls even when msg.id matches
+    // an in-flight call id. Before YW-99 the engine relied on a reserved `call:`
+    // id prefix to keep the keyspaces disjoint; now the tag is self-describing so
+    // caller-supplied subscription ids are unconstrained.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
     await settle()
 
-    // A subscription whose id is the closest a caller can plausibly get to the
-    // reserved format — the worst case the prefix must still keep disjoint.
-    engine.subscribe('call-1', 'some.sub', {}, () => {})
+    // A subscription whose id INTENTIONALLY matches the call id below.
+    // This is the exact same-id collision scenario YW-99 is designed to handle.
+    engine.subscribe('1', 'some.sub', {}, () => {})
 
-    // An in-flight call. Its id is reserved (`call:N`), disjoint from `call-1`.
+    // An in-flight call. Its id will be `'1'` (plain counter).
     const result = engine.call('the.call', {})
     await settle()
 
@@ -886,11 +878,11 @@ describe('engine.call — call/result correlation', () => {
       | Extract<ClientMessage, { type: 'call' }>
       | undefined
     expect(callFrame).toBeDefined()
-    expect(callFrame!.id).toBe('call:1') // reserved namespace, not `call-1`
+    expect(callFrame!.id).toBe('1')
 
-    // Server sends an error for the SUBSCRIPTION (`call-1`). The pending call
-    // (`call:1`) must NOT be rejected by it — different keyspace.
-    server.send({ type: 'error', id: 'call-1', error: 'subscription failed' })
+    // Server sends a subscription error for id `'1'` with kind: 'subscription'.
+    // The pending call (also id '1') must NOT be rejected by it.
+    server.send({ type: 'error', kind: 'subscription', id: '1', error: 'subscription failed' })
     await settle()
 
     // Prove the call is still live: not settled by the subscription error.
@@ -909,27 +901,62 @@ describe('engine.call — call/result correlation', () => {
     // The call's real result resolves it normally.
     server.send({ type: 'result', id: callFrame!.id, data: 'call-data' })
     await settle()
-    expect(await withTimeout(result, 'reserved-namespace call')).toBe('call-data')
+    expect(await withTimeout(result, 'kind-discriminant call')).toBe('call-data')
 
     engine.disconnect()
   })
 
-  test('subscribe() rejects a reserved call-id-prefixed id (enforces the invariant)', async () => {
-    // Codex P2 follow-up: the reserved namespace only stays disjoint if subscribe()
-    // refuses ids in it. Without this guard the disjointness was a convention, not
-    // an invariant — a caller could subscribe with `call:1` and have a subscription
-    // error mis-reject an in-flight RPC. subscribe() now throws on the prefix.
+  test('call error (kind:call) with same id as subscription correctly rejects the call', async () => {
+    // Complementary to the subscription-kind test: an error tagged kind:'call'
+    // MUST reject the pending call, even if a subscription with the same id exists.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
     await settle()
 
-    expect(() => engine.subscribe('call:1', 'some.sub', {}, () => {})).toThrow(
-      ReservedSubscriptionIdError,
-    )
-    // A non-reserved id (even the lookalike `call-1`) is still accepted.
-    expect(() => engine.subscribe('call-1', 'some.sub', {}, () => {})).not.toThrow()
+    // Subscribe with the same id the call will use.
+    engine.subscribe('1', 'some.sub', {}, () => {})
 
+    const result = engine.call('the.call', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('1')
+
+    // Server sends a call error — must reject the pending call.
+    server.send({ type: 'error', kind: 'call', id: '1', error: 'call failed' })
+    await settle()
+
+    await expect(result).rejects.toThrow('call failed')
+    engine.disconnect()
+  })
+
+  test('backward-compat: error with id and absent kind still rejects the pending call', async () => {
+    // Older servers omit `kind`. The client must treat absent kind as 'call'
+    // (backward-compatible) so existing RPC error flows keep working.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.fail', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    // Old-server error: no kind field.
+    server.send({ type: 'error', id: callFrame!.id, error: 'old server error' })
+    await settle()
+
+    await expect(result).rejects.toThrow('old server error')
     engine.disconnect()
   })
 

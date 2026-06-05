@@ -194,7 +194,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     try {
       context = await session.resolveSubContext()
     } catch (err) {
-      send({ type: 'error', id: msg.id, error: errorMessage(err) })
+      send({ type: 'error', kind: 'call', id: msg.id, error: errorMessage(err) })
       return
     }
     if (closed) return
@@ -210,7 +210,12 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       send({ type: 'result', id: msg.id, data: result })
     } catch (err) {
       if (closed) return
-      const payload: ServerMessage = { type: 'error', id: msg.id, error: errorMessage(err) }
+      const payload: ServerMessage = {
+        type: 'error',
+        kind: 'call',
+        id: msg.id,
+        error: errorMessage(err),
+      }
       if (err instanceof ValidationError) payload.issues = err.issues
       send(payload)
     }
@@ -238,7 +243,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
     const fn = app.functions.get(path)
     if (!fn || fn.type !== 'query') {
-      send({ type: 'error', id, error: `Unknown query: ${path}` })
+      send({ type: 'error', kind: 'subscription', id, error: `Unknown query: ${path}` })
       return
     }
 
@@ -252,7 +257,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       context = await session.resolveSubContext()
     } catch (err) {
       pendingSubIds.delete(id)
-      send({ type: 'error', id, error: errorMessage(err) })
+      send({ type: 'error', kind: 'subscription', id, error: errorMessage(err) })
       return
     }
 
@@ -279,7 +284,12 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       send({ type: 'subscribed', id })
     } catch (err) {
       pendingSubIds.delete(id)
-      const payload: ServerMessage = { type: 'error', id, error: errorMessage(err) }
+      const payload: ServerMessage = {
+        type: 'error',
+        kind: 'subscription',
+        id,
+        error: errorMessage(err),
+      }
       if (err instanceof ValidationError) payload.issues = err.issues
       send(payload)
     }
@@ -377,7 +387,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       case 'subscribe':
         if (!reactiveEnabled) {
           // Reactive tier not wired (Spec ADR #12). The capability-discovery floor.
-          send({ type: 'error', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+          send({ type: 'error', kind: 'subscription', id: msg.id, error: REACTIVITY_NOT_ENABLED })
           return
         }
         void handleSubscribe(msg)

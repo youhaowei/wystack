@@ -4,9 +4,9 @@
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
 //   - Subscription registry (replay on (re)connect, invalidation dispatch)
-//   - Call/result correlation (Spec ADR #9, YW-97 / T3d): engine.call() sends a
-//     `call` frame, registers a pending entry keyed by id, and resolves/rejects
-//     it when the matching `result` or `error` frame arrives from the server.
+//   - Call/result correlation (Spec ADR #9, YW-97 / T3d, YW-99): engine.call()
+//     sends a `call` frame, registers a pending entry keyed by id, and
+//     resolves/rejects it when the matching `result` or `error` frame arrives.
 //
 // Driven by a `Pipe<ServerMessage, ClientMessage>` factory — never imports a
 // concrete transport. The WebSocket-backed factory lives in `ws.ts` (until the
@@ -21,7 +21,11 @@
 //     pipe open) when a newer `connect()` or `disconnect()` has happened.
 //
 // Call correlation + generation discipline:
-//   - Pending calls are stored in `pendingCalls` keyed by id.
+//   - Pending calls are stored in `pendingCalls` keyed by a monotonic id.
+//   - Error frame routing uses the wire-level `kind` discriminant (YW-99):
+//     `kind === 'subscription'` → subscription error, does NOT touch pendingCalls.
+//     `kind === 'call'` or absent (backward-compat with older servers) → reject
+//     the pending call by id, as today.
 //   - On pipe close (`handleClose`) or explicit `disconnect()`, ALL pending
 //     calls are rejected immediately (no hangs). See `rejectAllPending`.
 //   - `handleClose` is already generation-gated (ownGeneration guard), so a
@@ -138,32 +142,6 @@ export class CallNotReadyError extends Error {
   constructor(reason: string) {
     super(`engine.call: not ready — ${reason}`)
     this.name = 'CallNotReadyError'
-  }
-}
-
-/**
- * The engine-reserved prefix for generated call ids. A colon never appears in a
- * caller-supplied subscription id (callers pass query-key-derived ids), so this
- * prefix keeps the call-id and subscription-id keyspaces disjoint in the shared
- * `pendingCalls` lookup — an `error` frame's id can never mis-route a
- * subscription error onto a pending call. `subscribe()` enforces the reservation
- * (see ReservedSubscriptionIdError) so the disjointness is an invariant, not a
- * convention the comment merely asserts.
- */
-const CALL_ID_PREFIX = 'call:'
-
-/**
- * Thrown by `subscribe()` when a caller passes an id in the engine-reserved
- * call-id namespace (`call:`-prefixed). Allowing it would let a subscription
- * error reject an unrelated in-flight RPC sharing the same id.
- */
-export class ReservedSubscriptionIdError extends Error {
-  constructor(id: string) {
-    super(
-      `engine.subscribe: id "${id}" uses the reserved "${CALL_ID_PREFIX}" prefix — ` +
-        'that namespace belongs to engine-generated call ids',
-    )
-    this.name = 'ReservedSubscriptionIdError'
   }
 }
 
@@ -352,10 +330,20 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'error': {
-        // If `id` matches a pending call, reject that call specifically.
-        // Otherwise this is a connection-level error — keep current behavior
-        // (no-op; connection-level errors arrive paired with a close event
-        // which triggers handleClose / scheduleReconnect).
+        // Route by the wire-level `kind` discriminant (YW-99):
+        //   - `kind === 'subscription'` → subscription error; must NOT touch
+        //     pendingCalls (a subscription id and a call id can now collide
+        //     without mis-routing because the tag is self-describing).
+        //   - `kind === 'call'` or absent (backward-compat with servers that
+        //     predate YW-99) → reject the pending call by id, as today.
+        //   - no `id` (connection-level error) → ignored here; the accompanying
+        //     close event handles reconnect.
+        if (msg.kind === 'subscription') {
+          // Subscription errors are currently surfaced only via the close path
+          // or by the subscription's own error handler (not yet wired). Do NOT
+          // touch pendingCalls.
+          return
+        }
         if (msg.id !== undefined) {
           const pending = pendingCalls.get(msg.id)
           if (pending !== undefined) {
@@ -521,10 +509,6 @@ export function createEngine(config: EngineConfig): Engine {
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
   ) {
-    // Enforce the reserved namespace: a caller-supplied id must not collide with
-    // the engine's generated call ids, or a subscription error could reject an
-    // in-flight RPC sharing that id in the pendingCalls lookup.
-    if (id.startsWith(CALL_ID_PREFIX)) throw new ReservedSubscriptionIdError(id)
     handlers.set(id, onInvalidate)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
@@ -552,13 +536,11 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    // Mint an id in the engine-reserved namespace (see CALL_ID_PREFIX). The
-    // server echoes `error` frames with the offending id for BOTH a failed call
-    // and a failed subscribe, and the wire doesn't tag which — the reserved
-    // prefix, enforced by subscribe(), is what keeps the two id spaces disjoint
-    // client-side. (Tagging error origin at the wire would remove the need for
-    // any prefix; that's a protocol change, tracked separately.)
-    const id = `${CALL_ID_PREFIX}${(++callSeq).toString(36)}`
+    // Mint a monotonically unique id for this call within the engine instance.
+    // The wire-level `kind` discriminant on `error` frames (YW-99) routes errors
+    // by origin (call vs subscription), so ids no longer need to be in a reserved
+    // namespace — any collision-free counter works.
+    const id = (++callSeq).toString(36)
     const target = pipe
     // Snapshot the generation NOW (mirrors sendOrClose's param): the async
     // rejection leg below must close the generation this call rode on, never a
