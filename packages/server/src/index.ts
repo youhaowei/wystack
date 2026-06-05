@@ -13,6 +13,7 @@ export {
   attachEngine,
   createInMemorySubscriptionStore,
   createDispatchInvalidationSource,
+  createInvalidationRouter,
 } from './engine'
 
 export type {
@@ -41,4 +42,5 @@ export type {
   InvalidationHandler,
   InvalidationSource,
   DispatchInvalidationSource,
+  InvalidationRouterOptions,
 } from './engine'

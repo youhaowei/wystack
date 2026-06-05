@@ -35,8 +35,13 @@
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { Pipe } from '@wystack/transport'
-import { parseEnvelope } from '@wystack/transport'
-import { attachEngine, type AttachEngineOptions } from './engine'
+import {
+  attachEngine,
+  type AttachEngineOptions,
+  createInMemorySubscriptionStore,
+  createDispatchInvalidationSource,
+  createInvalidationRouter,
+} from './engine'
 import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
@@ -46,19 +51,14 @@ import { ValidationError } from './validation'
 export { buildAuthRequest } from './engine'
 
 /**
- * Per-connection subscription state, keyed by the platform socket (`ws.raw`).
- * Auth and RPC state has moved into the engine's Session (`handle.session`);
- * only the reactive-tier bookkeeping lives here now.
+ * Per-connection state, keyed by the platform socket (`ws.raw`).
  *
- * `handle`    — the EngineHandle returned by `attachEngine` for this connection.
- * `engineInbound` — the single inbound handler the engine registered on the
- *               Pipe's synthetic `onMessage`. Routes.ts calls it directly for
- *               frames it does not handle (auth, call, malformed, unknown-type),
- *               preserving the engine's protocol policy without a real Pipe.
- *               `null` once the engine has detached (post-close), so the call
- *               site must null-check before invoking.
- * `subIds`    — IDs of active subscriptions on this socket (for cleanup on close).
- * `pendingSubIds` — IDs of in-flight subscribes (see `handleSubscribe`).
+ * `handle`       — the EngineHandle returned by `attachEngine` for this
+ *                  connection.
+ * `engineInbound`— the single inbound handler the engine registered on the
+ *                  Pipe's `onMessage`. Routes.ts calls it directly for all
+ *                  inbound WS frames. A getter so the connection always sees
+ *                  the engine's current handler — `null` after detach.
  *
  * GOTCHA: Hono creates a new `WSContext` per event callback, so its identity is
  * not stable — the raw socket object is. `Map<object, …>` rather than
@@ -67,21 +67,6 @@ export { buildAuthRequest } from './engine'
 interface Connection {
   handle: ReturnType<typeof attachEngine>
   engineInbound: ((message: unknown) => void) | null
-  subIds: Set<string>
-  /**
-   * Subscribe IDs whose `resolveContext` / `app.call` is in-flight. Lets an
-   * `unsubscribe` arriving mid-await cancel the pending registration so the
-   * resolved subscription doesn't orphan itself in `app.subscriptions`.
-   *
-   * known-debt: this is flag-check cancellation, not signal-plumbing. The
-   * adapter's `resolveContext` keeps running to completion even after
-   * cancellation — we bail at the `.then` boundary. Wasted work for expensive
-   * adapters (external auth service, DB session lookup). Upgrading to
-   * `AbortSignal` on the `Request` passed to `resolveContext` would let
-   * adapters opt into cancellation. Deferred until an adapter proposal makes
-   * the cost measurable. Search: `kb search "AbortSignal resolveContext"`.
-   */
-  pendingSubIds: Set<string>
 }
 
 // Monotonic source for per-connection Pipe ids. `ws.raw` is a stable identity
@@ -91,19 +76,6 @@ let nextConnectionId = 0
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
-}
-
-/**
- * Send JSON over a WS, swallowing the post-close throw. Outbound frames
- * race against unrelated closes; collapsing the try/catch at the call
- * site keeps handler logic linear.
- */
-function safeSend(ws: WSContext, payload: unknown): void {
-  try {
-    ws.send(JSON.stringify(payload))
-  } catch {
-    /* socket closed */
-  }
 }
 
 export interface RouteOptions {
@@ -125,118 +97,38 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
   const hono = new Hono()
 
-  // Per-connection reactive-tier state, keyed by the platform socket.
+  // --- Shared reactive tier: one store + source per server instance ---
+  //
+  // A single SubscriptionStore holds all live subscriptions across every
+  // connection. A single DispatchInvalidationSource fans out write-events.
+  //
+  // ONE InvalidationRouter is registered here (not per-connection) to avoid
+  // the double-fan trap: if each attachEngine registered its own onInvalidation
+  // handler, N connections would produce N invalidate frames per affected sub.
+  //
+  // The router does the re-query using entry.context (subscription-time context)
+  // — it never calls resolveContext again. entry.send is the post-close-safe
+  // closure the engine built at subscribe time.
+  const subscriptionStore = createInMemorySubscriptionStore()
+  const { source: invalidationSource, emit: publishInvalidation } =
+    createDispatchInvalidationSource()
+
+  createInvalidationRouter({
+    source: invalidationSource,
+    store: subscriptionStore,
+    recompute: async (entry) => {
+      const { tablesRead } = await app.call(entry.functionPath, entry.args, entry.context)
+      return { tablesRead }
+    },
+  })
+
+  // Per-connection state, keyed by the platform socket.
   const rawToConnection = new Map<object, Connection>()
-  // sub ID → WSContext, for invalidation dispatch.
-  const subToWs = new Map<string, WSContext>()
 
   // Hono types `ws.raw` as `unknown`; in practice it's always the platform
   // socket object (Bun ServerWebSocket, etc.). Single cast site so if Hono
   // ever tightens the type, there's one place to update.
   const keyOf = (ws: WSContext): object => ws.raw as object
-
-  function addSub(id: string, ws: WSContext): void {
-    subToWs.set(id, ws)
-    const conn = rawToConnection.get(keyOf(ws))
-    if (conn) conn.subIds.add(id)
-  }
-
-  function removeSub(id: string, ws: WSContext): void {
-    app.subscriptions.remove(id)
-    subToWs.delete(id)
-    rawToConnection.get(keyOf(ws))?.subIds.delete(id)
-  }
-
-  function removeAllForSocket(ws: WSContext): void {
-    const conn = rawToConnection.get(keyOf(ws))
-    if (!conn) return
-    for (const id of conn.subIds) {
-      app.subscriptions.remove(id)
-      subToWs.delete(id)
-    }
-    // Drop pending-subscribe IDs so any in-flight resolveContext/.then bails.
-    conn.pendingSubIds.clear()
-    rawToConnection.delete(keyOf(ws))
-  }
-
-  /**
-   * Handle an inbound `{type:"subscribe", id, path, args}` frame. Uses
-   * `conn.pendingSubIds` so an `unsubscribe` arriving during the
-   * `resolveContext` await cleanly cancels the registration, rather than
-   * orphaning the sub in `app.subscriptions`. A hung adapter has no timer
-   * here — cancellation arrives via client unsubscribe or socket close
-   * (both drop the id from `pendingSubIds` and the `.then` bails).
-   */
-  async function handleSubscribe(
-    msg: Record<string, unknown>,
-    ws: WSContext,
-    conn: Connection,
-    rawSocket: object,
-  ): Promise<void> {
-    // Runtime narrowing: `id` is used as a Map key and `path` as a function
-    // registry lookup. Non-string values (object, number) would bypass
-    // `pendingSubIds` reference-identity guards and silently orphan the sub.
-    if (typeof msg.id !== 'string' || typeof msg.path !== 'string') {
-      safeSend(ws, {
-        type: 'error',
-        id: typeof msg.id === 'string' ? msg.id : undefined,
-        error: 'invalid subscribe message',
-      })
-      return
-    }
-    const id = msg.id
-    const path = msg.path
-    const args = (msg.args ?? {}) as Record<string, unknown>
-    const fn = app.functions.get(path)
-    if (!fn || fn.type !== 'query') {
-      safeSend(ws, { type: 'error', id, error: `Unknown query: ${path}` })
-      return
-    }
-
-    conn.pendingSubIds.add(id)
-
-    // Resolve context PER subscription — Spec Decision:
-    // "Context resolved at subscription time, preserved for re-queries"
-    let context: Record<string, unknown>
-    try {
-      context = await conn.handle.session.resolveSubContext()
-    } catch (err) {
-      conn.pendingSubIds.delete(id)
-      safeSend(ws, { type: 'error', id, error: errorMessage(err) })
-      return
-    }
-
-    // Unsubscribe may have arrived during the await — it dropped `id` from
-    // pendingSubIds. Bail before running the query.
-    if (!conn.pendingSubIds.has(id)) return
-
-    app
-      .call(path, args, context)
-      .then(({ tablesRead }) => {
-        // Guard: socket closed, OR unsubscribe arrived during the query.
-        if (!rawToConnection.has(rawSocket) || !conn.pendingSubIds.has(id)) return
-        conn.pendingSubIds.delete(id)
-        app.subscriptions.add({
-          id,
-          functionPath: path,
-          args,
-          context,
-          tablesWatched: tablesRead,
-        })
-        addSub(id, ws)
-        safeSend(ws, { type: 'subscribed', id })
-      })
-      .catch((err: unknown) => {
-        conn.pendingSubIds.delete(id)
-        const payload: Record<string, unknown> = {
-          type: 'error',
-          id,
-          error: errorMessage(err),
-        }
-        if (err instanceof ValidationError) payload.issues = err.issues
-        safeSend(ws, payload)
-      })
-  }
 
   // --- WebSocket (registered before /:fn to avoid param catch) ---
   hono.get(
@@ -249,12 +141,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         onOpen(_evt, ws) {
           const rawSocket = keyOf(ws)
 
-          // Build a minimal Pipe wrapping this Hono WS. The engine uses
-          // `pipe.send` for outbound frames (authenticated, result, error).
-          // `pipe.onMessage` is only used by the engine to register its inbound
-          // handler — routes.ts calls that handler directly rather than routing
-          // all frames through the Pipe abstraction, so that subscribe/unsubscribe
-          // can be intercepted here first (reactive tier stays in routes.ts).
+          // Build a minimal Pipe wrapping this Hono WS. The engine handles all
+          // frame types (auth, call, subscribe, unsubscribe) — routes.ts no longer
+          // intercepts subscribe/unsubscribe before forwarding to the engine.
           let engineInbound: ((message: unknown) => void) | null = null
           let pipeClosed = false
 
@@ -312,6 +201,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             authTimeoutMs,
             baseRequest: upgradeRequest,
             onClose: mapCloseCode,
+            subscriptionStore,
+            publishInvalidation,
           }
 
           const handle = attachEngine(pipe, engineOpts)
@@ -324,12 +215,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             get engineInbound() {
               return engineInbound
             },
-            subIds: new Set(),
-            pendingSubIds: new Set(),
           })
         },
 
-        async onMessage(event, ws) {
+        onMessage(event, ws) {
           const rawSocket = keyOf(ws)
           const conn = rawToConnection.get(rawSocket)
           if (!conn) {
@@ -339,52 +228,21 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             return
           }
 
-          const raw = String(event.data)
-
-          // Lenient envelope parse to decide routing. If unparseable, forward to
-          // the engine (which handles pre/post-auth malformed-frame policy).
-          const envelope = parseEnvelope(raw)
-
-          // Reactive-tier frames (subscribe / unsubscribe) are handled here when
-          // the connection is authenticated. Everything else — auth, call, unknown
-          // type, and ALL pre-auth frames — goes to the engine.
-          if (envelope !== null && conn.handle.session.authenticated) {
-            if (envelope.type === 'subscribe') {
-              await handleSubscribe(envelope as Record<string, unknown>, ws, conn, rawSocket)
-              return
-            }
-
-            if (envelope.type === 'unsubscribe') {
-              if (typeof envelope.id !== 'string') {
-                safeSend(ws, { type: 'error', error: 'invalid unsubscribe message' })
-                return
-              }
-              const subId = envelope.id
-              // Cancel a pending (in-flight) subscribe before it finishes, so
-              // the .then() that registers it sees "not pending" and bails.
-              conn.pendingSubIds.delete(subId)
-              const sub = app.subscriptions.get(subId)
-              if (sub) removeSub(subId, ws)
-              return
-            }
-          }
-
-          // Forward to the engine's inbound handler. The engine owns:
-          //   - auth frames (both before and after auth, including idempotent ACK)
-          //   - call frames
-          //   - malformed / unparseable frames (pre-auth 4001, post-auth error)
-          //   - unknown-type frames post-auth (error frame)
-          //   - pre-auth non-auth frames (4001)
+          // Forward all frames to the engine's inbound handler. The engine now
+          // owns auth, call, subscribe, unsubscribe, malformed-frame policy, and
+          // the reactive tier (when subscriptionStore + publishInvalidation are wired).
           const handler = conn.engineInbound
-          if (handler) handler(raw)
+          if (handler) handler(String(event.data))
         },
 
         onClose(_evt, ws) {
-          // Engine teardown: detach cleans up its inbound handler and session.
+          // Engine teardown: detach cleans up its inbound handler, session,
+          // and all reactive subscriptions registered by this connection.
           const conn = rawToConnection.get(keyOf(ws))
-          if (conn) conn.handle.detach()
-          // Reactive-tier cleanup: remove all subscriptions for this socket.
-          removeAllForSocket(ws)
+          if (conn) {
+            conn.handle.detach()
+            rawToConnection.delete(keyOf(ws))
+          }
         },
       }
     }),
@@ -466,8 +324,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       const callResult = await app.call(functionPath, body, context)
 
+      // Emit write-tags to the shared invalidation channel. The router
+      // (registered once above) fans out re-queries and invalidate signals.
       if (callResult.tablesWritten.size > 0) {
-        await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
+        publishInvalidation(callResult.tablesWritten)
       }
 
       return c.json({ data: callResult.result })
@@ -480,30 +340,4 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   })
 
   return hono
-}
-
-// TODO: serialize invalidation per-subscription to prevent tablesWatched race under concurrent mutations
-async function invalidateSubscriptions(
-  app: WyStackApp,
-  writtenTables: Set<string>,
-  subToWs: Map<string, WSContext>,
-) {
-  const affected = app.subscriptions.getAffectedSubscriptions(writtenTables)
-
-  await Promise.allSettled(
-    affected.map(async (sub) => {
-      const ws = subToWs.get(sub.id)
-      if (!ws) return
-
-      // Re-run query to update table dependencies (tables watched may change)
-      try {
-        const { tablesRead } = await app.call(sub.functionPath, sub.args, sub.context)
-        sub.tablesWatched = tablesRead
-      } catch {
-        // Keep existing table watches — client will see the error on refetch
-      }
-
-      safeSend(ws, { type: 'invalidate', id: sub.id })
-    }),
-  )
 }
