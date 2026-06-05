@@ -36,4 +36,11 @@ export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { IpcManager, IpcManagerConfig, IpcRendererLike } from './transport/electron'
 export type { WyStackClientConfig } from './types'
-export type { Engine, EngineConfig, EnginePipe, PipeFactory, CloseInfo } from './engine'
+export type {
+  Engine,
+  EngineConfig,
+  EnginePipe,
+  PipeFactory,
+  CloseInfo,
+  SubscriptionErrorHandler,
+} from './engine'

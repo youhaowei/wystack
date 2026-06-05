@@ -253,6 +253,115 @@ describe('createEngine', () => {
     engine.disconnect()
   }, 10_000)
 
+  test('durable subscription error stops the retry loop — drops the sub, fires onError, no replay (YW-108)', async () => {
+    // Regression (YW-108): a `kind: 'subscription'` error must drop the sub so
+    // reconnect's sendSubscriptions() does NOT replay it. Without the drop, the
+    // sub stays in activeSubs and every reconnect re-sends it → another sub
+    // error → silent infinite loop. The terminating proxy: after the error, a
+    // reconnect produces NO subscribe frame for that id.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    const errors: Error[] = []
+    engine.subscribe(
+      's1',
+      'unknown.query',
+      {},
+      () => {},
+      (err) => errors.push(err),
+    )
+    await settle()
+    expect(firstServer.received).toEqual([
+      { type: 'subscribe', id: 's1', path: 'unknown.query', args: {} },
+    ])
+
+    // Server rejects the subscription with a durable error.
+    firstServer.send({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      error: 'Unknown query: unknown.query',
+    })
+    await settle()
+
+    // onError fired with the durable error.
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.message).toBe('Unknown query: unknown.query')
+
+    // Now force a reconnect. The dropped sub must NOT be replayed.
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+
+    const secondServer = harness.server()
+    await settle()
+    // The loop-stopper: no subscribe frame for the dropped sub on the new pipe.
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('subscription error without onError still drops the sub (no loop, no throw)', async () => {
+    // onError is optional. A subscription error must still drop the sub even when
+    // no callback was registered — the loop fix is independent of the callback.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    engine.subscribe('s1', 'unknown.query', {}, () => {})
+    await settle()
+
+    firstServer.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('after a subscription error, a late invalidate for the dropped id is a no-op (YW-108)', async () => {
+    // The sub was removed from `handlers`, so a stale `invalidate` for it must
+    // not fire the (now-gone) onInvalidate.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    let invalidations = 0
+    engine.subscribe(
+      's1',
+      'unknown.query',
+      {},
+      () => {
+        invalidations++
+      },
+      () => {},
+    )
+    await settle()
+
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    // A stale invalidate for the dropped sub must not fire.
+    server.send({ type: 'invalidate', id: 's1' })
+    await settle()
+    expect(invalidations).toBe(0)
+
+    engine.disconnect()
+  })
+
   test('unsubscribe stops invalidation delivery and notifies server', async () => {
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })

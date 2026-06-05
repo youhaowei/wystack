@@ -14,7 +14,7 @@
  *   4001 — auth failed / protocol violation → latch authFailed, no reconnect
  *   4002 — transient (timeout, flake) → reconnect per exponential backoff
  */
-import { createEngine, type Engine } from './engine'
+import { createEngine, type Engine, type SubscriptionErrorHandler } from './engine'
 import { createWebSocketPipe } from './transport/websocket'
 
 type InvalidateHandler = () => void
@@ -59,6 +59,7 @@ export interface WsManager {
     path: string,
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
+    onError?: SubscriptionErrorHandler,
   ): void
   unsubscribe(id: string): void
   isConnected(): boolean
@@ -93,8 +94,8 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   return {
     connect: () => engine.connect(),
     disconnect: () => engine.disconnect(),
-    subscribe(id, path, args, onInvalidate) {
-      engine.subscribe(id, path, args, onInvalidate)
+    subscribe(id, path, args, onInvalidate, onError) {
+      engine.subscribe(id, path, args, onInvalidate, onError)
     },
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),

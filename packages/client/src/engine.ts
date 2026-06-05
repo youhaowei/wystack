@@ -3,7 +3,9 @@
 // Owns the carrier-agnostic half of the v0.2 client (Spec ADR #11):
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
-//   - Subscription registry (replay on (re)connect, invalidation dispatch)
+//   - Subscription registry (replay on (re)connect, invalidation dispatch). A
+//     subscription-origin error (YW-108) drops the sub and fires its optional
+//     `onError` so reconnect never replays a durably-failing sub — no silent loop.
 //   - Call/result correlation (Spec ADR #9, YW-97 / T3d, YW-99): engine.call()
 //     sends a `call` frame, registers a pending entry keyed by id, and
 //     resolves/rejects it when the matching `result` or `error` frame arrives.
@@ -39,6 +41,14 @@
 import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
 
 type InvalidateHandler = () => void
+
+/**
+ * Per-subscription error callback (YW-108). Invoked once when a
+ * `kind: 'subscription'` error frame arrives for a registered subscription.
+ * The engine drops the subscription before calling this — it will NOT be
+ * replayed on reconnect — so this is a terminal signal for that sub id.
+ */
+export type SubscriptionErrorHandler = (err: Error) => void
 
 /**
  * Engine view of a pipe close. Adapters relay native close codes here so the
@@ -102,11 +112,21 @@ export interface EngineConfig {
 export interface Engine {
   connect(): void
   disconnect(): void
+  /**
+   * Register a reactive subscription. `onInvalidate` fires when the server
+   * signals the sub's data is stale. Optional `onError` (YW-108) fires once if
+   * the server rejects the subscription (`kind: 'subscription'` error frame) —
+   * the engine drops the sub so it is NOT replayed on reconnect, stopping a
+   * silent retry loop for durable failures (unknown query, sub-path auth reject,
+   * `REACTIVITY_NOT_ENABLED`). After `onError`, the caller must re-`subscribe`
+   * to retry.
+   */
   subscribe(
     id: string,
     path: string,
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
+    onError?: SubscriptionErrorHandler,
   ): void
   unsubscribe(id: string): void
   isConnected(): boolean
@@ -164,6 +184,11 @@ export function createEngine(config: EngineConfig): Engine {
   let reconnectAttempt = 0
 
   const handlers = new Map<string, InvalidateHandler>()
+  // Per-subscription error callbacks (YW-108), keyed by sub id. Same lifecycle as
+  // `handlers` — set in subscribe(), cleared in unsubscribe() and when a
+  // subscription error drops the sub. Persists across reconnect (not cleared on
+  // disconnect) so a replayed sub keeps its error handler.
+  const errorHandlers = new Map<string, SubscriptionErrorHandler>()
   const activeSubs = new Map<string, { path: string; args: Record<string, unknown> }>()
 
   // Pending call correlator: id → {resolve, reject}. Entries are added by
@@ -339,9 +364,29 @@ export function createEngine(config: EngineConfig): Engine {
         //   - no `id` (connection-level error) → ignored here; the accompanying
         //     close event handles reconnect.
         if (msg.kind === 'subscription') {
-          // Subscription errors are currently surfaced only via the close path
-          // or by the subscription's own error handler (not yet wired). Do NOT
-          // touch pendingCalls.
+          // Subscription-origin error (YW-108). Drop the sub so reconnect's
+          // sendSubscriptions() does NOT replay it — that replay is what would
+          // otherwise loop forever (error → drop-nothing → reconnect → re-send →
+          // error …) for a durable failure. Removing from `activeSubs` is the
+          // actual loop-stopper; we also clear `handlers`/`errorHandlers` so a
+          // later stale `invalidate`/`error` for this id is a no-op.
+          //
+          // This branch touches ONLY the subscription maps, never pendingCalls —
+          // a subscription error must never reject an in-flight call sharing the
+          // id (the YW-99 routing contract).
+          if (msg.id !== undefined) {
+            const onError = errorHandlers.get(msg.id)
+            handlers.delete(msg.id)
+            activeSubs.delete(msg.id)
+            errorHandlers.delete(msg.id)
+            if (onError !== undefined) {
+              const err = new Error(msg.error)
+              if (msg.issues !== undefined) {
+                ;(err as Error & { issues?: unknown[] }).issues = msg.issues
+              }
+              onError(err)
+            }
+          }
           return
         }
         if (msg.id !== undefined) {
@@ -508,8 +553,10 @@ export function createEngine(config: EngineConfig): Engine {
     path: string,
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
+    onError?: SubscriptionErrorHandler,
   ) {
     handlers.set(id, onInvalidate)
+    if (onError !== undefined) errorHandlers.set(id, onError)
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
@@ -519,6 +566,7 @@ export function createEngine(config: EngineConfig): Engine {
 
   function unsubscribe(id: string) {
     handlers.delete(id)
+    errorHandlers.delete(id)
     activeSubs.delete(id)
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'unsubscribe', id }, connectGeneration)

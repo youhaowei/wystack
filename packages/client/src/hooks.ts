@@ -87,9 +87,30 @@ export function useQuery<TArgs, TReturn>(
 
     const subId = nextSubId()
 
-    client.ws.subscribe(subId, path, stableArgs as Record<string, unknown>, () => {
-      queryClient.invalidateQueries({ queryKey })
-    })
+    client.ws.subscribe(
+      subId,
+      path,
+      stableArgs as Record<string, unknown>,
+      () => {
+        queryClient.invalidateQueries({ queryKey })
+      },
+      // Durable subscription error (YW-108). The engine has already dropped the
+      // sub, so it will NOT be replayed on reconnect — this stops the silent
+      // retry loop. We deliberately do NOT push the TanStack query into error
+      // state: useQuery loads its data over HTTP and uses WS only for live
+      // invalidation, so a failed sub means "no live updates," not "no data."
+      // Forcing an error here would falsely fail every query on an RPC-only
+      // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
+      // working fine. Surface it as a dev-only warning instead.
+      (err) => {
+        if (process.env.NODE_ENV !== 'production') {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[wystack] live updates unavailable for "${path}" — query data still loads over HTTP. ${err.message}`,
+          )
+        }
+      },
+    )
 
     return () => {
       client.ws.unsubscribe(subId)
