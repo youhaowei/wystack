@@ -362,6 +362,44 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
+  test('re-subscribe without onError clears a stale error handler (YW-108)', async () => {
+    // Regression (Greptile P1): handlers.set() unconditionally overwrites the
+    // invalidate handler, but errorHandlers must be cleared too when the new
+    // registrant omits onError. Otherwise a subscribe(id, …, onError) followed by
+    // a re-subscribe(id, …) with NO onError (no unsubscribe between) leaves the
+    // OLD onError in the map, and the next subscription error for that id fires
+    // the stale closure against a subscription the new registrant never wired.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    let oldErrors = 0
+    // First registration WITH an onError.
+    engine.subscribe(
+      's1',
+      'q',
+      {},
+      () => {},
+      () => {
+        oldErrors++
+      },
+    )
+    await settle()
+
+    // Re-subscribe the SAME id WITHOUT an onError and WITHOUT unsubscribing.
+    engine.subscribe('s1', 'q', {}, () => {})
+    await settle()
+
+    // A subscription error for 's1' must NOT fire the stale first onError.
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+    expect(oldErrors).toBe(0)
+
+    engine.disconnect()
+  })
+
   test('unsubscribe stops invalidation delivery and notifies server', async () => {
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })

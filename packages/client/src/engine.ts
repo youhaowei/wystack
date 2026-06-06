@@ -556,7 +556,15 @@ export function createEngine(config: EngineConfig): Engine {
     onError?: SubscriptionErrorHandler,
   ) {
     handlers.set(id, onInvalidate)
-    if (onError !== undefined) errorHandlers.set(id, onError)
+    // Keep errorHandlers symmetric with the unconditional overwrite of
+    // `handlers`: a re-subscribe with the SAME id but no `onError` (without an
+    // unsubscribe between) must CLEAR any stale handler from a prior registrant,
+    // or that old closure would fire on the new subscription's error frame.
+    if (onError !== undefined) {
+      errorHandlers.set(id, onError)
+    } else {
+      errorHandlers.delete(id)
+    }
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
