@@ -340,7 +340,16 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'invalidate': {
-        handlers.get(msg.id)?.()
+        const handler = handlers.get(msg.id)
+        if (handler !== undefined) {
+          // A throwing app-supplied invalidate handler must not propagate into
+          // the engine's message loop — isolate it so later frames still process.
+          try {
+            handler()
+          } catch {
+            /* user onInvalidate threw — isolated; the engine keeps processing */
+          }
+        }
         return
       }
       case 'result': {
@@ -376,6 +385,9 @@ export function createEngine(config: EngineConfig): Engine {
           // id (the YW-99 routing contract).
           if (msg.id !== undefined) {
             const onError = errorHandlers.get(msg.id)
+            // Cleanup FIRST so a throwing onError can't leave the sub registered
+            // (and thus replayable on reconnect — the loop this branch exists to
+            // stop). The maps are cleared before the callback runs, never after.
             handlers.delete(msg.id)
             activeSubs.delete(msg.id)
             errorHandlers.delete(msg.id)
@@ -384,7 +396,14 @@ export function createEngine(config: EngineConfig): Engine {
               if (msg.issues !== undefined) {
                 ;(err as Error & { issues?: unknown[] }).issues = msg.issues
               }
-              onError(err)
+              // A throwing app-supplied handler must not propagate into the
+              // engine's message loop and wedge it — isolate it (swallow,
+              // matching the `send` helper's silent post-close style).
+              try {
+                onError(err)
+              } catch {
+                /* user onError threw — isolated; the engine keeps processing */
+              }
             }
           }
           return

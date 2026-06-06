@@ -400,6 +400,86 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
+  test('a throwing onError does not break the engine loop and cleanup still happens (YW-108)', async () => {
+    // Regression (CodeRabbit MUST): a user-supplied onError that THROWS must not
+    // propagate into handleMessage and wedge the engine — a subsequent message
+    // must still process. Cleanup (dropping the sub) must also happen regardless
+    // of the throw, so the sub is not left registered (and replayable).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    engine.subscribe(
+      's1',
+      'q',
+      {},
+      () => {},
+      () => {
+        throw new Error('app onError boom')
+      },
+    )
+    await settle()
+
+    // Subscription error fires the throwing onError. The throw must be isolated.
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    // The engine still processes a subsequent message — prove with a round-trip
+    // call that resolves after the throw.
+    const result = engine.call('the.call', {})
+    await settle()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(result, 'call after throwing onError')).toBe('ok')
+
+    // Cleanup happened despite the throw: a reconnect must NOT replay the sub.
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('a throwing onInvalidate does not break the engine loop (YW-108)', async () => {
+    // Regression (CodeRabbit MUST, preexisting twin): a user-supplied
+    // onInvalidate that THROWS must not propagate into handleMessage. A
+    // subsequent message must still process.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    engine.subscribe('s1', 'q', {}, () => {
+      throw new Error('app onInvalidate boom')
+    })
+    await settle()
+
+    // Invalidate fires the throwing handler. The throw must be isolated.
+    server.send({ type: 'invalidate', id: 's1' })
+    await settle()
+
+    // The engine still processes a subsequent message — prove with a round-trip.
+    const result = engine.call('the.call', {})
+    await settle()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(result, 'call after throwing onInvalidate')).toBe('ok')
+
+    engine.disconnect()
+  })
+
   test('unsubscribe stops invalidation delivery and notifies server', async () => {
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })

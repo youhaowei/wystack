@@ -103,7 +103,14 @@ export function useQuery<TArgs, TReturn>(
       // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
       // working fine. Surface it as a dev-only warning instead.
       (err) => {
-        if (process.env.NODE_ENV !== 'production') {
+        // Browser-safe dev gate: `@wystack/client` ships as plain ESM, so
+        // `process` is not defined in a browser build without a Node-globals
+        // polyfill. Reference it ONLY behind a `typeof` guard, or a subscription
+        // rejection would throw `ReferenceError: process is not defined` in the
+        // exact path YW-108 makes safe. (`process.env?.` also guards the rare
+        // case where `process` exists but `env` does not.)
+        const isDev = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production'
+        if (isDev) {
           // eslint-disable-next-line no-console
           console.warn(
             `[wystack] live updates unavailable for "${path}" — query data still loads over HTTP. ${err.message}`,

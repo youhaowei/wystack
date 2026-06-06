@@ -35,6 +35,7 @@ type SubscribeArgs = {
   path: string
   args: Record<string, unknown>
   onInvalidate: () => void
+  onError?: (err: Error) => void
 }
 
 interface MockWs extends WsManager {
@@ -54,9 +55,9 @@ function makeMockWs(): MockWs {
     disconnect: mock(() => {}),
     isConnected: mock(() => false),
     call: mock(() => Promise.resolve(null)),
-    subscribe(id, path, args, onInvalidate) {
+    subscribe(id, path, args, onInvalidate, onError) {
       state._subscribeCallCount++
-      state._lastSubscribe = { id, path, args, onInvalidate }
+      state._lastSubscribe = { id, path, args, onInvalidate, onError }
     },
     unsubscribe(id) {
       state._unsubscribeCallCount++
@@ -234,6 +235,36 @@ describe('useQuery', () => {
     expect(call.ref._path).toBe('allTodos')
     // normalizedArgs is {} for undefined args
     expect(call.args).toEqual({})
+  })
+
+  test('subscription-error surfacing is browser-safe — does not throw when `process` is undefined (YW-108)', async () => {
+    // Regression (Codex MUST): the YW-108 onError surfacing read
+    // `process.env.NODE_ENV` unguarded. `@wystack/client` ships as plain ESM, so
+    // `process` is not defined in a browser build — a subscription rejection
+    // would throw `ReferenceError: process is not defined` in the exact path
+    // YW-108 makes safe. The fix guards the access with `typeof process`.
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    const wrapper = makeWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, unknown>('listTodos')
+
+    renderHook(() => useQuery(ref), { wrapper })
+
+    // The hook registers an onError on mount.
+    await waitFor(() => expect(ws._subscribeCallCount).toBe(1))
+    const onError = ws._lastSubscribe!.onError
+    expect(onError).toBeDefined()
+
+    // Simulate the browser: no `process` global. Capture and delete it, invoke
+    // the surfacing path, and assert it does NOT throw. Restore in a finally so
+    // a failure can't leak the deletion into other tests.
+    const savedProcess = (globalThis as { process?: unknown }).process
+    try {
+      delete (globalThis as { process?: unknown }).process
+      expect(() => onError!(new Error('REACTIVITY_NOT_ENABLED'))).not.toThrow()
+    } finally {
+      ;(globalThis as { process?: unknown }).process = savedProcess
+    }
   })
 })
 
