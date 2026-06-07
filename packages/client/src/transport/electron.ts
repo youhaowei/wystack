@@ -36,7 +36,7 @@
 import type { ServerMessage, ClientMessage } from '@wystack/transport'
 import { parseServerMessage } from '@wystack/transport'
 import type { EnginePipe, CloseInfo } from '../engine'
-import { createEngine, type Engine } from '../engine'
+import { createEngine, type Engine, type SubscriptionErrorHandler } from '../engine'
 
 // ─── IPC channel names (contract-pinned) ─────────────────────────────────────
 
@@ -228,7 +228,13 @@ export interface IpcManagerConfig {
 export interface IpcManager {
   connect(): void
   disconnect(): void
-  subscribe(id: string, path: string, args: Record<string, unknown>, onInvalidate: () => void): void
+  subscribe(
+    id: string,
+    path: string,
+    args: Record<string, unknown>,
+    onInvalidate: () => void,
+    onError?: SubscriptionErrorHandler,
+  ): void
   unsubscribe(id: string): void
   isConnected(): boolean
   /** RPC call over the IPC pipe — correlates by id, resolves with result.data. */
@@ -247,8 +253,8 @@ export function createIpcManager(config: IpcManagerConfig): IpcManager {
   return {
     connect: () => engine.connect(),
     disconnect: () => engine.disconnect(),
-    subscribe(id, path, args, onInvalidate) {
-      engine.subscribe(id, path, args, onInvalidate)
+    subscribe(id, path, args, onInvalidate, onError) {
+      engine.subscribe(id, path, args, onInvalidate, onError)
     },
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),

@@ -243,6 +243,61 @@ describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
   // Both emits use `todos` and both recomputes return `todos` so the entry
   // stays matched on every `getAffected` call.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // Reused-id replacement (YW-108): a client reconnects and resubscribes with
+  // the SAME id, producing a fresh entry instance (the store replaces the old
+  // one). The replacement's recompute must NOT chain behind the dead
+  // predecessor's tail — a hung predecessor must not block its replacement.
+  //
+  // Red→green: with the old id-keyed tails (#39), entry B (id 's1', new
+  // instance) chains behind entry A's never-resolving recompute → B never runs.
+  // With instance-keyed tails (WeakMap), B starts its own chain and runs even
+  // while A hangs.
+  //
+  // Critically, the recompute branches on OBJECT IDENTITY (entry === entryA),
+  // not on entry.id — both entries share id 's1', so id cannot distinguish them.
+  // ---------------------------------------------------------------------------
+  test('reused-id replacement entry does not chain behind a hung predecessor (YW-108)', async () => {
+    const store = createInMemorySubscriptionStore()
+    const { source, emit } = createDispatchInvalidationSource()
+
+    // entryA hangs forever; entryB (same id, new instance) must run regardless.
+    const entryA = makeEntry('s1', ['todos'])
+    const entryB = makeEntry('s1', ['todos'])
+
+    let bRan = false
+    createInvalidationRouter({
+      source,
+      store,
+      recompute: async (entry) => {
+        if (entry === entryA) {
+          // Never resolves — simulates a hung predecessor recompute.
+          await new Promise<void>(() => {})
+        }
+        if (entry === entryB) {
+          bRan = true
+        }
+        return { tablesRead: new Set(['todos']) }
+      },
+    })
+
+    // A subscribes and an invalidation starts A's (hung) recompute.
+    store.add(entryA)
+    emit(new Set(['todos']))
+    await flush()
+    expect(bRan).toBe(false) // only A has been touched so far
+
+    // Client reconnects → resubscribes with the same id 's1'. The store replaces
+    // entryA with entryB; getAffected now returns ONLY entryB.
+    store.add(entryB)
+    emit(new Set(['todos']))
+    await flush()
+
+    // B must have run despite A still hanging. With id-keyed tails this is false
+    // (B chained behind A's pending tail); with instance-keyed tails it is true.
+    expect(bRan).toBe(true)
+  })
+
   test('entry.send error does not break subsequent invalidations for the same sub', async () => {
     const store = createInMemorySubscriptionStore()
     const { source, emit } = createDispatchInvalidationSource()

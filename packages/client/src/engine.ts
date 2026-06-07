@@ -3,10 +3,12 @@
 // Owns the carrier-agnostic half of the v0.2 client (Spec ADR #11):
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
-//   - Subscription registry (replay on (re)connect, invalidation dispatch)
-//   - Call/result correlation (Spec ADR #9, YW-97 / T3d): engine.call() sends a
-//     `call` frame, registers a pending entry keyed by id, and resolves/rejects
-//     it when the matching `result` or `error` frame arrives from the server.
+//   - Subscription registry (replay on (re)connect, invalidation dispatch). A
+//     subscription-origin error (YW-108) drops the sub and fires its optional
+//     `onError` so reconnect never replays a durably-failing sub — no silent loop.
+//   - Call/result correlation (Spec ADR #9, YW-97 / T3d, YW-99): engine.call()
+//     sends a `call` frame, registers a pending entry keyed by id, and
+//     resolves/rejects it when the matching `result` or `error` frame arrives.
 //
 // Driven by a `Pipe<ServerMessage, ClientMessage>` factory — never imports a
 // concrete transport. The WebSocket-backed factory lives in `ws.ts` (until the
@@ -21,7 +23,11 @@
 //     pipe open) when a newer `connect()` or `disconnect()` has happened.
 //
 // Call correlation + generation discipline:
-//   - Pending calls are stored in `pendingCalls` keyed by id.
+//   - Pending calls are stored in `pendingCalls` keyed by a monotonic id.
+//   - Error frame routing uses the wire-level `kind` discriminant (YW-99):
+//     `kind === 'subscription'` → subscription error, does NOT touch pendingCalls.
+//     `kind === 'call'` or absent (backward-compat with older servers) → reject
+//     the pending call by id, as today.
 //   - On pipe close (`handleClose`) or explicit `disconnect()`, ALL pending
 //     calls are rejected immediately (no hangs). See `rejectAllPending`.
 //   - `handleClose` is already generation-gated (ownGeneration guard), so a
@@ -35,6 +41,14 @@
 import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
 
 type InvalidateHandler = () => void
+
+/**
+ * Per-subscription error callback (YW-108). Invoked once when a
+ * `kind: 'subscription'` error frame arrives for a registered subscription.
+ * The engine drops the subscription before calling this — it will NOT be
+ * replayed on reconnect — so this is a terminal signal for that sub id.
+ */
+export type SubscriptionErrorHandler = (err: Error) => void
 
 /**
  * Engine view of a pipe close. Adapters relay native close codes here so the
@@ -98,11 +112,21 @@ export interface EngineConfig {
 export interface Engine {
   connect(): void
   disconnect(): void
+  /**
+   * Register a reactive subscription. `onInvalidate` fires when the server
+   * signals the sub's data is stale. Optional `onError` (YW-108) fires once if
+   * the server rejects the subscription (`kind: 'subscription'` error frame) —
+   * the engine drops the sub so it is NOT replayed on reconnect, stopping a
+   * silent retry loop for durable failures (unknown query, sub-path auth reject,
+   * `REACTIVITY_NOT_ENABLED`). After `onError`, the caller must re-`subscribe`
+   * to retry.
+   */
   subscribe(
     id: string,
     path: string,
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
+    onError?: SubscriptionErrorHandler,
   ): void
   unsubscribe(id: string): void
   isConnected(): boolean
@@ -141,32 +165,6 @@ export class CallNotReadyError extends Error {
   }
 }
 
-/**
- * The engine-reserved prefix for generated call ids. A colon never appears in a
- * caller-supplied subscription id (callers pass query-key-derived ids), so this
- * prefix keeps the call-id and subscription-id keyspaces disjoint in the shared
- * `pendingCalls` lookup — an `error` frame's id can never mis-route a
- * subscription error onto a pending call. `subscribe()` enforces the reservation
- * (see ReservedSubscriptionIdError) so the disjointness is an invariant, not a
- * convention the comment merely asserts.
- */
-const CALL_ID_PREFIX = 'call:'
-
-/**
- * Thrown by `subscribe()` when a caller passes an id in the engine-reserved
- * call-id namespace (`call:`-prefixed). Allowing it would let a subscription
- * error reject an unrelated in-flight RPC sharing the same id.
- */
-export class ReservedSubscriptionIdError extends Error {
-  constructor(id: string) {
-    super(
-      `engine.subscribe: id "${id}" uses the reserved "${CALL_ID_PREFIX}" prefix — ` +
-        'that namespace belongs to engine-generated call ids',
-    )
-    this.name = 'ReservedSubscriptionIdError'
-  }
-}
-
 interface PendingCall {
   resolve: (data: unknown) => void
   reject: (err: unknown) => void
@@ -186,6 +184,11 @@ export function createEngine(config: EngineConfig): Engine {
   let reconnectAttempt = 0
 
   const handlers = new Map<string, InvalidateHandler>()
+  // Per-subscription error callbacks (YW-108), keyed by sub id. Same lifecycle as
+  // `handlers` — set in subscribe(), cleared in unsubscribe() and when a
+  // subscription error drops the sub. Persists across reconnect (not cleared on
+  // disconnect) so a replayed sub keeps its error handler.
+  const errorHandlers = new Map<string, SubscriptionErrorHandler>()
   const activeSubs = new Map<string, { path: string; args: Record<string, unknown> }>()
 
   // Pending call correlator: id → {resolve, reject}. Entries are added by
@@ -337,7 +340,16 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'invalidate': {
-        handlers.get(msg.id)?.()
+        const handler = handlers.get(msg.id)
+        if (handler !== undefined) {
+          // A throwing app-supplied invalidate handler must not propagate into
+          // the engine's message loop — isolate it so later frames still process.
+          try {
+            handler()
+          } catch {
+            /* user onInvalidate threw — isolated; the engine keeps processing */
+          }
+        }
         return
       }
       case 'result': {
@@ -352,10 +364,50 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'error': {
-        // If `id` matches a pending call, reject that call specifically.
-        // Otherwise this is a connection-level error — keep current behavior
-        // (no-op; connection-level errors arrive paired with a close event
-        // which triggers handleClose / scheduleReconnect).
+        // Route by the wire-level `kind` discriminant (YW-99):
+        //   - `kind === 'subscription'` → subscription error; must NOT touch
+        //     pendingCalls (a subscription id and a call id can now collide
+        //     without mis-routing because the tag is self-describing).
+        //   - `kind === 'call'` or absent (backward-compat with servers that
+        //     predate YW-99) → reject the pending call by id, as today.
+        //   - no `id` (connection-level error) → ignored here; the accompanying
+        //     close event handles reconnect.
+        if (msg.kind === 'subscription') {
+          // Subscription-origin error (YW-108). Drop the sub so reconnect's
+          // sendSubscriptions() does NOT replay it — that replay is what would
+          // otherwise loop forever (error → drop-nothing → reconnect → re-send →
+          // error …) for a durable failure. Removing from `activeSubs` is the
+          // actual loop-stopper; we also clear `handlers`/`errorHandlers` so a
+          // later stale `invalidate`/`error` for this id is a no-op.
+          //
+          // This branch touches ONLY the subscription maps, never pendingCalls —
+          // a subscription error must never reject an in-flight call sharing the
+          // id (the YW-99 routing contract).
+          if (msg.id !== undefined) {
+            const onError = errorHandlers.get(msg.id)
+            // Cleanup FIRST so a throwing onError can't leave the sub registered
+            // (and thus replayable on reconnect — the loop this branch exists to
+            // stop). The maps are cleared before the callback runs, never after.
+            handlers.delete(msg.id)
+            activeSubs.delete(msg.id)
+            errorHandlers.delete(msg.id)
+            if (onError !== undefined) {
+              const err = new Error(msg.error)
+              if (msg.issues !== undefined) {
+                ;(err as Error & { issues?: unknown[] }).issues = msg.issues
+              }
+              // A throwing app-supplied handler must not propagate into the
+              // engine's message loop and wedge it — isolate it (swallow,
+              // matching the `send` helper's silent post-close style).
+              try {
+                onError(err)
+              } catch {
+                /* user onError threw — isolated; the engine keeps processing */
+              }
+            }
+          }
+          return
+        }
         if (msg.id !== undefined) {
           const pending = pendingCalls.get(msg.id)
           if (pending !== undefined) {
@@ -520,12 +572,18 @@ export function createEngine(config: EngineConfig): Engine {
     path: string,
     args: Record<string, unknown>,
     onInvalidate: InvalidateHandler,
+    onError?: SubscriptionErrorHandler,
   ) {
-    // Enforce the reserved namespace: a caller-supplied id must not collide with
-    // the engine's generated call ids, or a subscription error could reject an
-    // in-flight RPC sharing that id in the pendingCalls lookup.
-    if (id.startsWith(CALL_ID_PREFIX)) throw new ReservedSubscriptionIdError(id)
     handlers.set(id, onInvalidate)
+    // Keep errorHandlers symmetric with the unconditional overwrite of
+    // `handlers`: a re-subscribe with the SAME id but no `onError` (without an
+    // unsubscribe between) must CLEAR any stale handler from a prior registrant,
+    // or that old closure would fire on the new subscription's error frame.
+    if (onError !== undefined) {
+      errorHandlers.set(id, onError)
+    } else {
+      errorHandlers.delete(id)
+    }
     activeSubs.set(id, { path, args })
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
@@ -535,6 +593,7 @@ export function createEngine(config: EngineConfig): Engine {
 
   function unsubscribe(id: string) {
     handlers.delete(id)
+    errorHandlers.delete(id)
     activeSubs.delete(id)
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'unsubscribe', id }, connectGeneration)
@@ -552,13 +611,11 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    // Mint an id in the engine-reserved namespace (see CALL_ID_PREFIX). The
-    // server echoes `error` frames with the offending id for BOTH a failed call
-    // and a failed subscribe, and the wire doesn't tag which — the reserved
-    // prefix, enforced by subscribe(), is what keeps the two id spaces disjoint
-    // client-side. (Tagging error origin at the wire would remove the need for
-    // any prefix; that's a protocol change, tracked separately.)
-    const id = `${CALL_ID_PREFIX}${(++callSeq).toString(36)}`
+    // Mint a monotonically unique id for this call within the engine instance.
+    // The wire-level `kind` discriminant on `error` frames (YW-99) routes errors
+    // by origin (call vs subscription), so ids no longer need to be in a reserved
+    // namespace — any collision-free counter works.
+    const id = (++callSeq).toString(36)
     const target = pipe
     // Snapshot the generation NOW (mirrors sendOrClose's param): the async
     // rejection leg below must close the generation this call rode on, never a

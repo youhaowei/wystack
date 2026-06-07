@@ -87,9 +87,37 @@ export function useQuery<TArgs, TReturn>(
 
     const subId = nextSubId()
 
-    client.ws.subscribe(subId, path, stableArgs as Record<string, unknown>, () => {
-      queryClient.invalidateQueries({ queryKey })
-    })
+    client.ws.subscribe(
+      subId,
+      path,
+      stableArgs as Record<string, unknown>,
+      () => {
+        queryClient.invalidateQueries({ queryKey })
+      },
+      // Durable subscription error (YW-108). The engine has already dropped the
+      // sub, so it will NOT be replayed on reconnect — this stops the silent
+      // retry loop. We deliberately do NOT push the TanStack query into error
+      // state: useQuery loads its data over HTTP and uses WS only for live
+      // invalidation, so a failed sub means "no live updates," not "no data."
+      // Forcing an error here would falsely fail every query on an RPC-only
+      // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
+      // working fine. Surface it as a dev-only warning instead.
+      (err) => {
+        // Browser-safe dev gate: `@wystack/client` ships as plain ESM, so
+        // `process` is not defined in a browser build without a Node-globals
+        // polyfill. Reference it ONLY behind a `typeof` guard, or a subscription
+        // rejection would throw `ReferenceError: process is not defined` in the
+        // exact path YW-108 makes safe. (`process.env?.` also guards the rare
+        // case where `process` exists but `env` does not.)
+        const isDev = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production'
+        if (isDev) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[wystack] live updates unavailable for "${path}" — query data still loads over HTTP. ${err.message}`,
+          )
+        }
+      },
+    )
 
     return () => {
       client.ws.unsubscribe(subId)

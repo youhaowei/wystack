@@ -141,7 +141,9 @@ describe('Engine — RPC tier (AC #1)', () => {
     h.send({ type: 'call', id: 'c2', path: 'nope', args: {} })
     await until(() => h.received.length > 0, 'error')
 
-    expect(h.received).toEqual([{ type: 'error', id: 'c2', error: 'Unknown function: nope' }])
+    expect(h.received).toEqual([
+      { type: 'error', kind: 'call', id: 'c2', error: 'Unknown function: nope' },
+    ])
   })
 
   test('call whose args fail validation → error frame with issues', async () => {
@@ -161,7 +163,7 @@ describe('Engine — RPC tier (AC #1)', () => {
     h.send({ type: 'call', id: 'c4', path: 'boom', args: {} })
     await until(() => h.received.length > 0, 'error')
 
-    expect(h.received).toEqual([{ type: 'error', id: 'c4', error: 'kaboom' }])
+    expect(h.received).toEqual([{ type: 'error', kind: 'call', id: 'c4', error: 'kaboom' }])
   })
 })
 
@@ -424,7 +426,9 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
     h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
     await flush()
 
-    expect(h.received).toEqual([{ type: 'error', id: 's1', error: REACTIVITY_NOT_ENABLED }])
+    expect(h.received).toEqual([
+      { type: 'error', kind: 'subscription', id: 's1', error: REACTIVITY_NOT_ENABLED },
+    ])
   })
 
   test('unsubscribe on an RPC-only server is tolerated silently', async () => {
@@ -690,7 +694,9 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
     await flush()
 
-    expect(h.received).toEqual([{ type: 'error', id: 's1', error: REACTIVITY_NOT_ENABLED }])
+    expect(h.received).toEqual([
+      { type: 'error', kind: 'subscription', id: 's1', error: REACTIVITY_NOT_ENABLED },
+    ])
   })
 
   test('capability gate: unsubscribe without reactive ports → tolerated silently', async () => {

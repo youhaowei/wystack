@@ -8,13 +8,7 @@ import {
   type ServerMessage,
   type Pipe,
 } from '@wystack/transport'
-import {
-  createEngine,
-  CallNotReadyError,
-  ReservedSubscriptionIdError,
-  type EnginePipe,
-  type CloseInfo,
-} from '../engine'
+import { createEngine, CallNotReadyError, type EnginePipe, type CloseInfo } from '../engine'
 
 /**
  * Wrap a base `Pipe` into the engine's `EnginePipe` shape, exposing a manual
@@ -258,6 +252,233 @@ describe('createEngine', () => {
     ])
     engine.disconnect()
   }, 10_000)
+
+  test('durable subscription error stops the retry loop — drops the sub, fires onError, no replay (YW-108)', async () => {
+    // Regression (YW-108): a `kind: 'subscription'` error must drop the sub so
+    // reconnect's sendSubscriptions() does NOT replay it. Without the drop, the
+    // sub stays in activeSubs and every reconnect re-sends it → another sub
+    // error → silent infinite loop. The terminating proxy: after the error, a
+    // reconnect produces NO subscribe frame for that id.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    const errors: Error[] = []
+    engine.subscribe(
+      's1',
+      'unknown.query',
+      {},
+      () => {},
+      (err) => errors.push(err),
+    )
+    await settle()
+    expect(firstServer.received).toEqual([
+      { type: 'subscribe', id: 's1', path: 'unknown.query', args: {} },
+    ])
+
+    // Server rejects the subscription with a durable error.
+    firstServer.send({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      error: 'Unknown query: unknown.query',
+    })
+    await settle()
+
+    // onError fired with the durable error.
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.message).toBe('Unknown query: unknown.query')
+
+    // Now force a reconnect. The dropped sub must NOT be replayed.
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+
+    const secondServer = harness.server()
+    await settle()
+    // The loop-stopper: no subscribe frame for the dropped sub on the new pipe.
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('subscription error without onError still drops the sub (no loop, no throw)', async () => {
+    // onError is optional. A subscription error must still drop the sub even when
+    // no callback was registered — the loop fix is independent of the callback.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    engine.subscribe('s1', 'unknown.query', {}, () => {})
+    await settle()
+
+    firstServer.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('after a subscription error, a late invalidate for the dropped id is a no-op (YW-108)', async () => {
+    // The sub was removed from `handlers`, so a stale `invalidate` for it must
+    // not fire the (now-gone) onInvalidate.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    let invalidations = 0
+    engine.subscribe(
+      's1',
+      'unknown.query',
+      {},
+      () => {
+        invalidations++
+      },
+      () => {},
+    )
+    await settle()
+
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    // A stale invalidate for the dropped sub must not fire.
+    server.send({ type: 'invalidate', id: 's1' })
+    await settle()
+    expect(invalidations).toBe(0)
+
+    engine.disconnect()
+  })
+
+  test('re-subscribe without onError clears a stale error handler (YW-108)', async () => {
+    // Regression (Greptile P1): handlers.set() unconditionally overwrites the
+    // invalidate handler, but errorHandlers must be cleared too when the new
+    // registrant omits onError. Otherwise a subscribe(id, …, onError) followed by
+    // a re-subscribe(id, …) with NO onError (no unsubscribe between) leaves the
+    // OLD onError in the map, and the next subscription error for that id fires
+    // the stale closure against a subscription the new registrant never wired.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    let oldErrors = 0
+    // First registration WITH an onError.
+    engine.subscribe(
+      's1',
+      'q',
+      {},
+      () => {},
+      () => {
+        oldErrors++
+      },
+    )
+    await settle()
+
+    // Re-subscribe the SAME id WITHOUT an onError and WITHOUT unsubscribing.
+    engine.subscribe('s1', 'q', {}, () => {})
+    await settle()
+
+    // A subscription error for 's1' must NOT fire the stale first onError.
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+    expect(oldErrors).toBe(0)
+
+    engine.disconnect()
+  })
+
+  test('a throwing onError does not break the engine loop and cleanup still happens (YW-108)', async () => {
+    // Regression (CodeRabbit MUST): a user-supplied onError that THROWS must not
+    // propagate into handleMessage and wedge the engine — a subsequent message
+    // must still process. Cleanup (dropping the sub) must also happen regardless
+    // of the throw, so the sub is not left registered (and replayable).
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    engine.subscribe(
+      's1',
+      'q',
+      {},
+      () => {},
+      () => {
+        throw new Error('app onError boom')
+      },
+    )
+    await settle()
+
+    // Subscription error fires the throwing onError. The throw must be isolated.
+    server.send({ type: 'error', kind: 'subscription', id: 's1', error: 'boom' })
+    await settle()
+
+    // The engine still processes a subsequent message — prove with a round-trip
+    // call that resolves after the throw.
+    const result = engine.call('the.call', {})
+    await settle()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(result, 'call after throwing onError')).toBe('ok')
+
+    // Cleanup happened despite the throw: a reconnect must NOT replay the sub.
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('a throwing onInvalidate does not break the engine loop (YW-108)', async () => {
+    // Regression (CodeRabbit MUST, preexisting twin): a user-supplied
+    // onInvalidate that THROWS must not propagate into handleMessage. A
+    // subsequent message must still process.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    engine.subscribe('s1', 'q', {}, () => {
+      throw new Error('app onInvalidate boom')
+    })
+    await settle()
+
+    // Invalidate fires the throwing handler. The throw must be isolated.
+    server.send({ type: 'invalidate', id: 's1' })
+    await settle()
+
+    // The engine still processes a subsequent message — prove with a round-trip.
+    const result = engine.call('the.call', {})
+    await settle()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    server.send({ type: 'result', id: callFrame!.id, data: 'ok' })
+    expect(await withTimeout(result, 'call after throwing onInvalidate')).toBe('ok')
+
+    engine.disconnect()
+  })
 
   test('unsubscribe stops invalidation delivery and notifies server', async () => {
     const harness = makeServerSide()
@@ -839,45 +1060,43 @@ describe('engine.call — call/result correlation', () => {
     const failed = engine.call('path.bigint', {})
     await expect(failed).rejects.toThrow('Do not know how to serialize a BigInt')
 
-    // A stray `result` for the failed call's id (`call:1`) is an unknown/stale
+    // A stray `result` for the failed call's id (`1`) is an unknown/stale
     // id: a no-op. No crash; the rejected promise stays rejected.
-    deliver({ type: 'result', id: 'call:1', data: 'stray' })
+    deliver({ type: 'result', id: '1', data: 'stray' })
     await settle()
 
     // The engine stays fully usable after a sync throw: the next call resolves
-    // end-to-end. Its id is `call:2` (the seq advanced past the failed call),
-    // so ids are never reused. The `call:` prefix is the engine-reserved namespace.
+    // end-to-end. Its id is `2` (the seq advanced past the failed call),
+    // so ids are never reused.
     const ok = engine.call('path.ok', {})
     await settle()
     const callFrame = sent.find((f) => f.type === 'call') as
       | Extract<ClientMessage, { type: 'call' }>
       | undefined
     expect(callFrame).toBeDefined()
-    expect(callFrame!.id).toBe('call:2')
+    expect(callFrame!.id).toBe('2')
     deliver({ type: 'result', id: callFrame!.id, data: 'ok' })
     expect(await withTimeout(ok, 'second call after sync throw')).toBe('ok')
 
     engine.disconnect()
   })
 
-  test('subscription error never mis-rejects a pending call (reserved id namespace)', async () => {
-    // Regression (Codex P2): the `error` handler looks up pendingCalls by msg.id,
-    // a keyspace shared with caller-supplied subscription ids. Before the fix, a
-    // subscription error whose id matched a generated call id (the engine used a
-    // bare `call-N` format) would mis-reject the in-flight RPC. The engine now
-    // mints call ids in a reserved `call:`-prefixed namespace that no normal
-    // caller sub id occupies (a colon never appears in a query-key-derived id),
-    // so the two keyspaces can never overlap.
+  test('subscription error (kind:subscription) never mis-rejects a pending call — same id (YW-99)', async () => {
+    // Spec contract (YW-99): the `error` frame carries a `kind` discriminant.
+    // `kind: 'subscription'` must NOT touch pendingCalls even when msg.id matches
+    // an in-flight call id. Before YW-99 the engine relied on a reserved `call:`
+    // id prefix to keep the keyspaces disjoint; now the tag is self-describing so
+    // caller-supplied subscription ids are unconstrained.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
     await settle()
 
-    // A subscription whose id is the closest a caller can plausibly get to the
-    // reserved format — the worst case the prefix must still keep disjoint.
-    engine.subscribe('call-1', 'some.sub', {}, () => {})
+    // A subscription whose id INTENTIONALLY matches the call id below.
+    // This is the exact same-id collision scenario YW-99 is designed to handle.
+    engine.subscribe('1', 'some.sub', {}, () => {})
 
-    // An in-flight call. Its id is reserved (`call:N`), disjoint from `call-1`.
+    // An in-flight call. Its id will be `'1'` (plain counter).
     const result = engine.call('the.call', {})
     await settle()
 
@@ -886,11 +1105,11 @@ describe('engine.call — call/result correlation', () => {
       | Extract<ClientMessage, { type: 'call' }>
       | undefined
     expect(callFrame).toBeDefined()
-    expect(callFrame!.id).toBe('call:1') // reserved namespace, not `call-1`
+    expect(callFrame!.id).toBe('1')
 
-    // Server sends an error for the SUBSCRIPTION (`call-1`). The pending call
-    // (`call:1`) must NOT be rejected by it — different keyspace.
-    server.send({ type: 'error', id: 'call-1', error: 'subscription failed' })
+    // Server sends a subscription error for id `'1'` with kind: 'subscription'.
+    // The pending call (also id '1') must NOT be rejected by it.
+    server.send({ type: 'error', kind: 'subscription', id: '1', error: 'subscription failed' })
     await settle()
 
     // Prove the call is still live: not settled by the subscription error.
@@ -909,27 +1128,62 @@ describe('engine.call — call/result correlation', () => {
     // The call's real result resolves it normally.
     server.send({ type: 'result', id: callFrame!.id, data: 'call-data' })
     await settle()
-    expect(await withTimeout(result, 'reserved-namespace call')).toBe('call-data')
+    expect(await withTimeout(result, 'kind-discriminant call')).toBe('call-data')
 
     engine.disconnect()
   })
 
-  test('subscribe() rejects a reserved call-id-prefixed id (enforces the invariant)', async () => {
-    // Codex P2 follow-up: the reserved namespace only stays disjoint if subscribe()
-    // refuses ids in it. Without this guard the disjointness was a convention, not
-    // an invariant — a caller could subscribe with `call:1` and have a subscription
-    // error mis-reject an in-flight RPC. subscribe() now throws on the prefix.
+  test('call error (kind:call) with same id as subscription correctly rejects the call', async () => {
+    // Complementary to the subscription-kind test: an error tagged kind:'call'
+    // MUST reject the pending call, even if a subscription with the same id exists.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
     await settle()
 
-    expect(() => engine.subscribe('call:1', 'some.sub', {}, () => {})).toThrow(
-      ReservedSubscriptionIdError,
-    )
-    // A non-reserved id (even the lookalike `call-1`) is still accepted.
-    expect(() => engine.subscribe('call-1', 'some.sub', {}, () => {})).not.toThrow()
+    // Subscribe with the same id the call will use.
+    engine.subscribe('1', 'some.sub', {}, () => {})
 
+    const result = engine.call('the.call', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+    expect(callFrame!.id).toBe('1')
+
+    // Server sends a call error — must reject the pending call.
+    server.send({ type: 'error', kind: 'call', id: '1', error: 'call failed' })
+    await settle()
+
+    await expect(result).rejects.toThrow('call failed')
+    engine.disconnect()
+  })
+
+  test('backward-compat: error with id and absent kind still rejects the pending call', async () => {
+    // Older servers omit `kind`. The client must treat absent kind as 'call'
+    // (backward-compatible) so existing RPC error flows keep working.
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.call('path.fail', {})
+    await settle()
+
+    const server = harness.server()
+    const callFrame = server.received.find((f) => f.type === 'call') as
+      | Extract<ClientMessage, { type: 'call' }>
+      | undefined
+    expect(callFrame).toBeDefined()
+
+    // Old-server error: no kind field.
+    server.send({ type: 'error', id: callFrame!.id, error: 'old server error' })
+    await settle()
+
+    await expect(result).rejects.toThrow('old server error')
     engine.disconnect()
   })
 
