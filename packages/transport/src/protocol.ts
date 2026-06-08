@@ -2,18 +2,15 @@
 //
 // Typed wire-protocol contract for the WyStack WebSocket transport.
 //
-// Source of truth: `packages/server/src/routes.ts` (the live v0.2 wire shipped
-// by TASK-489 — WebSocket auth handshake). This package is type-only; it does
-// NOT change the wire and has no runtime dependencies.
+// Source of truth: `packages/server/src/routes.ts`. This package is type-only;
+// it does NOT change the wire and has no runtime dependencies.
 //
 // Active vs reserved:
 //   - The active discriminated unions (ClientMessage / ServerMessage) cover
 //     every message kind sent on the wire today, including the RPC pair
-//     (`call` / `result`) added by the Engine extraction (Spec ADR #9, #12).
+//     (`call` / `result`) added by the Engine extraction.
 //   - `NextMessage` and `ResyncMessage` are typed but excluded from the active
-//     unions. They are reserved for the post-v0.2 incremental push profile
-//     (Spec ADR #10 — signal-first reactive delivery). Defining them here lets
-//     the push profile land cleanly later without relocating types.
+//     unions. They are reserved for the post-v0.2 incremental push profile.
 //
 // Discriminator: the wire field is `type` (string). The TypeScript type names
 // end in `Message` (AuthMessage, SubscribeMessage, ...) but that suffix is not
@@ -75,8 +72,8 @@ export interface UnsubscribeMessage {
 /**
  * RPC call over message transports (IPC, loopback). One unified kind for both
  * queries and mutations — the server's function registry resolves which `path`
- * is (Spec ADR #9). HTTP keeps REST verbs; this kind is for transports that
- * have no verb to carry intent. The connection's token is captured at `auth`
+ * is. HTTP keeps REST verbs; this kind is for transports that have no verb to
+ * carry intent. The connection's token is captured at `auth`
  * time and reused, so there is no `token` field here.
  */
 export interface CallMessage {
@@ -91,8 +88,8 @@ export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
 /**
- * Ack for a successful auth handshake. Wire value is `"authenticated"`
- * (historical — the Spec proposes `"auth-ack"` for v0.3; T2b/T3a may rename).
+ * Ack for a successful auth handshake. Wire value is `"authenticated"`;
+ * a later protocol version may rename this to `"auth-ack"`.
  */
 export interface AuthenticatedMessage {
   type: 'authenticated'
@@ -137,8 +134,7 @@ export interface InvalidateMessage {
  *
  * `issues` carries Zod validation issues when the server's
  * `ValidationError` surfaces — typed as `unknown[]` here to keep the
- * protocol package free of a Zod dependency. T2b can thread the
- * concrete shape through if it stays stable.
+ * protocol package free of a Zod dependency.
  */
 export interface ErrorMessage {
   type: 'error'
@@ -171,7 +167,7 @@ export type ServerMessage =
 
 /**
  * Sentinel `error` string returned to any `subscribe` on a server that has not
- * wired the reactive tier (Spec ADR #12 — RPC always-on, reactive opt-in). The
+ * wired the reactive tier. The
  * v0.2 capability-discovery floor: a client learns the tier is absent from this
  * error rather than from wire-protocol version negotiation (deferred).
  */
@@ -180,7 +176,7 @@ export const REACTIVITY_NOT_ENABLED = 'REACTIVITY_NOT_ENABLED'
 // ─── Reserved (post-v0.2 push profile — NOT in active unions) ────────────────
 
 /**
- * RESERVED — post-v0.2 incremental push (Spec ADR #10). Carries either a
+ * RESERVED — post-v0.2 incremental push. Carries either a
  * full `value` snapshot or a `delta` patch, versioned monotonically per sub
  * so the client can detect gaps and request a resync. Not on the active
  * wire today; exported for forward-compatibility only.
@@ -287,6 +283,37 @@ export function parseClientMessage(data: string): ClientMessage | null {
   }
 }
 
+type ServerMessageParser = (msg: Envelope) => ServerMessage | null
+
+const parseServerMessageByType: Record<string, ServerMessageParser> = {
+  authenticated: () => ({ type: 'authenticated' }),
+  subscribed: (msg) => {
+    if (typeof msg.id !== 'string') return null
+    return { type: 'subscribed', id: msg.id }
+  },
+  invalidate: (msg) => {
+    if (typeof msg.id !== 'string') return null
+    return { type: 'invalidate', id: msg.id }
+  },
+  result: (msg) => {
+    if (typeof msg.id !== 'string') return null
+    return { type: 'result', id: msg.id, data: msg.data }
+  },
+  error: (msg) => {
+    if (typeof msg.error !== 'string') return null
+    if (msg.id !== undefined && typeof msg.id !== 'string') return null
+    if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
+    if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
+
+    const out: ErrorMessage = { type: 'error', error: msg.error }
+    if (typeof msg.id === 'string') out.id = msg.id
+    if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
+    if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
+    if (Array.isArray(msg.issues)) out.issues = msg.issues
+    return out
+  },
+}
+
 /**
  * Strict parse for a Server → Client frame. Returns the typed message on
  * success, `null` for any rejection. Symmetry with `parseClientMessage` —
@@ -296,44 +323,5 @@ export function parseServerMessage(data: string): ServerMessage | null {
   const msg = parseEnvelope(data)
   if (msg === null) return null
 
-  switch (msg.type) {
-    case 'authenticated': {
-      return { type: 'authenticated' }
-    }
-    case 'subscribed': {
-      if (typeof msg.id !== 'string') return null
-      return { type: 'subscribed', id: msg.id }
-    }
-    case 'invalidate': {
-      if (typeof msg.id !== 'string') return null
-      return { type: 'invalidate', id: msg.id }
-    }
-    case 'result': {
-      // `data` is `unknown` by design — the function's return value carries no
-      // wire-level shape contract. Only `id` is structurally required.
-      if (typeof msg.id !== 'string') return null
-      return { type: 'result', id: msg.id, data: msg.data }
-    }
-    case 'error': {
-      if (typeof msg.error !== 'string') return null
-      // `id` is optional. If present, must be a string. Missing is fine.
-      if (msg.id !== undefined && typeof msg.id !== 'string') return null
-      // `kind` is optional. Unknown future values are tolerated as absent so
-      // older clients still parse the id/error and can route by backward-compat
-      // rules instead of dropping the whole frame.
-      // `issues` is optional. If present, must be an array. Element shape is
-      // intentionally `unknown` here (see ErrorMessage doc).
-      if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
-      // `retryable` is optional. If present, must be boolean.
-      if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
-      const out: ErrorMessage = { type: 'error', error: msg.error }
-      if (typeof msg.id === 'string') out.id = msg.id
-      if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
-      if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
-      if (Array.isArray(msg.issues)) out.issues = msg.issues
-      return out
-    }
-    default:
-      return null
-  }
+  return parseServerMessageByType[msg.type]?.(msg) ?? null
 }

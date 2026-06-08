@@ -237,12 +237,9 @@ describe('useQuery', () => {
     expect(call.args).toEqual({})
   })
 
-  test('subscription-error surfacing is browser-safe — does not throw when `process` is undefined (YW-108)', async () => {
-    // Regression (Codex MUST): the YW-108 onError surfacing read
-    // `process.env.NODE_ENV` unguarded. `@wystack/client` ships as plain ESM, so
-    // `process` is not defined in a browser build — a subscription rejection
-    // would throw `ReferenceError: process is not defined` in the exact path
-    // YW-108 makes safe. The fix guards the access with `typeof process`.
+  test('subscription-error surfacing is browser-safe — does not throw when `process` is undefined', async () => {
+    // Browser ESM builds may not define `process`. Subscription-error surfacing
+    // must still call the app-supplied callback instead of throwing first.
     const ws = makeMockWs()
     const client = makeMockClient(ws)
     const wrapper = makeWrapper(client)

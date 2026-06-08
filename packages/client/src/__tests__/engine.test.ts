@@ -257,12 +257,10 @@ describe('createEngine', () => {
     engine.disconnect()
   }, 10_000)
 
-  test('durable subscription error stops the retry loop — drops the sub, fires onError, no replay (YW-108)', async () => {
-    // Regression (YW-108): a `kind: 'subscription'` error must drop the sub so
-    // reconnect's sendSubscriptions() does NOT replay it. Without the drop, the
-    // sub stays in activeSubs and every reconnect re-sends it → another sub
-    // error → silent infinite loop. The terminating proxy: after the error, a
-    // reconnect produces NO subscribe frame for that id.
+  test('durable subscription error stops the retry loop — drops the sub, fires onError, no replay', async () => {
+    // Durable subscription errors must drop the sub before reconnect. Otherwise
+    // each reconnect would re-send the same bad subscription and receive the
+    // same terminal error again.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
@@ -334,7 +332,7 @@ describe('createEngine', () => {
     engine.disconnect()
   }, 10_000)
 
-  test('retryable subscription error keeps the sub registered for reconnect replay', async () => {
+  test('retryable subscription error re-sends on the live pipe', async () => {
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
@@ -353,6 +351,40 @@ describe('createEngine', () => {
     expect(firstServer.received).toEqual([
       { type: 'subscribe', id: 's1', path: 'sometimes.boom', args: {} },
     ])
+
+    firstServer.send({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: true,
+      error: 'temporary failure',
+    })
+    await settle()
+    expect(errors).toHaveLength(0)
+    expect(firstServer.received.filter((f) => f.type === 'subscribe')).toEqual([
+      { type: 'subscribe', id: 's1', path: 'sometimes.boom', args: {} },
+      { type: 'subscribe', id: 's1', path: 'sometimes.boom', args: {} },
+    ])
+
+    engine.disconnect()
+  })
+
+  test('retryable subscription error keeps the sub registered for reconnect replay', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    const errors: Error[] = []
+    engine.subscribe(
+      's1',
+      'sometimes.boom',
+      {},
+      () => {},
+      (err) => errors.push(err),
+    )
+    await settle()
 
     firstServer.send({
       type: 'error',
@@ -418,7 +450,7 @@ describe('createEngine', () => {
     engine.disconnect()
   }, 10_000)
 
-  test('after a subscription error, a late invalidate for the dropped id is a no-op (YW-108)', async () => {
+  test('after a subscription error, a late invalidate for the dropped id is a no-op', async () => {
     // The sub was removed from `handlers`, so a stale `invalidate` for it must
     // not fire the (now-gone) onInvalidate.
     const harness = makeServerSide()
@@ -450,13 +482,9 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
-  test('re-subscribe without onError clears a stale error handler (YW-108)', async () => {
-    // Regression (Greptile P1): handlers.set() unconditionally overwrites the
-    // invalidate handler, but errorHandlers must be cleared too when the new
-    // registrant omits onError. Otherwise a subscribe(id, …, onError) followed by
-    // a re-subscribe(id, …) with NO onError (no unsubscribe between) leaves the
-    // OLD onError in the map, and the next subscription error for that id fires
-    // the stale closure against a subscription the new registrant never wired.
+  test('re-subscribe without onError clears a stale error handler', async () => {
+    // handlers.set() overwrites the invalidate handler. errorHandlers must stay
+    // symmetric so a same-id re-subscribe without onError clears the old closure.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
@@ -488,11 +516,9 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
-  test('a throwing onError does not break the engine loop and cleanup still happens (YW-108)', async () => {
-    // Regression (CodeRabbit MUST): a user-supplied onError that THROWS must not
-    // propagate into handleMessage and wedge the engine — a subsequent message
-    // must still process. Cleanup (dropping the sub) must also happen regardless
-    // of the throw, so the sub is not left registered (and replayable).
+  test('a throwing onError does not break the engine loop and cleanup still happens', async () => {
+    // A throwing app callback must not wedge the engine. Cleanup also has to
+    // happen before the callback so the sub is not left replayable.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
@@ -536,10 +562,8 @@ describe('createEngine', () => {
     engine.disconnect()
   }, 10_000)
 
-  test('a throwing onInvalidate does not break the engine loop (YW-108)', async () => {
-    // Regression (CodeRabbit MUST, preexisting twin): a user-supplied
-    // onInvalidate that THROWS must not propagate into handleMessage. A
-    // subsequent message must still process.
+  test('a throwing onInvalidate does not break the engine loop', async () => {
+    // A throwing app callback must not wedge the engine.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
@@ -850,7 +874,7 @@ describe('createEngine', () => {
   })
 })
 
-// ─── Call / result correlation (YW-97 / T3d) ─────────────────────────────────
+// ─── Call / result correlation ────────────────────────────────────────────────
 
 describe('engine.call — call/result correlation', () => {
   test('call→result: loopback round-trip resolves with data', async () => {
@@ -1169,19 +1193,15 @@ describe('engine.call — call/result correlation', () => {
     engine.disconnect()
   })
 
-  test('subscription error (kind:subscription) never mis-rejects a pending call — same id (YW-99)', async () => {
-    // Spec contract (YW-99): the `error` frame carries a `kind` discriminant.
-    // `kind: 'subscription'` must NOT touch pendingCalls even when msg.id matches
-    // an in-flight call id. Before YW-99 the engine relied on a reserved `call:`
-    // id prefix to keep the keyspaces disjoint; now the tag is self-describing so
-    // caller-supplied subscription ids are unconstrained.
+  test('subscription error (kind:subscription) never mis-rejects a pending call — same id', async () => {
+    // The `kind` field owns error routing. A subscription error must not reject
+    // a pending call even when both frames share the same id.
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })
     engine.connect()
     await settle()
 
-    // A subscription whose id INTENTIONALLY matches the call id below.
-    // This is the exact same-id collision scenario YW-99 is designed to handle.
+    // A subscription whose id intentionally matches the call id below.
     engine.subscribe('1', 'some.sub', {}, () => {})
 
     // An in-flight call. Its id will be `'1'` (plain counter).
@@ -1276,10 +1296,8 @@ describe('engine.call — call/result correlation', () => {
   })
 
   test('control-frame sync send throw closes the connection (does not escape subscribe)', async () => {
-    // Regression (CodeRabbit): sendOrClose must catch a SYNCHRONOUS encode throw
-    // from the transport and route it through handleClose — not let it propagate
-    // out of subscribe()/the connect chain. Before hardening, only call() guarded
-    // sync throws; subscribe/unsubscribe/auth rode the bare async-only wrapper.
+    // sendOrClose must catch a synchronous encode throw from the transport and
+    // route it through handleClose, not let it escape subscribe().
     const closeHandlers = new Set<(info: CloseInfo) => void>()
     let socketClosed = 0
     const pipe: EnginePipe = {

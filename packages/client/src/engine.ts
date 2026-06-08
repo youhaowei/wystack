@@ -1,56 +1,18 @@
 // @wystack/client — neutral reactive engine
 //
-// Owns the carrier-agnostic half of the v0.2 client (Spec ADR #11):
+// Owns the carrier-agnostic half of the v0.2 client:
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
 //   - Subscription registry (replay on (re)connect, invalidation dispatch). A
-//     durable subscription-origin error (YW-108/YW-109) drops the sub and fires
-//     optional `onError` so reconnect never replays a durably-failing sub; a
-//     retryable subscription-origin error stays registered for reconnect replay.
-//   - Call/result correlation (Spec ADR #9, YW-97 / T3d, YW-99): engine.call()
-//     sends a `call` frame, registers a pending entry keyed by id, and
-//     resolves/rejects it when the matching `result` or `error` frame arrives.
-//
-// Driven by a `Pipe<ServerMessage, ClientMessage>` factory — never imports a
-// concrete transport. The WebSocket-backed factory lives in `ws.ts` (until the
-// T3b adapter relocates it).
-//
-// Reconnect semantics mirror the previous `ws.ts`:
-//   - close-code 4001 → latch `authFailed`, fire invalidations to nudge HTTP
-//     refetch, stop retrying.
-//   - any other close → exponential backoff (1s base, ×2 per attempt, capped
-//     at 30s, [50%, 100%) of base jitter).
-//   - `connectGeneration` invalidates stale async callbacks (token fetch,
-//     pipe open) when a newer `connect()` or `disconnect()` has happened.
-//
-// Call correlation + generation discipline:
-//   - Pending calls are stored in `pendingCalls` keyed by a monotonic id.
-//   - Error frame routing uses the wire-level `kind` discriminant (YW-99):
-//     `kind === 'subscription'` → subscription error, does NOT touch pendingCalls.
-//     `kind === 'call'` or absent (backward-compat with older servers) → reject
-//     the pending call by id, as today.
-//   - On pipe close (`handleClose`) or explicit `disconnect()`, ALL pending
-//     calls are rejected immediately (no hangs). See `rejectAllPending`.
-//   - `handleClose` is already generation-gated (ownGeneration guard), so a
-//     stale close from a previous generation cannot reject current-generation
-//     pending calls.
-//   - A `call()` issued when the pipe is not live (not connected, or auth
-//     pending on a requiresAuth transport) is rejected immediately with a clear
-//     error — buffering-until-connected is deferred (future work; one-shot
-//     RPC retry semantics are non-trivial).
+//     durable subscription-origin error drops the sub; a retryable one re-sends
+//     the subscribe frame while bounded by a cap.
+//   - Call/result correlation by result id.
 
 import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
 
 type InvalidateHandler = () => void
 
-/**
- * Per-subscription error callback (YW-108). Invoked once when a
- * durable `kind: 'subscription'` error frame arrives for a registered
- * subscription. The engine drops the subscription before calling this — it
- * will NOT be replayed on reconnect — so this is a terminal signal for that
- * sub id. Retryable subscription errors stay registered and do not invoke this
- * callback unless they exceed the bounded retryable-error cap.
- */
+/** Called when a subscription reaches a terminal error. */
 export type SubscriptionErrorHandler = (err: Error) => void
 
 /**
@@ -186,10 +148,6 @@ export function createEngine(config: EngineConfig): Engine {
   let reconnectAttempt = 0
 
   const handlers = new Map<string, InvalidateHandler>()
-  // Per-subscription error callbacks (YW-108), keyed by sub id. Same lifecycle as
-  // `handlers` — set in subscribe(), cleared in unsubscribe() and when a
-  // subscription error drops the sub. Persists across reconnect (not cleared on
-  // disconnect) so a replayed sub keeps its error handler.
   const errorHandlers = new Map<string, SubscriptionErrorHandler>()
   const activeSubs = new Map<
     string,
@@ -262,6 +220,15 @@ export function createEngine(config: EngineConfig): Engine {
         /* user onError threw — isolated; the engine keeps processing */
       }
     }
+  }
+
+  function retrySubscription(id: string): boolean {
+    const sub = activeSubs.get(id)
+    if (sub === undefined) return false
+    sub.retryableErrors++
+    if (sub.retryableErrors > MAX_RETRYABLE_SUBSCRIPTION_ERRORS) return false
+    sendOrClose({ type: 'subscribe', id, path: sub.path, args: sub.args }, connectGeneration)
+    return true
   }
 
   function detachPipe() {
@@ -399,31 +366,9 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'error': {
-        // Route by the wire-level `kind` discriminant (YW-99):
-        //   - `kind === 'subscription'` → subscription error; must NOT touch
-        //     pendingCalls (a subscription id and a call id can now collide
-        //     without mis-routing because the tag is self-describing).
-        //   - `kind === 'call'` or absent (backward-compat with servers that
-        //     predate YW-99) → reject the pending call by id, as today.
-        //   - no `id` (connection-level error) → ignored here; the accompanying
-        //     close event handles reconnect.
         if (msg.kind === 'subscription') {
-          // Subscription-origin error (YW-108/YW-109). Durable errors drop the
-          // sub so reconnect's sendSubscriptions() does NOT replay it. Retryable
-          // errors keep the sub registered for reconnect replay, bounded by a
-          // cap so a mislabeled-transient persistent failure cannot loop forever.
-          //
-          // This branch touches ONLY the subscription maps, never pendingCalls —
-          // a subscription error must never reject an in-flight call sharing the
-          // id (the YW-99 routing contract).
           if (msg.id !== undefined) {
-            if (msg.retryable === true) {
-              const sub = activeSubs.get(msg.id)
-              if (sub !== undefined) {
-                sub.retryableErrors++
-                if (sub.retryableErrors <= MAX_RETRYABLE_SUBSCRIPTION_ERRORS) return
-              }
-            }
+            if (msg.retryable === true && retrySubscription(msg.id)) return
             dropSubscriptionWithError(msg.id, msg)
           }
           return
@@ -632,10 +577,6 @@ export function createEngine(config: EngineConfig): Engine {
       return Promise.reject(new CallNotReadyError('auth handshake pending'))
     }
 
-    // Mint a monotonically unique id for this call within the engine instance.
-    // The wire-level `kind` discriminant on `error` frames (YW-99) routes errors
-    // by origin (call vs subscription), so ids no longer need to be in a reserved
-    // namespace — any collision-free counter works.
     const id = (++callSeq).toString(36)
     const target = pipe
     // Snapshot the generation NOW (mirrors sendOrClose's param): the async
