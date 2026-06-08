@@ -4,8 +4,9 @@
 //   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
 //   - Auth handshake (send `auth`, await `authenticated`)
 //   - Subscription registry (replay on (re)connect, invalidation dispatch). A
-//     subscription-origin error (YW-108) drops the sub and fires its optional
-//     `onError` so reconnect never replays a durably-failing sub — no silent loop.
+//     durable subscription-origin error (YW-108/YW-109) drops the sub and fires
+//     optional `onError` so reconnect never replays a durably-failing sub; a
+//     retryable subscription-origin error stays registered for reconnect replay.
 //   - Call/result correlation (Spec ADR #9, YW-97 / T3d, YW-99): engine.call()
 //     sends a `call` frame, registers a pending entry keyed by id, and
 //     resolves/rejects it when the matching `result` or `error` frame arrives.
@@ -44,9 +45,11 @@ type InvalidateHandler = () => void
 
 /**
  * Per-subscription error callback (YW-108). Invoked once when a
- * `kind: 'subscription'` error frame arrives for a registered subscription.
- * The engine drops the subscription before calling this — it will NOT be
- * replayed on reconnect — so this is a terminal signal for that sub id.
+ * durable `kind: 'subscription'` error frame arrives for a registered
+ * subscription. The engine drops the subscription before calling this — it
+ * will NOT be replayed on reconnect — so this is a terminal signal for that
+ * sub id. Retryable subscription errors stay registered and do not invoke this
+ * callback unless they exceed the bounded retryable-error cap.
  */
 export type SubscriptionErrorHandler = (err: Error) => void
 
@@ -114,12 +117,10 @@ export interface Engine {
   disconnect(): void
   /**
    * Register a reactive subscription. `onInvalidate` fires when the server
-   * signals the sub's data is stale. Optional `onError` (YW-108) fires once if
-   * the server rejects the subscription (`kind: 'subscription'` error frame) —
-   * the engine drops the sub so it is NOT replayed on reconnect, stopping a
-   * silent retry loop for durable failures (unknown query, sub-path auth reject,
-   * `REACTIVITY_NOT_ENABLED`). After `onError`, the caller must re-`subscribe`
-   * to retry.
+   * signals the sub's data is stale. Optional `onError` fires once if the server
+   * durably rejects the subscription (`kind: 'subscription'` with
+   * `retryable: false` or absent) or if retryable errors exceed the cap. Durable
+   * failures are dropped so they are NOT replayed on reconnect.
    */
   subscribe(
     id: string,
@@ -147,6 +148,7 @@ export interface Engine {
 
 const MAX_RECONNECT_DELAY_MS = 30_000
 const DEFAULT_AUTH_ACK_TIMEOUT_MS = 10_000
+const MAX_RETRYABLE_SUBSCRIPTION_ERRORS = 3
 
 /**
  * Thrown (as a rejection) when `engine.call()` is invoked but the pipe is
@@ -189,7 +191,10 @@ export function createEngine(config: EngineConfig): Engine {
   // subscription error drops the sub. Persists across reconnect (not cleared on
   // disconnect) so a replayed sub keeps its error handler.
   const errorHandlers = new Map<string, SubscriptionErrorHandler>()
-  const activeSubs = new Map<string, { path: string; args: Record<string, unknown> }>()
+  const activeSubs = new Map<
+    string,
+    { path: string; args: Record<string, unknown>; retryableErrors: number }
+  >()
 
   // Pending call correlator: id → {resolve, reject}. Entries are added by
   // call() and removed by the matching `result` or `error` frame, or by
@@ -229,6 +234,34 @@ export function createEngine(config: EngineConfig): Engine {
     const snapshot = Array.from(pendingCalls.values())
     pendingCalls.clear()
     for (const entry of snapshot) entry.reject(reason)
+  }
+
+  function errorFromMessage(msg: Extract<ServerMessage, { type: 'error' }>): Error {
+    const err = new Error(msg.error)
+    if (msg.issues !== undefined) {
+      ;(err as Error & { issues?: unknown[] }).issues = msg.issues
+    }
+    return err
+  }
+
+  function dropSubscriptionWithError(
+    id: string,
+    msg: Extract<ServerMessage, { type: 'error' }>,
+  ): void {
+    const onError = errorHandlers.get(id)
+    // Cleanup FIRST so a throwing onError can't leave the sub registered (and
+    // thus replayable on reconnect — the loop this branch exists to stop). The
+    // maps are cleared before the callback runs, never after.
+    handlers.delete(id)
+    activeSubs.delete(id)
+    errorHandlers.delete(id)
+    if (onError !== undefined) {
+      try {
+        onError(errorFromMessage(msg))
+      } catch {
+        /* user onError threw — isolated; the engine keeps processing */
+      }
+    }
   }
 
   function detachPipe() {
@@ -336,6 +369,8 @@ export function createEngine(config: EngineConfig): Engine {
         return
       }
       case 'subscribed': {
+        const sub = activeSubs.get(msg.id)
+        if (sub !== undefined) sub.retryableErrors = 0
         onSubscribed?.(msg.id)
         return
       }
@@ -373,38 +408,23 @@ export function createEngine(config: EngineConfig): Engine {
         //   - no `id` (connection-level error) → ignored here; the accompanying
         //     close event handles reconnect.
         if (msg.kind === 'subscription') {
-          // Subscription-origin error (YW-108). Drop the sub so reconnect's
-          // sendSubscriptions() does NOT replay it — that replay is what would
-          // otherwise loop forever (error → drop-nothing → reconnect → re-send →
-          // error …) for a durable failure. Removing from `activeSubs` is the
-          // actual loop-stopper; we also clear `handlers`/`errorHandlers` so a
-          // later stale `invalidate`/`error` for this id is a no-op.
+          // Subscription-origin error (YW-108/YW-109). Durable errors drop the
+          // sub so reconnect's sendSubscriptions() does NOT replay it. Retryable
+          // errors keep the sub registered for reconnect replay, bounded by a
+          // cap so a mislabeled-transient persistent failure cannot loop forever.
           //
           // This branch touches ONLY the subscription maps, never pendingCalls —
           // a subscription error must never reject an in-flight call sharing the
           // id (the YW-99 routing contract).
           if (msg.id !== undefined) {
-            const onError = errorHandlers.get(msg.id)
-            // Cleanup FIRST so a throwing onError can't leave the sub registered
-            // (and thus replayable on reconnect — the loop this branch exists to
-            // stop). The maps are cleared before the callback runs, never after.
-            handlers.delete(msg.id)
-            activeSubs.delete(msg.id)
-            errorHandlers.delete(msg.id)
-            if (onError !== undefined) {
-              const err = new Error(msg.error)
-              if (msg.issues !== undefined) {
-                ;(err as Error & { issues?: unknown[] }).issues = msg.issues
-              }
-              // A throwing app-supplied handler must not propagate into the
-              // engine's message loop and wedge it — isolate it (swallow,
-              // matching the `send` helper's silent post-close style).
-              try {
-                onError(err)
-              } catch {
-                /* user onError threw — isolated; the engine keeps processing */
+            if (msg.retryable === true) {
+              const sub = activeSubs.get(msg.id)
+              if (sub !== undefined) {
+                sub.retryableErrors++
+                if (sub.retryableErrors <= MAX_RETRYABLE_SUBSCRIPTION_ERRORS) return
               }
             }
+            dropSubscriptionWithError(msg.id, msg)
           }
           return
         }
@@ -412,12 +432,7 @@ export function createEngine(config: EngineConfig): Engine {
           const pending = pendingCalls.get(msg.id)
           if (pending !== undefined) {
             pendingCalls.delete(msg.id)
-            const err = new Error(msg.error)
-            // Attach Zod validation issues if present, for consumers that care.
-            if (msg.issues !== undefined) {
-              ;(err as Error & { issues?: unknown[] }).issues = msg.issues
-            }
-            pending.reject(err)
+            pending.reject(errorFromMessage(msg))
           }
         }
         // Connection-level errors (no id, or id not in pending): ignored here;
@@ -451,7 +466,13 @@ export function createEngine(config: EngineConfig): Engine {
       // app's data layer. If HTTP also fails, the data layer raises; if it
       // succeeds, data is fresh but the realtime channel stays off until
       // disconnect() + connect() with a new token.
-      for (const handler of handlers.values()) handler()
+      for (const handler of handlers.values()) {
+        try {
+          handler()
+        } catch {
+          /* user invalidation handler threw — isolate siblings */
+        }
+      }
       return
     }
     scheduleReconnect()
@@ -584,7 +605,7 @@ export function createEngine(config: EngineConfig): Engine {
     } else {
       errorHandlers.delete(id)
     }
-    activeSubs.set(id, { path, args })
+    activeSubs.set(id, { path, args, retryableErrors: 0 })
     if (pipe !== null && authenticated) {
       sendOrClose({ type: 'subscribe', id, path, args }, connectGeneration)
     }

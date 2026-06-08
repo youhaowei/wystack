@@ -33,6 +33,7 @@ type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'quer
 export type QueryConfig<TArgs, TReturn> = WyQueryOptions<TReturn> & {
   args?: TArgs | undefined
   skip?: boolean
+  onLiveUpdatesError?: (err: Error) => void
 }
 
 type EmptyArgs = Record<string, never>
@@ -64,7 +65,7 @@ export function useQuery<TArgs, TReturn>(
   const client = useWyStackClient()
   const queryClient = useQueryClient()
 
-  const { args, skip = false, ...options } = config ?? {}
+  const { args, skip = false, onLiveUpdatesError, ...options } = config ?? {}
   const normalizedArgs = (args ?? {}) as TArgs | Record<string, never>
 
   const stableArgsKey = JSON.stringify(normalizedArgs)
@@ -103,6 +104,7 @@ export function useQuery<TArgs, TReturn>(
       // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
       // working fine. Surface it as a dev-only warning instead.
       (err) => {
+        onLiveUpdatesError?.(err)
         // Browser-safe dev gate: `@wystack/client` ships as plain ESM, so
         // `process` is not defined in a browser build without a Node-globals
         // polyfill. Reference it ONLY behind a `typeof` guard, or a subscription
@@ -122,7 +124,7 @@ export function useQuery<TArgs, TReturn>(
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgs, skip])
+  }, [client.ws, queryClient, path, stableArgs, skip, onLiveUpdatesError])
 
   return query
 }

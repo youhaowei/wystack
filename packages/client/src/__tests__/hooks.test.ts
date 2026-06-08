@@ -266,6 +266,28 @@ describe('useQuery', () => {
       ;(globalThis as { process?: unknown }).process = savedProcess
     }
   })
+
+  test('onLiveUpdatesError receives durable subscription errors', async () => {
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    const wrapper = makeWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, unknown>('listTodos')
+    const liveErrors: Error[] = []
+
+    renderHook(() => useQuery(ref, { onLiveUpdatesError: (err) => liveErrors.push(err) }), {
+      wrapper,
+    })
+
+    await waitFor(() => expect(ws._subscribeCallCount).toBe(1))
+    expect(ws._lastSubscribe!.onError).toBeDefined()
+
+    act(() => {
+      ws._lastSubscribe!.onError!(new Error('REACTIVITY_NOT_ENABLED'))
+    })
+
+    expect(liveErrors).toHaveLength(1)
+    expect(liveErrors[0]?.message).toBe('REACTIVITY_NOT_ENABLED')
+  })
 })
 
 describe('useMutation', () => {

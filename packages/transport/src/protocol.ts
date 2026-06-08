@@ -132,6 +132,9 @@ export interface InvalidateMessage {
  *                        (backward-compatible: treat as `'call'` when `id`
  *                        is present).
  *
+ * `retryable` tags whether a subscription-origin error should stay registered
+ * for reconnect replay. Absent is backward-compatible durable behavior.
+ *
  * `issues` carries Zod validation issues when the server's
  * `ValidationError` surfaces — typed as `unknown[]` here to keep the
  * protocol package free of a Zod dependency. T2b can thread the
@@ -141,6 +144,7 @@ export interface ErrorMessage {
   type: 'error'
   id?: string
   kind?: 'call' | 'subscription'
+  retryable?: boolean
   error: string
   issues?: unknown[]
 }
@@ -314,14 +318,18 @@ export function parseServerMessage(data: string): ServerMessage | null {
       if (typeof msg.error !== 'string') return null
       // `id` is optional. If present, must be a string. Missing is fine.
       if (msg.id !== undefined && typeof msg.id !== 'string') return null
-      // `kind` is optional. If present, must be 'call' or 'subscription'.
-      if (msg.kind !== undefined && msg.kind !== 'call' && msg.kind !== 'subscription') return null
+      // `kind` is optional. Unknown future values are tolerated as absent so
+      // older clients still parse the id/error and can route by backward-compat
+      // rules instead of dropping the whole frame.
       // `issues` is optional. If present, must be an array. Element shape is
       // intentionally `unknown` here (see ErrorMessage doc).
       if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
+      // `retryable` is optional. If present, must be boolean.
+      if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
       const out: ErrorMessage = { type: 'error', error: msg.error }
       if (typeof msg.id === 'string') out.id = msg.id
       if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
+      if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
       if (Array.isArray(msg.issues)) out.issues = msg.issues
       return out
     }

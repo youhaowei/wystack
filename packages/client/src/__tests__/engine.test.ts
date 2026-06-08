@@ -202,6 +202,9 @@ describe('createEngine', () => {
 
     let invalidations = 0
     engine.subscribe('s1', 'listTodos', {}, () => {
+      throw new Error('app invalidate failed')
+    })
+    engine.subscribe('s2', 'listTodos', {}, () => {
       invalidations++
     })
 
@@ -212,6 +215,7 @@ describe('createEngine', () => {
     harness.closeActive(4001)
 
     // 4001 must fire invalidations so HTTP refetches surface the auth error.
+    // A throwing handler must not stop its siblings.
     await settle()
     expect(invalidations).toBe(1)
     expect(engine.isConnected()).toBe(false)
@@ -323,6 +327,90 @@ describe('createEngine', () => {
     await new Promise((r) => setTimeout(r, 1800))
     expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
 
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('retryable subscription error keeps the sub registered for reconnect replay', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const firstServer = harness.server()
+    const errors: Error[] = []
+    engine.subscribe(
+      's1',
+      'sometimes.boom',
+      {},
+      () => {},
+      (err) => errors.push(err),
+    )
+    await settle()
+    expect(firstServer.received).toEqual([
+      { type: 'subscribe', id: 's1', path: 'sometimes.boom', args: {} },
+    ])
+
+    firstServer.send({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: true,
+      error: 'temporary failure',
+    })
+    await settle()
+    expect(errors).toHaveLength(0)
+
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
+
+    const secondServer = harness.server()
+    await settle()
+    expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([
+      { type: 'subscribe', id: 's1', path: 'sometimes.boom', args: {} },
+    ])
+
+    engine.disconnect()
+  }, 10_000)
+
+  test('retryable subscription errors are capped and then surface as terminal', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const server = harness.server()
+    const errors: Error[] = []
+    engine.subscribe(
+      's1',
+      'always.boom',
+      {},
+      () => {},
+      (err) => errors.push(err),
+    )
+    await settle()
+
+    for (let i = 0; i < 4; i++) {
+      server.send({
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: true,
+        error: `temporary failure ${i}`,
+      })
+      await settle()
+    }
+
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.message).toBe('temporary failure 3')
+
+    harness.closeActive(1006)
+    await new Promise((r) => setTimeout(r, 1800))
+    expect(harness.pairCount()).toBeGreaterThanOrEqual(2)
     const secondServer = harness.server()
     await settle()
     expect(secondServer.received.filter((f) => f.type === 'subscribe')).toEqual([])

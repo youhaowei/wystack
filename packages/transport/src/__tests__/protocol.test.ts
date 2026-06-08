@@ -329,17 +329,74 @@ describe('parseServerMessage — error', () => {
       ),
     ).toEqual({ type: 'error', kind: 'subscription', id: 's1', error: 'oops' })
   })
+  test('accepts retryable and threads it through', () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          type: 'error',
+          kind: 'subscription',
+          id: 's1',
+          retryable: true,
+          error: 'oops',
+        }),
+      ),
+    ).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: true,
+      error: 'oops',
+    })
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          type: 'error',
+          kind: 'subscription',
+          id: 's2',
+          retryable: false,
+          error: 'nope',
+        }),
+      ),
+    ).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's2',
+      retryable: false,
+      error: 'nope',
+    })
+  })
+  test('rejects non-boolean retryable when present', () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: 'error', id: 's1', retryable: 'yes', error: 'boom' }),
+      ),
+    ).toBeNull()
+  })
   test('omits kind when it was absent on the wire (backward-compat)', () => {
     const got = parseServerMessage(JSON.stringify({ type: 'error', id: 'c1', error: 'boom' }))
     expect(got).not.toBeNull()
     expect(Object.hasOwn(got as object, 'kind')).toBe(false)
   })
-  test('rejects an unrecognized kind value', () => {
+  test('tolerates an unrecognized future kind value as absent', () => {
+    const got = parseServerMessage(
+      JSON.stringify({ type: 'error', kind: 'unknown', id: 'c1', error: 'boom' }),
+    )
+
+    expect(got).toEqual({ type: 'error', id: 'c1', error: 'boom' })
+    expect(Object.hasOwn(got as object, 'kind')).toBe(false)
+  })
+  test('tolerates unknown future kind while preserving retryable', () => {
     expect(
       parseServerMessage(
-        JSON.stringify({ type: 'error', kind: 'unknown', id: 'c1', error: 'boom' }),
+        JSON.stringify({
+          type: 'error',
+          kind: 'future-subscription',
+          id: 's1',
+          retryable: true,
+          error: 'boom',
+        }),
       ),
-    ).toBeNull()
+    ).toEqual({ type: 'error', id: 's1', retryable: true, error: 'boom' })
   })
 })
 
