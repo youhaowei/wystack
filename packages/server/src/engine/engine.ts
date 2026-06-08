@@ -330,7 +330,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: true,
+        retryable: !(err instanceof ValidationError),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues

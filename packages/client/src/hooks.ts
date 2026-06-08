@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   useQuery as useTanstackQuery,
   useMutation as useTanstackMutation,
@@ -66,6 +66,8 @@ export function useQuery<TArgs, TReturn>(
   const queryClient = useQueryClient()
 
   const { args, skip = false, onLiveUpdatesError, ...options } = config ?? {}
+  const onLiveUpdatesErrorRef = useRef(onLiveUpdatesError)
+  onLiveUpdatesErrorRef.current = onLiveUpdatesError
   const normalizedArgs = (args ?? {}) as TArgs | Record<string, never>
 
   const stableArgsKey = JSON.stringify(normalizedArgs)
@@ -104,7 +106,7 @@ export function useQuery<TArgs, TReturn>(
       // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
       // working fine. Surface it as a dev-only warning instead.
       (err) => {
-        onLiveUpdatesError?.(err)
+        onLiveUpdatesErrorRef.current?.(err)
         // Browser-safe dev gate: `@wystack/client` ships as plain ESM, so
         // `process` is not defined in a browser build without a Node-globals
         // polyfill. Reference it ONLY behind a `typeof` guard, or a subscription
@@ -124,7 +126,7 @@ export function useQuery<TArgs, TReturn>(
     return () => {
       client.ws.unsubscribe(subId)
     }
-  }, [client.ws, queryClient, path, stableArgs, skip, onLiveUpdatesError])
+  }, [client.ws, queryClient, path, stableArgs, skip])
 
   return query
 }

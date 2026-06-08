@@ -288,6 +288,42 @@ describe('useQuery', () => {
     expect(liveErrors).toHaveLength(1)
     expect(liveErrors[0]?.message).toBe('REACTIVITY_NOT_ENABLED')
   })
+
+  test('changing onLiveUpdatesError does not resubscribe but uses latest callback', async () => {
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    const wrapper = makeWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, unknown>('listTodos')
+    const firstErrors: Error[] = []
+    const secondErrors: Error[] = []
+
+    const { rerender } = renderHook(
+      ({ onLiveUpdatesError }) => useQuery(ref, { onLiveUpdatesError }),
+      {
+        wrapper,
+        initialProps: { onLiveUpdatesError: (err: Error) => firstErrors.push(err) },
+      },
+    )
+
+    await waitFor(() => expect(ws._subscribeCallCount).toBe(1))
+    const subId = ws._lastSubscribe!.id
+    const onError = ws._lastSubscribe!.onError
+    expect(onError).toBeDefined()
+
+    rerender({ onLiveUpdatesError: (err: Error) => secondErrors.push(err) })
+
+    expect(ws._subscribeCallCount).toBe(1)
+    expect(ws._unsubscribeCallCount).toBe(0)
+    expect(ws._lastSubscribe!.id).toBe(subId)
+
+    act(() => {
+      onError!(new Error('durable failure'))
+    })
+
+    expect(firstErrors).toHaveLength(0)
+    expect(secondErrors).toHaveLength(1)
+    expect(secondErrors[0]?.message).toBe('durable failure')
+  })
 })
 
 describe('useMutation', () => {
