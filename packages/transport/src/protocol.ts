@@ -302,6 +302,7 @@ const parseServerMessageByType: Record<string, ServerMessageParser> = {
   error: (msg) => {
     if (typeof msg.error !== 'string') return null
     if (msg.id !== undefined && typeof msg.id !== 'string') return null
+    if (msg.kind !== undefined && typeof msg.kind !== 'string') return null
     if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
     if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
 

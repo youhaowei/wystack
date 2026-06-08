@@ -31,6 +31,7 @@ import {
 } from '@wystack/transport'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
+import { ValidationError } from '../validation'
 import {
   attachEngine,
   type AttachEngineOptions,
@@ -589,6 +590,37 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
       id: 's1',
       retryable: true,
       error: 'context temporarily unavailable',
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe context validation failure emits durable subscription error with issues', async () => {
+    // Context can be validated before a subscription is registered. A validation
+    // failure is durable caller/input state, unlike a temporary context outage,
+    // so the client must receive issues and must not retry it as transient.
+    const issues = [{ code: 'custom' as const, path: ['token'], message: 'Required' }]
+    let callCount = 0
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) throw new ValidationError(issues)
+        return {}
+      },
+    })
+
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'context validation error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+      error: 'Validation failed: token: Required',
+      issues,
     })
     expect(h.subscriptionStore.size()).toBe(0)
   })

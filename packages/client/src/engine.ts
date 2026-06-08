@@ -1,12 +1,6 @@
 // @wystack/client — neutral reactive engine
 //
-// Owns the carrier-agnostic half of the v0.2 client:
-//   - Connection lifecycle (connect / disconnect, exponential-backoff reconnect)
-//   - Auth handshake (send `auth`, await `authenticated`)
-//   - Subscription registry (replay on (re)connect, invalidation dispatch). A
-//     durable subscription-origin error drops the sub; a retryable one re-sends
-//     the subscribe frame while bounded by a cap.
-//   - Call/result correlation by result id.
+// Owns the carrier-agnostic half of the v0.2 client.
 
 import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
 
@@ -112,16 +106,6 @@ const MAX_RECONNECT_DELAY_MS = 30_000
 const DEFAULT_AUTH_ACK_TIMEOUT_MS = 10_000
 const MAX_RETRYABLE_SUBSCRIPTION_ERRORS = 3
 
-/**
- * Thrown (as a rejection) when `engine.call()` is invoked but the pipe is
- * not ready to accept frames. This covers:
- *   - Not connected yet (connect() not called, or still in the async open chain)
- *   - Auth pending (requiresAuth transport that hasn't received `authenticated`)
- *   - Disconnected or closed
- *
- * Buffering until ready is future work; the immediate-reject keeps the
- * pending-calls map from accumulating entries that can never be drained.
- */
 export class CallNotReadyError extends Error {
   constructor(reason: string) {
     super(`engine.call: not ready — ${reason}`)
@@ -154,11 +138,7 @@ export function createEngine(config: EngineConfig): Engine {
     { path: string; args: Record<string, unknown>; retryableErrors: number }
   >()
 
-  // Pending call correlator: id → {resolve, reject}. Entries are added by
-  // call() and removed by the matching `result` or `error` frame, or by
-  // rejectAllPending() on close/disconnect.
   const pendingCalls = new Map<string, PendingCall>()
-  // Monotonic call-id sequence — collision-free within this engine instance.
   let callSeq = 0
 
   let connected = false
@@ -166,9 +146,6 @@ export function createEngine(config: EngineConfig): Engine {
   let authenticated = false
   let authFailed = false
 
-  // Monotonic counter — disconnect() and every connect() increment it so a
-  // stale async tail (token fetch, pipe open) can detect it's no longer the
-  // active attempt and bail without racing on shared booleans.
   let connectGeneration = 0
 
   function clearAuthAckTimer() {
@@ -178,15 +155,6 @@ export function createEngine(config: EngineConfig): Engine {
     }
   }
 
-  /**
-   * Reject every entry in `pendingCalls` with `reason` and clear the map.
-   * Must be called from every path that closes or invalidates the current
-   * connection — `handleClose` and `disconnect` — so callers of `call()` never
-   * hang waiting for a result that will never arrive.
-   *
-   * Called AFTER the ownGeneration guard in `handleClose`, so a stale close
-   * from a previous generation never touches current-generation pending calls.
-   */
   function rejectAllPending(reason: Error) {
     if (pendingCalls.size === 0) return
     const snapshot = Array.from(pendingCalls.values())
@@ -207,9 +175,6 @@ export function createEngine(config: EngineConfig): Engine {
     msg: Extract<ServerMessage, { type: 'error' }>,
   ): void {
     const onError = errorHandlers.get(id)
-    // Cleanup FIRST so a throwing onError can't leave the sub registered (and
-    // thus replayable on reconnect — the loop this branch exists to stop). The
-    // maps are cleared before the callback runs, never after.
     handlers.delete(id)
     activeSubs.delete(id)
     errorHandlers.delete(id)
@@ -262,53 +227,17 @@ export function createEngine(config: EngineConfig): Engine {
     }
   }
 
-  /**
-   * Tear down after a *send-side* failure (sync encode throw or async write
-   * rejection). Unlike a transport-emitted close event — which `handleClose`
-   * handles reactively, assuming the socket is already dead — a send failure
-   * leaves the underlying socket OPEN. So we close the captured target before
-   * synthesizing the close, or it leaks: `handleClose` detaches listeners and
-   * nulls `pipe` but never calls `close()`, so a still-open socket would linger
-   * while `scheduleReconnect` opens a second connection.
-   *
-   * `target` is captured at the call site (not read from `pipe`) for the same
-   * reason `generation` is: by the time an async rejection settles, `pipe` may
-   * point at a newer connection that must not be closed.
-   */
   function closeAfterSendFailure(target: Pipe, generation: number) {
     target.close()
     handleClose({ code: 1006 }, generation)
   }
 
-  /**
-   * Close the connection if a send's returned promise rejects asynchronously —
-   * a real write failure on a live carrier (transport death). Both `sendOrClose`
-   * and `call()` route their async-rejection leg here so the generation is
-   * *required* to be snapshotted at the call site (not read live at catch time):
-   * a stale rejection from a superseded pipe must close THAT generation, never a
-   * newer one. Taking `generation` as a parameter makes the snapshot structural.
-   */
   function closeOnSendRejection(target: Pipe, sent: unknown, generation: number) {
     void Promise.resolve(sent).catch(() => {
       closeAfterSendFailure(target, generation)
     })
   }
 
-  /**
-   * Send a fire-and-forget control-plane frame (auth / subscribe / unsubscribe).
-   * On ANY send failure — a synchronous encode throw OR an async send rejection —
-   * the frame is unrecoverable and the connection is torn down (`handleClose`
-   * with 1006) so the reconnect machinery takes over.
-   *
-   * NOT used by `call()`: a correlated RPC treats a synchronous encode throw as
-   * bad caller args (reject that one call, keep the connection alive), which is a
-   * different policy. `call()` does its own `target.send` + try/catch — see there.
-   *
-   * The synchronous try/catch matters: the transport encodes the frame inside
-   * `send` (e.g. the WS adapter's `JSON.stringify(message)`), which throws
-   * synchronously on a BigInt or cyclic arg. Wrapping only the returned promise
-   * (`Promise.resolve(target.send(...))`) would let that sync throw escape.
-   */
   function sendOrClose(message: ClientMessage, generation: number) {
     const target = pipe
     if (target === null) return

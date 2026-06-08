@@ -371,17 +371,3 @@ afterAll(async () => {
     await GlobalRegistrator.unregister()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Red→green evidence capture
-// ---------------------------------------------------------------------------
-// The invalidation test above (cache invalidation: WS onInvalidate triggers
-// refetch) is the acceptance criterion. To verify red→green:
-//
-// 1. Temporarily remove the ws.subscribe() call in useQuery's useEffect
-//    (or remove the queryClient.invalidateQueries call) → the test fails
-//    because callCount stays at 1 after invoking onInvalidate.
-// 2. Restore → test turns green.
-//
-// This file captures that verified green state. The hooks source (hooks.ts) was
-// NOT modified; only this test file was added.

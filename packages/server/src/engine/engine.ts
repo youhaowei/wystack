@@ -1,17 +1,4 @@
 // @wystack/server — Engine (Session + Dispatch over a Pipe)
-//
-// `attachEngine(pipe, opts)` wires the two-timescale Engine (Spec ADR #8) onto
-// any `Pipe`: Session for the connection-timescale auth gate, Dispatch for
-// request-timescale RPC. It is the transport-neutral entry point — the loopback
-// pair drives it in tests today; the Hono WS adapter and Electron IPC adapter
-// drive it next (YW-57, T5/T6), each supplying its own close-code mapping.
-//
-// Tier model (Spec ADR #12): the RPC tier (`call` → `result`) is always on. The
-// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in. When BOTH
-// `subscriptionStore` AND `publishInvalidation` are provided, subscribe/unsubscribe
-// are handled per-connection and mutations emit invalidations. When either is
-// absent, subscribe → error{REACTIVITY_NOT_ENABLED} and unsubscribe is tolerated
-// silently (capability discovery floor).
 
 import {
   parseClientMessage,
@@ -247,20 +234,6 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
   }
 
-  // --- Reactive tier handlers (only called when reactiveEnabled) ---
-
-  /**
-   * Handle a `subscribe` frame. Follows the routes.ts pattern:
-   *   1. Resolve context per-subscription (spec: "subscription-time context").
-   *   2. Run the query via app.call to get initial tablesRead.
-   *   3. Register the entry in the shared SubscriptionStore with `entry.send`
-   *      pointing at this connection's post-close-safe `send` helper.
-   *   4. ACK with `{ type: 'subscribed', id }`.
-   *
-   * `pendingSubAttempts` guards mid-await cancellation and replacement: an
-   * `unsubscribe` or newer subscribe arriving during steps 1–2 changes/removes
-   * the token; the await-tail bail-check then skips step 3 and emits no error.
-   */
   async function handleSubscribe(
     msg: Extract<ClientMessage, { type: 'subscribe' }>,
   ): Promise<void> {
@@ -282,37 +255,31 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       return
     }
 
-    // Resolve context PER subscription — spec: "Context resolved at
-    // subscription time, preserved for re-queries". Never call resolveSubContext
-    // again for this sub; the re-query uses entry.context.
     let context: Record<string, unknown>
     try {
       context = await session.resolveSubContext()
     } catch (err) {
       if (!isCurrentSubscribeAttempt(id, attempt)) return
       finishSubscribeAttempt(id, attempt)
-      send({
+      const payload: ServerMessage = {
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: true,
+        retryable: !(err instanceof ValidationError),
         error: errorMessage(err),
-      })
+      }
+      if (err instanceof ValidationError) payload.issues = err.issues
+      send(payload)
       return
     }
 
-    // Unsubscribe or a newer subscribe may have arrived during context resolve.
     if (closed || !isCurrentSubscribeAttempt(id, attempt)) return
 
     try {
       const { tablesRead } = await app.call(path, args, context)
-      // Guard: connection closed, unsubscribe arrived, or a newer subscribe
-      // superseded this attempt during app.call.
       if (closed || !isCurrentSubscribeAttempt(id, attempt)) return
       finishSubscribeAttempt(id, attempt)
 
-      // Register in the shared store. `send` is the post-close-safe helper
-      // already defined in this closure — it swallows post-close sends.
       subscriptionStore!.add({
         id,
         functionPath: path,

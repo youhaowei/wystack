@@ -312,6 +312,14 @@ describe('parseServerMessage — error', () => {
   test('rejects non-string id when present', () => {
     expect(parseServerMessage(JSON.stringify({ type: 'error', id: 1, error: 'boom' }))).toBeNull()
   })
+  test('rejects non-string kind when present', () => {
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'error', kind: 123, error: 'boom' })),
+    ).toBeNull()
+    expect(
+      parseServerMessage(JSON.stringify({ type: 'error', kind: false, error: 'boom' })),
+    ).toBeNull()
+  })
   test('rejects non-array issues when present', () => {
     expect(
       parseServerMessage(JSON.stringify({ type: 'error', error: 'boom', issues: 'oops' })),
