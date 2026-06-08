@@ -221,6 +221,14 @@ describe('parseServerMessage — envelope rejection', () => {
     expect(parseServerMessage(JSON.stringify({ type: 'next', id: 'x', version: 1 }))).toBeNull()
     expect(parseServerMessage(JSON.stringify({ type: 'resync', id: 'x' }))).toBeNull()
   })
+  test('rejects prototype-key discriminants without throwing', () => {
+    for (const type of ['__proto__', 'constructor', 'toString']) {
+      const frame = JSON.stringify({ type, error: 'boom' })
+
+      expect(() => parseServerMessage(frame)).not.toThrow()
+      expect(parseServerMessage(frame)).toBeNull()
+    }
+  })
 })
 
 // ─── parseServerMessage: per-kind ────────────────────────────────────────────

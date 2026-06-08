@@ -283,38 +283,6 @@ export function parseClientMessage(data: string): ClientMessage | null {
   }
 }
 
-type ServerMessageParser = (msg: Envelope) => ServerMessage | null
-
-const parseServerMessageByType: Record<string, ServerMessageParser> = {
-  authenticated: () => ({ type: 'authenticated' }),
-  subscribed: (msg) => {
-    if (typeof msg.id !== 'string') return null
-    return { type: 'subscribed', id: msg.id }
-  },
-  invalidate: (msg) => {
-    if (typeof msg.id !== 'string') return null
-    return { type: 'invalidate', id: msg.id }
-  },
-  result: (msg) => {
-    if (typeof msg.id !== 'string') return null
-    return { type: 'result', id: msg.id, data: msg.data }
-  },
-  error: (msg) => {
-    if (typeof msg.error !== 'string') return null
-    if (msg.id !== undefined && typeof msg.id !== 'string') return null
-    if (msg.kind !== undefined && typeof msg.kind !== 'string') return null
-    if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
-    if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
-
-    const out: ErrorMessage = { type: 'error', error: msg.error }
-    if (typeof msg.id === 'string') out.id = msg.id
-    if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
-    if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
-    if (Array.isArray(msg.issues)) out.issues = msg.issues
-    return out
-  },
-}
-
 /**
  * Strict parse for a Server → Client frame. Returns the typed message on
  * success, `null` for any rejection. Symmetry with `parseClientMessage` —
@@ -324,5 +292,36 @@ export function parseServerMessage(data: string): ServerMessage | null {
   const msg = parseEnvelope(data)
   if (msg === null) return null
 
-  return parseServerMessageByType[msg.type]?.(msg) ?? null
+  switch (msg.type) {
+    case 'authenticated':
+      return { type: 'authenticated' }
+    case 'subscribed': {
+      if (typeof msg.id !== 'string') return null
+      return { type: 'subscribed', id: msg.id }
+    }
+    case 'invalidate': {
+      if (typeof msg.id !== 'string') return null
+      return { type: 'invalidate', id: msg.id }
+    }
+    case 'result': {
+      if (typeof msg.id !== 'string') return null
+      return { type: 'result', id: msg.id, data: msg.data }
+    }
+    case 'error': {
+      if (typeof msg.error !== 'string') return null
+      if (msg.id !== undefined && typeof msg.id !== 'string') return null
+      if (msg.kind !== undefined && typeof msg.kind !== 'string') return null
+      if (msg.issues !== undefined && !Array.isArray(msg.issues)) return null
+      if (msg.retryable !== undefined && typeof msg.retryable !== 'boolean') return null
+
+      const out: ErrorMessage = { type: 'error', error: msg.error }
+      if (typeof msg.id === 'string') out.id = msg.id
+      if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
+      if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
+      if (Array.isArray(msg.issues)) out.issues = msg.issues
+      return out
+    }
+    default:
+      return null
+  }
 }
