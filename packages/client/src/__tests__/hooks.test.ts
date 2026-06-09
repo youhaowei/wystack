@@ -237,12 +237,9 @@ describe('useQuery', () => {
     expect(call.args).toEqual({})
   })
 
-  test('subscription-error surfacing is browser-safe — does not throw when `process` is undefined (YW-108)', async () => {
-    // Regression (Codex MUST): the YW-108 onError surfacing read
-    // `process.env.NODE_ENV` unguarded. `@wystack/client` ships as plain ESM, so
-    // `process` is not defined in a browser build — a subscription rejection
-    // would throw `ReferenceError: process is not defined` in the exact path
-    // YW-108 makes safe. The fix guards the access with `typeof process`.
+  test('subscription-error surfacing is browser-safe — does not throw when `process` is undefined', async () => {
+    // Browser ESM builds may not define `process`. Subscription-error surfacing
+    // must still call the app-supplied callback instead of throwing first.
     const ws = makeMockWs()
     const client = makeMockClient(ws)
     const wrapper = makeWrapper(client)
@@ -265,6 +262,64 @@ describe('useQuery', () => {
     } finally {
       ;(globalThis as { process?: unknown }).process = savedProcess
     }
+  })
+
+  test('onLiveUpdatesError receives durable subscription errors', async () => {
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    const wrapper = makeWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, unknown>('listTodos')
+    const liveErrors: Error[] = []
+
+    renderHook(() => useQuery(ref, { onLiveUpdatesError: (err) => liveErrors.push(err) }), {
+      wrapper,
+    })
+
+    await waitFor(() => expect(ws._subscribeCallCount).toBe(1))
+    expect(ws._lastSubscribe!.onError).toBeDefined()
+
+    act(() => {
+      ws._lastSubscribe!.onError!(new Error('REACTIVITY_NOT_ENABLED'))
+    })
+
+    expect(liveErrors).toHaveLength(1)
+    expect(liveErrors[0]?.message).toBe('REACTIVITY_NOT_ENABLED')
+  })
+
+  test('changing onLiveUpdatesError does not resubscribe but uses latest callback', async () => {
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    const wrapper = makeWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, unknown>('listTodos')
+    const firstErrors: Error[] = []
+    const secondErrors: Error[] = []
+
+    const { rerender } = renderHook(
+      ({ onLiveUpdatesError }) => useQuery(ref, { onLiveUpdatesError }),
+      {
+        wrapper,
+        initialProps: { onLiveUpdatesError: (err: Error) => firstErrors.push(err) },
+      },
+    )
+
+    await waitFor(() => expect(ws._subscribeCallCount).toBe(1))
+    const subId = ws._lastSubscribe!.id
+    const onError = ws._lastSubscribe!.onError
+    expect(onError).toBeDefined()
+
+    rerender({ onLiveUpdatesError: (err: Error) => secondErrors.push(err) })
+
+    expect(ws._subscribeCallCount).toBe(1)
+    expect(ws._unsubscribeCallCount).toBe(0)
+    expect(ws._lastSubscribe!.id).toBe(subId)
+
+    act(() => {
+      onError!(new Error('durable failure'))
+    })
+
+    expect(firstErrors).toHaveLength(0)
+    expect(secondErrors).toHaveLength(1)
+    expect(secondErrors[0]?.message).toBe('durable failure')
   })
 })
 
@@ -316,17 +371,3 @@ afterAll(async () => {
     await GlobalRegistrator.unregister()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Red→green evidence capture
-// ---------------------------------------------------------------------------
-// The invalidation test above (cache invalidation: WS onInvalidate triggers
-// refetch) is the acceptance criterion. To verify red→green:
-//
-// 1. Temporarily remove the ws.subscribe() call in useQuery's useEffect
-//    (or remove the queryClient.invalidateQueries call) → the test fails
-//    because callCount stays at 1 after invoking onInvalidate.
-// 2. Restore → test turns green.
-//
-// This file captures that verified green state. The hooks source (hooks.ts) was
-// NOT modified; only this test file was added.

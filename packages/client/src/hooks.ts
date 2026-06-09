@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   useQuery as useTanstackQuery,
   useMutation as useTanstackMutation,
@@ -33,6 +33,7 @@ type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'quer
 export type QueryConfig<TArgs, TReturn> = WyQueryOptions<TReturn> & {
   args?: TArgs | undefined
   skip?: boolean
+  onLiveUpdatesError?: (err: Error) => void
 }
 
 type EmptyArgs = Record<string, never>
@@ -64,7 +65,9 @@ export function useQuery<TArgs, TReturn>(
   const client = useWyStackClient()
   const queryClient = useQueryClient()
 
-  const { args, skip = false, ...options } = config ?? {}
+  const { args, skip = false, onLiveUpdatesError, ...options } = config ?? {}
+  const onLiveUpdatesErrorRef = useRef(onLiveUpdatesError)
+  onLiveUpdatesErrorRef.current = onLiveUpdatesError
   const normalizedArgs = (args ?? {}) as TArgs | Record<string, never>
 
   const stableArgsKey = JSON.stringify(normalizedArgs)
@@ -94,21 +97,8 @@ export function useQuery<TArgs, TReturn>(
       () => {
         queryClient.invalidateQueries({ queryKey })
       },
-      // Durable subscription error (YW-108). The engine has already dropped the
-      // sub, so it will NOT be replayed on reconnect — this stops the silent
-      // retry loop. We deliberately do NOT push the TanStack query into error
-      // state: useQuery loads its data over HTTP and uses WS only for live
-      // invalidation, so a failed sub means "no live updates," not "no data."
-      // Forcing an error here would falsely fail every query on an RPC-only
-      // server (where every sub gets REACTIVITY_NOT_ENABLED) despite HTTP
-      // working fine. Surface it as a dev-only warning instead.
       (err) => {
-        // Browser-safe dev gate: `@wystack/client` ships as plain ESM, so
-        // `process` is not defined in a browser build without a Node-globals
-        // polyfill. Reference it ONLY behind a `typeof` guard, or a subscription
-        // rejection would throw `ReferenceError: process is not defined` in the
-        // exact path YW-108 makes safe. (`process.env?.` also guards the rare
-        // case where `process` exists but `env` does not.)
+        onLiveUpdatesErrorRef.current?.(err)
         const isDev = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production'
         if (isDev) {
           // eslint-disable-next-line no-console

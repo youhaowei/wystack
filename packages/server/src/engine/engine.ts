@@ -1,17 +1,4 @@
 // @wystack/server — Engine (Session + Dispatch over a Pipe)
-//
-// `attachEngine(pipe, opts)` wires the two-timescale Engine (Spec ADR #8) onto
-// any `Pipe`: Session for the connection-timescale auth gate, Dispatch for
-// request-timescale RPC. It is the transport-neutral entry point — the loopback
-// pair drives it in tests today; the Hono WS adapter and Electron IPC adapter
-// drive it next (YW-57, T5/T6), each supplying its own close-code mapping.
-//
-// Tier model (Spec ADR #12): the RPC tier (`call` → `result`) is always on. The
-// reactive tier (`subscribe`/`unsubscribe`/`invalidate`) is opt-in. When BOTH
-// `subscriptionStore` AND `publishInvalidation` are provided, subscribe/unsubscribe
-// are handled per-connection and mutations emit invalidations. When either is
-// absent, subscribe → error{REACTIVITY_NOT_ENABLED} and unsubscribe is tolerated
-// silently (capability discovery floor).
 
 import {
   parseClientMessage,
@@ -112,16 +99,42 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
   // --- Reactive tier: per-connection subscription bookkeeping ---
   //
-  // `mySubIds`     — IDs of subscriptions registered by this connection. Used
-  //                  during teardown to remove only this connection's entries.
-  // `pendingSubIds`— IDs of in-flight subscribes (resolveSubContext / app.call
-  //                  in progress). An `unsubscribe` arriving mid-await drops the
-  //                  id from here; the `.then` bail-path then skips registration.
-  //                  known-debt: flag-check cancellation, not AbortSignal. The
-  //                  underlying context resolution keeps running to completion;
-  //                  we bail at the .then boundary. See YW-63 known-debt note.
+  // `mySubIds`          — IDs of subscriptions registered by this connection.
+  //                       Used during teardown to remove only this connection's
+  //                       entries.
+  // `pendingSubAttempts`— id → attempt token for in-flight subscribes
+  //                       (resolveSubContext / app.call in progress). A newer
+  //                       subscribe for the same id replaces the token so stale
+  //                       async tails cannot register, delete, or emit a
+  //                       terminal error for the superseded attempt.
+  //                       known-debt: flag-check cancellation, not AbortSignal.
+  //                       The underlying context resolution keeps running to
+  //                       completion; we bail at await boundaries. See YW-63.
   const mySubIds = new Set<string>()
-  const pendingSubIds = new Set<string>()
+  const pendingSubAttempts = new Map<string, number>()
+  let nextSubAttempt = 0
+
+  function clearSubscriptionOwnership(id: string): void {
+    if (mySubIds.has(id)) {
+      subscriptionStore!.remove(id)
+      mySubIds.delete(id)
+    }
+  }
+
+  function startSubscribeAttempt(id: string): number {
+    const attempt = ++nextSubAttempt
+    pendingSubAttempts.set(id, attempt)
+    clearSubscriptionOwnership(id)
+    return attempt
+  }
+
+  function isCurrentSubscribeAttempt(id: string, attempt: number): boolean {
+    return pendingSubAttempts.get(id) === attempt
+  }
+
+  function finishSubscribeAttempt(id: string, attempt: number): void {
+    if (isCurrentSubscribeAttempt(id, attempt)) pendingSubAttempts.delete(id)
+  }
 
   // Shared teardown: flip the closed guard, disarm the handshake timer, drop
   // the inbound handler, and (when reactive is enabled) remove this connection's
@@ -134,9 +147,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     if (timeout !== null) clearTimeout(timeout)
     unsubscribe?.()
     // Reactive cleanup: remove all subscriptions owned by this connection.
-    // Drop pendingSubIds so any in-flight .then bail-checks see "not pending".
+    // Drop pendingSubAttempts so any in-flight bail-checks see "not current".
     if (reactiveEnabled) {
-      pendingSubIds.clear()
+      pendingSubAttempts.clear()
       for (const id of mySubIds) {
         subscriptionStore!.remove(id)
       }
@@ -221,57 +234,52 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
   }
 
-  // --- Reactive tier handlers (only called when reactiveEnabled) ---
-
-  /**
-   * Handle a `subscribe` frame. Follows the routes.ts pattern:
-   *   1. Resolve context per-subscription (spec: "subscription-time context").
-   *   2. Run the query via app.call to get initial tablesRead.
-   *   3. Register the entry in the shared SubscriptionStore with `entry.send`
-   *      pointing at this connection's post-close-safe `send` helper.
-   *   4. ACK with `{ type: 'subscribed', id }`.
-   *
-   * `pendingSubIds` guards mid-await cancellation: an `unsubscribe` arriving
-   * during steps 1–2 drops the id; the `.then` bail-check then skips step 3.
-   */
   async function handleSubscribe(
     msg: Extract<ClientMessage, { type: 'subscribe' }>,
   ): Promise<void> {
     const id = msg.id
     const path = msg.path
     const args = (msg.args ?? {}) as Record<string, unknown>
+    const attempt = startSubscribeAttempt(id)
 
     const fn = app.functions.get(path)
     if (!fn || fn.type !== 'query') {
-      send({ type: 'error', kind: 'subscription', id, error: `Unknown query: ${path}` })
+      finishSubscribeAttempt(id, attempt)
+      send({
+        type: 'error',
+        kind: 'subscription',
+        id,
+        retryable: false,
+        error: `Unknown query: ${path}`,
+      })
       return
     }
 
-    pendingSubIds.add(id)
-
-    // Resolve context PER subscription — spec: "Context resolved at
-    // subscription time, preserved for re-queries". Never call resolveSubContext
-    // again for this sub; the re-query uses entry.context.
     let context: Record<string, unknown>
     try {
       context = await session.resolveSubContext()
     } catch (err) {
-      pendingSubIds.delete(id)
-      send({ type: 'error', kind: 'subscription', id, error: errorMessage(err) })
+      if (!isCurrentSubscribeAttempt(id, attempt)) return
+      finishSubscribeAttempt(id, attempt)
+      const payload: ServerMessage = {
+        type: 'error',
+        kind: 'subscription',
+        id,
+        retryable: !(err instanceof ValidationError),
+        error: errorMessage(err),
+      }
+      if (err instanceof ValidationError) payload.issues = err.issues
+      send(payload)
       return
     }
 
-    // Unsubscribe may have arrived during the context-resolve await.
-    if (!pendingSubIds.has(id)) return
+    if (closed || !isCurrentSubscribeAttempt(id, attempt)) return
 
     try {
       const { tablesRead } = await app.call(path, args, context)
-      // Guard: connection closed, OR unsubscribe arrived during app.call.
-      if (closed || !pendingSubIds.has(id)) return
-      pendingSubIds.delete(id)
+      if (closed || !isCurrentSubscribeAttempt(id, attempt)) return
+      finishSubscribeAttempt(id, attempt)
 
-      // Register in the shared store. `send` is the post-close-safe helper
-      // already defined in this closure — it swallows post-close sends.
       subscriptionStore!.add({
         id,
         functionPath: path,
@@ -283,11 +291,13 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       mySubIds.add(id)
       send({ type: 'subscribed', id })
     } catch (err) {
-      pendingSubIds.delete(id)
+      if (!isCurrentSubscribeAttempt(id, attempt)) return
+      finishSubscribeAttempt(id, attempt)
       const payload: ServerMessage = {
         type: 'error',
         kind: 'subscription',
         id,
+        retryable: !(err instanceof ValidationError),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -297,18 +307,15 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
 
   /**
    * Handle an `unsubscribe` frame. Cancels in-flight subscribes (removes from
-   * pendingSubIds so the .then bail-path sees "not pending") and removes any
+   * pendingSubAttempts so the await-tail sees "not current") and removes any
    * committed entry from the shared store.
    */
   function handleUnsubscribe(msg: Extract<ClientMessage, { type: 'unsubscribe' }>): void {
     const id = msg.id
     // Cancel a pending (in-flight) subscribe before it finishes.
-    pendingSubIds.delete(id)
+    pendingSubAttempts.delete(id)
     // Remove a committed subscription from the shared store.
-    if (mySubIds.has(id)) {
-      subscriptionStore!.remove(id)
-      mySubIds.delete(id)
-    }
+    clearSubscriptionOwnership(id)
   }
 
   function handleMessage(raw: unknown): void {
@@ -387,7 +394,13 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       case 'subscribe':
         if (!reactiveEnabled) {
           // Reactive tier not wired (Spec ADR #12). The capability-discovery floor.
-          send({ type: 'error', kind: 'subscription', id: msg.id, error: REACTIVITY_NOT_ENABLED })
+          send({
+            type: 'error',
+            kind: 'subscription',
+            id: msg.id,
+            retryable: false,
+            error: REACTIVITY_NOT_ENABLED,
+          })
           return
         }
         void handleSubscribe(msg)

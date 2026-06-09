@@ -31,6 +31,7 @@ import {
 } from '@wystack/transport'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
+import { ValidationError } from '../validation'
 import {
   attachEngine,
   type AttachEngineOptions,
@@ -53,6 +54,10 @@ async function makeApp() {
     functions: {
       listTodos: query({ args: {}, handler: async (ctx) => ctx.db.from(schema.todos).all() }),
       whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId ?? null }) }),
+      todoByTitle: query({
+        args: { title: text },
+        handler: async (ctx) => ctx.db.from(schema.todos).all(),
+      }),
       addTodo: mutation({
         args: { title: text },
         handler: async (ctx, args) =>
@@ -427,7 +432,13 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
     await flush()
 
     expect(h.received).toEqual([
-      { type: 'error', kind: 'subscription', id: 's1', error: REACTIVITY_NOT_ENABLED },
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: false,
+        error: REACTIVITY_NOT_ENABLED,
+      },
     ])
   })
 
@@ -495,8 +506,12 @@ function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
  * as `harness` plus the shared `publishInvalidation` for driving invalidations
  * from a test.
  */
-async function reactiveHarness(opts?: Partial<AttachEngineOptions>) {
+async function reactiveHarness(
+  opts?: Partial<AttachEngineOptions>,
+  configureApp?: (app: Awaited<ReturnType<typeof makeApp>>) => void,
+) {
   const app = await makeApp()
+  configureApp?.(app)
   const { subscriptionStore, publishInvalidation } = makeReactiveShared(app)
 
   const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
@@ -541,9 +556,106 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     h.send({ type: 'subscribe', id: 's1', path: 'nonExistent', args: {} })
     await until(() => h.received.length > 0, 'error')
 
-    const err = h.received.find((m) => m.type === 'error')
-    expect(err).toBeDefined()
-    expect(err && 'id' in err && err.id).toBe('s1')
+    expect(h.received).toEqual([
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: false,
+        error: 'Unknown query: nonExistent',
+      },
+    ])
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe context failure emits retryable subscription error', async () => {
+    let callCount = 0
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) throw new Error('context temporarily unavailable')
+        return {}
+      },
+    })
+
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'context error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: true,
+      error: 'context temporarily unavailable',
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe context validation failure emits durable subscription error with issues', async () => {
+    // Context can be validated before a subscription is registered. A validation
+    // failure is durable caller/input state, unlike a temporary context outage,
+    // so the client must receive issues and must not retry it as transient.
+    const issues = [{ code: 'custom' as const, path: ['token'], message: 'Required' }]
+    let callCount = 0
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) throw new ValidationError(issues)
+        return {}
+      },
+    })
+
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'context validation error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+      error: 'Validation failed: token: Required',
+      issues,
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe query failure emits retryable subscription error', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'boom', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'query error')
+
+    expect(h.received).toEqual([
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: true,
+        error: 'kaboom',
+      },
+    ])
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe validation failure emits durable subscription error with issues', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'todoByTitle', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'validation error')
+
+    const err = h.received[0]
+    expect(err).toMatchObject({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+    })
+    expect(err && 'error' in err && err.error).toContain('Validation failed')
+    expect(err && 'issues' in err && Array.isArray(err.issues)).toBe(true)
     expect(h.subscriptionStore.size()).toBe(0)
   })
 
@@ -598,6 +710,55 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     expect(h.received.length).toBe(countBefore)
   })
 
+  test('re-subscribe with durable rejection clears the prior active entry', async () => {
+    const h = await reactiveHarness()
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'subscribed')
+    expect(h.subscriptionStore.size()).toBe(1)
+
+    h.send({ type: 'subscribe', id: 's1', path: 'nonExistent', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'replacement error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+      error: 'Unknown query: nonExistent',
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('superseded older subscribe error cannot disable a newer successful replacement', async () => {
+    let rejectOlderQuery!: (err: Error) => void
+    const olderQuery = new Promise<never>((_, reject) => {
+      rejectOlderQuery = reject
+    })
+
+    const h = await reactiveHarness(undefined, (app) => {
+      app.functions.set(
+        'delayedBoom',
+        query({
+          args: {},
+          handler: async () => olderQuery,
+        }),
+      )
+    })
+
+    h.send({ type: 'subscribe', id: 's1', path: 'delayedBoom', args: {} })
+    await new Promise((r) => setTimeout(r, 5))
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'subscribed'), 'replacement subscribed')
+    expect(h.subscriptionStore.size()).toBe(1)
+
+    rejectOlderQuery(new Error('older query failed late'))
+    await flush()
+
+    expect(h.received.filter((m) => m.type === 'error')).toHaveLength(0)
+    expect(h.subscriptionStore.size()).toBe(1)
+  })
+
   test('in-flight subscribe cancelled by unsubscribe: no orphan entry in store', async () => {
     // Simulate an unsubscribe arriving during the per-subscription context-resolve await.
     // Auth resolves immediately; the subscribe-time resolve is blocked until we control it.
@@ -632,7 +793,7 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     await flush()
 
     // Unblock the pending context resolve — the subscribe handler should see
-    // pendingSubIds.has(id) === false and bail before registering in the store.
+    // the id no longer has a current attempt and bail before registering in the store.
     resolveSubscribeContext()
     await flush()
 
@@ -695,7 +856,13 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     await flush()
 
     expect(h.received).toEqual([
-      { type: 'error', kind: 'subscription', id: 's1', error: REACTIVITY_NOT_ENABLED },
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: false,
+        error: REACTIVITY_NOT_ENABLED,
+      },
     ])
   })
 
