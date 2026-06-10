@@ -3,7 +3,7 @@
  * reactive subscriptions together into a running app.
  */
 import { createTrackedDb, createDb } from '@wystack/db'
-import type { DbConfig } from '@wystack/db'
+import type { DbConfig, TrackedDb } from '@wystack/db'
 import type { FunctionDef, FunctionContext, DbInput } from './types'
 import { createSubscriptionManager } from './subscriptions'
 import { buildArgsSchema, ValidationError } from './validation'
@@ -21,6 +21,42 @@ export interface WyStackApp {
     tablesRead: Set<string>
     tablesWritten: Set<string>
   }>
+  /**
+   * Run one registered function's handler against a SUPPLIED TrackedDb instead
+   * of a fresh per-call one. This is the seam `applyCommands` uses to dispatch
+   * every command in a batch through the same tx-bound tracker, so their writes
+   * land in one native transaction and one merged Tag-set.
+   *
+   * Validation (the cached Zod schema) runs here exactly as in `call`, so a
+   * batch command and a plain RPC to the same path validate identically. The
+   * caller owns the TrackedDb lifecycle (creation, transaction, tracking-set
+   * collection); this method only validates args and invokes the handler with
+   * `{ ...context, db: tracked }`.
+   *
+   * This is a LOW-LEVEL escape hatch, reachable on the exported `WyStackApp`
+   * type but not part of the intended public API — prefer `applyCommands` or
+   * `call`. Calling it directly bypasses the transaction envelope, so the
+   * caller is responsible for atomicity and invalidation. It exists so the
+   * in-package `applyCommands` engine can dispatch a handler against a supplied
+   * tx-bound tracker; external use is unsupported and may change.
+   */
+  runHandler: (
+    path: string,
+    args: unknown,
+    tracked: TrackedDb,
+    context?: Record<string, unknown>,
+  ) => Promise<unknown>
+  /**
+   * Mint a fresh TrackedDb bound to this app's connection, with empty tracking
+   * sets. The seam `applyCommands` uses to obtain an OUTER tracker whose
+   * `.transaction(...)` opens one native transaction for a whole command batch.
+   * Equivalent to the fresh-per-call tracker `call` builds internally, exposed
+   * so the batch engine can own the transaction lifecycle.
+   *
+   * Low-level escape hatch like `runHandler` — reachable on the exported type
+   * but not the intended public API; prefer `applyCommands`/`call`.
+   */
+  createTracked: () => TrackedDb
 }
 
 function resolveDbConfig(db: DbInput): DbConfig | null {
@@ -52,33 +88,52 @@ export async function createWyStack(opts: {
     functions.set(path, def)
   }
 
+  // Validate args against the cached Zod schema — produces validated + stripped
+  // output. Shared by `call` (fresh tracker) and `runHandler` (supplied tracker)
+  // so a path validates identically however it is dispatched.
+  function validateAndGetHandler(path: string, args: unknown) {
+    const fn = functions.get(path)
+    if (!fn) throw new Error(`Unknown function: ${path}`)
+
+    const schema = argsSchemas.get(path)
+    let validatedArgs = args
+    if (schema) {
+      const parsed = schema.safeParse(args)
+      if (!parsed.success) throw new ValidationError(parsed.error.issues)
+      validatedArgs = parsed.data
+    }
+    return { fn, validatedArgs }
+  }
+
   const app: WyStackApp = {
     functions,
     subscriptions,
 
+    createTracked() {
+      return createTrackedDb(drizzleDb)
+    },
+
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
-      const fn = functions.get(path)
-      if (!fn) throw new Error(`Unknown function: ${path}`)
-
-      // Validate args against the cached Zod schema — produces validated + stripped output
-      const schema = argsSchemas.get(path)
-      let validatedArgs = args
-      if (schema) {
-        const parsed = schema.safeParse(args)
-        if (!parsed.success) throw new ValidationError(parsed.error.issues)
-        validatedArgs = parsed.data
-      }
-
       // Fresh TrackedDb per call — no shared mutable state
-      const tracked = createTrackedDb(drizzleDb)
-      const ctx: FunctionContext = { ...context, db: tracked }
-      const result = await fn.handler(ctx, validatedArgs)
+      const tracked = app.createTracked()
+      const result = await app.runHandler(path, args, tracked, context)
 
       return {
         result,
         tablesRead: tracked.tablesRead,
         tablesWritten: tracked.tablesWritten,
       }
+    },
+
+    async runHandler(
+      path: string,
+      args: unknown,
+      tracked: TrackedDb,
+      context: Record<string, unknown> = {},
+    ) {
+      const { fn, validatedArgs } = validateAndGetHandler(path, args)
+      const ctx: FunctionContext = { ...context, db: tracked }
+      return fn.handler(ctx, validatedArgs)
     },
   }
 
