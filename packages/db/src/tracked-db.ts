@@ -60,22 +60,23 @@ export interface TrackedDb {
    * tracker, so only the outermost call's set reaches invalidation.
    *
    * `opts` is passed through to the lowering's native transaction. Isolation
-   * level / access mode can only be set at transaction start (not reachable via
-   * `tx.raw` once `fn` runs), so the slot is frozen into the contract now even
-   * though no caller sets it yet — adding it later would break the signature.
+   * level / access mode can only be set at transaction start — once `fn` runs the
+   * transaction is already open and `tx.raw` offers no path to set them — so this
+   * slot is the only entry point for them, and the contract carries it now even
+   * though no caller sets it yet.
    */
   transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
 /**
  * Lowering-agnostic transaction options, passed through to the native
- * transaction. Mirrors the subset of Drizzle's PgTransactionConfig that is
- * portable across SQL dialects; dialect-specific options stay behind subpaths.
+ * transaction. These two fields are the conceptual subset every SQL dialect
+ * shares (a dialect with no analog ignores them); dialect-specific options
+ * (e.g. Postgres `deferrable`) stay behind subpaths per the db dialect policy.
  */
 export interface TransactionOptions {
   isolationLevel?: 'read uncommitted' | 'read committed' | 'repeatable read' | 'serializable'
   accessMode?: 'read write' | 'read only'
-  deferrable?: boolean
 }
 
 export class SelectBuilder<T extends AnyTable> {
