@@ -39,6 +39,22 @@ beforeEach(async () => {
           return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
         },
       }),
+      addTwoInTx: mutation({
+        args: { a: text, b: text },
+        handler: async (ctx, args) =>
+          ctx.db.transaction(async (tx) => {
+            await tx.into(schema.todos).insert({ title: args.a, done: false })
+            await tx.into(schema.todos).insert({ title: args.b, done: false })
+          }),
+      }),
+      addThenFail: mutation({
+        args: { title: text },
+        handler: async (ctx, args) =>
+          ctx.db.transaction(async (tx) => {
+            await tx.into(schema.todos).insert({ title: args.title, done: false })
+            throw new Error('handler boom')
+          }),
+      }),
     },
   })
 })
@@ -65,5 +81,23 @@ describe('createWyStack', () => {
 
   test('call() throws for unknown function', async () => {
     expect(app.call('unknown', {})).rejects.toThrow('Unknown function: unknown')
+  })
+
+  test('call() surfaces tablesWritten from a committed tracked transaction', async () => {
+    const { tablesWritten } = await app.call('addTwoInTx', { a: 'X', b: 'Y' })
+    // The transaction's write Tags must reach the call-scope set, or
+    // invalidateSubscriptions never fires for a committed batch.
+    expect(tablesWritten.has('todos')).toBe(true)
+
+    const { result } = await app.call('listTodos', {})
+    expect(result as unknown[]).toHaveLength(2)
+  })
+
+  test('call() surfaces no tablesWritten when a tracked transaction rolls back', async () => {
+    await expect(app.call('addThenFail', { title: 'ghost' })).rejects.toThrow('handler boom')
+
+    // Fresh call: the rolled-back write neither persisted nor emitted a Tag.
+    const { result } = await app.call('listTodos', {})
+    expect(result as unknown[]).toHaveLength(0)
   })
 })
