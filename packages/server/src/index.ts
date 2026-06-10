@@ -3,6 +3,7 @@
 
 export { query, mutation } from './functions'
 export { createWyStack } from './create'
+export { applyCommands } from './apply-commands'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
@@ -27,6 +28,13 @@ export type {
   WyStackServer,
 } from './types'
 export type { WyStackApp } from './create'
+export type {
+  Command,
+  ApplyResult,
+  CommitResult,
+  PreviewResult,
+  ApplyCommandsOptions,
+} from './apply-commands'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'
 // Public engine types expose attach options plus reactive port contracts.
