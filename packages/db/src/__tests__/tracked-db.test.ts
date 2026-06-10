@@ -224,7 +224,12 @@ describe('TrackedDb.transaction', () => {
     await expect(
       tracked.transaction(async (tx) => {
         await tx.into(schema.todos).insert({ title: 'A', done: false })
-        tx.raw.rollback()
+        // Must be awaited: Drizzle's rollback() returns a rejected promise (it
+        // does not throw synchronously). Unawaited, the callback resolves with
+        // undefined and the driver proceeds to COMMIT — the assertions below
+        // would then pass only by a PGlite microtask-ordering accident and
+        // break on a real async driver (postgres.js / node-postgres).
+        await tx.raw.rollback()
       }),
     ).rejects.toThrow()
 
