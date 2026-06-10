@@ -18,5 +18,5 @@ export type {
 } from './dsl'
 export type { FilterOp, FilterDescriptor } from './operators'
 export type { SyncTarget } from './sync'
-export type { TrackedDb, SelectBuilder, InsertBuilder } from './tracked-db'
+export type { TrackedDb, SelectBuilder, InsertBuilder, TransactionOptions } from './tracked-db'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'

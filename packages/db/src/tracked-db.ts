@@ -39,6 +39,43 @@ export interface TrackedDb {
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): SelectBuilder<T>
   into<T extends AnyTable>(table: T): InsertBuilder<T>
+  /**
+   * Run `fn` inside an atomic transaction whose writes still emit reactive Tags.
+   *
+   * `fn` receives a fresh TrackedDb bound to the native transaction handle. On
+   * commit (fn resolves) the inner reads/writes merge into this tracker's sets,
+   * so a successful batch's write Tags flush to invalidation as one set. On
+   * rollback (fn throws, or `tx.raw.rollback()`) the merge is skipped and the
+   * transaction emits nothing.
+   *
+   * This rollback-emits-nothing property is what preview's execute-then-rollback
+   * builds on, but preview is not fully served by this signature alone: rollback
+   * only happens via a throw, which destroys the `R` return channel — a preview
+   * that must roll back *and* return a diff has to smuggle the diff through a
+   * thrown sentinel. The diff-returning preview contract is YW-124's to design;
+   * this primitive only guarantees the atomicity + no-emit-on-rollback floor.
+   *
+   * Atomicity is the lowering's native transaction; this only adds Tag-tracking
+   * over it. Nested transactions flatten: inner Tags merge into their parent
+   * tracker, so only the outermost call's set reaches invalidation.
+   *
+   * `opts` is passed through to the lowering's native transaction. Isolation
+   * level / access mode can only be set at transaction start (not reachable via
+   * `tx.raw` once `fn` runs), so the slot is frozen into the contract now even
+   * though no caller sets it yet — adding it later would break the signature.
+   */
+  transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+}
+
+/**
+ * Lowering-agnostic transaction options, passed through to the native
+ * transaction. Mirrors the subset of Drizzle's PgTransactionConfig that is
+ * portable across SQL dialects; dialect-specific options stay behind subpaths.
+ */
+export interface TransactionOptions {
+  isolationLevel?: 'read uncommitted' | 'read committed' | 'repeatable read' | 'serializable'
+  accessMode?: 'read write' | 'read only'
+  deferrable?: boolean
 }
 
 export class SelectBuilder<T extends AnyTable> {
@@ -163,6 +200,30 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
     },
     into<T extends AnyTable>(table: T) {
       return new InsertBuilder(table, drizzleDb, tracker)
+    },
+    async transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R> {
+      // The lowering owns atomicity: Drizzle's native transaction provides the
+      // tx handle and commits/rolls back. We add Tag-tracking by wrapping that
+      // handle in a fresh TrackedDb. If `fn` throws, calls rollback, or the
+      // COMMIT itself fails, the native transaction rejects this await before
+      // the merge below runs — so a non-committed transaction merges nothing
+      // and emits no Tags. The merge-after-await placement IS the guarantee;
+      // there is deliberately no `committed` flag to drift out of sync.
+      let inner: TrackedDb | undefined
+      const result = await drizzleDb.transaction(async (txHandle: DrizzleDb) => {
+        inner = createTrackedDb(txHandle)
+        return fn(inner)
+      }, opts)
+      // Reached only on commit. Flush the transaction's accumulated Tags up to
+      // the caller's tracker (the call-scope set that reaches invalidation).
+      // tablesRead is merged too (intentional): a tx that reads to compute a
+      // write contributes those reads to the call's read-set, same as a
+      // non-transactional handler would.
+      if (inner) {
+        for (const t of inner.tablesRead) tracker.tablesRead.add(t)
+        for (const t of inner.tablesWritten) tracker.tablesWritten.add(t)
+      }
+      return result
     },
   }
   return tracker
