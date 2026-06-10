@@ -91,7 +91,7 @@ describe('applyCommands — commit mode', () => {
     )
 
     expect(result.mode).toBe('commit')
-    expect(result.commandCount).toBe(2)
+    expect(result.commands).toHaveLength(2)
 
     const { result: todos } = await app.call('listTodos', {})
     const { result: tags } = await app.call('listTags', {})
@@ -143,7 +143,7 @@ describe('applyCommands — commit mode', () => {
       { mode: 'commit' },
     )
 
-    expect(result.commandCount).toBe(2)
+    expect(result.commands).toHaveLength(2)
     const { result: todos } = await app.call('listTodos', {})
     const rows = todos as { id: number; done: boolean }[]
     expect(rows).toHaveLength(1)
@@ -162,11 +162,51 @@ describe('applyCommands — commit mode', () => {
       { mode: 'commit' },
     )
 
-    // results[i] is commands[i]'s handler return — same value app.call surfaces.
+    // results[i].value is commands[i]'s handler return — same value app.call surfaces.
     expect(result.results).toHaveLength(2)
-    const [todoRows, tagRows] = result.results as { title?: string; label?: string }[][]
-    expect(todoRows[0].title).toBe('A')
-    expect(tagRows[0].label).toBe('urgent')
+    const [todo, tag] = result.results
+    expect((todo.value as { title?: string }[])[0].title).toBe('A')
+    expect((tag.value as { label?: string }[])[0].label).toBe('urgent')
+  })
+
+  test('echoes each command id onto its result for nominal correlation', async () => {
+    const result = await applyCommands(
+      app,
+      [
+        { id: 'cmd-todo', path: 'addTodo', args: { id: 1, title: 'A' } },
+        { id: 'cmd-tag', path: 'addTag', args: { id: 1, label: 'urgent' } },
+      ],
+      { mode: 'commit' },
+    )
+
+    // A consumer maps a result back to its command by id, not by array position —
+    // the key the agent retry loops need when a batch is filtered or partly retried.
+    const byId = new Map(result.results.map((r) => [r.id, r.value]))
+    expect((byId.get('cmd-todo') as { title?: string }[])[0].title).toBe('A')
+    expect((byId.get('cmd-tag') as { label?: string }[])[0].label).toBe('urgent')
+  })
+
+  test('a command without an id gets an undefined result id (correlation falls back to order)', async () => {
+    const result = await applyCommands(
+      app,
+      [{ path: 'addTodo', args: { id: 1, title: 'A' } }],
+      { mode: 'commit' },
+    )
+
+    expect(result.results[0].id).toBeUndefined()
+    expect((result.results[0].value as { title?: string }[])[0].title).toBe('A')
+  })
+
+  test('an empty batch is a no-op: empty results, empty tablesWritten, nothing persists', async () => {
+    const result = await applyCommands(app, [], { mode: 'commit' })
+
+    expect(result.mode).toBe('commit')
+    expect(result.commands).toHaveLength(0)
+    expect(result.results).toHaveLength(0)
+    expect(result.tablesWritten.size).toBe(0)
+
+    const { result: todos } = await app.call('listTodos', {})
+    expect(todos as unknown[]).toHaveLength(0)
   })
 })
 
@@ -198,7 +238,6 @@ describe('applyCommands — preview mode', () => {
     )
 
     expect(result.mode).toBe('preview')
-    expect(result.commandCount).toBe(2)
     expect(result.commands).toHaveLength(2)
     // The set reflects what a commit WOULD have flushed.
     expect(result.tablesWritten.has('todos')).toBe(true)
@@ -236,15 +275,42 @@ describe('applyCommands — preview mode', () => {
       ),
     ).rejects.toThrow('command boom')
   })
+
+  test('an empty batch rolls back cleanly and returns an empty result', async () => {
+    const result = await applyCommands(app, [], { mode: 'preview' })
+
+    expect(result.mode).toBe('preview')
+    expect(result.commands).toHaveLength(0)
+    expect(result.results).toHaveLength(0)
+    expect(result.tablesWritten.size).toBe(0)
+  })
 })
 
-describe('applyCommands — back-compat', () => {
-  test('app.call still works alongside the batch engine', async () => {
-    const { result, tablesWritten } = await app.call('addTodo', { id: 1, title: 'Direct' })
-    expect((result as { title: string }[])[0].title).toBe('Direct')
+describe('applyCommands — result is a snapshot', () => {
+  test('mutating the input batch after the call does not mutate result.commands', async () => {
+    const batch = [{ path: 'addTodo', args: { id: 1, title: 'A' } }]
+    const result = await applyCommands(app, batch, { mode: 'commit' })
+
+    // The engine copies the batch (`[...batch]`); a caller reusing its array must
+    // not retroactively alter what the result reports it applied.
+    batch[0] = { path: 'boom', args: {} }
+    expect(result.commands).toHaveLength(1)
+    expect(result.commands[0].path).toBe('addTodo')
+  })
+})
+
+describe('applyCommands — coexists with app.call', () => {
+  test('a commit batch then a plain app.call both land, app state stays clean', async () => {
+    await applyCommands(app, [{ path: 'addTodo', args: { id: 1, title: 'batched' } }], {
+      mode: 'commit',
+    })
+
+    const { result, tablesWritten } = await app.call('addTodo', { id: 2, title: 'direct' })
+    expect((result as { title: string }[])[0].title).toBe('direct')
     expect(tablesWritten.has('todos')).toBe(true)
 
+    // The batch engine left no residual tx open / tracker bleed — both rows persist.
     const { result: todos } = await app.call('listTodos', {})
-    expect(todos as unknown[]).toHaveLength(1)
+    expect(todos as unknown[]).toHaveLength(2)
   })
 })

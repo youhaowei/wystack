@@ -30,6 +30,7 @@ export type {
 export type { WyStackApp } from './create'
 export type {
   Command,
+  CommandResult,
   ApplyResult,
   CommitResult,
   PreviewResult,

@@ -42,30 +42,46 @@ import type { WyStackApp } from './create'
  * The engine needs no special handling for this beyond applying commands in
  * order within one transaction — an earlier insert is visible to a later
  * command because they share the same tx handle.
+ *
+ * `id` is an OPTIONAL client-minted correlation key. The engine treats it as an
+ * opaque token — exactly like `args`, it never parses or interprets it — and
+ * echoes it onto the matching `CommandResult.id`. It exists so a consumer can
+ * map a result back to its command NOMINALLY (by id) rather than POSITIONALLY
+ * (by array index), which matters for agent emit→validate→retry loops where a
+ * batch may be filtered or partially retried and indices shift. Omit it and
+ * correlation falls back to order — `results[i]` still pairs with `commands[i]`.
  */
 export interface Command {
+  id?: string
   path: string
   args: unknown
 }
 
+/**
+ * One command's outcome: its handler return `value` plus the `id` echoed from
+ * the source `Command` (undefined when the command carried none). `value` is
+ * `unknown` because a vocabulary-free engine cannot know handler return types —
+ * the typed vocabulary layer (YW-106/124) narrows it. Same value `app.call`
+ * surfaces as `result`, so a batched command and a plain RPC to the same path
+ * yield the same `value`.
+ */
+export interface CommandResult {
+  id?: string
+  value: unknown
+}
+
 /** Shared shape across both modes: which commands ran and what they touched. */
 interface ApplyResultBase {
-  /** Echo of the batch that was applied, in order. */
+  /** Echo of the batch that was applied, in order. Read `.length` for the count. */
   commands: Command[]
-  /** Number of commands applied — convenience for callers/telemetry. */
-  commandCount: number
   /**
-   * Each command's handler return value, in batch order — `results[i]` is the
-   * return of `commands[i]`. Mirrors what `app.call` surfaces as `result`, so a
-   * batched command and a plain RPC to the same path yield the same value. The
-   * envelope carries no per-command id; array index IS the correlation key
-   * (commands run in order, never reordered). A later vocabulary command that
-   * needs a server-derived value (e.g. a created entity's computed field) reads
-   * it here. Frozen now because adding it post-freeze would break the result
-   * type; an optional `Command.id` correlation key stays additive and is
-   * deferred until a consumer needs index-independent correlation.
+   * Each command's outcome, in batch order — `results[i]` corresponds to
+   * `commands[i]`, and each entry also carries the `id` echoed from its source
+   * `Command` so a consumer can correlate by id instead of by index. A later
+   * vocabulary command that needs a server-derived value (e.g. a created
+   * entity's computed field) reads `results[i].value` here.
    */
-  results: unknown[]
+  results: CommandResult[]
   /**
    * Union of every table written across the batch. In `commit` this is the set
    * the caller flushes to invalidation; in `preview` it is the set that WOULD
@@ -87,8 +103,8 @@ export interface CommitResult extends ApplyResultBase {
  * Result of a preview batch. Nothing persisted and no Tags emitted; the fields
  * describe what the commit WOULD have done. The artifact-grouped diff
  * (directNodes / affectedDownstream with real DuckDB compute) is a higher
- * layer's job (YW-124) — this generic result is intentionally serializable and
- * vocabulary-free.
+ * layer's job (YW-124) — this generic result is intentionally vocabulary-free
+ * (no artifact types leak in; a future wire layer picks its own encoding).
  */
 export interface PreviewResult extends ApplyResultBase {
   mode: 'preview'
@@ -113,7 +129,7 @@ export interface ApplyCommandsOptions {
  */
 class PreviewRollback {
   constructor(
-    public readonly results: unknown[],
+    public readonly results: CommandResult[],
     public readonly tablesWritten: Set<string>,
   ) {}
 }
@@ -130,7 +146,7 @@ class PreviewRollback {
  *     order (subject, payload, options) so the two entry points read alike.
  *   - `ApplyResult` is a discriminated union on `mode`, not a flag, so callers
  *     narrow `CommitResult` vs `PreviewResult` exhaustively.
- *   - The result is generic + serializable (no artifact types): a future
+ *   - The result is generic + vocabulary-free (no artifact types): a future
  *     DashFrame layer wraps it, it does not leak into this primitive.
  */
 export async function applyCommands(
@@ -151,7 +167,7 @@ export async function applyCommands(
     // Apply every command in order inside one transaction. Any throw rolls the
     // whole batch back (including commands applied before the failure) and the
     // tracked-transaction merge is skipped, so nothing flushes to invalidation.
-    let results: unknown[] = []
+    let results: CommandResult[] = []
     await outer.transaction(async (tx) => {
       results = await applyAll(app, batch, tx, context)
     })
@@ -160,8 +176,10 @@ export async function applyCommands(
     // (the inner tx tracker's writes were merged up on commit).
     return {
       mode: 'commit',
-      commands: batch,
-      commandCount: batch.length,
+      // Snapshot the batch — `results`/`tablesWritten` are defensively copied,
+      // so copy `commands` too; otherwise a caller mutating its `batch` array
+      // after the call would silently mutate `result.commands`.
+      commands: [...batch],
       results,
       tablesWritten: new Set(outer.tablesWritten),
     }
@@ -184,8 +202,7 @@ export async function applyCommands(
     if (err instanceof PreviewRollback) {
       return {
         mode: 'preview',
-        commands: batch,
-        commandCount: batch.length,
+        commands: [...batch],
         results: err.results,
         tablesWritten: err.tablesWritten,
       }
@@ -212,10 +229,13 @@ async function applyAll(
   batch: Command[],
   tx: TrackedDb,
   context: Record<string, unknown>,
-): Promise<unknown[]> {
-  const results: unknown[] = []
+): Promise<CommandResult[]> {
+  const results: CommandResult[] = []
   for (const cmd of batch) {
-    results.push(await app.runHandler(cmd.path, cmd.args, tx, context))
+    const value = await app.runHandler(cmd.path, cmd.args, tx, context)
+    // Echo the command's opaque correlation id onto its result; the engine
+    // never interprets it, only carries it from input to output.
+    results.push({ id: cmd.id, value })
   }
   return results
 }

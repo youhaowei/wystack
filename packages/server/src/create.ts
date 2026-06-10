@@ -31,8 +31,14 @@ export interface WyStackApp {
    * batch command and a plain RPC to the same path validate identically. The
    * caller owns the TrackedDb lifecycle (creation, transaction, tracking-set
    * collection); this method only validates args and invokes the handler with
-   * `{ ...context, db: tracked }`. Not exported on the npm surface — it is an
-   * intra-package seam for the engine, not a public API.
+   * `{ ...context, db: tracked }`.
+   *
+   * This is a LOW-LEVEL escape hatch, reachable on the exported `WyStackApp`
+   * type but not part of the intended public API — prefer `applyCommands` or
+   * `call`. Calling it directly bypasses the transaction envelope, so the
+   * caller is responsible for atomicity and invalidation. It exists so the
+   * in-package `applyCommands` engine can dispatch a handler against a supplied
+   * tx-bound tracker; external use is unsupported and may change.
    */
   runHandler: (
     path: string,
@@ -45,8 +51,10 @@ export interface WyStackApp {
    * sets. The seam `applyCommands` uses to obtain an OUTER tracker whose
    * `.transaction(...)` opens one native transaction for a whole command batch.
    * Equivalent to the fresh-per-call tracker `call` builds internally, exposed
-   * so the batch engine can own the transaction lifecycle. Not on the npm
-   * surface — an intra-package seam.
+   * so the batch engine can own the transaction lifecycle.
+   *
+   * Low-level escape hatch like `runHandler` — reachable on the exported type
+   * but not the intended public API; prefer `applyCommands`/`call`.
    */
   createTracked: () => TrackedDb
 }
