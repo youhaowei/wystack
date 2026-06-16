@@ -187,11 +187,9 @@ describe('applyCommands — commit mode', () => {
   })
 
   test('a command without an id gets an undefined result id (correlation falls back to order)', async () => {
-    const result = await applyCommands(
-      app,
-      [{ path: 'addTodo', args: { id: 1, title: 'A' } }],
-      { mode: 'commit' },
-    )
+    const result = await applyCommands(app, [{ path: 'addTodo', args: { id: 1, title: 'A' } }], {
+      mode: 'commit',
+    })
 
     expect(result.results[0].id).toBeUndefined()
     expect((result.results[0].value as { title?: string }[])[0].title).toBe('A')
