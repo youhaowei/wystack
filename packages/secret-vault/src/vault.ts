@@ -41,7 +41,22 @@ export class SecretVault {
     const { name, backend } = this.#registry.getForClass(opts.class)
     const locator = await backend.store(plaintext, opts.locatorHint)
     const ref = makeSecretRef()
-    await this.#mapping.set(ref, { backend: name, locator })
+    try {
+      await this.#mapping.set(ref, { backend: name, locator })
+    } catch (err) {
+      // The plaintext is already in the backend but the ref→locator binding
+      // never persisted, so SecretVault.delete() can never reach it. Roll the
+      // backend write back best-effort to avoid orphaning a live credential.
+      // (The in-memory mapping never throws; persistent stores — SQLite/IPC —
+      // can.) A failed rollback is swallowed: the original mapping error is
+      // the one the caller must see.
+      try {
+        await backend.delete(locator)
+      } catch {
+        // best-effort — surface the original mapping failure below
+      }
+      throw err
+    }
     return ref
   }
 

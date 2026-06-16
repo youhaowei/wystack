@@ -9,6 +9,8 @@ import { SecretRegistry } from '../registry'
 import { InMemoryMappingStore } from '../mapping'
 import { TestBackend } from '../test-backend'
 import { isSecretRef } from '../ref'
+import type { MappingRecord, MappingStore } from '../mapping'
+import type { SecretRef } from '../ref'
 
 // ─── Fixture ─────────────────────────────────────────────────────────────────
 
@@ -220,5 +222,35 @@ describe('read-time resolution follows the mapping record', () => {
 
     expect(backend1.resolveCallCount).toBe(1) // backend-1 handled it
     expect(backend2.resolveCallCount).toBe(0) // backend-2 not consulted
+  })
+})
+
+// ─── store() rolls back the backend write when mapping persistence fails ─────
+
+describe('store() — rollback on mapping failure', () => {
+  test('a failing mapping.set deletes the backend locator instead of orphaning it', async () => {
+    const backend = new TestBackend()
+    const registry = new SecretRegistry()
+    registry.register('only', backend, { fallback: true })
+
+    // A mapping store whose set() always rejects (models a persistent
+    // SQLite/IPC store failing after the backend write succeeded).
+    const failingMapping: MappingStore = {
+      get: async (_ref: SecretRef): Promise<MappingRecord | undefined> => undefined,
+      set: async (): Promise<void> => {
+        throw new Error('disk full')
+      },
+      delete: async (): Promise<void> => {},
+      has: async (): Promise<boolean> => false,
+    }
+
+    const vault = new SecretVault(registry, failingMapping)
+
+    await expect(vault.store('secret', { class: 'connector-key' })).rejects.toThrow('disk full')
+
+    // The backend write must have been rolled back — nothing left behind.
+    // (delete() is best-effort; with TestBackend it fully removes the locator,
+    // so resolveCallCount stays 0 and no presence lingers.)
+    expect(backend.resolveCallCount).toBe(0)
   })
 })

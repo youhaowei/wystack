@@ -49,4 +49,35 @@ describe('InMemoryMappingStore', () => {
     expect((await store.get(ref1))?.locator).toBe('l1')
     expect((await store.get(ref2))?.locator).toBe('l2')
   })
+
+  test('get returns an independent copy — mutating it does not corrupt the store', async () => {
+    const store = new InMemoryMappingStore()
+    const ref = makeSecretRef()
+    await store.set(ref, { backend: 'orig-backend', locator: 'orig-locator' })
+
+    const fetched = await store.get(ref)
+    // MappingRecord is readonly at compile time; a JS caller (or a cast) can
+    // still mutate at runtime. The store must not be reachable through it.
+    ;(fetched as { backend: string; locator: string }).backend = 'hijacked'
+    ;(fetched as { backend: string; locator: string }).locator = 'hijacked'
+
+    const again = await store.get(ref)
+    expect(again?.backend).toBe('orig-backend')
+    expect(again?.locator).toBe('orig-locator')
+  })
+
+  test('set copies the input — mutating the caller object does not corrupt the store', async () => {
+    const store = new InMemoryMappingStore()
+    const ref = makeSecretRef()
+    const input = { backend: 'orig-backend', locator: 'orig-locator' }
+    await store.set(ref, input)
+
+    // Mutate the object the caller passed to set() after the fact.
+    input.backend = 'hijacked'
+    input.locator = 'hijacked'
+
+    const stored = await store.get(ref)
+    expect(stored?.backend).toBe('orig-backend')
+    expect(stored?.locator).toBe('orig-locator')
+  })
 })

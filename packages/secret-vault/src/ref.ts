@@ -12,6 +12,9 @@ export type SecretRef = string & { readonly [__secretRefBrand]: 'SecretRef' }
 
 const PREFIX = 'secret:'
 
+// v4 UUID shape — matches what `crypto.randomUUID()` emits.
+const UUID_V4_RE = /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
+
 /**
  * Mint a new {@link SecretRef} containing a freshly generated v4 UUID.
  * Never reuse UUIDs across refs.
@@ -21,9 +24,11 @@ export function makeSecretRef(): SecretRef {
 }
 
 /**
- * Narrowing guard — returns `true` if `v` is a well-formed SecretRef.
- * Does NOT validate that the ref exists in any store.
+ * Narrowing guard — returns `true` if `v` is a well-formed SecretRef
+ * (the `secret:` prefix followed by a v4 UUID). Does NOT validate that the
+ * ref exists in any store. A malformed suffix (e.g. `secret:not-a-uuid`)
+ * does NOT narrow — boundaries that deserialize refs rely on this.
  */
 export function isSecretRef(v: unknown): v is SecretRef {
-  return typeof v === 'string' && v.startsWith(PREFIX) && v.length > PREFIX.length
+  return typeof v === 'string' && v.startsWith(PREFIX) && UUID_V4_RE.test(v.slice(PREFIX.length))
 }

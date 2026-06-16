@@ -39,11 +39,18 @@ export class InMemoryMappingStore implements MappingStore {
   readonly #store = new Map<SecretRef, MappingRecord>()
 
   async get(ref: SecretRef): Promise<MappingRecord | undefined> {
-    return this.#store.get(ref)
+    // Copy-on-boundary: never hand out the stored reference. A caller that
+    // mutates a fetched record must not corrupt the persisted binding. This
+    // is the reference impl every backing store models, so the invariant
+    // must hold here.
+    const record = this.#store.get(ref)
+    return record ? { ...record } : undefined
   }
 
   async set(ref: SecretRef, record: MappingRecord): Promise<void> {
-    this.#store.set(ref, record)
+    // Copy-on-boundary: store our own copy so later mutation of the caller's
+    // object cannot reach into the store.
+    this.#store.set(ref, { ...record })
   }
 
   async delete(ref: SecretRef): Promise<void> {
