@@ -75,6 +75,13 @@
         "pino-pretty",
       ],
     },
+    "packages/secret-vault": {
+      "name": "@wystack/secret-vault",
+      "version": "0.0.1",
+      "devDependencies": {
+        "typescript": "^5.8.3",
+      },
+    },
     "packages/server": {
       "name": "@wystack/server",
       "version": "0.0.1",
@@ -175,6 +182,8 @@
     "@wystack/db": ["@wystack/db@workspace:packages/db"],
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
+
+    "@wystack/secret-vault": ["@wystack/secret-vault@workspace:packages/secret-vault"],
 
     "@wystack/server": ["@wystack/server@workspace:packages/server"],
 

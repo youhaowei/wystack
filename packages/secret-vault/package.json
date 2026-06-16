@@ -1,0 +1,24 @@
+{
+  "name": "@wystack/secret-vault",
+  "version": "0.0.1",
+  "description": "Secret vault substrate: opaque SecretRef, backend contract, registry, mapping store, and test double — the credential boundary both control and data planes depend on",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
