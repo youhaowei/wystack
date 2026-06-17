@@ -13,10 +13,30 @@ const schema = defineSchema({
   },
 })
 
+// Track every PGlite handle opened in this file so afterEach can close them
+// all. PGlite WASM instances that are never closed accumulate memory and WASM
+// worker threads across tests, which slows down later tests (especially those
+// that sleep 2500ms inside a 5s timeout) and can trigger flaky WASM crashes.
+const pgliteHandles: Array<{ close(): Promise<void> }> = []
+
+/**
+ * Open a fresh in-memory PGlite, register it for cleanup, and return the
+ * Drizzle db handle.  Call this instead of `createDb({ dev: 'pglite://' })`
+ * inside tests so the handle is always paired with a close() in afterEach.
+ */
+async function openTrackedDb() {
+  const db = await createDb({ dev: 'pglite://' })
+  // drizzle-orm/pglite exposes the PGlite client via `$client`.
+  pgliteHandles.push(db.$client as { close(): Promise<void> })
+  return db
+}
+
 // Per-test app factory for auth scenarios — each test creates its own
 // PGlite + createWyStack so resolveContext can vary freely.
+// Returns both the WyStack app and the db handle so callers can close the
+// underlying PGlite instance (via the pgliteHandles registry above).
 async function makeAuthApp() {
-  const db = await createDb({ dev: 'pglite://' })
+  const db = await openTrackedDb()
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -182,7 +202,7 @@ async function openProbeSubscription(
 }
 
 beforeEach(async () => {
-  const db = await createDb({ dev: 'pglite://' })
+  const db = await openTrackedDb()
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,
@@ -212,8 +232,14 @@ beforeEach(async () => {
   baseUrl = `http://localhost:${server.port}`
 })
 
-afterEach(() => {
+afterEach(async () => {
+  // Stop the server first, then drain every PGlite handle that was opened
+  // during this test (both the beforeEach handle and any makeAuthApp() handles).
+  // PGlite.close() is async — not awaiting it leaves WASM workers running and
+  // accumulates memory pressure that flakes later tests.
   server.stop(true)
+  const toClose = pgliteHandles.splice(0)
+  await Promise.allSettled(toClose.map((h) => h.close()))
 })
 
 describe('WsManager', () => {
@@ -472,7 +498,12 @@ describe('WsManager', () => {
     } finally {
       authServer.stop(true)
     }
-  })
+    // Per-test timeout: this test sleeps 2500ms; the bun default 5s is tight on
+    // a loaded CI runner once WASM cold-start is added. Scoped to this test so
+    // other suites in the package keep the default fast-fail bound. (bunfig's
+    // [test].timeout is ignored by bun 1.3.x — the per-test arg is the honored
+    // knob.)
+  }, 15000)
 
   test('re-subscribes on reconnect', async () => {
     let subscribedCount = 0
@@ -734,5 +765,7 @@ describe('WsManager', () => {
     } finally {
       authServer.stop(true)
     }
-  })
+    // Per-test timeout: sleeps 2500ms; see the matching note on the 4001 test
+    // above. Scoped here rather than package-wide via bunfig (which bun ignores).
+  }, 15000)
 })
