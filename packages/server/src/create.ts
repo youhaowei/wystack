@@ -3,7 +3,7 @@
  * reactive subscriptions together into a running app.
  */
 import { createTrackedDb, createDb } from '@wystack/db'
-import type { DbConfig, TrackedDb } from '@wystack/db'
+import type { DbConfig, TrackedDb, DraftTrackedDb } from '@wystack/db'
 import type { FunctionDef, FunctionContext, DbInput } from './types'
 import { createSubscriptionManager } from './subscriptions'
 import { buildArgsSchema, ValidationError } from './validation'
@@ -39,11 +39,18 @@ export interface WyStackApp {
    * caller is responsible for atomicity and invalidation. It exists so the
    * in-package `applyCommands` engine can dispatch a handler against a supplied
    * tx-bound tracker; external use is unsupported and may change.
+   *
+   * `tracked` may also be a `DraftTrackedDb` (a `base.withDraft(draftId)` handle):
+   * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
+   * command handler's writes (`ctx.db.into/update/delete`) into the
+   * `<table>__draft` overlay. Handlers are authored against `TrackedDb` and only
+   * touch the from/into/where/all/insert/update/delete surface both handles
+   * share — so the substitution is transparent to them.
    */
   runHandler: (
     path: string,
     args: unknown,
-    tracked: TrackedDb,
+    tracked: TrackedDb | DraftTrackedDb,
     context?: Record<string, unknown>,
   ) => Promise<unknown>
   /**
@@ -128,11 +135,16 @@ export async function createWyStack(opts: {
     async runHandler(
       path: string,
       args: unknown,
-      tracked: TrackedDb,
+      tracked: TrackedDb | DraftTrackedDb,
       context: Record<string, unknown> = {},
     ) {
       const { fn, validatedArgs } = validateAndGetHandler(path, args)
-      const ctx: FunctionContext = { ...context, db: tracked }
+      // A DraftTrackedDb shares the from/into/where/all/insert/update/delete
+      // surface handlers use; the cast bridges the structural difference in
+      // builder return types (DraftSelectBuilder vs SelectBuilder) that handlers
+      // never observe. The draft handle has no `transaction` (publish owns the
+      // atomic boundary), which a command handler must not call directly.
+      const ctx: FunctionContext = { ...context, db: tracked as TrackedDb }
       return fn.handler(ctx, validatedArgs)
     },
   }
