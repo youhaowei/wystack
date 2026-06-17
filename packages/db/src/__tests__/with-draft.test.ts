@@ -457,8 +457,11 @@ describe('withDraft primary-key detection', () => {
     expect(byId[3]['label']).toBe('initech-new')
   })
 
-  test('throws a clear error for a composite (table-level) primary key', () => {
-    expect(() => tracked.withDraft('dm').from(memberships).all()).toThrow(
+  test('throws a clear error for a composite (table-level) primary key', async () => {
+    // all() is async — the PK-resolution throw surfaces as a rejection, so this
+    // must use `.rejects` (a plain `expect(() => ...).toThrow()` passes
+    // vacuously here, asserting nothing).
+    await expect(tracked.withDraft('dm').from(memberships).all()).rejects.toThrow(
       /composite primary key/i,
     )
   })
