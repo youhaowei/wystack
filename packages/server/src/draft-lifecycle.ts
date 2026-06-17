@@ -109,7 +109,7 @@ interface DraftEntry {
    * via `applyCommands`. Compacted on append (see `compactLog`) so a long
    * add→tweak→delete chain collapses to its net effect.
    */
-  log: Command[]
+  log: DraftCommand[]
   /**
    * The Drizzle table OBJECTS this draft wrote into the shadow, keyed by SQL
    * table name. Detection + teardown need the table object (schema + PK
@@ -136,9 +136,15 @@ export interface DraftLifecycle {
    * Returns the per-command results (same shape as `applyCommands`).
    *
    * NOT atomic across the batch the way `publish` is — append is incremental
-   * draft authoring; the atomic boundary is `publish`.
+   * draft authoring; the atomic boundary is `publish`. On a mid-batch command
+   * failure the throw propagates with the already-applied commands left in the
+   * shadow + log — the conducting app owns recovery (re-append or `discard`).
+   *
+   * `batch` is `DraftCommand[]` so the optional `compactionKey`/`kind` fields
+   * are discoverable at the call site — an app that wants net-effect log
+   * compaction mints those; a plain `Command` (no key) is never compacted.
    */
-  append(draftId: string, batch: Command[]): Promise<CommandResult[]>
+  append(draftId: string, batch: DraftCommand[]): Promise<CommandResult[]>
   /**
    * PUBLISH = replay the ordered command log onto canonical via
    * `applyCommands(app, log, {commit})`, calling `resolve(log)` IMMEDIATELY
@@ -217,18 +223,21 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
     lastByKey.set(cmd.compactionKey, cmd)
   }
 
-  const emitted = new Set<string>()
+  // Emit the survivor at the key's LAST occurrence, not its first. Publish
+  // replays this log IN ORDER, and the client-id invariant (a create must
+  // precede a command referencing it) rides on that order — so the net-effect
+  // command must keep its latest position, not jump back to where the key first
+  // appeared. We detect "last occurrence" by identity: the survivor IS the last
+  // command we stored for that key, so emit only when `cmd === survivor`.
   const out: DraftCommand[] = []
   for (const cmd of log) {
     if (cmd.compactionKey === undefined) {
       out.push(cmd)
       continue
     }
-    if (emitted.has(cmd.compactionKey)) continue
     const survivor = lastByKey.get(cmd.compactionKey)
-    emitted.add(cmd.compactionKey)
     if (survivor === undefined || survivor === CANCELLED) continue
-    out.push(survivor)
+    if (cmd === survivor) out.push(cmd)
   }
   return out
 }
@@ -294,7 +303,7 @@ export function createDraftLifecycle(
         entry.log.push(cmd)
       }
       // Compact the accumulated log to net effect (no-op for keyless commands).
-      entry.log = compactLog(entry.log as DraftCommand[])
+      entry.log = compactLog(entry.log)
       return results
     },
 
@@ -379,6 +388,9 @@ function recordTouchedTables(
       record(table)
       return draftDb.into(table)
     },
+    // Delegate to the underlying draft handle's transaction, which throws the
+    // named "drafts have no per-handler transaction" contract error.
+    transaction: draftDb.transaction.bind(draftDb),
   }
 }
 

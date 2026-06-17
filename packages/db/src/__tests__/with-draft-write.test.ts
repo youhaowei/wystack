@@ -17,6 +17,7 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { pgTable, integer, text as pgText, boolean as pgBoolean } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
 import { createTrackedDb } from '../tracked-db'
 import { eq } from '../operators'
 
@@ -59,8 +60,10 @@ beforeEach(async () => {
 })
 
 async function shadowRows(draftId: string) {
+  // Bound parameter (sql tag) — never string-interpolate a draftId, even in a
+  // test helper (the injection test feeds a DROP TABLE payload through here).
   const res = await db.execute(
-    `SELECT * FROM todos__draft WHERE draft_id = '${draftId}' ORDER BY id`,
+    sql`SELECT * FROM todos__draft WHERE draft_id = ${draftId} ORDER BY id`,
   )
   // PGlite returns { rows }
   // oxlint-disable-next-line typescript/no-explicit-any
@@ -199,7 +202,13 @@ describe('withDraft write — isolation + injection safety', () => {
     const byId = Object.fromEntries(rows.map((r) => [r['id'], r]))
     expect(byId[9]).toBeDefined()
     expect(byId[9]['title']).toBe('safe')
-    // The table still exists and canonical is intact.
+    // The shadow stores exactly one row under the literal evil draftId — proving
+    // the write side bound it too (read back through the parameterized helper).
+    const shadow = await shadowRows(evil)
+    expect(shadow).toHaveLength(1)
+    expect(shadow[0]['id']).toBe(9)
+    // The table still exists (the DROP TABLE payload never executed) and
+    // canonical is intact.
     expect(await tracked.from(todos).all()).toHaveLength(3)
   })
 
@@ -221,5 +230,11 @@ describe('withDraft write — read-path guard preserved', () => {
   test('.orderBy()/.limit() still throw on a draft read builder', () => {
     expect(() => tracked.withDraft('d1').from(todos).orderBy('id')).toThrow('not yet implemented')
     expect(() => tracked.withDraft('d1').from(todos).limit(5)).toThrow('not yet implemented')
+  })
+
+  test('draft handle.transaction() throws a named contract error (publish owns atomicity)', () => {
+    expect(() => tracked.withDraft('d1').transaction(async () => 1)).toThrow(
+      /cannot open its own transaction/,
+    )
   })
 })

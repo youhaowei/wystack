@@ -49,9 +49,13 @@ const drizzleOpMap = {
  * UNMODIFIED when `ctx.db = base.withDraft(draftId)`. The handler is unaware it
  * is writing into a draft.
  *
- * `transaction` is intentionally omitted: a draft's atomic boundary is the
+ * `transaction` is present but THROWS: a draft's atomic boundary is the
  * lifecycle's `publish` (which replays the command log inside `applyCommands`'s
- * tracked tx), not a per-handler transaction.
+ * tracked tx), not a per-handler transaction. It exists (rather than being
+ * omitted) so a command handler that mistakenly opens a transaction inside a
+ * draft fails with a clear named error instead of a cryptic
+ * `undefined is not a function` — the `runHandler` widening erases the
+ * structural difference, so the runtime guard is the only signal.
  */
 export interface DraftTrackedDb {
   tablesRead: Set<string>
@@ -60,6 +64,8 @@ export interface DraftTrackedDb {
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
   into<T extends AnyTable>(table: T): DraftInsertBuilder<T>
+  /** Always throws — drafts have no per-handler transaction (publish owns atomicity). */
+  transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
 export interface TrackedDb {
@@ -736,6 +742,17 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
         },
         into<T extends AnyTable>(table: T) {
           return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle)
+        },
+        transaction<R>(_fn: (tx: TrackedDb) => Promise<R>, _opts?: TransactionOptions): Promise<R> {
+          // A command handler must not open its own transaction inside a draft —
+          // the draft's atomic boundary is the lifecycle's `publish` (one tracked
+          // tx via applyCommands). Fail loud with a named contract message rather
+          // than a cryptic `undefined is not a function` from the runHandler cast.
+          throw new Error(
+            'DraftTrackedDb.transaction() is not supported: a draft handler cannot open its own ' +
+              'transaction — the draft atomic boundary is the lifecycle `publish` (which replays ' +
+              'the command log inside one tracked transaction).',
+          )
         },
       }
       return draftHandle

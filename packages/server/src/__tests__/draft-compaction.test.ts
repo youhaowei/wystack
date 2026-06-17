@@ -40,6 +40,20 @@ describe('compactLog — net-effect collapse', () => {
     expect((out[0].args as { title: string }).title).toBe('b')
   })
 
+  test('survivor is emitted at the key LAST occurrence, not its first (replay order)', () => {
+    // Interleaved keys: X is edited, then Y, then X again. The X survivor must
+    // land at X's LAST position (after Y), because publish replays in order and
+    // the client-id invariant (a create precedes its referrer) rides on it.
+    // A first-occurrence emit would (wrongly) yield [X_v2, Y].
+    const log: DraftCommand[] = [
+      { path: 'renameTodo', args: { id: 1, title: 'X1' }, compactionKey: 'todo:1', kind: 'update' },
+      { path: 'renameTodo', args: { id: 2, title: 'Y' }, compactionKey: 'todo:2', kind: 'update' },
+      { path: 'renameTodo', args: { id: 1, title: 'X2' }, compactionKey: 'todo:1', kind: 'update' },
+    ]
+    const out = compactLog(log)
+    expect(out.map((c) => (c.args as { title: string }).title)).toEqual(['Y', 'X2'])
+  })
+
   test('keyless commands are never compacted and keep their order', () => {
     const log: DraftCommand[] = [
       { path: 'sideEffectA', args: {} },
