@@ -54,7 +54,13 @@ function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<str
     col = col.notNull()
   }
 
-  if (opts.isPrimaryKey && !isSerial) {
+  // Mark the PK primary in Drizzle metadata for BOTH the integer and serial
+  // paths. `serial()` alone does not set the column's `primary` flag, so without
+  // this a serial PK is invisible to PK detection that reads column/table
+  // metadata (e.g. the draft coalesce primitive) — and the generated DDL would
+  // omit PRIMARY KEY. Chaining `.primaryKey()` onto serial keeps its SQL type
+  // (`serial`) while recording the primary-key constraint.
+  if (opts.isPrimaryKey) {
     col = col.primaryKey()
   }
 

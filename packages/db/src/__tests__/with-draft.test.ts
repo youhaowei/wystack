@@ -10,7 +10,16 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { pgTable, integer, text as pgText, boolean as pgBoolean } from 'drizzle-orm/pg-core'
+import {
+  pgTable,
+  pgSchema,
+  integer,
+  serial,
+  timestamp as pgTimestamp,
+  text as pgText,
+  boolean as pgBoolean,
+  primaryKey,
+} from 'drizzle-orm/pg-core'
 import { createTrackedDb, DraftSelectBuilder, SelectBuilder } from '../tracked-db'
 
 // ---------------------------------------------------------------------------
@@ -262,11 +271,15 @@ describe('withDraft tablesRead tracking', () => {
     expect(draftHandle.tablesRead.has('todos')).toBe(true)
   })
 
-  test('tablesRead does not include todos__draft (internal implementation detail)', async () => {
+  test('tablesRead includes both todos AND todos__draft (shadow-table dependency)', async () => {
     await tracked.withDraft('d1').from(todos).all()
-    // The coalesce joins todos__draft internally but we only expose the base table name
-    expect(tracked.tablesRead.has('todos__draft')).toBe(false)
+    // The draft read's result genuinely depends on the shadow table: a write to
+    // todos__draft (publishing tablesWritten={'todos__draft'}) must invalidate
+    // this subscription. That only fires if the shadow table is in tablesRead so
+    // the reactive router's read∩write intersection matches. Recording only the
+    // base table would silently drop draft-edit invalidations.
     expect(tracked.tablesRead.has('todos')).toBe(true)
+    expect(tracked.tablesRead.has('todos__draft')).toBe(true)
   })
 })
 
@@ -295,5 +308,202 @@ describe('withDraft edge cases', () => {
     expect(() =>
       tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'eq', value: 1 }),
     ).toThrow('DraftSelectBuilder.where() is not yet implemented')
+  })
+
+  test('orderBy() throws (fail-loud, not a silent no-op)', () => {
+    expect(() => tracked.withDraft('d1').from(todos).orderBy('id', 'desc')).toThrow(
+      'DraftSelectBuilder.orderBy() is not yet implemented',
+    )
+  })
+
+  test('limit() throws (fail-loud, not a silent no-op)', () => {
+    expect(() => tracked.withDraft('d1').from(todos).limit(10)).toThrow(
+      'DraftSelectBuilder.limit() is not yet implemented',
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 6: Row shape — property name ≠ SQL column name (camelCase ↔ snake_case)
+// ---------------------------------------------------------------------------
+
+// Drizzle property `createdAt` maps to SQL column `created_at`. The coalesce
+// must alias the result back to the PROPERTY KEY so the draft row shape matches
+// canonical from().all() — consumers reading `row.createdAt` must not get undefined.
+const events = pgTable('events', {
+  id: integer('id').primaryKey(),
+  eventName: pgText('event_name').notNull(),
+  createdAt: pgTimestamp('created_at').notNull(),
+})
+
+const eventsDraft = pgTable('events__draft', {
+  draftId: pgText('draft_id').notNull(),
+  id: integer('id').notNull(),
+  eventName: pgText('event_name'),
+  createdAt: pgTimestamp('created_at'),
+  tombstone: pgBoolean('__tombstone').notNull(),
+})
+void eventsDraft
+
+describe('withDraft row shape — property name differs from SQL column name', () => {
+  test('result rows are keyed by Drizzle property name, not SQL column name', async () => {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY,
+        event_name TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL
+      )
+    `)
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS events__draft (
+        draft_id TEXT NOT NULL,
+        id INTEGER NOT NULL,
+        event_name TEXT,
+        created_at TIMESTAMP,
+        __tombstone BOOLEAN NOT NULL,
+        PRIMARY KEY (draft_id, id)
+      )
+    `)
+    await db.execute(`
+      INSERT INTO events (id, event_name, created_at) VALUES
+        (1, 'login', '2026-01-01T00:00:00Z')
+    `)
+    await db.execute(`
+      INSERT INTO events__draft (draft_id, id, event_name, created_at, __tombstone) VALUES
+        ('de', 1, 'login-edited', null, false)
+    `)
+
+    const rows = await tracked.withDraft('de').from(events).all()
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+
+    // Aliased to property key `eventName` / `createdAt`, NOT `event_name` / `created_at`.
+    expect(row['eventName']).toBe('login-edited')
+    expect(row['createdAt']).toBeDefined()
+    expect(row['event_name']).toBeUndefined()
+    expect(row['created_at']).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 7: Primary-key detection — serial PK not named `id`, composite PK throws
+// ---------------------------------------------------------------------------
+
+// A serial integer PK named `tenant_id` (not `id`). schema.ts marks serial PKs
+// primary in Drizzle metadata, so PK detection finds it without an `id` fallback.
+const tenants = pgTable('tenants', {
+  tenantId: serial('tenant_id').primaryKey(),
+  label: pgText('label').notNull(),
+})
+
+const tenantsDraft = pgTable('tenants__draft', {
+  draftId: pgText('draft_id').notNull(),
+  tenantId: integer('tenant_id').notNull(),
+  label: pgText('label'),
+  tombstone: pgBoolean('__tombstone').notNull(),
+})
+void tenantsDraft
+
+// Table-level composite PK via primaryKey({ columns: [...] }) — must throw, not
+// silently coalesce on the wrong single column.
+const memberships = pgTable(
+  'memberships',
+  {
+    userId: integer('user_id').notNull(),
+    groupId: integer('group_id').notNull(),
+    role: pgText('role').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.groupId] })],
+)
+
+describe('withDraft primary-key detection', () => {
+  test('coalesces on a serial PK that is not named `id`', async () => {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tenants (
+        tenant_id SERIAL PRIMARY KEY,
+        label TEXT NOT NULL
+      )
+    `)
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tenants__draft (
+        draft_id TEXT NOT NULL,
+        tenant_id INTEGER NOT NULL,
+        label TEXT,
+        __tombstone BOOLEAN NOT NULL,
+        PRIMARY KEY (draft_id, tenant_id)
+      )
+    `)
+    await db.execute(`
+      INSERT INTO tenants (tenant_id, label) VALUES (1, 'acme'), (2, 'globex')
+    `)
+    await db.execute(`
+      INSERT INTO tenants__draft (draft_id, tenant_id, label, __tombstone) VALUES
+        ('dt', 1, 'acme-edited', false),
+        ('dt', 3, 'initech-new', false)
+    `)
+
+    const rows = await tracked.withDraft('dt').from(tenants).all()
+    const byId = Object.fromEntries(rows.map((r) => [r['tenantId'], r]))
+
+    // Edit wins on tenant_id=1, canonical tenant_id=2 untouched, draft insert id=3.
+    expect(rows).toHaveLength(3)
+    expect(byId[1]['label']).toBe('acme-edited')
+    expect(byId[2]['label']).toBe('globex')
+    expect(byId[3]['label']).toBe('initech-new')
+  })
+
+  test('throws a clear error for a composite (table-level) primary key', () => {
+    expect(() => tracked.withDraft('dm').from(memberships).all()).toThrow(
+      /composite primary key/i,
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 8: Schema-qualified tables (pgSchema('app').table(...))
+// ---------------------------------------------------------------------------
+
+const appSchema = pgSchema('app')
+const accounts = appSchema.table('accounts', {
+  id: integer('id').primaryKey(),
+  owner: pgText('owner').notNull(),
+})
+const accountsDraft = appSchema.table('accounts__draft', {
+  draftId: pgText('draft_id').notNull(),
+  id: integer('id').notNull(),
+  owner: pgText('owner'),
+  tombstone: pgBoolean('__tombstone').notNull(),
+})
+void accountsDraft
+
+describe('withDraft schema-qualified tables', () => {
+  test('coalesce qualifies base + draft relations with the schema', async () => {
+    await db.execute(`CREATE SCHEMA IF NOT EXISTS app`)
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS app.accounts (
+        id INTEGER PRIMARY KEY,
+        owner TEXT NOT NULL
+      )
+    `)
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS app.accounts__draft (
+        draft_id TEXT NOT NULL,
+        id INTEGER NOT NULL,
+        owner TEXT,
+        __tombstone BOOLEAN NOT NULL,
+        PRIMARY KEY (draft_id, id)
+      )
+    `)
+    await db.execute(`INSERT INTO app.accounts (id, owner) VALUES (1, 'root'), (2, 'guest')`)
+    await db.execute(`
+      INSERT INTO app.accounts__draft (draft_id, id, owner, __tombstone) VALUES
+        ('da', 1, 'root-edited', false)
+    `)
+
+    const rows = await tracked.withDraft('da').from(accounts).all()
+    const byId = Object.fromEntries(rows.map((r) => [r['id'], r]))
+    expect(rows).toHaveLength(2)
+    expect(byId[1]['owner']).toBe('root-edited')
+    expect(byId[2]['owner']).toBe('guest')
   })
 })

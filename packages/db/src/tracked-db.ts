@@ -15,6 +15,7 @@ import {
   sql,
 } from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
+import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import { getTableName, getTableColumns } from 'drizzle-orm'
 
@@ -145,52 +146,46 @@ export class SelectBuilder<T extends AnyTable> {
     })
   }
 
-  async all() {
-    this._tracker.tablesRead.add(getTableName(this._table))
+  /**
+   * Build the lowered Drizzle select query (where / orderBy / limit applied).
+   * Single source of truth shared by `all()` and `toSql()` so a future clause
+   * (join, group-by, …) is added once and both paths stay in lockstep — the
+   * byte-identical zero-overhead assertion in `toSql()` only stays meaningful
+   * if it lowers the exact same query `all()` executes.
+   */
+  private _buildSelectQuery() {
     let q = this._db.select().from(this._table)
-
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const conditions = this._buildConditions(columns)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
-
     if (this._orderByCol) {
       const col = columns[this._orderByCol]
       if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
       q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
     }
-
     if (this._limitVal !== undefined) {
       q = q.limit(this._limitVal)
     }
-
     return q
+  }
+
+  async all() {
+    this._tracker.tablesRead.add(getTableName(this._table))
+    return this._buildSelectQuery()
   }
 
   /**
    * Return the lowered SQL without executing. Used in tests to assert that the
    * canonical read path generates byte-identical SQL when no draft is active —
-   * i.e., zero-overhead is structural, not conditional.
+   * i.e., zero-overhead is structural, not conditional. Builds via the same
+   * `_buildSelectQuery()` as `all()`; the only difference is the missing
+   * `tablesRead` side-effect and the final `.toSQL()` instead of execute.
    */
   toSql() {
-    let q = this._db.select().from(this._table)
-    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
-    const conditions = this._buildConditions(columns)
-    if (conditions.length > 0) {
-      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
-    }
-    if (this._orderByCol) {
-      const col = columns[this._orderByCol]
-      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
-      q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
-    }
-    if (this._limitVal !== undefined) {
-      q = q.limit(this._limitVal)
-    }
-    return q.toSQL()
+    return this._buildSelectQuery().toSQL()
   }
 
   async first() {
@@ -233,9 +228,13 @@ export class SelectBuilder<T extends AnyTable> {
  * The draft table name is derived automatically: `<base_table>__draft`.
  * No application-specific mapping is required.
  *
- * `where()`, `orderBy()`, and `limit()` are accepted for API symmetry with
- * `SelectBuilder` but are NOT yet applied inside the coalesce SQL.
- * TODO: where/orderBy/limit not yet applied inside draft coalesce (YW-120 scope is the primitive only)
+ * `where()`, `orderBy()`, and `limit()` exist on this builder for type-shape
+ * symmetry with `SelectBuilder`, but they THROW when called — they are NOT
+ * silently accepted no-ops. This is deliberate fail-loud behavior: a caller
+ * must not believe a draft read was filtered (especially for auth/authz) when
+ * the coalesce SQL applied no filter. Pushing these clauses down into the
+ * coalesce SQL is out of YW-120 scope (the primitive only); until then, the
+ * only safe shape is `.from(table).all()`.
  */
 export class DraftSelectBuilder<T extends AnyTable> {
   private _table: T
@@ -272,30 +271,88 @@ export class DraftSelectBuilder<T extends AnyTable> {
     )
   }
 
+  /**
+   * Resolve the single PK column's SQL name from the table's full Drizzle
+   * config, covering all the ways a PK is declared:
+   *   - inline `.primaryKey()`         → column-level `.primary === true`
+   *   - serial PKs (defineSchema)      → marked primary in schema.ts, so also column-level
+   *   - table-level `primaryKey({...})` → only visible in `config.primaryKeys`
+   *   - no explicit PK                 → fall back to a column literally named `id`
+   *
+   * Composite PKs (2+ columns) are unsupported — the coalesce join is single-key
+   * — so we throw a clear error rather than silently joining on the wrong column.
+   */
+  private _resolvePkColumnName(): string {
+    const config = getTableConfig(this._table)
+    const tableName = getTableName(this._table)
+
+    // Table-level primaryKey({ columns: [...] }) — authoritative when present.
+    if (config.primaryKeys.length > 0) {
+      const pk = config.primaryKeys[0]
+      if (pk.columns.length > 1) {
+        throw new Error(
+          `DraftSelectBuilder: table "${tableName}" has a composite primary key ` +
+            `(${pk.columns.map((c) => c.name).join(', ')}). Composite PKs are not supported ` +
+            `by the draft coalesce primitive.`,
+        )
+      }
+      return pk.columns[0].name
+    }
+
+    // Inline column-level .primaryKey() (and serial PKs, which schema.ts marks primary).
+    const inlinePks = config.columns.filter((c) => c.primary === true)
+    if (inlinePks.length > 1) {
+      throw new Error(
+        `DraftSelectBuilder: table "${tableName}" has multiple primary-key columns ` +
+          `(${inlinePks.map((c) => c.name).join(', ')}). Composite PKs are not supported ` +
+          `by the draft coalesce primitive.`,
+      )
+    }
+    if (inlinePks.length === 1) return inlinePks[0].name
+
+    // Last resort: a column whose SQL name is literally "id".
+    const idCol = config.columns.find((c) => c.name === 'id')
+    if (idCol) return idCol.name
+
+    throw new Error(
+      `DraftSelectBuilder: table "${tableName}" has no primary key column and no column named "id". ` +
+        `Cannot build draft coalesce query.`,
+    )
+  }
+
   async all(): Promise<Record<string, unknown>[]> {
     const tableName = getTableName(this._table)
+    const draftTableName = `${tableName}__draft`
+
+    // Record the base table read AND the shadow-table read. The draft read's
+    // result genuinely depends on `<table>__draft`: a write to it (e.g.
+    // `into(todosDraft).insert(...)` publishing tablesWritten={'todos__draft'})
+    // must invalidate this subscription, which only happens if the shadow table
+    // is in tablesRead so the reactive router's read∩write intersection fires.
     this._tracker.tablesRead.add(tableName)
+    this._tracker.tablesRead.add(draftTableName)
 
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
-    const colValues = Object.values(columns)
+    const colEntries = Object.entries(columns)
 
-    // Determine the primary key column (single pass: prefer explicit pk, fall back to 'id').
-    // `col.primary` is the PgColumn flag set by `.primaryKey()` in drizzle-orm/pg-core.
-    const pkCol =
-      colValues.find((c) => c.primary === true) ??
-      colValues.find((c) => (c.name as string) === 'id')
-    if (!pkCol) {
-      throw new Error(
-        `DraftSelectBuilder: table "${tableName}" has no primary key column and no column named "id". ` +
-          `Cannot build draft coalesce query.`,
-      )
-    }
-    const pkColName = pkCol.name as string
+    const pkColName = this._resolvePkColumnName()
 
-    const draftTableName = `${tableName}__draft`
+    // Schema-qualify both relations when the table lives outside the default
+    // schema (pgSchema('app').table(...)). Canonical Drizzle selects emit the
+    // schema prefix; the raw coalesce SQL must match or it reads the wrong
+    // relation / fails with relation-not-found.
+    const schema = getTableConfig(this._table).schema
+    const baseRel = schema ? `"${schema}"."${tableName}"` : `"${tableName}"`
+    const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
 
-    // Build: COALESCE(d."col", b."col") AS "col" for every base-table column.
+    // Build: COALESCE(d."sql_col", b."sql_col") AS "propertyKey" for every column.
+    //
+    // The JOIN/COALESCE operate on the SQL column name (col.name), but the
+    // result is aliased to the Drizzle PROPERTY KEY so the returned row shape is
+    // byte-identical to canonical `from().all()`. Without this, a column like
+    // `createdAt: timestamp('created_at')` would come back as `created_at` and
+    // consumers reading `row.createdAt` would see undefined.
     //
     // Storage convention (load-bearing): NULL in a draft shadow column means
     // "no override for this column" — NOT "set this column to NULL". Setting a
@@ -304,10 +361,10 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // This convention must be enforced by the schema (shadow columns default to NULL,
     // tombstone = true captures deletes). Column-drift (base schema evolves under an
     // old draft) is out of scope — see PR body.
-    const colSelects = colValues
-      .map((col) => {
+    const colSelects = colEntries
+      .map(([propKey, col]) => {
         const sqlName = col.name as string
-        return `COALESCE(d."${sqlName}", b."${sqlName}") AS "${sqlName}"`
+        return `COALESCE(d."${sqlName}", b."${sqlName}") AS "${propKey}"`
       })
       .join(', ')
 
@@ -323,8 +380,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // that hazard by restricting the right side to exactly this draft's rows.
     const prefix = sql.raw(
       `SELECT ${colSelects} ` +
-        `FROM "${tableName}" b ` +
-        `FULL OUTER JOIN (SELECT * FROM "${draftTableName}" WHERE "draft_id" = `,
+        `FROM ${baseRel} b ` +
+        `FULL OUTER JOIN (SELECT * FROM ${draftRel} WHERE "draft_id" = `,
     )
     const suffix = sql.raw(
       `) d ON b."${pkColName}" = d."${pkColName}" ` +
@@ -335,9 +392,35 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const query = sql`${prefix}${this._draftId}${suffix}`
 
     const result = await this._db.execute(query)
-    // db.execute returns { rows: [...], fields: [...], affectedRows: number }
+    return normalizeExecuteRows(result)
+  }
+}
+
+/**
+ * Normalize a raw `db.execute(sql)` result to a plain row array across drivers.
+ *
+ * The two drivers this package supports return DIFFERENT shapes from a raw
+ * `.execute()`:
+ *   - PGlite (drizzle-orm/pglite): a `{ rows, fields, affectedRows }` object —
+ *     rows live under `.rows`.
+ *   - postgres-js (drizzle-orm/postgres-js, the production path in `createDb`):
+ *     the result IS the row list (a postgres.js `RowList`, an Array subclass) —
+ *     there is no `.rows` wrapper, so `(result as {rows}).rows` is `undefined`.
+ *
+ * This normalizer is the production-correctness fix: prefer `.rows` when the
+ * driver wraps, otherwise treat an array-shaped result as the rows directly.
+ */
+function normalizeExecuteRows(result: unknown): Record<string, unknown>[] {
+  if (Array.isArray(result)) {
+    return result as Record<string, unknown>[]
+  }
+  if (result && typeof result === 'object' && 'rows' in result) {
     return (result as { rows: Record<string, unknown>[] }).rows
   }
+  throw new Error(
+    'DraftSelectBuilder: unexpected db.execute() result shape — expected an array of rows ' +
+      '(postgres-js) or a { rows } object (PGlite).',
+  )
 }
 
 export class InsertBuilder<T extends AnyTable> {
