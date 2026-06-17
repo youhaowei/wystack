@@ -79,4 +79,15 @@ describe('compactLog — net-effect collapse', () => {
     ]
     expect(compactLog(log)).toEqual(log)
   })
+
+  test('create → delete → create REOPENS the key (the second create survives)', () => {
+    const log: DraftCommand[] = [
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      { path: 'addTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'create' },
+    ]
+    const out = compactLog(log)
+    expect(out).toHaveLength(1)
+    expect((out[0].args as { title: string }).title).toBe('b')
+  })
 })

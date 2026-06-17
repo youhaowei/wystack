@@ -208,6 +208,9 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
   // Last-write-wins per key, with create+delete cancellation.
   const lastByKey = new Map<string, DraftCommand>()
   const createdKeys = new Set<string>()
+  // Keys whose create was cancelled by a delete within this draft — both the
+  // create and the delete are dropped (the row never existed canonically).
+  const cancelledKeys = new Set<string>()
   for (const cmd of log) {
     if (cmd.compactionKey === undefined) continue
     if (cmd.kind === 'create') createdKeys.add(cmd.compactionKey)
@@ -216,10 +219,12 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
       // canonically, so neither command should publish. Drop the whole history.
       lastByKey.delete(cmd.compactionKey)
       createdKeys.delete(cmd.compactionKey)
-      // Mark as cancelled so we also skip it in the emit pass below.
-      lastByKey.set(cmd.compactionKey, CANCELLED)
+      cancelledKeys.add(cmd.compactionKey)
       continue
     }
+    // A later non-cancelling command for a previously-cancelled key reopens it
+    // (e.g. create→delete→create): clear the cancellation and let it survive.
+    cancelledKeys.delete(cmd.compactionKey)
     lastByKey.set(cmd.compactionKey, cmd)
   }
 
@@ -235,15 +240,13 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
       out.push(cmd)
       continue
     }
+    if (cancelledKeys.has(cmd.compactionKey)) continue
     const survivor = lastByKey.get(cmd.compactionKey)
-    if (survivor === undefined || survivor === CANCELLED) continue
+    if (survivor === undefined) continue
     if (cmd === survivor) out.push(cmd)
   }
   return out
 }
-
-/** Sentinel marking a compaction key whose create was cancelled by a delete. */
-const CANCELLED = Symbol('cancelled') as unknown as DraftCommand
 
 let draftCounter = 0
 function mintDraftId(): string {
@@ -317,10 +320,18 @@ export function createDraftLifecycle(
         mode: 'commit',
         context: entry.context,
       })) as CommitResult
-      // Published — tear down the draft's shadow + registry. The host flushes
-      // `result.tablesWritten` to invalidation (lifecycle does not, by design).
-      await clearShadow(app, draftId, [...entry.touchedTables.values()])
+      // Forget the draft BEFORE teardown. The canonical commit has already
+      // landed durably; deleting the registry entry first makes publish
+      // idempotent-on-retry — if `clearShadow` then throws (transient connection
+      // error), a caller that retries `publish(draftId)` hits "unknown draft"
+      // rather than re-replaying the whole log against canonical (a
+      // double-publish). The leftover shadow rows are inert (no live draft reads
+      // them) and the host can sweep them later; re-applying the log would not be.
+      const touched = [...entry.touchedTables.values()]
       drafts.delete(draftId)
+      // Best-effort teardown. The host flushes `result.tablesWritten` to
+      // invalidation (lifecycle does not, by design).
+      await clearShadow(app, draftId, touched)
       return result
     },
 
