@@ -309,10 +309,13 @@ describe('withDraft edge cases', () => {
     expect(rows).toHaveLength(3)
   })
 
-  test('where() throws to prevent silent auth/authz bypass', () => {
-    expect(() =>
-      tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'eq', value: 1 }),
-    ).toThrow('DraftSelectBuilder.where() is not yet implemented')
+  test('where() then all() throws to prevent silent auth/authz bypass', async () => {
+    // YW-121 made `where()` valid (it pins the PK for the write path), but a
+    // FILTERED READ is still unsupported — the coalesce does not push `where`
+    // down — so `.where().all()` throws rather than silently returning every row.
+    await expect(
+      tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'eq', value: 1 }).all(),
+    ).rejects.toThrow(/after .where.* is not supported|does not apply row filters/)
   })
 
   test('orderBy() throws (fail-loud, not a silent no-op)', () => {

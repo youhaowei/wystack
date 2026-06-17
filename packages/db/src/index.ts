@@ -3,7 +3,7 @@
 
 export { defineSchema } from './schema'
 export { createDb } from './driver'
-export { createTrackedDb, resetTracking } from './tracked-db'
+export { createTrackedDb, resetTracking, resolvePkColumnName } from './tracked-db'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
@@ -24,6 +24,7 @@ export type {
   SelectBuilder,
   DraftSelectBuilder,
   InsertBuilder,
+  DraftInsertBuilder,
   TransactionOptions,
 } from './tracked-db'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'
