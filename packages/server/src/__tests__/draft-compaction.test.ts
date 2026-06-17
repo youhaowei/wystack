@@ -80,6 +80,29 @@ describe('compactLog — net-effect collapse', () => {
     expect(compactLog(log)).toEqual(log)
   })
 
+  test('create + update keeps BOTH (create then update) so publish inserts then edits', () => {
+    // A create followed by an update of the SAME key must NOT collapse to the
+    // update alone — that update would UPDATE a row that does not exist in
+    // canonical yet, silently dropping the created item. Keep the create + the
+    // last update, in order.
+    const log: DraftCommand[] = [
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
+      { path: 'renameTodo', args: { id: 1, title: 'c' }, compactionKey: 'todo:1', kind: 'update' },
+    ]
+    const out = compactLog(log)
+    expect(out.map((c) => c.kind)).toEqual(['create', 'update'])
+    expect((out[1].args as { title: string }).title).toBe('c') // last update wins
+  })
+
+  test('delete of a canonical row supersedes prior updates of the same key', () => {
+    const log: DraftCommand[] = [
+      { path: 'renameTodo', args: { id: 9, title: 'x' }, compactionKey: 'todo:9', kind: 'update' },
+      { path: 'removeTodo', args: { id: 9 }, compactionKey: 'todo:9', kind: 'delete' },
+    ]
+    expect(compactLog(log).map((c) => c.kind)).toEqual(['delete'])
+  })
+
   test('create → delete → create REOPENS the key (the second create survives)', () => {
     const log: DraftCommand[] = [
       { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },

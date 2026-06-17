@@ -195,55 +195,74 @@ export interface DraftCommand extends Command {
 }
 
 /**
- * Compact the log: collapse runs that share a `compactionKey` to net effect.
- *   - create then delete (same key)      → both removed (never existed)
- *   - create/update then update (same key) → the LATER kept, earlier dropped
- *   - delete then anything (same key)      → later kept
- * Commands with no `compactionKey` are never compacted and keep their order.
+ * Compact the log to net effect, per `compactionKey`. The collapse is
+ * deliberately CONSERVATIVE — it never fuses commands of different `kind`,
+ * because the lifecycle is generic: it cannot merge an `addTodo` and a
+ * `renameTodo` into one command without artifact knowledge. Per key:
  *
- * Ordering is preserved by anchoring each key's surviving command at the
- * position of the key's LAST occurrence (its net effect happens "last").
+ *   - **create + delete** (delete after a live create) → BOTH dropped: the row
+ *     never existed canonically, so neither should publish.
+ *   - **redundant updates** (a run of `kind:'update'`) → only the LAST survives
+ *     (a SQL `UPDATE` is idempotent on the final value).
+ *   - **create + later update(s)** → the create is KEPT (so publish inserts the
+ *     row) AND the last update is kept (so publish applies the final edit), in
+ *     order. The create is NOT replaced by the update — replacing it would make
+ *     publish `UPDATE` a row that does not exist in canonical yet, silently
+ *     dropping a created-then-edited item.
+ *   - **delete of a canonical row** (no prior create) → kept.
+ *
+ * Commands with no `compactionKey`, or no `kind`, are never compacted and keep
+ * their position. Surviving commands keep their original relative ORDER (publish
+ * replays in order; the client-id invariant — a create precedes its referrer —
+ * rides on that).
  */
 export function compactLog(log: DraftCommand[]): DraftCommand[] {
-  // Last-write-wins per key, with create+delete cancellation.
-  const lastByKey = new Map<string, DraftCommand>()
-  const createdKeys = new Set<string>()
-  // Keys whose create was cancelled by a delete within this draft — both the
-  // create and the delete are dropped (the row never existed canonically).
-  const cancelledKeys = new Set<string>()
+  // For each key, decide which ORIGINAL command instances survive. We keep
+  // instances by identity so the emit pass can preserve order trivially.
+  const survivingCreate = new Map<string, DraftCommand>()
+  const lastUpdate = new Map<string, DraftCommand>()
+  const survivingDelete = new Map<string, DraftCommand>()
+
   for (const cmd of log) {
-    if (cmd.compactionKey === undefined) continue
-    if (cmd.kind === 'create') createdKeys.add(cmd.compactionKey)
-    if (cmd.kind === 'delete' && createdKeys.has(cmd.compactionKey)) {
-      // A delete cancelling a create within this draft: the row never existed
-      // canonically, so neither command should publish. Drop the whole history.
-      lastByKey.delete(cmd.compactionKey)
-      createdKeys.delete(cmd.compactionKey)
-      cancelledKeys.add(cmd.compactionKey)
-      continue
+    const key = cmd.compactionKey
+    if (key === undefined || cmd.kind === undefined) continue
+    if (cmd.kind === 'create') {
+      // (Re)open the key: a create after a delete revives it; clear stale update/delete.
+      survivingCreate.set(key, cmd)
+      lastUpdate.delete(key)
+      survivingDelete.delete(key)
+    } else if (cmd.kind === 'update') {
+      lastUpdate.set(key, cmd)
+    } else {
+      // delete
+      if (survivingCreate.has(key)) {
+        // Cancels a live create — the row never existed canonically. Drop all.
+        survivingCreate.delete(key)
+        lastUpdate.delete(key)
+        survivingDelete.delete(key)
+      } else {
+        // Delete of a canonical row: it wins, and supersedes any prior updates.
+        lastUpdate.delete(key)
+        survivingDelete.set(key, cmd)
+      }
     }
-    // A later non-cancelling command for a previously-cancelled key reopens it
-    // (e.g. create→delete→create): clear the cancellation and let it survive.
-    cancelledKeys.delete(cmd.compactionKey)
-    lastByKey.set(cmd.compactionKey, cmd)
   }
 
-  // Emit the survivor at the key's LAST occurrence, not its first. Publish
-  // replays this log IN ORDER, and the client-id invariant (a create must
-  // precede a command referencing it) rides on that order — so the net-effect
-  // command must keep its latest position, not jump back to where the key first
-  // appeared. We detect "last occurrence" by identity: the survivor IS the last
-  // command we stored for that key, so emit only when `cmd === survivor`.
+  // A command instance survives iff it is one of the kept instances for its key.
+  const survivors = new Set<DraftCommand>()
+  for (const m of [survivingCreate, lastUpdate, survivingDelete]) {
+    for (const cmd of m.values()) survivors.add(cmd)
+  }
+
+  // Emit in original order. Keyless / kindless commands always pass through;
+  // keyed-and-kinded ones only if they are a surviving instance.
   const out: DraftCommand[] = []
   for (const cmd of log) {
-    if (cmd.compactionKey === undefined) {
+    if (cmd.compactionKey === undefined || cmd.kind === undefined) {
       out.push(cmd)
       continue
     }
-    if (cancelledKeys.has(cmd.compactionKey)) continue
-    const survivor = lastByKey.get(cmd.compactionKey)
-    if (survivor === undefined) continue
-    if (cmd === survivor) out.push(cmd)
+    if (survivors.has(cmd)) out.push(cmd)
   }
   return out
 }
@@ -253,6 +272,27 @@ function mintDraftId(): string {
   // Monotonic + random suffix: unique within a process without a uuid dep.
   draftCounter += 1
   return `draft_${Date.now().toString(36)}_${draftCounter.toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+/**
+ * Deep-copy a command for the publish log so a later mutation of the caller's
+ * batch/args cannot change what `publish` replays. `args` is opaque JSON-shaped
+ * data (it crosses the RPC boundary), so `structuredClone` is the correct,
+ * reference-breaking copy; the lifecycle never interprets `args`.
+ */
+function snapshotCommand(cmd: DraftCommand): DraftCommand {
+  return {
+    ...cmd,
+    args: cmd.args === undefined ? cmd.args : structuredClone(cmd.args),
+  }
+}
+
+/** Schema-qualified table key (`schema.table` or bare `table`) — disambiguates
+ * same-named tables in different schemas in the touched-tables map. */
+function qualifiedTableKey(table: AnyTable): string {
+  const name = getTableName(table)
+  const schema = getTableConfig(table).schema
+  return schema ? `${schema}.${name}` : name
 }
 
 /**
@@ -303,7 +343,12 @@ export function createDraftLifecycle(
       for (const cmd of batch) {
         const value = await app.runHandler(cmd.path, cmd.args, draftDb, entry.context)
         results.push({ id: cmd.id, value })
-        entry.log.push(cmd)
+        // Snapshot the command before storing it in the log. The log is the
+        // publish unit (replayed verbatim later); storing the caller's object by
+        // reference would let a post-append mutation of the batch or its `args`
+        // silently change what `publish` replays — diverging the canonical
+        // commit from the draft preview that was executed here.
+        entry.log.push(snapshotCommand(cmd))
       }
       // Compact the accumulated log to net effect (no-op for keyless commands).
       entry.log = compactLog(entry.log)
@@ -385,7 +430,11 @@ function recordTouchedTables(
   touchedTables: Map<string, AnyTable>,
 ): DraftTrackedDb {
   const record = (table: AnyTable) => {
-    touchedTables.set(getTableName(table), table)
+    // Key by SCHEMA-QUALIFIED name. A bare `getTableName` would collide
+    // `app.accounts` with `audit.accounts` (same base name, different schema),
+    // so the later record would drop the earlier table object — leaving one
+    // shadow uncleaned + one set of cells invisible to conflict detection.
+    touchedTables.set(qualifiedTableKey(table), table)
   }
   return {
     tablesRead: draftDb.tablesRead,

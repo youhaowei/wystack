@@ -461,6 +461,20 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const result = await this._db.execute(query)
     return normalizeExecuteRows(result)
   }
+
+  /**
+   * Coalesced first-row read. Mirrors `SelectBuilder.first()` so an UNMODIFIED
+   * handler that calls `ctx.db.from(table).first()` works inside a draft instead
+   * of throwing on a missing method (the `runHandler` widening hides the
+   * structural gap from the typechecker). Since the draft coalesce cannot push
+   * `where`/`limit` down (YW-120 scope), this returns the first row of the FULL
+   * coalesced set in PK order — the same row `SelectBuilder.first()` (which
+   * limits to 1, unfiltered) would return on the canonical path.
+   */
+  async first(): Promise<Record<string, unknown> | null> {
+    const rows = await this.all()
+    return rows[0] ?? null
+  }
 }
 
 /**

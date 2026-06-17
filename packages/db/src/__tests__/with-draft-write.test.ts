@@ -237,4 +237,12 @@ describe('withDraft write — read-path guard preserved', () => {
       /cannot open its own transaction/,
     )
   })
+
+  test('draft from().first() returns the first coalesced row (unmodified handlers can call it)', async () => {
+    // A draft insert of id=4 + canonical 1,2,3 → first() returns id=1 (pk order).
+    await tracked.withDraft('d1').into(todos).insert({ id: 4, title: 'date', done: false })
+    const row = await tracked.withDraft('d1').from(todos).first()
+    expect(row).not.toBeNull()
+    expect((row as { id: number }).id).toBe(1)
+  })
 })
