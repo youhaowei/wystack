@@ -217,22 +217,25 @@ export interface DraftCommand extends Command {
  * rides on that).
  */
 export function compactLog(log: DraftCommand[]): DraftCommand[] {
-  // For each key, decide which ORIGINAL command instances survive. We keep
-  // instances by identity so the emit pass can preserve order trivially.
-  const survivingCreate = new Map<string, DraftCommand>()
-  const lastUpdate = new Map<string, DraftCommand>()
-  const survivingDelete = new Map<string, DraftCommand>()
+  // For each key, decide which command POSITIONS (indices) survive. Tracking
+  // indices — not object identity — makes the emit pass robust to the same
+  // command object reference appearing multiple times in `log`: each surviving
+  // role resolves to exactly one position, so no duplicate is emitted.
+  const survivingCreate = new Map<string, number>()
+  const lastUpdate = new Map<string, number>()
+  const survivingDelete = new Map<string, number>()
 
-  for (const cmd of log) {
+  for (let i = 0; i < log.length; i++) {
+    const cmd = log[i]
     const key = cmd.compactionKey
     if (key === undefined || cmd.kind === undefined) continue
     if (cmd.kind === 'create') {
       // (Re)open the key: a create after a delete revives it; clear stale update/delete.
-      survivingCreate.set(key, cmd)
+      survivingCreate.set(key, i)
       lastUpdate.delete(key)
       survivingDelete.delete(key)
     } else if (cmd.kind === 'update') {
-      lastUpdate.set(key, cmd)
+      lastUpdate.set(key, i)
     } else {
       // delete
       if (survivingCreate.has(key)) {
@@ -243,26 +246,27 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
       } else {
         // Delete of a canonical row: it wins, and supersedes any prior updates.
         lastUpdate.delete(key)
-        survivingDelete.set(key, cmd)
+        survivingDelete.set(key, i)
       }
     }
   }
 
-  // A command instance survives iff it is one of the kept instances for its key.
-  const survivors = new Set<DraftCommand>()
+  // A position survives iff it is one of the kept positions for its key.
+  const survivingIndices = new Set<number>()
   for (const m of [survivingCreate, lastUpdate, survivingDelete]) {
-    for (const cmd of m.values()) survivors.add(cmd)
+    for (const idx of m.values()) survivingIndices.add(idx)
   }
 
   // Emit in original order. Keyless / kindless commands always pass through;
-  // keyed-and-kinded ones only if they are a surviving instance.
+  // keyed-and-kinded ones only at a surviving position.
   const out: DraftCommand[] = []
-  for (const cmd of log) {
+  for (let i = 0; i < log.length; i++) {
+    const cmd = log[i]
     if (cmd.compactionKey === undefined || cmd.kind === undefined) {
       out.push(cmd)
       continue
     }
-    if (survivors.has(cmd)) out.push(cmd)
+    if (survivingIndices.has(i)) out.push(cmd)
   }
   return out
 }
@@ -333,8 +337,8 @@ export function createDraftLifecycle(
       const entry = require(draftId)
       // Route writes through the draft handle so `ctx.db.into/update/delete`
       // lands in the `<table>__draft` overlay. The recording wrapper captures
-      // the Drizzle table OBJECTS written, keyed by SQL name, so detection +
-      // teardown can introspect schema/PK without a global schema registry.
+      // the Drizzle table OBJECTS written, keyed by schema-qualified name, so
+      // detection + teardown can introspect schema/PK without a global schema registry.
       const draftDb: DraftTrackedDb = recordTouchedTables(
         app.createTracked().withDraft(draftId),
         entry.touchedTables,
@@ -374,9 +378,19 @@ export function createDraftLifecycle(
       // them) and the host can sweep them later; re-applying the log would not be.
       const touched = [...entry.touchedTables.values()]
       drafts.delete(draftId)
-      // Best-effort teardown. The host flushes `result.tablesWritten` to
-      // invalidation (lifecycle does not, by design).
-      await clearShadow(app, draftId, touched)
+      // Best-effort teardown — never flip a logically-successful publish to a
+      // failure. The canonical commit is already durable and the draft is
+      // already forgotten; if shadow cleanup throws (transient connection
+      // error), the leftover rows are inert (no live draft reads them) and the
+      // host can sweep them later. Swallowing here means a caller's `publish`
+      // resolves with the real CommitResult instead of an error for work that
+      // actually committed. The host flushes `result.tablesWritten` to
+      // invalidation (the lifecycle does not, by design).
+      try {
+        await clearShadow(app, draftId, touched)
+      } catch {
+        // Orphaned shadow rows only; intentionally non-fatal.
+      }
       return result
     },
 

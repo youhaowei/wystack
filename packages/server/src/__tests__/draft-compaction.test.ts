@@ -54,6 +54,20 @@ describe('compactLog — net-effect collapse', () => {
     expect(out.map((c) => (c.args as { title: string }).title)).toEqual(['Y', 'X2'])
   })
 
+  test('a repeated command object reference is emitted at most once per surviving role', () => {
+    // compactLog is exported/public; a caller could hand it an array where the
+    // SAME object reference appears twice. Position-based (not identity-based)
+    // survivor tracking must still emit the key exactly once.
+    const dup: DraftCommand = {
+      path: 'renameTodo',
+      args: { id: 1, title: 'x' },
+      compactionKey: 'todo:1',
+      kind: 'update',
+    }
+    const out = compactLog([dup, dup])
+    expect(out).toHaveLength(1)
+  })
+
   test('keyless commands are never compacted and keep their order', () => {
     const log: DraftCommand[] = [
       { path: 'sideEffectA', args: {} },
