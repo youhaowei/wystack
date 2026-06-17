@@ -20,7 +20,12 @@ import {
   boolean as pgBoolean,
   primaryKey,
 } from 'drizzle-orm/pg-core'
-import { createTrackedDb, DraftSelectBuilder, SelectBuilder } from '../tracked-db'
+import {
+  createTrackedDb,
+  DraftSelectBuilder,
+  SelectBuilder,
+  normalizeExecuteRows,
+} from '../tracked-db'
 
 // ---------------------------------------------------------------------------
 // Toy schema — raw pgTable, no defineSchema wrapper needed
@@ -505,5 +510,51 @@ describe('withDraft schema-qualified tables', () => {
     expect(rows).toHaveLength(2)
     expect(byId[1]['owner']).toBe('root-edited')
     expect(byId[2]['owner']).toBe('guest')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 9: normalizeExecuteRows — driver result-shape normalization
+//
+// The integration tests above all run against PGlite, whose db.execute()
+// returns a { rows } wrapper. The PRODUCTION path (postgres-js) instead returns
+// a RowList — a postgres.js `Result extends Array` with non-enumerable metadata
+// props (count, command, columns). That array branch is the highest-severity
+// fix in this change and is invisible to the PGlite integration tests, so it
+// gets a direct unit test here.
+// ---------------------------------------------------------------------------
+
+describe('normalizeExecuteRows — driver result shapes', () => {
+  test('postgres-js shape: a RowList (Array subclass) is returned as the rows', () => {
+    // Mirror postgres.js: `class Result extends Array` with non-enumerable
+    // metadata properties that must NOT leak into the returned row objects.
+    class RowList extends Array {}
+    const result = RowList.from([{ id: 1, name: 'a' }]) as RowList & {
+      count?: number
+      command?: string
+    }
+    Object.defineProperty(result, 'count', { value: 1, enumerable: false })
+    Object.defineProperty(result, 'command', { value: 'SELECT', enumerable: false })
+
+    const rows = normalizeExecuteRows(result)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toEqual({ id: 1, name: 'a' })
+    // The result IS the rows — no wrapper unwrap, metadata stays non-enumerable.
+    expect(Object.keys(rows[0])).toEqual(['id', 'name'])
+  })
+
+  test('PGlite shape: a { rows } wrapper is unwrapped to its rows array', () => {
+    const result = { rows: [{ id: 2 }], fields: [], affectedRows: 0 }
+    expect(normalizeExecuteRows(result)).toBe(result.rows)
+  })
+
+  test('empty postgres-js RowList normalizes to an empty array', () => {
+    expect(normalizeExecuteRows([])).toEqual([])
+  })
+
+  test('throws on an unrecognized result shape (neither array nor { rows })', () => {
+    expect(() => normalizeExecuteRows({ unexpected: true })).toThrow(
+      'unexpected db.execute() result shape',
+    )
   })
 })

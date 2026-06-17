@@ -90,6 +90,12 @@ export interface TrackedDb {
    * draft inserts, and suppressing tombstoned rows — all without touching the
    * canonical `from().all()` code path. A no-draft read is structurally
    * zero-overhead: it never reaches the coalesce logic.
+   *
+   * API CONSTRAINT (load-bearing): a NULL in a draft shadow column means "no
+   * override for this column", NOT "set this column to NULL". A draft therefore
+   * cannot clear a nullable field back to NULL — the canonical value is kept and
+   * no error is raised. Deleting a row is expressed via the `__tombstone` flag,
+   * not by nulling its columns.
    */
   withDraft(draftId: string): DraftTrackedDb
 }
@@ -174,7 +180,9 @@ export class SelectBuilder<T extends AnyTable> {
 
   async all() {
     this._tracker.tablesRead.add(getTableName(this._table))
-    return this._buildSelectQuery()
+    // Await here (not a bare return) so errors surface in this async frame and
+    // the inferred return type is the row array, not the Drizzle builder.
+    return await this._buildSelectQuery()
   }
 
   /**
@@ -282,8 +290,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * Composite PKs (2+ columns) are unsupported — the coalesce join is single-key
    * — so we throw a clear error rather than silently joining on the wrong column.
    */
-  private _resolvePkColumnName(): string {
-    const config = getTableConfig(this._table)
+  private _resolvePkColumnName(config: ReturnType<typeof getTableConfig>): string {
     const tableName = getTableName(this._table)
 
     // Table-level primaryKey({ columns: [...] }) — authoritative when present.
@@ -310,7 +317,12 @@ export class DraftSelectBuilder<T extends AnyTable> {
     }
     if (inlinePks.length === 1) return inlinePks[0].name
 
-    // Last resort: a column whose SQL name is literally "id".
+    // Last resort: a column whose SQL name is literally "id". This assumes the
+    // `id` column is the row identity (it is for every defineSchema table —
+    // serial PKs are now marked primary above — and the documented convention
+    // for raw pgTable callers). If a table has a non-unique `id` that is NOT the
+    // identity, the FULL OUTER JOIN would mis-merge; such a table must declare an
+    // explicit primary key so detection takes a branch above instead.
     const idCol = config.columns.find((c) => c.name === 'id')
     if (idCol) return idCol.name
 
@@ -336,13 +348,15 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const columns = getTableColumns(this._table) as Record<string, any>
     const colEntries = Object.entries(columns)
 
-    const pkColName = this._resolvePkColumnName()
+    // Single getTableConfig() read shared by PK resolution + schema qualification.
+    const config = getTableConfig(this._table)
+    const pkColName = this._resolvePkColumnName(config)
 
     // Schema-qualify both relations when the table lives outside the default
     // schema (pgSchema('app').table(...)). Canonical Drizzle selects emit the
     // schema prefix; the raw coalesce SQL must match or it reads the wrong
     // relation / fails with relation-not-found.
-    const schema = getTableConfig(this._table).schema
+    const schema = config.schema
     const baseRel = schema ? `"${schema}"."${tableName}"` : `"${tableName}"`
     const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
 
@@ -409,8 +423,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
  *
  * This normalizer is the production-correctness fix: prefer `.rows` when the
  * driver wraps, otherwise treat an array-shaped result as the rows directly.
+ *
+ * Exported so the postgres-js (array) branch — the production path — can be
+ * unit-tested directly; the integration tests only exercise PGlite's `{ rows }`.
  */
-function normalizeExecuteRows(result: unknown): Record<string, unknown>[] {
+export function normalizeExecuteRows(result: unknown): Record<string, unknown>[] {
   if (Array.isArray(result)) {
     return result as Record<string, unknown>[]
   }
