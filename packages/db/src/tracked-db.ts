@@ -12,6 +12,7 @@ import {
   asc,
   desc,
   and,
+  sql,
 } from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
@@ -30,6 +31,20 @@ const drizzleOpMap = {
   lt: drizzleLt,
   lte: drizzleLte,
 } as const
+
+/**
+ * A read-focused handle returned by `withDraft(draftId)`. Exposes the same
+ * read surface as `TrackedDb` but `from()` returns a draft-coalescing builder.
+ * Write methods (`into`, `transaction`) are intentionally omitted — draft reads
+ * are a separate entry point and do not participate in write transactions.
+ */
+export interface DraftTrackedDb {
+  tablesRead: Set<string>
+  tablesWritten: Set<string>
+  /** Raw Drizzle instance, same as `TrackedDb.raw`. */
+  raw: DrizzleDb
+  from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
+}
 
 export interface TrackedDb {
   tablesRead: Set<string>
@@ -66,6 +81,16 @@ export interface TrackedDb {
    * though no caller sets it yet.
    */
   transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+  /**
+   * Return a draft-coalescing read handle for the given draft ID.
+   *
+   * `handle.from(table).all()` executes a FULL OUTER JOIN coalesce between the
+   * base table and its `<table>__draft` shadow, applying delta edits, surfacing
+   * draft inserts, and suppressing tombstoned rows — all without touching the
+   * canonical `from().all()` code path. A no-draft read is structurally
+   * zero-overhead: it never reaches the coalesce logic.
+   */
+  withDraft(draftId: string): DraftTrackedDb
 }
 
 /**
@@ -144,6 +169,30 @@ export class SelectBuilder<T extends AnyTable> {
     return q
   }
 
+  /**
+   * Return the lowered SQL without executing. Used in tests to assert that the
+   * canonical read path generates byte-identical SQL when no draft is active —
+   * i.e., zero-overhead is structural, not conditional.
+   */
+  toSql() {
+    let q = this._db.select().from(this._table)
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const columns = getTableColumns(this._table) as Record<string, any>
+    const conditions = this._buildConditions(columns)
+    if (conditions.length > 0) {
+      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
+    }
+    if (this._orderByCol) {
+      const col = columns[this._orderByCol]
+      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
+      q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
+    }
+    if (this._limitVal !== undefined) {
+      q = q.limit(this._limitVal)
+    }
+    return q.toSQL()
+  }
+
   async first() {
     this._limitVal = 1
     const rows = await this.all()
@@ -170,6 +219,124 @@ export class SelectBuilder<T extends AnyTable> {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
     return q.returning()
+  }
+}
+
+/**
+ * Draft-coalescing select builder returned by `DraftTrackedDb.from()`.
+ *
+ * `all()` executes a FULL OUTER JOIN between the base table and its
+ * `<table>__draft` shadow, coalescing every column so that draft edits win
+ * over canonical values, draft inserts appear, and tombstoned rows are
+ * excluded.
+ *
+ * The draft table name is derived automatically: `<base_table>__draft`.
+ * No application-specific mapping is required.
+ *
+ * `where()`, `orderBy()`, and `limit()` are accepted for API symmetry with
+ * `SelectBuilder` but are NOT yet applied inside the coalesce SQL.
+ * TODO: where/orderBy/limit not yet applied inside draft coalesce (YW-120 scope is the primitive only)
+ */
+export class DraftSelectBuilder<T extends AnyTable> {
+  private _table: T
+  private _db: DrizzleDb
+  private _draftId: string
+  private _tracker: DraftTrackedDb
+
+  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftTrackedDb) {
+    this._table = table
+    this._db = db
+    this._draftId = draftId
+    this._tracker = tracker
+  }
+
+  where(_filters: FilterDescriptor | FilterDescriptor[]): this {
+    // where/orderBy/limit are not yet applied inside the draft coalesce SQL.
+    // Callers must not rely on these for row-level filtering (including auth/authz)
+    // until implemented. Throw loudly to prevent silent filter bypass.
+    throw new Error(
+      'DraftSelectBuilder.where() is not yet implemented (YW-120 scope: coalesce primitive only). ' +
+        'Do not use .where() on a draft handle for row-level filtering.',
+    )
+  }
+
+  orderBy(_col: string, _dir: 'asc' | 'desc' = 'asc'): this {
+    throw new Error(
+      'DraftSelectBuilder.orderBy() is not yet implemented (YW-120 scope: coalesce primitive only).',
+    )
+  }
+
+  limit(_n: number): this {
+    throw new Error(
+      'DraftSelectBuilder.limit() is not yet implemented (YW-120 scope: coalesce primitive only).',
+    )
+  }
+
+  async all(): Promise<Record<string, unknown>[]> {
+    const tableName = getTableName(this._table)
+    this._tracker.tablesRead.add(tableName)
+
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const columns = getTableColumns(this._table) as Record<string, any>
+    const colValues = Object.values(columns)
+
+    // Determine the primary key column (single pass: prefer explicit pk, fall back to 'id').
+    // `col.primary` is the PgColumn flag set by `.primaryKey()` in drizzle-orm/pg-core.
+    const pkCol =
+      colValues.find((c) => c.primary === true) ??
+      colValues.find((c) => (c.name as string) === 'id')
+    if (!pkCol) {
+      throw new Error(
+        `DraftSelectBuilder: table "${tableName}" has no primary key column and no column named "id". ` +
+          `Cannot build draft coalesce query.`,
+      )
+    }
+    const pkColName = pkCol.name as string
+
+    const draftTableName = `${tableName}__draft`
+
+    // Build: COALESCE(d."col", b."col") AS "col" for every base-table column.
+    //
+    // Storage convention (load-bearing): NULL in a draft shadow column means
+    // "no override for this column" — NOT "set this column to NULL". Setting a
+    // nullable column to NULL via a draft is therefore not supported by this
+    // primitive. The `__tombstone` flag is the only way to delete a row.
+    // This convention must be enforced by the schema (shadow columns default to NULL,
+    // tombstone = true captures deletes). Column-drift (base schema evolves under an
+    // old draft) is out of scope — see PR body.
+    const colSelects = colValues
+      .map((col) => {
+        const sqlName = col.name as string
+        return `COALESCE(d."${sqlName}", b."${sqlName}") AS "${sqlName}"`
+      })
+      .join(', ')
+
+    // Build the coalesce query using a Drizzle sql-tagged-template so draftId is
+    // sent as a bound parameter (not interpolated into the SQL string).
+    // Table/column names come from schema introspection (not user input) and are
+    // double-quoted; they are safe to include as raw SQL fragments.
+    //
+    // The draft table is pre-filtered by draftId in a subquery BEFORE the FULL
+    // OUTER JOIN. This is critical: a bare `FULL OUTER JOIN draft ON pk AND
+    // draft_id = $id` leaks unrelated draft rows (for other draftIds) as
+    // right-side-only rows when $id doesn't match — the subquery eliminates
+    // that hazard by restricting the right side to exactly this draft's rows.
+    const prefix = sql.raw(
+      `SELECT ${colSelects} ` +
+        `FROM "${tableName}" b ` +
+        `FULL OUTER JOIN (SELECT * FROM "${draftTableName}" WHERE "draft_id" = `,
+    )
+    const suffix = sql.raw(
+      `) d ON b."${pkColName}" = d."${pkColName}" ` +
+        `WHERE COALESCE(d."__tombstone", false) = false ` +
+        `ORDER BY COALESCE(d."${pkColName}", b."${pkColName}")`,
+    )
+    // `this._draftId` is interpolated as a bound parameter by the sql tag.
+    const query = sql`${prefix}${this._draftId}${suffix}`
+
+    const result = await this._db.execute(query)
+    // db.execute returns { rows: [...], fields: [...], affectedRows: number }
+    return (result as { rows: Record<string, unknown>[] }).rows
   }
 }
 
@@ -201,6 +368,17 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
     },
     into<T extends AnyTable>(table: T) {
       return new InsertBuilder(table, drizzleDb, tracker)
+    },
+    withDraft(draftId: string): DraftTrackedDb {
+      const draftHandle: DraftTrackedDb = {
+        tablesRead: tracker.tablesRead,
+        tablesWritten: tracker.tablesWritten,
+        raw: drizzleDb,
+        from<T extends AnyTable>(table: T) {
+          return new DraftSelectBuilder(table, drizzleDb, draftId, draftHandle)
+        },
+      }
+      return draftHandle
     },
     async transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R> {
       // The lowering owns atomicity: Drizzle's native transaction provides the
