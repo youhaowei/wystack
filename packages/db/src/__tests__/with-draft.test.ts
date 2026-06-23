@@ -21,11 +21,13 @@ import {
   jsonb as pgJsonb,
   primaryKey,
 } from 'drizzle-orm/pg-core'
+import { getTableColumns, sql } from 'drizzle-orm'
 import {
   createTrackedDb,
   DraftSelectBuilder,
   SelectBuilder,
   normalizeExecuteRows,
+  decodeRowFromDriver,
 } from '../tracked-db'
 import { eq } from '../operators'
 
@@ -655,6 +657,168 @@ describe('withDraft jsonb codec on writes (Gap 1)', () => {
     await jtracked.withDraft('dj').from(reports).where(eq('id', 3)).update({ fields: next })
     const row = await jtracked.withDraft('dj').from(reports).where(eq('id', 3)).first()
     expect((row as { fields: unknown }).fields).toEqual(next)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 10b: decodeRowFromDriver — the READ mirror of the #48 write-codec fix.
+//
+// `DraftSelectBuilder.all()` runs a raw coalesce SELECT and returns
+// `normalizeExecuteRows(result)` — RAW driver rows. The write path (#48) routes
+// values through `col.mapToDriverValue` (encode); the READ path must route the
+// returned values through `col.mapFromDriverValue` (decode). The two drivers
+// differ in COLUMN DECODE exactly as they differ in ROW SHAPE:
+//   - PGlite auto-parses a jsonb column to a JS object on read, so the
+//     integration jsonb round-trip above passes WITHOUT any read decode — the
+//     bug is invisible to PGlite.
+//   - postgres-js (the `createDb` production driver) returns a jsonb column as a
+//     raw JSON STRING. Without decode, a draft read of `insights.definition`
+//     hands a string to consumers expecting an object → silent misbehavior.
+//
+// This unit-tests the decode against the postgres-js shape directly (a jsonb
+// column as a raw STRING), the same reason `normalizeExecuteRows` is exported —
+// the production path is unreachable from PGlite. It also proves the column's
+// own codec (not a hand-rolled jsonb-only JSON.parse) is what makes it
+// driver-independent: a non-jsonb non-identity type (timestamp) decodes too, and
+// decode is a no-op on an already-parsed PGlite value (idempotent).
+// ---------------------------------------------------------------------------
+
+describe('decodeRowFromDriver — column codec decode (read mirror of #48)', () => {
+  // [propKey, col] entries exactly as `all()` builds them from the schema.
+  const reportEntries = Object.entries(getTableColumns(reports)) as [
+    string,
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    any,
+  ][]
+
+  test('postgres-js shape: a jsonb column arriving as a raw STRING is decoded to the parsed object', () => {
+    // The production bug: postgres-js returns jsonb as a JSON string. The raw
+    // coalesce row carries `fields`/`config` as strings; decode must JSON.parse
+    // them via the column codec so consumers get objects, not strings.
+    const fieldsObj = [{ a: 1 }, { b: [2, 3] }]
+    const configObj = { theme: 'dark', n: 50 }
+    const rawRow = {
+      id: 1,
+      title: 'r',
+      fields: JSON.stringify(fieldsObj),
+      config: JSON.stringify(configObj),
+    }
+
+    const decoded = decodeRowFromDriver(rawRow, reportEntries)
+
+    // Decoded to structured values — NOT the raw strings.
+    expect(decoded['fields']).toEqual(fieldsObj)
+    expect(decoded['config']).toEqual(configObj)
+    expect(typeof decoded['fields']).toBe('object')
+    // Identity-codec columns pass through untouched.
+    expect(decoded['id']).toBe(1)
+    expect(decoded['title']).toBe('r')
+  })
+
+  test('PGlite shape: an already-parsed jsonb object is left intact (decode is idempotent — no double-parse)', () => {
+    // PGlite hands back a parsed JS object; the string-guarded jsonb codec must
+    // no-op on it. This is the crux that makes ONE decode correct on BOTH drivers.
+    const fieldsObj = [{ already: 'parsed' }]
+    const rawRow = { id: 2, title: 'r2', fields: fieldsObj, config: { k: 'v' } }
+
+    const decoded = decodeRowFromDriver(rawRow, reportEntries)
+
+    expect(decoded['fields']).toEqual(fieldsObj)
+    expect(decoded['config']).toEqual({ k: 'v' })
+  })
+
+  test('a NULL column value passes through (no override sentinel preserved, codec not invoked)', () => {
+    // `config` is nullable; a coalesced NULL means SQL NULL / no override and
+    // must never be fed to the codec (jsonb would stringify null → "null").
+    const decoded = decodeRowFromDriver(
+      { id: 3, title: 'r3', fields: '[]', config: null },
+      reportEntries,
+    )
+    expect(decoded['config']).toBeNull()
+    expect(decoded['fields']).toEqual([])
+  })
+
+  test('decodes EVERY non-identity column type, not just jsonb (timestamp via its own codec)', () => {
+    // Proves the fix uses the column codec generically: a timestamp column comes
+    // back from the driver as a string/Date and is decoded by ITS codec to a
+    // Date — a hand-rolled jsonb-only JSON.parse hack would miss this.
+    const events = pgTable('events', {
+      id: integer('id').primaryKey(),
+      at: pgTimestamp('at'),
+    })
+    const entries = Object.entries(getTableColumns(events)) as [
+      string,
+      // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+      any,
+    ][]
+    const decoded = decodeRowFromDriver({ id: 1, at: '2026-06-23 12:00:00' }, entries)
+    expect(decoded['at']).toBeInstanceOf(Date)
+  })
+
+  test('a column present in the row but absent from the schema is left untouched', () => {
+    const decoded = decodeRowFromDriver(
+      { id: 1, title: 't', fields: '[]', __extra: 'keep-me' },
+      reportEntries,
+    )
+    expect(decoded['__extra']).toBe('keep-me')
+  })
+})
+
+describe('withDraft coalesce read decode (integration, driver-independent)', () => {
+  // Integration mirror: a jsonb column round-trips as a PARSED OBJECT through a
+  // real draft coalesce read, on BOTH coalesce sides — a base-side column (no
+  // draft delta) and a draft-side overlay value. On PGlite these pass via
+  // auto-parse; the decode is what makes the SAME reads correct on postgres-js
+  // (see the unit test above for the raw-string production path). Deep-equal
+  // guards that the decode wired into all() does not corrupt the PGlite path.
+  let jpg: PGlite
+  let jdb: ReturnType<typeof drizzle>
+  let jtracked: ReturnType<typeof createTrackedDb>
+
+  beforeEach(async () => {
+    jpg = new PGlite()
+    jdb = drizzle(jpg)
+    await jdb.execute(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY, title TEXT NOT NULL, fields JSONB NOT NULL, config JSONB
+      )
+    `)
+    await jdb.execute(`
+      CREATE TABLE IF NOT EXISTS reports__draft (
+        draft_id TEXT NOT NULL, id INTEGER NOT NULL, title TEXT, fields JSONB, config JSONB,
+        __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id)
+      )
+    `)
+    jtracked = createTrackedDb(jdb)
+  })
+
+  test('a BASE-side jsonb row (no draft delta) reads back as a PARSED OBJECT through the coalesce', async () => {
+    // COALESCE returns the base side here (no draft row for id=1). Guards that
+    // decode wired into all() does not corrupt the canonical column of a draft read.
+    const fields = [{ source: 'orders' }, { join: { on: 'id' } }]
+    await jdb.execute(
+      sql`INSERT INTO reports (id, title, fields) VALUES (1, 'canon', ${JSON.stringify(fields)}::jsonb)`,
+    )
+    const row = await jtracked.withDraft('dk').from(reports).where(eq('id', 1)).first()
+    expect(row).not.toBeNull()
+    // Deep-equals a structured object — accessing `.source` on the first element
+    // works (the exact consumer shape: isOrphanedBy / insightTableRefs).
+    expect((row as { fields: unknown }).fields).toEqual(fields)
+    expect((row as { fields: { source?: string }[] }).fields[0].source).toBe('orders')
+  })
+
+  test('a DRAFT-side jsonb value (overlay row) reads back as a PARSED OBJECT through the coalesce', async () => {
+    // The overlay path: the jsonb value comes from the DRAFT shadow column, not
+    // the base table. write (mapToDriverValue → string) then coalesce-read
+    // (mapFromDriverValue → object) must round-trip — the full read/write codec
+    // symmetry on the draft side, the exact shape the DashFrame draft controller
+    // depends on for reading an edited insights.definition.
+    const fields = [{ source: 'edited_in_draft' }, { filters: [1, 2, 3] }]
+    await jtracked.withDraft('dk').into(reports).insert({ id: 9, title: 'd', fields })
+    const row = await jtracked.withDraft('dk').from(reports).where(eq('id', 9)).first()
+    expect(row).not.toBeNull()
+    expect((row as { fields: unknown }).fields).toEqual(fields)
+    expect((row as { fields: { source?: string }[] }).fields[0].source).toBe('edited_in_draft')
   })
 })
 

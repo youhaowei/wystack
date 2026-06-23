@@ -542,7 +542,25 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}`
 
     const result = await this._db.execute(query)
-    return normalizeExecuteRows(result)
+    const rows = normalizeExecuteRows(result)
+
+    // Decode each returned column value through its Drizzle column codec — the
+    // READ mirror of the write path's `mapColumnValue` (encode). The coalesce
+    // SELECT aliases every column to its Drizzle PROPERTY KEY (`AS "propKey"`),
+    // so `colEntries` (propKey → col) is exactly the map to decode by. Without
+    // this, a non-identity column type (jsonb, timestamp, …) comes back in its
+    // RAW driver representation on the production driver:
+    //   - PGlite auto-parses jsonb → JS object, so the integration tests pass
+    //     even without decode (the bug is invisible to them).
+    //   - postgres-js (the `createDb` production driver) returns a jsonb column
+    //     as a raw JSON STRING. A draft-context read of `insights.definition`
+    //     then hands a string to consumers expecting an object, which silently
+    //     misbehave (`.source` on a string) or throw.
+    // The column's own `mapFromDriverValue` is driver-independent: jsonb's is
+    // guarded with `typeof value === 'string'`, so it JSON.parses the
+    // postgres-js string AND is a no-op on the already-parsed PGlite object — no
+    // double-parse. Columns not in the schema are left untouched.
+    return rows.map((row) => decodeRowFromDriver(row, colEntries))
   }
 
   /**
@@ -589,6 +607,38 @@ export function normalizeExecuteRows(result: unknown): Record<string, unknown>[]
     'DraftSelectBuilder: unexpected db.execute() result shape — expected an array of rows ' +
       '(postgres-js) or a { rows } object (PGlite).',
   )
+}
+
+/**
+ * Decode one normalized coalesce row through its columns' driver codecs — the
+ * READ mirror of the write-path encode (`toSqlColumnMap` / `mapColumnValue`).
+ *
+ * `colEntries` is the `[propKey, col]` list from `getTableColumns()`; the
+ * coalesce SELECT aliases every column to its propKey (`AS "propKey"`), so a
+ * returned row is keyed by propKey and decodes 1:1 against this list. Each value
+ * is routed through the column's own `mapFromDriverValue` (via
+ * `mapColumnValueFromDriver`), which is the only driver-independent decode — see
+ * `DraftSelectBuilder.all()` for why the column codec (not a hand-rolled
+ * `typeof === 'string' ? JSON.parse`) is load-bearing: it decodes EVERY
+ * non-identity column type (jsonb, timestamp, …), not just jsonb. A key present
+ * in the row but absent from the schema is left untouched.
+ *
+ * Exported so the postgres-js decode path — a jsonb column arriving as a raw
+ * JSON STRING, the production shape the PGlite integration tests cannot produce
+ * (PGlite auto-parses jsonb) — can be unit-tested directly, the same reason
+ * `normalizeExecuteRows` is exported.
+ */
+export function decodeRowFromDriver(
+  row: Record<string, unknown>,
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  colEntries: [string, any][],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...row }
+  for (const [propKey, col] of colEntries) {
+    if (!(propKey in out)) continue
+    out[propKey] = mapColumnValueFromDriver(col, out[propKey])
+  }
+  return out
 }
 
 /**
@@ -694,6 +744,25 @@ function toSqlColumnMap(
 function mapColumnValue(col: any, value: unknown): unknown {
   if (value === null || value === undefined) return value
   return col.mapToDriverValue(value)
+}
+
+/**
+ * READ mirror of `mapColumnValue`: route a RAW driver value through a Drizzle
+ * column's decode codec (`col.mapFromDriverValue`), the inverse of the write
+ * path's `mapToDriverValue`. `mapFromDriverValue` is the standard PgColumn decode
+ * method — defined as identity on the base `Column` and overridden per type
+ * (jsonb/json → `JSON.parse`-when-string, timestamp → `Date`, …).
+ *
+ * `null`/`undefined` is passed through untouched, mirroring the write side: a
+ * coalesced row carries already-merged columns (no `__tombstone` column in the
+ * output), and a NULL there means "no override / SQL NULL" — never a value to
+ * decode. (jsonb's `mapFromDriverValue` is string-guarded, so it would no-op on
+ * null anyway, but the explicit passthrough keeps the read/write symmetry exact.)
+ */
+// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+function mapColumnValueFromDriver(col: any, value: unknown): unknown {
+  if (value === null || value === undefined) return value
+  return col.mapFromDriverValue(value)
 }
 
 /**
