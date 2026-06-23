@@ -221,10 +221,14 @@ describe('withDraft write — isolation + injection safety', () => {
 })
 
 describe('withDraft write — read-path guard preserved', () => {
-  test('.where().all() throws (no silent unfiltered draft read)', async () => {
-    await expect(tracked.withDraft('d1').from(todos).where(eq('id', 1)).all()).rejects.toThrow(
-      /after .where.* is not supported|does not apply row filters/,
-    )
+  test('.where(eq(pk)).all() now returns the PK-pinned coalesced row (read path)', async () => {
+    // A single PK eq is a valid READ predicate (the handler shape). Here no
+    // draft delta exists for id=1, so the canonical row is returned, scoped to
+    // that one PK. Non-PK / multi-filter reads still throw (covered elsewhere).
+    const rows = await tracked.withDraft('d1').from(todos).where(eq('id', 1)).all()
+    expect(rows).toHaveLength(1)
+    expect((rows[0] as { id: number; title: string }).id).toBe(1)
+    expect((rows[0] as { title: string }).title).toBe('apple')
   })
 
   test('.orderBy()/.limit() still throw on a draft read builder', () => {

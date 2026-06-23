@@ -18,6 +18,7 @@ import {
   timestamp as pgTimestamp,
   text as pgText,
   boolean as pgBoolean,
+  jsonb as pgJsonb,
   primaryKey,
 } from 'drizzle-orm/pg-core'
 import {
@@ -26,6 +27,7 @@ import {
   SelectBuilder,
   normalizeExecuteRows,
 } from '../tracked-db'
+import { eq } from '../operators'
 
 // ---------------------------------------------------------------------------
 // Toy schema — raw pgTable, no defineSchema wrapper needed
@@ -309,13 +311,17 @@ describe('withDraft edge cases', () => {
     expect(rows).toHaveLength(3)
   })
 
-  test('where() then all() throws to prevent silent auth/authz bypass', async () => {
-    // YW-121 made `where()` valid (it pins the PK for the write path), but a
-    // FILTERED READ is still unsupported — the coalesce does not push `where`
-    // down — so `.where().all()` throws rather than silently returning every row.
-    await expect(
-      tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'eq', value: 1 }).all(),
-    ).rejects.toThrow(/after .where.* is not supported|does not apply row filters/)
+  test('a single PK eq filter on all() is pushed into the coalesce (not a throw)', async () => {
+    // A PK-pinned read IS supported: it returns the one coalesced row. (The
+    // fail-loud cases — non-PK column, non-eq op, multiple filters — are covered
+    // in the PK-filtered read suite below.)
+    const rows = await tracked
+      .withDraft('d1')
+      .from(todos)
+      .where({ column: 'id', op: 'eq', value: 1 })
+      .all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]['title']).toBe('APPLE-edited')
   })
 
   test('orderBy() throws (fail-loud, not a silent no-op)', () => {
@@ -562,5 +568,284 @@ describe('normalizeExecuteRows — driver result shapes', () => {
     expect(() => normalizeExecuteRows({ unexpected: true })).toThrow(
       'unexpected db.execute() result shape',
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 10: jsonb codec on draft writes (Gap 1)
+//
+// A draft write must route each value through the Drizzle column codec, exactly
+// as the canonical insert path does. A `jsonb('fields')` column receiving a JS
+// array/object must be JSON-serialized (`mapToDriverValue` === JSON.stringify),
+// NOT bound as a raw JS array — which produces a SQL type error or stored
+// garbage. Every draftable artifact table has a jsonb column, so this is the
+// floor for ALL draft writes.
+// ---------------------------------------------------------------------------
+
+const reports = pgTable('reports', {
+  id: integer('id').primaryKey(),
+  title: pgText('title').notNull(),
+  fields: pgJsonb('fields').notNull(),
+  config: pgJsonb('config'),
+})
+
+const reportsDraft = pgTable('reports__draft', {
+  draftId: pgText('draft_id').notNull(),
+  id: integer('id').notNull(),
+  title: pgText('title'),
+  fields: pgJsonb('fields'),
+  config: pgJsonb('config'),
+  tombstone: pgBoolean('__tombstone').notNull(),
+})
+void reportsDraft
+
+describe('withDraft jsonb codec on writes (Gap 1)', () => {
+  let jpg: PGlite
+  let jdb: ReturnType<typeof drizzle>
+  let jtracked: ReturnType<typeof createTrackedDb>
+
+  beforeEach(async () => {
+    jpg = new PGlite()
+    jdb = drizzle(jpg)
+    await jdb.execute(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        fields JSONB NOT NULL,
+        config JSONB
+      )
+    `)
+    await jdb.execute(`
+      CREATE TABLE IF NOT EXISTS reports__draft (
+        draft_id TEXT NOT NULL,
+        id INTEGER NOT NULL,
+        title TEXT,
+        fields JSONB,
+        config JSONB,
+        __tombstone BOOLEAN NOT NULL DEFAULT false,
+        PRIMARY KEY (draft_id, id)
+      )
+    `)
+    jtracked = createTrackedDb(jdb)
+  })
+
+  test('CONTRACT 1: a jsonb value round-trips through a draft insert + coalesce read', async () => {
+    // Without the codec fix this throws (binding a raw JS array to a jsonb param)
+    // or stores garbage. With it, the value is JSON-serialized on write and
+    // parsed back on read — a structural deep-equal round-trip.
+    const fields = [{ a: 1 }, { b: [2, 3], nested: { ok: true } }]
+    await jtracked.withDraft('dj').into(reports).insert({ id: 1, title: 'r', fields })
+
+    const rows = await jtracked.withDraft('dj').from(reports).all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]['fields']).toEqual(fields)
+  })
+
+  test('a jsonb object value also round-trips (object, not just array)', async () => {
+    const config = { theme: 'dark', limit: 50, tags: ['x', 'y'] }
+    await jtracked.withDraft('dj').into(reports).insert({ id: 2, title: 'r2', fields: [], config })
+    const row = await jtracked.withDraft('dj').from(reports).where(eq('id', 2)).first()
+    expect(row).not.toBeNull()
+    expect((row as { config: unknown }).config).toEqual(config)
+  })
+
+  test('a jsonb edit via draft update round-trips through the codec', async () => {
+    await jdb.execute(`INSERT INTO reports (id, title, fields) VALUES (3, 'canon', '[]'::jsonb)`)
+    const next = [{ edited: true }]
+    await jtracked.withDraft('dj').from(reports).where(eq('id', 3)).update({ fields: next })
+    const row = await jtracked.withDraft('dj').from(reports).where(eq('id', 3)).first()
+    expect((row as { fields: unknown }).fields).toEqual(next)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 11: PK-filtered draft read coalesce (Gap 2 — the blocker)
+//
+// Every command handler reads `from(t).where(eq('id', x)).first()`. Under a
+// draft that shape must coalesce a SINGLE PK-pinned row (the handler runs
+// unmodified inside a draft). These exercise the exact consumer shape across:
+// delta overlay, canonical-only, draft-only, tombstone suppression, cross-draft
+// isolation, and the fail-loud guards.
+// ---------------------------------------------------------------------------
+
+describe('withDraft PK-filtered read coalesce (Gap 2)', () => {
+  // Reuses the top-level `todos` schema + `tracked` (canonical 1,2,3; draft d1:
+  // id=1 edited, id=2 tombstoned, id=4 inserted) seeded in the outer beforeEach.
+
+  test('CONTRACT 2: PK-pinned read returns the COALESCED row (draft delta wins, other fields canonical)', async () => {
+    // The exact handler shape: from(t).where(eq('id', x)).first().
+    const row = await tracked.withDraft('d1').from(todos).where(eq('id', 1)).first()
+    expect(row).not.toBeNull()
+    // Overlaid field from the draft …
+    expect((row as { title: string }).title).toBe('APPLE-edited')
+    // … untouched field still from canonical (done was never edited in d1).
+    expect((row as { done: boolean }).done).toBe(false)
+    expect((row as { id: number }).id).toBe(1)
+  })
+
+  test('CONTRACT 3: PK-pinned read of a canonical-only row (no draft delta) returns the canonical row', async () => {
+    const row = await tracked.withDraft('d1').from(todos).where(eq('id', 3)).first()
+    expect(row).not.toBeNull()
+    expect((row as { title: string }).title).toBe('cherry')
+  })
+
+  test('CONTRACT 4: PK-pinned read of a draft-only row (draft insert, no canonical) returns the draft row', async () => {
+    // id=4 exists ONLY in the draft (base side of the FULL OUTER JOIN is NULL).
+    const row = await tracked.withDraft('d1').from(todos).where(eq('id', 4)).first()
+    expect(row).not.toBeNull()
+    expect((row as { id: number }).id).toBe(4)
+    expect((row as { title: string }).title).toBe('date-new')
+  })
+
+  test('CONTRACT 5: PK-pinned read of a tombstoned row returns null (draft delete suppresses)', async () => {
+    // id=2 is tombstoned in d1 — the pk predicate must compose with the
+    // tombstone-suppression WHERE, so the pinned read yields no row.
+    const row = await tracked.withDraft('d1').from(todos).where(eq('id', 2)).first()
+    expect(row).toBeNull()
+    // .all() with the same pin returns the empty array (not a throw).
+    const rows = await tracked.withDraft('d1').from(todos).where(eq('id', 2)).all()
+    expect(rows).toEqual([])
+  })
+
+  test('CONTRACT 6: cross-draft isolation under a PK filter — draftA pin returns A, not B', async () => {
+    // Same pk overlaid in two drafts with different values; a PK-pinned read in
+    // each returns only that draft's overlay (the draft subquery is pre-filtered
+    // by draft_id before the join — no cross-draft leak).
+    await tracked.withDraft('dA').from(todos).where(eq('id', 3)).update({ title: 'A-cherry' })
+    await tracked.withDraft('dB').from(todos).where(eq('id', 3)).update({ title: 'B-cherry' })
+
+    const a = await tracked.withDraft('dA').from(todos).where(eq('id', 3)).first()
+    const b = await tracked.withDraft('dB').from(todos).where(eq('id', 3)).first()
+    expect((a as { title: string }).title).toBe('A-cherry')
+    expect((b as { title: string }).title).toBe('B-cherry')
+  })
+
+  test('CONTRACT 7a: two filters on a read throws (fail-loud)', async () => {
+    await expect(
+      tracked.withDraft('d1').from(todos).where(eq('id', 1)).where(eq('title', 'apple')).all(),
+    ).rejects.toThrow(/exactly one .*where|single PK predicate/i)
+  })
+
+  test('CONTRACT 7b: a non-eq op on a read throws (fail-loud)', async () => {
+    await expect(
+      tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'gt', value: 1 }).all(),
+    ).rejects.toThrow(/pinned by the primary key|requires .*eq/i)
+  })
+
+  test('CONTRACT 7c: a non-PK column filter on a read throws (fail-loud)', async () => {
+    await expect(
+      tracked.withDraft('d1').from(todos).where(eq('title', 'apple')).all(),
+    ).rejects.toThrow(/pinned by the primary key|requires .*eq/i)
+  })
+
+  test('CONTRACT 7d: an unfiltered .all() still returns the FULL coalesced set', async () => {
+    const rows = await tracked.withDraft('d1').from(todos).all()
+    // id=1 (edited), id=3 (canonical), id=4 (draft insert); id=2 tombstoned.
+    expect(rows.map((r) => r['id'])).toEqual([1, 3, 4])
+  })
+
+  test('CONTRACT 8: the mirror — both first() AND all() honor the PK filter', async () => {
+    // first() → single coalesced row.
+    const row = await tracked.withDraft('d1').from(todos).where(eq('id', 1)).first()
+    expect((row as { title: string }).title).toBe('APPLE-edited')
+
+    // all() → a 1-element array of the same coalesced row (not the full set).
+    const rows = await tracked.withDraft('d1').from(todos).where(eq('id', 1)).all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]['title']).toBe('APPLE-edited')
+
+    // And the WRITE path still rejects an unfiltered update (PK filter is the
+    // write target, unchanged by the read path addition).
+    await expect(tracked.withDraft('d1').from(todos).update({ title: 'x' })).rejects.toThrow(
+      /requires exactly one .*where/,
+    )
+  })
+
+  test('CONTRACT 7e: a PK pinned to undefined/null throws (never silently widens to the full set)', async () => {
+    // The auth/authz hazard the MUST guards: `eq('id', undefined)` passes the
+    // op/column checks but, if its value were used to gate the predicate, would
+    // drop the WHERE and return EVERY coalesced row. The resolver must reject it
+    // loud. `null` is rejected too (it would bind `= NULL` → 0 rows, an
+    // inconsistent silent fail-closed).
+    await expect(
+      tracked.withDraft('d1').from(todos).where(eq('id', undefined)).all(),
+    ).rejects.toThrow(/pinned to undefined|defined PK value/i)
+    await expect(tracked.withDraft('d1').from(todos).where(eq('id', null)).all()).rejects.toThrow(
+      /pinned to null|defined PK value/i,
+    )
+  })
+
+  test('a falsy-but-valid PK (0) still pins (presence is keyed on the filter, not the value)', async () => {
+    // id=0 is a legitimate PK value — it must pin the read, not be treated as
+    // "no filter". Seed a canonical id=0 row and assert the pin returns exactly it.
+    await db.execute(`INSERT INTO todos (id, title, done) VALUES (0, 'zero', false)`)
+    const rows = await tracked.withDraft('d1').from(todos).where(eq('id', 0)).all()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]['id']).toBe(0)
+    expect(rows[0]['title']).toBe('zero')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 12: PK pin via SQL column name distinct from the property key
+//
+// A handler may pin by the SQL column name rather than the Drizzle property
+// key. The resolver accepts EITHER form (same as the write path). This needs a
+// table whose pk prop key ≠ sql col name so the sql-name acceptance branch is
+// actually exercised (the `todos` table has prop key === sql col `id`, which
+// can't distinguish the branches).
+// ---------------------------------------------------------------------------
+
+const reportRows = pgTable('report_rows', {
+  reportId: integer('report_id').primaryKey(),
+  label: pgText('label').notNull(),
+})
+
+const reportRowsDraft = pgTable('report_rows__draft', {
+  draftId: pgText('draft_id').notNull(),
+  reportId: integer('report_id').notNull(),
+  label: pgText('label'),
+  tombstone: pgBoolean('__tombstone').notNull(),
+})
+void reportRowsDraft
+
+describe('withDraft PK pin by SQL column name (prop key ≠ col name)', () => {
+  test('a read filter using the SQL column name (report_id) pins, equivalently to the prop key (reportId)', async () => {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS report_rows (
+        report_id INTEGER PRIMARY KEY,
+        label TEXT NOT NULL
+      )
+    `)
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS report_rows__draft (
+        draft_id TEXT NOT NULL,
+        report_id INTEGER NOT NULL,
+        label TEXT,
+        __tombstone BOOLEAN NOT NULL DEFAULT false,
+        PRIMARY KEY (draft_id, report_id)
+      )
+    `)
+    await db.execute(`INSERT INTO report_rows (report_id, label) VALUES (1, 'one'), (2, 'two')`)
+    await db.execute(`
+      INSERT INTO report_rows__draft (draft_id, report_id, label, __tombstone) VALUES
+        ('dr', 1, 'one-edited', false)
+    `)
+
+    // Pin by the SQL column name — exercises the `f.column === pkColName` branch.
+    const bySqlName = await tracked
+      .withDraft('dr')
+      .from(reportRows)
+      .where({ column: 'report_id', op: 'eq', value: 1 })
+      .first()
+    expect((bySqlName as { label: string }).label).toBe('one-edited')
+
+    // Pin by the prop key — must be equivalent.
+    const byPropKey = await tracked
+      .withDraft('dr')
+      .from(reportRows)
+      .where(eq('reportId', 1))
+      .first()
+    expect((byPropKey as { label: string }).label).toBe('one-edited')
   })
 })
