@@ -257,11 +257,16 @@ export class SelectBuilder<T extends AnyTable> {
  * The draft table name is derived automatically: `<base_table>__draft`.
  * No application-specific mapping is required.
  *
- * READ side (`.all()`): `where()`/`orderBy()`/`limit()` are NOT pushed into the
- * coalesce SQL (YW-120 scope). `orderBy`/`limit` THROW immediately. `where`
- * is accepted but only for the WRITE side (`.update()`/`.delete()`) — calling
- * `.all()` after `.where()` THROWS, so a caller can never believe a draft read
- * was row-filtered when it was not (an auth/authz hazard).
+ * READ side (`.all()` / `.first()`): a SINGLE `where(eq(pk, value))` IS pushed
+ * into the coalesce SQL as a bound `AND COALESCE(d."<pk>", b."<pk>") = $value`
+ * predicate — this is the exact shape every command handler emits
+ * (`from(t).where(eq('id', x)).first()`), so a handler reads its row unmodified
+ * inside a draft. Any OTHER read filter shape (a non-`eq` op, a non-PK column,
+ * or more than one filter) THROWS, so a caller can never believe a draft read
+ * was row-filtered when it was not (an auth/authz hazard). An UNFILTERED `.all()`
+ * returns the full coalesced set, as before.
+ *
+ * `orderBy`/`limit` still THROW immediately (not yet pushed down; YW-120 scope).
  *
  * WRITE side (`.where(eqPk).update(vals)` / `.where(eqPk).delete()`): routes the
  * mutation into the `<table>__draft` shadow as a sparse upsert (update) or
@@ -275,7 +280,13 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _db: DrizzleDb
   private _draftId: string
   private _tracker: DraftTrackedDb
-  private _writeFilters: FilterDescriptor[] = []
+  // Accumulated `where()` predicates. The consuming method decides intent:
+  //   - READ (`all`/`first`) interprets a single PK `eq` as a row predicate
+  //     pushed into the coalesce SQL (any other shape throws).
+  //   - WRITE (`update`/`delete`) interprets a single PK `eq` as the write
+  //     target via `_requirePkFilter` (any other shape throws).
+  // The same accumulated filter serves both; only the consumer differs.
+  private _filters: FilterDescriptor[] = []
 
   constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftTrackedDb) {
     this._table = table
@@ -285,10 +296,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   where(filters: FilterDescriptor | FilterDescriptor[]): this {
-    // Accumulate filters for the WRITE path (update/delete). The READ path
-    // (`all()`) rejects if any filter was set — see `all()`.
     const toAdd = Array.isArray(filters) ? filters : [filters]
-    this._writeFilters.push(...toAdd)
+    this._filters.push(...toAdd)
     return this
   }
 
@@ -357,14 +366,14 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const columns = getTableColumns(this._table) as Record<string, any>
     const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
 
-    if (this._writeFilters.length !== 1) {
+    if (this._filters.length !== 1) {
       throw new Error(
         `DraftSelectBuilder.${op}() requires exactly one \`where(eq('${pkPropKey ?? pkColName}', value))\` ` +
-          `filter pinning the primary key — got ${this._writeFilters.length}. A draft write addresses ` +
+          `filter pinning the primary key — got ${this._filters.length}. A draft write addresses ` +
           `a single row by PK (it cannot honor a general predicate against the shadow).`,
       )
     }
-    const f = this._writeFilters[0]
+    const f = this._filters[0]
     if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
       throw new Error(
         `DraftSelectBuilder.${op}() requires \`where(eq('${pkPropKey ?? pkColName}', value))\` on table ` +
@@ -374,18 +383,62 @@ export class DraftSelectBuilder<T extends AnyTable> {
     return f.value
   }
 
-  async all(): Promise<Record<string, unknown>[]> {
-    if (this._writeFilters.length > 0) {
-      // `.where(...)` was called, then `.all()`. The read coalesce does not push
-      // `where` down (YW-120 scope), so a filtered read would silently return
-      // EVERY row — a correctness/auth hazard. Fail loud, same as a bare
-      // `.where().all()` would have under the original throw-on-where contract.
+  /**
+   * Resolve the single PK `eq` value the READ coalesce should pin, from the
+   * accumulated `where` filters. Returns `{ present: false }` when no filter was
+   * set (an unfiltered full-set read). When exactly one filter is present it MUST
+   * be an `eq` on the PK column (prop-key or sql-col-name form) with a defined,
+   * non-null value — the only shape a command handler emits
+   * (`where(eq('id', x)).first()`). Anything else (a non-`eq` op, a non-PK
+   * column, 2+ filters, or a PK pinned to `undefined`/`null`) THROWS rather than
+   * silently returning every row — a filtered-but-unfiltered draft read is an
+   * auth/authz hazard.
+   *
+   * Presence is keyed on filter COUNT, not on the resolved value: a falsy-but-
+   * valid PK (`0`, `''`) must still pin. `undefined`/`null` are rejected loud —
+   * binding them would either widen to the full set (`undefined` → no predicate)
+   * or fail closed inconsistently (`= NULL` → 0 rows); a handler reading by an
+   * absent id is a bug, not a request for every row. Mirrors `_requirePkFilter`
+   * (the write path) so read and write reject the same shapes identically.
+   */
+  private _resolvePkReadFilter(
+    pkColName: string,
+  ): { present: false } | { present: true; value: unknown } {
+    if (this._filters.length === 0) return { present: false }
+
+    const tableName = getTableName(this._table)
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const columns = getTableColumns(this._table) as Record<string, any>
+    const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
+
+    if (this._filters.length !== 1) {
       throw new Error(
-        'DraftSelectBuilder.all() after .where() is not supported — the draft read ' +
-          'coalesce does not apply row filters (YW-120 scope). `.where()` on a draft ' +
-          'handle is only valid before `.update()` / `.delete()`.',
+        `DraftSelectBuilder.all()/first() after .where() supports exactly one ` +
+          `\`where(eq('${pkPropKey ?? pkColName}', value))\` pinning the primary key — got ` +
+          `${this._filters.length} filters. The draft read coalesce can only push a single PK ` +
+          `predicate down (a general predicate is not supported — it would silently return every row).`,
       )
     }
+    const f = this._filters[0]
+    if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
+      throw new Error(
+        `DraftSelectBuilder.all()/first() after .where() requires ` +
+          `\`where(eq('${pkPropKey ?? pkColName}', value))\` on table "${tableName}" — got ` +
+          `\`${f.op}('${f.column}', …)\`. A draft read can only be pinned by the primary key.`,
+      )
+    }
+    if (f.value === undefined || f.value === null) {
+      throw new Error(
+        `DraftSelectBuilder.all()/first() after .where() got ` +
+          `\`where(eq('${pkPropKey ?? pkColName}', ${String(f.value)}))\` — a primary-key read ` +
+          `pinned to ${String(f.value)} is rejected (it would otherwise silently return every ` +
+          `coalesced row). Pass a defined PK value.`,
+      )
+    }
+    return { present: true, value: f.value }
+  }
+
+  async all(): Promise<Record<string, unknown>[]> {
     const tableName = getTableName(this._table)
     const draftTableName = `${tableName}__draft`
 
@@ -404,6 +457,22 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // Single getTableConfig() read shared by PK resolution + schema qualification.
     const config = getTableConfig(this._table)
     const pkColName = resolvePkColumnName(this._table, config)
+
+    // Resolve an optional single-PK read predicate from `where()`. No filter
+    // → unfiltered full-set read (as before). A present filter → push
+    // `AND COALESCE(d."<pk>", b."<pk>") = $value` into the WHERE as a bound
+    // param. Any non-PK / non-`eq` / multi-filter / null-pinned shape throws
+    // inside the resolver (an auth/authz hazard if silently dropped). Presence
+    // is a discriminated flag keyed on the filter, NOT on the value — a falsy
+    // PK (`0`, `''`) must still pin. The value is routed through the PK column
+    // codec so it binds identically to the write path.
+    const pkFilter = this._resolvePkReadFilter(pkColName)
+    const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
+    const pkFilterValue = pkFilter.present
+      ? pkCol
+        ? mapColumnValue(pkCol, pkFilter.value)
+        : pkFilter.value
+      : undefined
 
     // Schema-qualify both relations when the table lives outside the default
     // schema (pgSchema('app').table(...)). Canonical Drizzle selects emit the
@@ -450,13 +519,27 @@ export class DraftSelectBuilder<T extends AnyTable> {
         `FROM ${baseRel} b ` +
         `FULL OUTER JOIN (SELECT * FROM ${draftRel} WHERE "draft_id" = `,
     )
-    const suffix = sql.raw(
+
+    // The join + tombstone-suppression WHERE is a single shared fragment so the
+    // filtered and unfiltered paths can never diverge on it. The optional pk
+    // predicate composes with the tombstone WHERE via COALESCE(d.pk, b.pk) — the
+    // SAME expression the ORDER BY uses, so it pins a draft-insert row (base side
+    // NULL) or a canonical row (draft side NULL) identically. It sits BEFORE the
+    // ORDER BY and AFTER the tombstone clause, so a tombstoned PK-pinned read
+    // still returns no row.
+    const joinAndTombstone = sql.raw(
       `) d ON b."${pkColName}" = d."${pkColName}" ` +
-        `WHERE COALESCE(d."__tombstone", false) = false ` +
-        `ORDER BY COALESCE(d."${pkColName}", b."${pkColName}")`,
+        `WHERE COALESCE(d."__tombstone", false) = false`,
     )
-    // `this._draftId` is interpolated as a bound parameter by the sql tag.
-    const query = sql`${prefix}${this._draftId}${suffix}`
+    const orderBy = sql.raw(` ORDER BY COALESCE(d."${pkColName}", b."${pkColName}")`)
+    // `present` → bound `AND COALESCE(...) = $pkFilterValue`; absent → no fragment.
+    const pkPredicate = pkFilter.present
+      ? sql`${sql.raw(` AND COALESCE(d."${pkColName}", b."${pkColName}") = `)}${pkFilterValue}`
+      : sql.raw('')
+
+    // `this._draftId` and `pkFilterValue` are interpolated as bound parameters by
+    // the sql tag; relation/column names are introspected identifiers via sql.raw.
+    const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}`
 
     const result = await this._db.execute(query)
     return normalizeExecuteRows(result)
@@ -464,12 +547,13 @@ export class DraftSelectBuilder<T extends AnyTable> {
 
   /**
    * Coalesced first-row read. Mirrors `SelectBuilder.first()` so an UNMODIFIED
-   * handler that calls `ctx.db.from(table).first()` works inside a draft instead
-   * of throwing on a missing method (the `runHandler` widening hides the
-   * structural gap from the typechecker). Since the draft coalesce cannot push
-   * `where`/`limit` down (YW-120 scope), this returns the first row of the FULL
-   * coalesced set in PK order — the same row `SelectBuilder.first()` (which
-   * limits to 1, unfiltered) would return on the canonical path.
+   * handler that calls `ctx.db.from(table).where(eq('id', x)).first()` works
+   * inside a draft (the `runHandler` widening hides the structural gap from the
+   * typechecker). Delegates to `all()`, so it honors the SAME single-PK read
+   * predicate: `where(eq(pk, x)).first()` returns the one coalesced row (or
+   * null); an unfiltered `first()` returns the first row of the full coalesced
+   * set in PK order. Any non-PK read filter throws in `all()` — the mirror of
+   * the `all()` guard, so neither read method can be silently unfiltered.
    */
   async first(): Promise<Record<string, unknown> | null> {
     const rows = await this.all()
@@ -571,6 +655,16 @@ export function resolvePkColumnName(
  * `.insert()` / `.update()`) to SQL column names, for the shadow upsert which
  * speaks raw SQL. A property whose key is not a real column is dropped (the
  * caller's schema is the source of truth for the shadow's column set).
+ *
+ * Each value is routed through the Drizzle column codec (`col.mapToDriverValue`)
+ * so it is bound exactly as the canonical INSERT path would bind it. This is
+ * load-bearing for non-identity codecs: a `jsonb('fields')` column serializes
+ * its JS array/object to a JSON string here (the codec is `JSON.stringify`),
+ * matching what Drizzle's own insert lowering emits. Without it the raw JS value
+ * binds straight to the driver and a `jsonb` column receives a JS array/object,
+ * producing a type error or stored garbage. Columns with an identity codec
+ * (text/integer/boolean) are unaffected — `mapToDriverValue` returns the value
+ * unchanged for them.
  */
 function toSqlColumnMap(
   table: AnyTable,
@@ -582,9 +676,24 @@ function toSqlColumnMap(
   for (const [propKey, value] of Object.entries(values)) {
     const col = columns[propKey]
     if (!col) continue
-    out.push({ sqlName: col.name as string, value })
+    out.push({ sqlName: col.name as string, value: mapColumnValue(col, value) })
   }
   return out
+}
+
+/**
+ * Route a value through a Drizzle column's driver codec, mirroring the canonical
+ * INSERT/UPDATE lowering. A `null`/`undefined` is passed through untouched: a
+ * codec like `jsonb`'s `JSON.stringify` would otherwise turn `null` into the
+ * literal string `"null"` (and `undefined` into `undefined`), corrupting the
+ * "no override" sentinel the shadow read relies on. For every supported column
+ * type, a real value (`fields: [...]`, `done: true`) is the only case that needs
+ * a non-identity codec, and those are never null.
+ */
+// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+function mapColumnValue(col: any, value: unknown): unknown {
+  if (value === null || value === undefined) return value
+  return col.mapToDriverValue(value)
 }
 
 /**
@@ -622,6 +731,15 @@ async function writeShadowRow(
 
   tracker.tablesWritten.add(draftTableName)
 
+  // Route the PK value through its column codec too, so a PK whose type has a
+  // non-identity codec binds identically to the canonical path. PKs are
+  // typically uuid/text/serial (identity codec → no-op), but routing rather than
+  // assuming keeps the write path codec-correct for any PK column type.
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  const columns = getTableColumns(table) as Record<string, any>
+  const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
+  const pkValue = pkCol ? mapColumnValue(pkCol, opts.pkValue) : opts.pkValue
+
   // Provided value columns (sparse), excluding the PK (carried separately) and
   // any accidental __tombstone / draft_id passthrough (owned by this writer).
   const valueCols = toSqlColumnMap(table, opts.values).filter(
@@ -643,12 +761,7 @@ async function writeShadowRow(
   // Assemble parameterized VALUES. Every dynamic value is a bound param; column
   // and relation names are introspected identifiers spliced via sql.raw.
   const head = sql.raw(`INSERT INTO ${draftRel} (${insertColSql}) VALUES (`)
-  const parts: ReturnType<typeof sql>[] = [
-    head,
-    sql`${draftId}`,
-    sql.raw(', '),
-    sql`${opts.pkValue}`,
-  ]
+  const parts: ReturnType<typeof sql>[] = [head, sql`${draftId}`, sql.raw(', '), sql`${pkValue}`]
   for (const c of valueCols) {
     parts.push(sql.raw(', '), sql`${c.value}`)
   }
