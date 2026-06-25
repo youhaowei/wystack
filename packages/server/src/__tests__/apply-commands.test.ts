@@ -450,11 +450,10 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
         },
       })
       // Should not throw — applyAll runs flat against guardedTx.
-      await applyCommands(
-        app,
-        [{ path: 'addTodo', args: { id: 99, title: 'flat' } }],
-        { mode: 'commit', tx: guardedTx },
-      )
+      await applyCommands(app, [{ path: 'addTodo', args: { id: 99, title: 'flat' } }], {
+        mode: 'commit',
+        tx: guardedTx,
+      })
     })
 
     const { result: todos } = await app.call('listTodos', {})
