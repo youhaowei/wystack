@@ -205,17 +205,23 @@ export async function applyCommands(
       // This is the atomic-publish seam: replay + caller bookkeeping (e.g. log
       // sweep) share one commit, so there is no crash window between them.
       //
-      // `tablesWritten` is snapshotted from `outerTx` directly (the writes
-      // accumulate there as commands run). The caller must NOT flush this set
-      // to invalidation until AFTER the outer transaction resolves — if the
-      // caller's tx rolls back (sweep failure or any other throw), these writes
-      // never committed and the set must be discarded, not emitted.
+      // `tablesWritten` snapshots ONLY the delta introduced by this command
+      // batch. The baseline is captured before `applyAll` so any tables the
+      // caller wrote BEFORE calling `applyCommands` (bookkeeping, lock rows,
+      // etc.) are excluded from the returned set. This upholds the
+      // "COMMAND-BATCH writes only" contract — callers flush only command-
+      // relevant tables to invalidation, not pre-existing bookkeeping writes.
+      // The caller must NOT flush this set until AFTER the outer tx resolves.
+      const tablesWrittenBefore = new Set(outerTx.tablesWritten)
       const results = await applyAll(app, batch, outerTx, context)
+      const tablesWritten = new Set(
+        [...outerTx.tablesWritten].filter((t) => !tablesWrittenBefore.has(t)),
+      )
       return {
         mode: 'commit',
         commands: [...batch],
         results,
-        tablesWritten: new Set(outerTx.tablesWritten),
+        tablesWritten,
       }
     }
 

@@ -459,4 +459,58 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     const { result: todos } = await app.call('listTodos', {})
     expect(todos as unknown[]).toHaveLength(1)
   })
+
+  test('opts.tx is silently ignored when mode is preview', async () => {
+    // Contract: tx is a commit-only param; preview manages its own rollback
+    // sentinel and threading an outer tx has no defined semantics there.
+    // This test ensures a future refactor cannot accidentally wire tx into
+    // the preview path and corrupt its rollback behaviour.
+    //
+    // We pass a TrackedDb handle as `tx` but use preview mode. The handle is a
+    // bare createTracked() (not inside a transaction callback) — we are not
+    // testing transaction nesting here, only that the tx param has no effect
+    // on preview semantics (no persistence, mode === 'preview').
+    const strayTx = app.createTracked()
+    const previewResult = await applyCommands(
+      app,
+      [{ path: 'addTodo', args: { id: 1, title: 'preview-ignored-tx' } }],
+      { mode: 'preview', tx: strayTx },
+    )
+
+    // Preview must not persist — regardless of the supplied tx.
+    const { result: todos } = await app.call('listTodos', {})
+    expect(todos as unknown[]).toHaveLength(0)
+    expect(previewResult.mode).toBe('preview')
+  })
+
+  test('tablesWritten excludes tables the caller wrote before calling applyCommands', async () => {
+    // Load-bearing: the "COMMAND-BATCH writes only" contract requires that any
+    // table the caller wrote to BEFORE calling applyCommands is excluded from the
+    // returned tablesWritten set. Without the baseline-snapshot fix, a pre-existing
+    // write on the tx contaminates the snapshot and causes over-broad invalidation.
+    //
+    // We simulate a realistic scenario: the caller inserts a "lock" row into the
+    // `tags` table via `tx.into()` before replaying, then applyCommands adds a
+    // `todos` write. tablesWritten must contain only `todos`, not `tags`.
+    const outer = app.createTracked()
+    let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
+    await outer.transaction(async (tx) => {
+      // Pre-existing write through the tx handle itself — this is how a caller
+      // would do bookkeeping (e.g. delete a log row) before replaying commands.
+      // Writing through `tx.into()` adds `tags` to `tx.tablesWritten` directly.
+      await tx.into(schema.tags).insert({ id: 99, label: 'pre-existing-lock' })
+      // applyCommands runs inside the same tx — `tags` is already in tablesWritten.
+      commitResult = await applyCommands(
+        app,
+        [{ path: 'addTodo', args: { id: 1, title: 'command-batch-only' } }],
+        { mode: 'commit', tx },
+      )
+    })
+
+    // Only the command-batch write (`todos`) must be in the result.
+    expect(commitResult!.tablesWritten.has('todos')).toBe(true)
+    // The pre-existing bookkeeping write (`tags`) must NOT appear.
+    expect(commitResult!.tablesWritten.has('tags')).toBe(false)
+    expect(commitResult!.tablesWritten.size).toBe(1)
+  })
 })
