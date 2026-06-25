@@ -17,6 +17,14 @@
 //               from sameness), capture what changed, then force a rollback so
 //               nothing persists and no Tags emit.
 //
+// OUTER-TX EXTENSION (commit mode only): `ApplyCommandsOptions.tx` threads an
+// already-open caller-supplied transaction handle into the engine. When supplied
+// the engine does NOT open its own transaction — all commands run directly
+// against `tx`, and the caller's transaction boundary governs atomicity. This
+// makes it possible to combine `applyCommands` with caller-side bookkeeping
+// (e.g. sweeping a durable command log) in a SINGLE commit, eliminating any
+// crash window between the two. See `ApplyCommandsOptions.tx` for semantics.
+//
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
 // command paths, mutation-only validation policy, artifact-grouped PreviewDiff
 // with real compute) is a separate layer (DashFrame's YW-106 / YW-124) that
@@ -117,6 +125,36 @@ export interface ApplyCommandsOptions {
   mode: 'commit' | 'preview'
   /** Per-batch context (auth, tenant) forwarded to every command's handler. */
   context?: Record<string, unknown>
+  /**
+   * ADDITIVE OPTIONAL — commit mode only.
+   *
+   * When supplied, `applyCommands` runs every command directly against this
+   * already-open `TrackedDb` (a tx handle the CALLER opened) instead of
+   * opening its own transaction. The caller's transaction boundary governs
+   * atomicity: if the caller's tx rolls back, the command writes roll back too.
+   *
+   * PRIMARY USE CASE — atomic publish: the caller opens ONE transaction, calls
+   * `applyCommands(app, log, { mode: 'commit', tx })` to replay the command
+   * log, then performs bookkeeping (e.g. deleting the durable command log)
+   * INSIDE THE SAME tx callback. If any step fails the whole tx rolls back,
+   * eliminating the crash window between canonical commit and log sweep.
+   *
+   * CONTRACT (caller must hold):
+   *   - `tx` is the TrackedDb handle from INSIDE an already-open transaction
+   *     (i.e. the argument passed to `TrackedDb.transaction(async (tx) => ...)`).
+   *   - `tablesWritten` on the returned `CommitResult` is snapshotted from
+   *     `tx.tablesWritten` directly (not from an outer wrapper) immediately
+   *     after command replay completes. It contains COMMAND-BATCH writes only —
+   *     any bookkeeping writes the caller performs in the same tx AFTER
+   *     `applyCommands` returns (e.g. the log delete) are intentionally
+   *     excluded, so the caller flushes only command-relevant tables to
+   *     invalidation. The caller must NOT flush this set to invalidation until
+   *     AFTER the outer transaction resolves successfully — side effects
+   *     (invalidation, pubsub) must never precede a durable commit.
+   *   - Ignored when `mode === 'preview'` (preview manages its own rollback
+   *     sentinel; threading an outer tx has no defined semantics there).
+   */
+  tx?: TrackedDb
 }
 
 /**
@@ -140,8 +178,11 @@ class PreviewRollback {
  * @param app    the WyStack app whose function registry resolves command paths
  * @param batch  ordered commands; applied in array order within one transaction
  * @param opts   `mode: 'commit' | 'preview'` plus optional per-batch context
+ *              and optional outer `tx` (commit mode only — see ApplyCommandsOptions.tx)
  *
- * The public signature is FROZEN. Shape rationale:
+ * The positional public signature `(app, batch, opts)` is FROZEN. The `opts`
+ * bag is additive: new optional fields (like `tx`) extend it without breaking
+ * existing call sites. Shape rationale:
  *   - `(app, batch, opts)` mirrors `app.call(path, args, context)` argument
  *     order (subject, payload, options) so the two entry points read alike.
  *   - `ApplyResult` is a discriminated union on `mode`, not a flag, so callers
@@ -154,16 +195,37 @@ export async function applyCommands(
   batch: Command[],
   opts: ApplyCommandsOptions,
 ): Promise<ApplyResult> {
-  const { mode, context = {} } = opts
-
-  // Outer tracker bound to the app's connection. Its `transaction` opens the
-  // native tx; on commit it merges the inner tx tracker's writes up into
-  // `outer.tablesWritten` (the call-scope set that reaches invalidation).
-  // `applyCommands` is a peer of `app.call`, which likewise mints its own fresh
-  // tracker per dispatch.
-  const outer = app.createTracked()
+  const { mode, context = {}, tx: outerTx } = opts
 
   if (mode === 'commit') {
+    if (outerTx !== undefined) {
+      // OUTER-TX PATH: the caller already opened a transaction and supplies the
+      // tx-bound TrackedDb handle. Run all commands directly against it — no
+      // new transaction is opened here; the caller's commit boundary governs.
+      // This is the atomic-publish seam: replay + caller bookkeeping (e.g. log
+      // sweep) share one commit, so there is no crash window between them.
+      //
+      // `tablesWritten` is snapshotted from `outerTx` directly (the writes
+      // accumulate there as commands run). The caller must NOT flush this set
+      // to invalidation until AFTER the outer transaction resolves — if the
+      // caller's tx rolls back (sweep failure or any other throw), these writes
+      // never committed and the set must be discarded, not emitted.
+      const results = await applyAll(app, batch, outerTx, context)
+      return {
+        mode: 'commit',
+        commands: [...batch],
+        results,
+        tablesWritten: new Set(outerTx.tablesWritten),
+      }
+    }
+
+    // SELF-CONTAINED PATH (no outer tx supplied): open our own transaction.
+    // Outer tracker bound to the app's connection. Its `transaction` opens the
+    // native tx; on commit it merges the inner tx tracker's writes up into
+    // `outer.tablesWritten` (the call-scope set that reaches invalidation).
+    // `applyCommands` is a peer of `app.call`, which likewise mints its own fresh
+    // tracker per dispatch.
+    const outer = app.createTracked()
     // Apply every command in order inside one transaction. Any throw rolls the
     // whole batch back (including commands applied before the failure) and the
     // tracked-transaction merge is skipped, so nothing flushes to invalidation.
@@ -189,13 +251,17 @@ export async function applyCommands(
   // throw the sentinel after capturing the inner tx's `tablesWritten` so the
   // transaction rolls back (nothing persists, no Tags merge). We unwrap the
   // sentinel outside; a real command error is NOT a sentinel and propagates.
+  // `opts.tx` is intentionally ignored in preview mode — preview manages its
+  // own rollback sentinel and has no defined semantics for an outer tx handle.
+  const previewOuter = app.createTracked()
   try {
-    await outer.transaction(async (tx) => {
+    await previewOuter.transaction(async (tx) => {
       const results = await applyAll(app, batch, tx, context)
       // Snapshot the per-command results and the set that WOULD have flushed,
       // then force rollback via the sentinel. We read `tx.tablesWritten` (the
-      // INNER tracker) here, not `outer`: the merge into `outer` only happens on
-      // commit, which a preview never reaches — so `outer` would read empty.
+      // INNER tracker) here, not `previewOuter`: the merge into `previewOuter`
+      // only happens on commit, which a preview never reaches — so `previewOuter`
+      // would read empty.
       throw new PreviewRollback(results, new Set(tx.tablesWritten))
     })
   } catch (err) {
