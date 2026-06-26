@@ -21,6 +21,14 @@
 // dashboard node — a row-delta cannot reconstruct that). The `<table>__draft`
 // delta tables are the READ overlay; the command log is the PUBLISH source. The
 // two are different artifacts with different jobs.
+//
+// ATOMIC PUBLISH (YW-300): `publish` adopts the `applyCommands` outer-tx seam
+// (added in YW-297) to wrap command-log replay + shadow-sweep in ONE transaction.
+// This eliminates the crash window that previously existed between "canonical
+// committed" and "shadow cleared" — if either step fails, both roll back. The
+// draft stays live and publish is retryable. This is the wystack-internal adoption
+// of the primitive; DashFrame's `DraftController.publishDraft` adopts separately
+// (the durable-log delete is the analogous bookkeeping step there).
 
 import { resolvePkColumnName, type DraftTrackedDb } from '@wystack/db'
 import { getTableConfig } from 'drizzle-orm/pg-core'
@@ -364,39 +372,53 @@ export function createDraftLifecycle(
       // Bind late-bound operands immediately before commit — the ONLY app
       // injection inside publish. Identity if no hook supplied.
       const boundLog = resolve ? await resolve([...entry.log]) : [...entry.log]
-      // PUBLISH = replay the ordered command log onto canonical, atomically.
-      const result = (await applyCommands(app, boundLog, {
-        mode: 'commit',
-        context: entry.context,
-      })) as CommitResult
-      // Forget the draft BEFORE teardown. The canonical commit has already
-      // landed durably; deleting the registry entry first makes publish
-      // idempotent-on-retry — if `clearShadow` then throws (transient connection
-      // error), a caller that retries `publish(draftId)` hits "unknown draft"
-      // rather than re-replaying the whole log against canonical (a
-      // double-publish). The leftover shadow rows are inert (no live draft reads
-      // them) and the host can sweep them later; re-applying the log would not be.
       const touched = [...entry.touchedTables.values()]
+
+      // ATOMIC PUBLISH (YW-300): open ONE outer transaction so command-log
+      // replay and shadow-sweep share a single commit boundary. A crash between
+      // the two is no longer possible — if either step fails, both roll back,
+      // and the in-memory registry entry stays intact so publish is retryable.
+      //
+      // Previously `clearShadow` ran AFTER `applyCommands` returned (two separate
+      // transactions). A process death in that gap left the canonical commit durable
+      // but shadow rows orphaned. While those orphans are inert for the in-memory
+      // lifecycle (the map is gone on restart), the same latent window exists for
+      // any durable consumer that wraps this lifecycle — closing it here at the
+      // framework level is the Rule-of-Three extraction.
+      // `TrackedDb.transaction` is generic over its callback return type — we
+      // capture the CommitResult directly rather than via a non-local variable.
+      const result = await app.createTracked().transaction(async (tx) => {
+        // Replay the command log against the caller-supplied tx handle. The
+        // outer-tx seam (applyCommands opts.tx, added in YW-297) routes all
+        // command writes through this same handle — no inner transaction is
+        // opened; the outer's commit boundary governs.
+        const committed = (await applyCommands(app, boundLog, {
+          mode: 'commit',
+          context: entry.context,
+          tx,
+        })) as CommitResult
+        // Shadow-sweep inside the SAME tx: shadow rows disappear atomically
+        // with the canonical commit. On failure the outer tx rolls back both.
+        // `tx.raw` is the native Drizzle handle bound to this transaction.
+        await clearShadow(tx.raw, draftId, touched)
+        return committed
+      })
+
+      // Outer transaction committed. Remove the in-memory registry entry now
+      // that the canonical write is durable and the shadow is swept. This is
+      // post-commit — a crash here is harmless (the map is ephemeral and will
+      // be empty on restart regardless). Deleting AFTER commit (not before)
+      // preserves the entry for a retry if the outer tx rolls back.
       drafts.delete(draftId)
-      // Best-effort teardown — never flip a logically-successful publish to a
-      // failure. The canonical commit is already durable and the draft is
-      // already forgotten; if shadow cleanup throws (transient connection
-      // error), the leftover rows are inert (no live draft reads them) and the
-      // host can sweep them later. Swallowing here means a caller's `publish`
-      // resolves with the real CommitResult instead of an error for work that
-      // actually committed. The host flushes `result.tablesWritten` to
-      // invalidation (the lifecycle does not, by design).
-      try {
-        await clearShadow(app, draftId, touched)
-      } catch {
-        // Orphaned shadow rows only; intentionally non-fatal.
-      }
+      // The host flushes result.tablesWritten to invalidation (the lifecycle
+      // does not, by design — same posture as applyCommands).
       return result
     },
 
     async discard(draftId) {
       const entry = require(draftId)
-      await clearShadow(app, draftId, [...entry.touchedTables.values()])
+      // Discard has no replay to be atomic with — a fresh connection suffices.
+      await clearShadow(app.createTracked().raw, draftId, [...entry.touchedTables.values()])
       drafts.delete(draftId)
     },
 
@@ -494,20 +516,29 @@ async function enumerateTouchedCells(
   return cells
 }
 
-/** Delete a draft's shadow rows across every table it touched. `draftId` bound. */
+/**
+ * Delete a draft's shadow rows across every table it touched. `draftId` bound.
+ *
+ * Accepts a `raw` Drizzle db handle directly (rather than a `WyStackApp`) so
+ * the caller can pass a tx-bound handle and share the commit boundary with the
+ * command replay. When called from `publish`, `raw` is `tx.raw` inside the outer
+ * transaction — sweep and replay commit atomically (YW-300). For `discard`, a
+ * fresh connection (`app.createTracked().raw`) is fine since discard has no
+ * replay to be atomic with.
+ */
 async function clearShadow(
-  app: WyStackApp,
+  // oxlint-disable-next-line typescript/no-explicit-any -- DrizzleDb is `any` in @wystack/db
+  raw: any,
   draftId: string,
   touchedTables: AnyTable[],
 ): Promise<void> {
-  const db = app.createTracked().raw
   for (const drizzleTable of touchedTables) {
     const tableName = getTableName(drizzleTable)
     const config = getTableConfig(drizzleTable)
     const schema = config.schema
     const draftRel = schema ? `"${schema}"."${tableName}__draft"` : `"${tableName}__draft"`
     const prefix = sql.raw(`DELETE FROM ${draftRel} WHERE "draft_id" = `)
-    await db.execute(sql`${prefix}${draftId}`)
+    await raw.execute(sql`${prefix}${draftId}`)
   }
 }
 
