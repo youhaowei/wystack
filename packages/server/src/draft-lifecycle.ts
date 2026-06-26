@@ -385,15 +385,14 @@ export function createDraftLifecycle(
       // lifecycle (the map is gone on restart), the same latent window exists for
       // any durable consumer that wraps this lifecycle — closing it here at the
       // framework level is the Rule-of-Three extraction.
-      const outer = app.createTracked()
-      let capturedResult: CommitResult | undefined
-
-      await outer.transaction(async (tx) => {
+      // `TrackedDb.transaction` is generic over its callback return type — we
+      // capture the CommitResult directly rather than via a non-local variable.
+      const result = await app.createTracked().transaction(async (tx) => {
         // Replay the command log against the caller-supplied tx handle. The
         // outer-tx seam (applyCommands opts.tx, added in YW-297) routes all
         // command writes through this same handle — no inner transaction is
         // opened; the outer's commit boundary governs.
-        capturedResult = (await applyCommands(app, boundLog, {
+        const committed = (await applyCommands(app, boundLog, {
           mode: 'commit',
           context: entry.context,
           tx,
@@ -402,6 +401,7 @@ export function createDraftLifecycle(
         // with the canonical commit. On failure the outer tx rolls back both.
         // `tx.raw` is the native Drizzle handle bound to this transaction.
         await clearShadow(tx.raw, draftId, touched)
+        return committed
       })
 
       // Outer transaction committed. Remove the in-memory registry entry now
@@ -412,7 +412,7 @@ export function createDraftLifecycle(
       drafts.delete(draftId)
       // The host flushes result.tablesWritten to invalidation (the lifecycle
       // does not, by design — same posture as applyCommands).
-      return capturedResult!
+      return result
     },
 
     async discard(draftId) {
