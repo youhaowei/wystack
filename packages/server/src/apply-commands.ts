@@ -4,7 +4,7 @@
 // the generic substrate under DashFrame's Artifact write-side: a frozen-API
 // primitive that knows NOTHING about concrete command types. It composes three
 // existing pieces — `WyStackApp.runHandler` (typed dispatch against a supplied
-// tracker), `TrackedDb.transaction` (atomic + Tag-tracked + rollback-emits-
+// tracker), `DrizzleTracker.transaction` (atomic + Tag-tracked + rollback-emits-
 // nothing), and the Tracker's `tablesWritten` set (the invalidation feed) —
 // into a command bus with two modes:
 //
@@ -37,7 +37,7 @@
 // reinvent those frameworks. This is a focused engine: one entry point, no
 // middleware pipeline, no decorators.
 
-import type { TrackedDb } from '@wystack/db'
+import type { DrizzleTracker } from '@wystack/db'
 import type { WyStackApp } from './create'
 
 /**
@@ -129,7 +129,7 @@ export interface ApplyCommandsOptions {
    * ADDITIVE OPTIONAL — commit mode only.
    *
    * When supplied, `applyCommands` runs every command directly against this
-   * already-open `TrackedDb` (a tx handle the CALLER opened) instead of
+   * already-open `DrizzleTracker` (a tx handle the CALLER opened) instead of
    * opening its own transaction. The caller's transaction boundary governs
    * atomicity: if the caller's tx rolls back, the command writes roll back too.
    *
@@ -140,8 +140,8 @@ export interface ApplyCommandsOptions {
    * eliminating the crash window between canonical commit and log sweep.
    *
    * CONTRACT (caller must hold):
-   *   - `tx` is the TrackedDb handle from INSIDE an already-open transaction
-   *     (i.e. the argument passed to `TrackedDb.transaction(async (tx) => ...)`).
+   *   - `tx` is the DrizzleTracker handle from INSIDE an already-open transaction
+   *     (i.e. the argument passed to `DrizzleTracker.transaction(async (tx) => ...)`).
    *   - `tablesWritten` on the returned `CommitResult` is snapshotted from
    *     `tx.tablesWritten` directly (not from an outer wrapper) immediately
    *     after command replay completes. It contains COMMAND-BATCH writes only —
@@ -154,12 +154,12 @@ export interface ApplyCommandsOptions {
    *   - Ignored when `mode === 'preview'` (preview manages its own rollback
    *     sentinel; threading an outer tx has no defined semantics there).
    */
-  tx?: TrackedDb
+  tx?: DrizzleTracker
 }
 
 /**
  * Sentinel thrown inside the preview transaction to force a rollback. The ONLY
- * rollback channel `TrackedDb.transaction` exposes is a throw (which also skips
+ * rollback channel `DrizzleTracker.transaction` exposes is a throw (which also skips
  * the Tag merge — exactly preview's "emit nothing" requirement). We capture the
  * result on the sentinel so it survives the throw, then unwrap it outside the
  * transaction. This sentinel must never propagate as a real error — `applyCommands`
@@ -200,7 +200,7 @@ export async function applyCommands(
   if (mode === 'commit') {
     if (outerTx !== undefined) {
       // OUTER-TX PATH: the caller already opened a transaction and supplies the
-      // tx-bound TrackedDb handle. Run all commands directly against it — no
+      // tx-bound DrizzleTracker handle. Run all commands directly against it — no
       // new transaction is opened here; the caller's commit boundary governs.
       // This is the atomic-publish seam: replay + caller bookkeeping (e.g. log
       // sweep) share one commit, so there is no crash window between them.
@@ -299,7 +299,7 @@ export async function applyCommands(
 async function applyAll(
   app: WyStackApp,
   batch: Command[],
-  tx: TrackedDb,
+  tx: DrizzleTracker,
   context: Record<string, unknown>,
 ): Promise<CommandResult[]> {
   const results: CommandResult[] = []

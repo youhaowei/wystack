@@ -1,5 +1,5 @@
 /**
- * Tests for `TrackedDb.withDraft(draftId)` — the draft coalesce read primitive.
+ * Tests for `DrizzleTracker.withDraft(draftId)` — the draft coalesce read primitive.
  *
  * The draft table convention is `<base_table>__draft`. The coalesce:
  * - applies draft edits (delta wins over canonical)
@@ -23,12 +23,12 @@ import {
 } from 'drizzle-orm/pg-core'
 import { getTableColumns, sql } from 'drizzle-orm'
 import {
-  createTrackedDb,
+  createDrizzleTracker,
   DraftSelectBuilder,
   SelectBuilder,
   normalizeExecuteRows,
   decodeRowFromDriver,
-} from '../tracked-db'
+} from '../drizzle-tracker'
 import { eq } from '../operators'
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ void widgetsDraft
 
 let pg: PGlite
 let db: ReturnType<typeof drizzle>
-let tracked: ReturnType<typeof createTrackedDb>
+let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
   pg = new PGlite()
@@ -148,7 +148,7 @@ beforeEach(async () => {
       ('dW', 3, 'sprocket', false)
   `)
 
-  tracked = createTrackedDb(db)
+  tracked = createDrizzleTracker(db)
 })
 
 // ---------------------------------------------------------------------------
@@ -604,7 +604,7 @@ void reportsDraft
 describe('withDraft jsonb codec on writes (Gap 1)', () => {
   let jpg: PGlite
   let jdb: ReturnType<typeof drizzle>
-  let jtracked: ReturnType<typeof createTrackedDb>
+  let jtracked: ReturnType<typeof createDrizzleTracker>
 
   beforeEach(async () => {
     jpg = new PGlite()
@@ -628,7 +628,7 @@ describe('withDraft jsonb codec on writes (Gap 1)', () => {
         PRIMARY KEY (draft_id, id)
       )
     `)
-    jtracked = createTrackedDb(jdb)
+    jtracked = createDrizzleTracker(jdb)
   })
 
   test('CONTRACT 1: a jsonb value round-trips through a draft insert + coalesce read', async () => {
@@ -773,7 +773,7 @@ describe('withDraft coalesce read decode (integration, driver-independent)', () 
   // guards that the decode wired into all() does not corrupt the PGlite path.
   let jpg: PGlite
   let jdb: ReturnType<typeof drizzle>
-  let jtracked: ReturnType<typeof createTrackedDb>
+  let jtracked: ReturnType<typeof createDrizzleTracker>
 
   beforeEach(async () => {
     jpg = new PGlite()
@@ -789,7 +789,7 @@ describe('withDraft coalesce read decode (integration, driver-independent)', () 
         __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id)
       )
     `)
-    jtracked = createTrackedDb(jdb)
+    jtracked = createDrizzleTracker(jdb)
   })
 
   test('a BASE-side jsonb row (no draft delta) reads back as a PARSED OBJECT through the coalesce', async () => {

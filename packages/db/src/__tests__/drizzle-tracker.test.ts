@@ -4,7 +4,7 @@ import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema } from '../schema'
 import { text, int, boolean } from '../dsl'
 import { eq } from '../operators'
-import { createTrackedDb, resetTracking } from '../tracked-db'
+import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
 
 const schema = defineSchema({
   todos: {
@@ -20,7 +20,7 @@ const schema = defineSchema({
 
 let pg: PGlite
 let db: ReturnType<typeof drizzle>
-let tracked: ReturnType<typeof createTrackedDb>
+let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
   pg = new PGlite()
@@ -53,10 +53,10 @@ beforeEach(async () => {
   await db.execute('DELETE FROM tags')
   await db.execute('DELETE FROM deferred_tags')
 
-  tracked = createTrackedDb(db)
+  tracked = createDrizzleTracker(db)
 })
 
-describe('TrackedDb', () => {
+describe('DrizzleTracker', () => {
   test('insert records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'Test', done: false })
     expect(tracked.tablesWritten.has('todos')).toBe(true)
@@ -158,7 +158,7 @@ describe('TrackedDb', () => {
   })
 })
 
-describe('TrackedDb.transaction', () => {
+describe('DrizzleTracker.transaction', () => {
   test('commit flushes write Tags from every table touched in the batch', async () => {
     await tracked.transaction(async (tx) => {
       await tx.into(schema.todos).insert({ title: 'A', done: false })

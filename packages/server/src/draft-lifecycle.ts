@@ -30,7 +30,7 @@
 // of the primitive; DashFrame's `DraftController.publishDraft` adopts separately
 // (the durable-log delete is the analogous bookkeeping step there).
 
-import { resolvePkColumnName, type DraftTrackedDb } from '@wystack/db'
+import { resolvePkColumnName, type DraftDrizzleTracker } from '@wystack/db'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import { getTableName, sql } from 'drizzle-orm'
 import {
@@ -41,7 +41,7 @@ import {
 } from './apply-commands'
 import type { WyStackApp } from './create'
 
-// oxlint-disable-next-line typescript/no-explicit-any -- polymorphic Drizzle table, mirrors tracked-db.ts
+// oxlint-disable-next-line typescript/no-explicit-any -- polymorphic Drizzle table, mirrors drizzle-tracker.ts
 type AnyTable = any
 
 /**
@@ -347,7 +347,7 @@ export function createDraftLifecycle(
       // lands in the `<table>__draft` overlay. The recording wrapper captures
       // the Drizzle table OBJECTS written, keyed by schema-qualified name, so
       // detection + teardown can introspect schema/PK without a global schema registry.
-      const draftDb: DraftTrackedDb = recordTouchedTables(
+      const draftDb: DraftDrizzleTracker = recordTouchedTables(
         app.createTracked().withDraft(draftId),
         entry.touchedTables,
       )
@@ -385,7 +385,7 @@ export function createDraftLifecycle(
       // lifecycle (the map is gone on restart), the same latent window exists for
       // any durable consumer that wraps this lifecycle — closing it here at the
       // framework level is the Rule-of-Three extraction.
-      // `TrackedDb.transaction` is generic over its callback return type — we
+      // `DrizzleTracker.transaction` is generic over its callback return type — we
       // capture the CommitResult directly rather than via a non-local variable.
       const result = await app.createTracked().transaction(async (tx) => {
         // Replay the command log against the caller-supplied tx handle. The
@@ -462,9 +462,9 @@ export function createDraftLifecycle(
  * routes through `from`, so a delete-only draft is still captured.
  */
 function recordTouchedTables(
-  draftDb: DraftTrackedDb,
+  draftDb: DraftDrizzleTracker,
   touchedTables: Map<string, AnyTable>,
-): DraftTrackedDb {
+): DraftDrizzleTracker {
   const record = (table: AnyTable) => {
     // Key by SCHEMA-QUALIFIED name. A bare `getTableName` would collide
     // `app.accounts` with `audit.accounts` (same base name, different schema),

@@ -1,6 +1,6 @@
 /**
- * Filter operators for TrackedDb queries.
- * Produce descriptors that TrackedDb translates to Drizzle SQL conditions.
+ * Filter operators for DrizzleTracker queries.
+ * Produce descriptors that DrizzleTracker translates to Drizzle SQL conditions.
  */
 
 export type FilterOp = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'

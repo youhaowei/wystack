@@ -466,7 +466,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // This test ensures a future refactor cannot accidentally wire tx into
     // the preview path and corrupt its rollback behaviour.
     //
-    // We pass a TrackedDb handle as `tx` but use preview mode. The handle is a
+    // We pass a DrizzleTracker handle as `tx` but use preview mode. The handle is a
     // bare createTracked() (not inside a transaction callback) — we are not
     // testing transaction nesting here, only that the tx param has no effect
     // on preview semantics (no persistence, mode === 'preview').

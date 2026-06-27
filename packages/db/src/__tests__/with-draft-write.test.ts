@@ -18,7 +18,7 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { pgTable, integer, text as pgText, boolean as pgBoolean } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
-import { createTrackedDb } from '../tracked-db'
+import { createDrizzleTracker } from '../drizzle-tracker'
 import { eq } from '../operators'
 
 const todos = pgTable('todos', {
@@ -29,7 +29,7 @@ const todos = pgTable('todos', {
 
 let pg: PGlite
 let db: ReturnType<typeof drizzle>
-let tracked: ReturnType<typeof createTrackedDb>
+let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
   pg = new PGlite()
@@ -56,7 +56,7 @@ beforeEach(async () => {
     INSERT INTO todos (id, title, done) VALUES
       (1,'apple',false),(2,'banana',false),(3,'cherry',false)
   `)
-  tracked = createTrackedDb(db)
+  tracked = createDrizzleTracker(db)
 })
 
 async function shadowRows(draftId: string) {

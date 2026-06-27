@@ -30,7 +30,7 @@ import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { PgTable } from 'drizzle-orm/pg-core'
 
 /** Anything that can execute a Drizzle SQL object. Covers both the PGLite-backed
- *  drizzle instance and the future tracked-db wrapper. */
+ *  drizzle instance and the future drizzle-tracker wrapper. */
 export interface SyncTarget {
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle's execute return varies per driver
   execute: (query: ReturnType<typeof sql>) => Promise<any>

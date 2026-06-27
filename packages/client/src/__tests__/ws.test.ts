@@ -24,7 +24,7 @@ const pgliteHandles: Array<{ close(): Promise<void> }> = []
  * Drizzle db handle.  Call this instead of `createDb({ dev: 'pglite://' })`
  * inside tests so the handle is always paired with a close() in afterEach.
  */
-async function openTrackedDb() {
+async function openDrizzleTracker() {
   const db = await createDb({ dev: 'pglite://' })
   // drizzle-orm/pglite exposes the PGlite client via `$client`.
   pgliteHandles.push(db.$client as { close(): Promise<void> })
@@ -36,7 +36,7 @@ async function openTrackedDb() {
 // Returns both the WyStack app and the db handle so callers can close the
 // underlying PGlite instance (via the pgliteHandles registry above).
 async function makeAuthApp() {
-  const db = await openTrackedDb()
+  const db = await openDrizzleTracker()
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -202,7 +202,7 @@ async function openProbeSubscription(
 }
 
 beforeEach(async () => {
-  const db = await openTrackedDb()
+  const db = await openDrizzleTracker()
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,

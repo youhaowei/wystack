@@ -1,10 +1,10 @@
-import type { TrackedDb, AnyColumnDef, ColumnDef, DbConfig } from '@wystack/db'
+import type { DrizzleTracker, AnyColumnDef, ColumnDef, DbConfig } from '@wystack/db'
 
 /** Function context passed to every query/mutation handler.
  *  `db` is always provided by WyStack.
  *  App-defined context (auth, tenant info) is merged in via createWyStack's generic. */
 export interface FunctionContext {
-  db: TrackedDb
+  db: DrizzleTracker
   [key: string]: unknown
 }
 
