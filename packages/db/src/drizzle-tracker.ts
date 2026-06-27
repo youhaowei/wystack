@@ -939,7 +939,10 @@ export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
         into<T extends AnyTable>(table: T) {
           return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle)
         },
-        transaction<R>(_fn: (tx: DrizzleTracker) => Promise<R>, _opts?: TransactionOptions): Promise<R> {
+        transaction<R>(
+          _fn: (tx: DrizzleTracker) => Promise<R>,
+          _opts?: TransactionOptions,
+        ): Promise<R> {
           // A command handler must not open its own transaction inside a draft —
           // the draft's atomic boundary is the lifecycle's `publish` (one tracked
           // tx via applyCommands). Fail loud with a named contract message rather
@@ -953,7 +956,10 @@ export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
       }
       return draftHandle
     },
-    async transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R> {
+    async transaction<R>(
+      fn: (tx: DrizzleTracker) => Promise<R>,
+      opts?: TransactionOptions,
+    ): Promise<R> {
       // The lowering owns atomicity: Drizzle's native transaction provides the
       // tx handle and commits/rolls back. We add Tag-tracking by wrapping that
       // handle in a fresh DrizzleTracker. If `fn` throws, calls rollback, or the
