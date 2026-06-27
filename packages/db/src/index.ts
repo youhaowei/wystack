@@ -3,7 +3,7 @@
 
 export { defineSchema } from './schema'
 export { createDb } from './driver'
-export { createTrackedDb, resetTracking, resolvePkColumnName } from './tracked-db'
+export { createDrizzleTracker, resetTracking, resolvePkColumnName } from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
@@ -19,12 +19,12 @@ export type {
 export type { FilterOp, FilterDescriptor } from './operators'
 export type { SyncTarget } from './sync'
 export type {
-  TrackedDb,
-  DraftTrackedDb,
+  DrizzleTracker,
+  DraftDrizzleTracker,
   SelectBuilder,
   DraftSelectBuilder,
   InsertBuilder,
   DraftInsertBuilder,
   TransactionOptions,
-} from './tracked-db'
+} from './drizzle-tracker'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'

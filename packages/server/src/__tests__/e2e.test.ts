@@ -1,6 +1,6 @@
 /**
  * E2E Integration Test — proves the full vertical slice:
- * Schema DSL → TrackedDb → createWyStack → serve → WS subscribe → HTTP mutate → invalidation
+ * Schema DSL → DrizzleTracker → createWyStack → serve → WS subscribe → HTTP mutate → invalidation
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'

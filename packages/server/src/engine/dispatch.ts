@@ -6,7 +6,7 @@
 // connection state, no auth state, no sockets — Session owns all of that.
 //
 // This is intentionally a thin wrapper over `WyStackApp.call`: validation,
-// fresh-TrackedDb-per-call, and read/write tracking already live there
+// fresh-DrizzleTracker-per-call, and read/write tracking already live there
 // (create.ts). Dispatch does not reimplement them — it names the seam so the
 // Engine's transport adapters route through one pure entry point rather than
 // reaching into `app.call` directly. When YW-62 wires the reactive tier, the
@@ -33,7 +33,7 @@ export interface DispatchResult {
 /**
  * The pure dispatch function: `dispatch(path, args, context) -> result + tags`.
  * No side effects beyond running the registered handler against a fresh
- * TrackedDb. Throws what `app.call` throws — `Unknown function`, `ValidationError`,
+ * DrizzleTracker. Throws what `app.call` throws — `Unknown function`, `ValidationError`,
  * or any handler error — for the caller (Session/adapter) to map to the wire.
  */
 export type Dispatch = (

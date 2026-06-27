@@ -1,5 +1,5 @@
 /**
- * TrackedDb — fluent query builder wrapping Drizzle that auto-records
+ * DrizzleTracker — fluent query builder wrapping Drizzle that auto-records
  * tablesRead / tablesWritten for reactive invalidation.
  */
 import {
@@ -35,7 +35,7 @@ const drizzleOpMap = {
 
 /**
  * A draft-scoped handle returned by `withDraft(draftId)`. Exposes the same
- * read+write surface shape as `TrackedDb`, but every operation is routed at the
+ * read+write surface shape as `DrizzleTracker`, but every operation is routed at the
  * `<table>__draft` shadow rather than the canonical table:
  *
  *   - `from(table).all()`            → coalesced read (canonical ⊕ draft delta)
@@ -57,18 +57,18 @@ const drizzleOpMap = {
  * `undefined is not a function` — the `runHandler` widening erases the
  * structural difference, so the runtime guard is the only signal.
  */
-export interface DraftTrackedDb {
+export interface DraftDrizzleTracker {
   tablesRead: Set<string>
   tablesWritten: Set<string>
-  /** Raw Drizzle instance, same as `TrackedDb.raw`. */
+  /** Raw Drizzle instance, same as `DrizzleTracker.raw`. */
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
   into<T extends AnyTable>(table: T): DraftInsertBuilder<T>
   /** Always throws — drafts have no per-handler transaction (publish owns atomicity). */
-  transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+  transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
-export interface TrackedDb {
+export interface DrizzleTracker {
   tablesRead: Set<string>
   tablesWritten: Set<string>
   /** Raw Drizzle instance for complex queries (joins, raw SQL). Caller must manually
@@ -79,7 +79,7 @@ export interface TrackedDb {
   /**
    * Run `fn` inside an atomic transaction whose writes still emit reactive Tags.
    *
-   * `fn` receives a fresh TrackedDb bound to the native transaction handle. On
+   * `fn` receives a fresh DrizzleTracker bound to the native transaction handle. On
    * commit (fn resolves) the inner reads/writes merge into this tracker's sets,
    * so a successful batch's write Tags flush to invalidation as one set. On
    * rollback (fn throws, or `tx.raw.rollback()`) the merge is skipped and the
@@ -102,7 +102,7 @@ export interface TrackedDb {
    * slot is the only entry point for them, and the contract carries it now even
    * though no caller sets it yet.
    */
-  transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+  transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
   /**
    * Return a draft-coalescing read handle for the given draft ID.
    *
@@ -118,7 +118,7 @@ export interface TrackedDb {
    * no error is raised. Deleting a row is expressed via the `__tombstone` flag,
    * not by nulling its columns.
    */
-  withDraft(draftId: string): DraftTrackedDb
+  withDraft(draftId: string): DraftDrizzleTracker
 }
 
 /**
@@ -135,13 +135,13 @@ export interface TransactionOptions {
 export class SelectBuilder<T extends AnyTable> {
   private _table: T
   private _db: DrizzleDb
-  private _tracker: TrackedDb
+  private _tracker: DrizzleTracker
   private _filters: FilterDescriptor[] = []
   private _orderByCol?: string
   private _orderDir: 'asc' | 'desc' = 'asc'
   private _limitVal?: number
 
-  constructor(table: T, db: DrizzleDb, tracker: TrackedDb) {
+  constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker) {
     this._table = table
     this._db = db
     this._tracker = tracker
@@ -247,7 +247,7 @@ export class SelectBuilder<T extends AnyTable> {
 }
 
 /**
- * Draft-coalescing select builder returned by `DraftTrackedDb.from()`.
+ * Draft-coalescing select builder returned by `DraftDrizzleTracker.from()`.
  *
  * `all()` executes a FULL OUTER JOIN between the base table and its
  * `<table>__draft` shadow, coalescing every column so that draft edits win
@@ -279,7 +279,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _table: T
   private _db: DrizzleDb
   private _draftId: string
-  private _tracker: DraftTrackedDb
+  private _tracker: DraftDrizzleTracker
   // Accumulated `where()` predicates. The consuming method decides intent:
   //   - READ (`all`/`first`) interprets a single PK `eq` as a row predicate
   //     pushed into the coalesce SQL (any other shape throws).
@@ -288,7 +288,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
   // The same accumulated filter serves both; only the consumer differs.
   private _filters: FilterDescriptor[] = []
 
-  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftTrackedDb) {
+  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
     this._table = table
     this._db = db
     this._draftId = draftId
@@ -847,7 +847,7 @@ async function writeShadowRow(
 }
 
 /**
- * Insert builder returned by `DraftTrackedDb.into(table)`. Routes
+ * Insert builder returned by `DraftDrizzleTracker.into(table)`. Routes
  * `.insert(rows)` into the `<table>__draft` shadow as a sparse upsert per row
  * (each row carrying the full PK + columns, `__tombstone = false`). Mirrors the
  * canonical `into(table).insert(...)` a command handler emits — the handler is
@@ -857,9 +857,9 @@ export class DraftInsertBuilder<T extends AnyTable> {
   private _table: T
   private _db: DrizzleDb
   private _draftId: string
-  private _tracker: DraftTrackedDb
+  private _tracker: DraftDrizzleTracker
 
-  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftTrackedDb) {
+  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
     this._table = table
     this._db = db
     this._draftId = draftId
@@ -902,9 +902,9 @@ export class DraftInsertBuilder<T extends AnyTable> {
 export class InsertBuilder<T extends AnyTable> {
   private _table: T
   private _db: DrizzleDb
-  private _tracker: TrackedDb
+  private _tracker: DrizzleTracker
 
-  constructor(table: T, db: DrizzleDb, tracker: TrackedDb) {
+  constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker) {
     this._table = table
     this._db = db
     this._tracker = tracker
@@ -917,8 +917,8 @@ export class InsertBuilder<T extends AnyTable> {
   }
 }
 
-export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
-  const tracker: TrackedDb = {
+export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
+  const tracker: DrizzleTracker = {
     tablesRead: new Set(),
     tablesWritten: new Set(),
     raw: drizzleDb,
@@ -928,8 +928,8 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
     into<T extends AnyTable>(table: T) {
       return new InsertBuilder(table, drizzleDb, tracker)
     },
-    withDraft(draftId: string): DraftTrackedDb {
-      const draftHandle: DraftTrackedDb = {
+    withDraft(draftId: string): DraftDrizzleTracker {
+      const draftHandle: DraftDrizzleTracker = {
         tablesRead: tracker.tablesRead,
         tablesWritten: tracker.tablesWritten,
         raw: drizzleDb,
@@ -939,13 +939,13 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
         into<T extends AnyTable>(table: T) {
           return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle)
         },
-        transaction<R>(_fn: (tx: TrackedDb) => Promise<R>, _opts?: TransactionOptions): Promise<R> {
+        transaction<R>(_fn: (tx: DrizzleTracker) => Promise<R>, _opts?: TransactionOptions): Promise<R> {
           // A command handler must not open its own transaction inside a draft —
           // the draft's atomic boundary is the lifecycle's `publish` (one tracked
           // tx via applyCommands). Fail loud with a named contract message rather
           // than a cryptic `undefined is not a function` from the runHandler cast.
           throw new Error(
-            'DraftTrackedDb.transaction() is not supported: a draft handler cannot open its own ' +
+            'DraftDrizzleTracker.transaction() is not supported: a draft handler cannot open its own ' +
               'transaction — the draft atomic boundary is the lifecycle `publish` (which replays ' +
               'the command log inside one tracked transaction).',
           )
@@ -953,17 +953,17 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
       }
       return draftHandle
     },
-    async transaction<R>(fn: (tx: TrackedDb) => Promise<R>, opts?: TransactionOptions): Promise<R> {
+    async transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R> {
       // The lowering owns atomicity: Drizzle's native transaction provides the
       // tx handle and commits/rolls back. We add Tag-tracking by wrapping that
-      // handle in a fresh TrackedDb. If `fn` throws, calls rollback, or the
+      // handle in a fresh DrizzleTracker. If `fn` throws, calls rollback, or the
       // COMMIT itself fails, the native transaction rejects this await before
       // the merge below runs — so a non-committed transaction merges nothing
       // and emits no Tags. The merge-after-await placement IS the guarantee;
       // there is deliberately no `committed` flag to drift out of sync.
-      let inner: TrackedDb | undefined
+      let inner: DrizzleTracker | undefined
       const result = await drizzleDb.transaction(async (txHandle: DrizzleDb) => {
-        inner = createTrackedDb(txHandle)
+        inner = createDrizzleTracker(txHandle)
         return fn(inner)
       }, opts)
       // Reached only on commit. Flush the transaction's accumulated Tags up to
@@ -981,7 +981,7 @@ export function createTrackedDb(drizzleDb: DrizzleDb): TrackedDb {
   return tracker
 }
 
-/** Create a fresh TrackedDb that shares the same Drizzle connection but with empty tracking sets */
-export function resetTracking(tracked: TrackedDb): TrackedDb {
-  return createTrackedDb(tracked.raw)
+/** Create a fresh DrizzleTracker that shares the same Drizzle connection but with empty tracking sets */
+export function resetTracking(tracked: DrizzleTracker): DrizzleTracker {
+  return createDrizzleTracker(tracked.raw)
 }
