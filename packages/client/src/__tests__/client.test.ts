@@ -33,9 +33,10 @@ function mutationRef<TArgs, TReturn>(path: string): MutationRef<TArgs, TReturn> 
 describe('createClient — non-2xx error body handling', () => {
   let server: ReturnType<typeof Bun.serve>
   let baseUrl: string
+  let pg: PGlite
 
   beforeEach(async () => {
-    const pg = new PGlite()
+    pg = new PGlite()
     const db = drizzle(pg)
     await db.execute(`CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, name TEXT NOT NULL)`)
 
@@ -64,8 +65,9 @@ describe('createClient — non-2xx error body handling', () => {
     baseUrl = `http://localhost:${server.port}`
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     server.stop(true)
+    await pg.close()
   })
 
   test('query(): server-thrown message survives the RPC boundary', async () => {
@@ -112,7 +114,7 @@ describe('createClient — non-JSON and empty error bodies', () => {
   let baseUrl: string
 
   afterEach(() => {
-    server.stop(true)
+    server?.stop(true)
   })
 
   test('query(): plain-text (non-JSON) error body falls back to the raw text', async () => {
@@ -126,6 +128,19 @@ describe('createClient — non-JSON and empty error bodies', () => {
     const ref = queryRef<Record<string, never>, unknown>('anything')
 
     await expect(client.query(ref)).rejects.toThrow('upstream proxy exploded')
+  })
+
+  test('mutate(): plain-text (non-JSON) error body falls back to the raw text', async () => {
+    server = Bun.serve({
+      fetch: () => new Response('upstream proxy exploded', { status: 502 }),
+      port: 0,
+    })
+    baseUrl = `http://localhost:${server.port}`
+
+    const client = createClient({ url: baseUrl })
+    const ref = mutationRef<Record<string, never>, unknown>('anything')
+
+    await expect(client.mutate(ref)).rejects.toThrow('upstream proxy exploded')
   })
 
   test('query(): empty error body falls back to `HTTP ${status}`', async () => {
