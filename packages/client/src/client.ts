@@ -19,6 +19,37 @@ export interface WyStackClient {
   mutate<TRef extends MutationRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
 }
 
+/**
+ * Build the Error to throw for a non-2xx response, preserving the server's
+ * message so callers can pattern-match on it (e.g. drift/validation copy).
+ *
+ * Body shape is `{ error: string, ... }` per @wystack/server's routes.ts, but
+ * this also tolerates a non-JSON text body (raw text becomes the message) and
+ * an empty body (falls back to `HTTP ${status}`). The HTTP status is attached
+ * as a `status` property on the Error for callers that want to introspect it,
+ * without inventing a bespoke error class.
+ */
+async function readHttpError(res: Response): Promise<Error> {
+  const text = await res.text().catch(() => '')
+  if (!text) {
+    return Object.assign(new Error(`HTTP ${res.status}`), { status: res.status })
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // Non-JSON body — surface the raw text as the message.
+    return Object.assign(new Error(text), { status: res.status })
+  }
+  const message =
+    parsed &&
+    typeof parsed === 'object' &&
+    typeof (parsed as { error?: unknown }).error === 'string'
+      ? (parsed as { error: string }).error
+      : text
+  return Object.assign(new Error(message), { status: res.status })
+}
+
 export function createClient(config: WyStackClientConfig): WyStackClient {
   const httpUrl = config.url.replace(/\/$/, '')
   const prefix = config.prefix ?? '/api'
@@ -47,7 +78,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
         headers: auth,
       })
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`)
+        throw await readHttpError(res)
       }
       const json = await res.json()
       if (json.error) throw new Error(json.error)
@@ -63,7 +94,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
         body: JSON.stringify(args ?? {}),
       })
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`)
+        throw await readHttpError(res)
       }
       const json = await res.json()
       if (json.error) throw new Error(json.error)
