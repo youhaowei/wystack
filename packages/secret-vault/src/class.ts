@@ -16,7 +16,4 @@
  * Extensible: add new members as new credential classes are introduced.
  * Existing members MUST NOT be renamed (stored in mapping records).
  */
-export type CredentialClass =
-  | 'connector-key'
-  | 'serve-token'
-  | 'assistant-provider'
+export type CredentialClass = 'connector-key' | 'serve-token' | 'assistant-provider'
