@@ -10,8 +10,10 @@
  * - `"connector-key"` — API keys / OAuth tokens for data-source connectors.
  * - `"serve-token"`   — tokens used by the WyStack serve layer (e.g. signed
  *                       JWTs, service account credentials).
+ * - `"assistant-provider"` — API keys / OAuth credentials for assistant model
+ *                            providers.
  *
  * Extensible: add new members as new credential classes are introduced.
  * Existing members MUST NOT be renamed (stored in mapping records).
  */
-export type CredentialClass = 'connector-key' | 'serve-token'
+export type CredentialClass = 'connector-key' | 'serve-token' | 'assistant-provider'
