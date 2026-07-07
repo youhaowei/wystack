@@ -12,6 +12,26 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+function corsHeaders(req: Request): HeadersInit {
+  return {
+    'Access-Control-Allow-Origin': req.headers.get('origin') ?? '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-WyStack-Org-Id',
+  }
+}
+
+function withCors(response: Response, req: Request): Response {
+  const headers = new Headers(response.headers)
+  for (const [key, value] of Object.entries(corsHeaders(req))) {
+    headers.set(key, value)
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
 interface ServeOptions {
   app: WyStackApp
   port?: number
@@ -40,6 +60,10 @@ export function serve(opts: ServeOptions) {
     async fetch(req, server) {
       const url = new URL(req.url)
 
+      if (req.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders(req) })
+      }
+
       // WebSocket upgrade — resolve context at connection time
       if (url.pathname === '/wystack/ws') {
         try {
@@ -48,22 +72,22 @@ export function serve(opts: ServeOptions) {
             data: { subscriptionIds: new Set<string>(), context },
           })
           if (upgraded) return undefined as unknown as Response
-          return new Response('WebSocket upgrade failed', { status: 400 })
+          return withCors(new Response('WebSocket upgrade failed', { status: 400 }), req)
         } catch (err: unknown) {
-          return Response.json({ error: errorMessage(err) }, { status: 401 })
+          return withCors(Response.json({ error: errorMessage(err) }, { status: 401 }), req)
         }
       }
 
       // Extract function path from /wystack/:functionName
       if (!url.pathname.startsWith('/wystack/')) {
-        return new Response('Not found', { status: 404 })
+        return withCors(new Response('Not found', { status: 404 }), req)
       }
 
       const functionPath = url.pathname.replace('/wystack/', '')
       const fn = app.functions.get(functionPath)
 
       if (!fn) {
-        return Response.json({ error: `Unknown function: ${functionPath}` }, { status: 404 })
+        return withCors(Response.json({ error: `Unknown function: ${functionPath}` }, { status: 404 }), req)
       }
 
       // Resolve context per request
@@ -71,7 +95,7 @@ export function serve(opts: ServeOptions) {
       try {
         context = await resolveContext(req)
       } catch (err: unknown) {
-        return Response.json({ error: errorMessage(err) }, { status: 401 })
+        return withCors(Response.json({ error: errorMessage(err) }, { status: 401 }), req)
       }
 
       // GET: queries (cacheable, SSR-friendly)
@@ -80,12 +104,12 @@ export function serve(opts: ServeOptions) {
           const argsParam = url.searchParams.get('args')
           const args = argsParam ? JSON.parse(argsParam) : {}
           const { result } = await app.call(functionPath, args, context)
-          return Response.json({ data: result })
+          return withCors(Response.json({ data: result }), req)
         } catch (err: unknown) {
           if (err instanceof ValidationError) {
-            return Response.json({ error: err.message, issues: err.issues }, { status: 400 })
+            return withCors(Response.json({ error: err.message, issues: err.issues }, { status: 400 }), req)
           }
-          return Response.json({ error: errorMessage(err) }, { status: 500 })
+          return withCors(Response.json({ error: errorMessage(err) }, { status: 500 }), req)
         }
       }
 
@@ -100,16 +124,16 @@ export function serve(opts: ServeOptions) {
             await invalidateSubscriptions(app, callResult.tablesWritten, subToWs)
           }
 
-          return Response.json({ data: callResult.result })
+          return withCors(Response.json({ data: callResult.result }), req)
         } catch (err: unknown) {
           if (err instanceof ValidationError) {
-            return Response.json({ error: err.message, issues: err.issues }, { status: 400 })
+            return withCors(Response.json({ error: err.message, issues: err.issues }, { status: 400 }), req)
           }
-          return Response.json({ error: errorMessage(err) }, { status: 500 })
+          return withCors(Response.json({ error: errorMessage(err) }, { status: 500 }), req)
         }
       }
 
-      return new Response('Method not allowed', { status: 405 })
+      return withCors(new Response('Method not allowed', { status: 405 }), req)
     },
 
     websocket: {

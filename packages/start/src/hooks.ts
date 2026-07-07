@@ -29,6 +29,7 @@ export function useWyQuery<T = unknown>(
   const query = useQuery<T>({
     queryKey,
     queryFn: () => client.call(path, args) as Promise<T>,
+    retry: false,
   })
 
   // WS subscription for live invalidation

@@ -15,6 +15,13 @@ import type { AnyColumnDef, ColumnDefOptions } from './dsl'
 
 type TableDefs = Record<string, Record<string, AnyColumnDef>>
 
+function toSnakeCase(name: string) {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .toLowerCase()
+}
+
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
 function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<string, any>) {
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builder types vary per column type; no common base type
@@ -94,9 +101,9 @@ export function defineSchema<T extends TableDefs>(tables: T) {
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
     const colDefs: Record<string, any> = {}
     for (const [colName, colDef] of Object.entries(columns)) {
-      colDefs[colName] = buildColumn(colName, colDef.opts, result)
+      colDefs[colName] = buildColumn(toSnakeCase(colName), colDef.opts, result)
     }
-    result[tableName] = pgTable(tableName, colDefs)
+    result[tableName] = pgTable(toSnakeCase(tableName), colDefs)
   }
 
   return result as { [K in keyof T]: ReturnType<typeof pgTable> }

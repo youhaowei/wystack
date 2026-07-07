@@ -8,11 +8,14 @@ export interface WyStartClientConfig {
   url: string
   /** App-provided function to get auth token. Called per HTTP request and on WS connect. */
   getToken?: () => Promise<string | null> | string | null
+  /** App-provided extra headers. Called per HTTP request after auth token resolution. */
+  getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
 }
 
 export interface WyStartClient {
   url: string
   getToken: () => Promise<string | null> | string | null
+  getHeaders: () => Promise<Record<string, string>> | Record<string, string>
   /** HTTP call to a WyStack function */
   call: (path: string, args?: unknown) => Promise<unknown>
   /** WS connection for invalidation signals */
@@ -27,6 +30,7 @@ export interface WyStartClient {
 export function createWyStartClient(config: WyStartClientConfig): WyStartClient {
   const baseUrl = config.url.replace(/\/$/, '')
   const getToken = config.getToken ?? (() => null)
+  const getHeaders = config.getHeaders ?? (() => ({}))
   const invalidateHandlers = new Map<string, () => void>()
   const activeSubs = new Map<string, { path: string; args: unknown }>()
 
@@ -36,7 +40,8 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
 
   async function getAuthHeaders(): Promise<Record<string, string>> {
     const token = await getToken()
-    return token ? { Authorization: `Bearer ${token}` } : {}
+    const extraHeaders = await getHeaders()
+    return token ? { ...extraHeaders, Authorization: `Bearer ${token}` } : extraHeaders
   }
 
   async function call(path: string, args: unknown = {}) {
@@ -139,6 +144,7 @@ export function createWyStartClient(config: WyStartClientConfig): WyStartClient 
   return {
     url: baseUrl,
     getToken,
+    getHeaders,
     call,
     get ws() { return ws },
     connect,

@@ -178,6 +178,16 @@ describe('defineSchema', () => {
 
     expect(getTableName(schema.users)).toBe('users')
     expect(getTableName(schema.people)).toBe('people')
-    expect(getTableName(schema.activityLog)).toBe('activityLog')
+    expect(getTableName(schema.activityLog)).toBe('activity_log')
+
+    const peopleCols = getTableColumns(schema.people)
+    expect(peopleCols.orgId.name).toBe('org_id')
+    expect(peopleCols.createdById.name).toBe('created_by_id')
+    expect(peopleCols.createdAt.name).toBe('created_at')
+
+    const activityCols = getTableColumns(schema.activityLog)
+    expect(activityCols.targetModel.name).toBe('target_model')
+    expect(activityCols.targetId.name).toBe('target_id')
+    expect(activityCols.createdAt.name).toBe('created_at')
   })
 })
