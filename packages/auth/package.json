@@ -12,7 +12,8 @@
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "bun run clean && tsc",
+    "clean": "rm -rf dist",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

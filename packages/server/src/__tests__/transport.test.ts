@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
+import { createBearerSessionProvider } from '../../../auth/src/index'
 import { createWyStack } from '../create'
 import { query, mutation } from '../functions'
 import { serve } from '../transport'
@@ -96,7 +97,9 @@ describe('HTTP transport', () => {
   test('resolveContext is called per request', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,
@@ -211,7 +214,9 @@ describe('WebSocket transport', () => {
   test('WS with resolveContext rejects unauthenticated', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
-    await db.execute(`CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
 
     const app = await createWyStack({
       db,
@@ -234,6 +239,61 @@ describe('WebSocket transport', () => {
       // Without token → HTTP 401 on upgrade
       const res = await fetch(`http://localhost:${authServer.port}/wystack/ws`)
       expect(res.status).toBe(401)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('bearer session provider accepts a query token only on a WebSocket upgrade', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await createWyStack({
+      db,
+      functions: {
+        listTodos: query({ args: {}, handler: async () => [] }),
+      },
+    })
+    const provider = createBearerSessionProvider({
+      allowQueryToken: (request) => request.headers.get('upgrade') === 'websocket',
+      verify: async (token) =>
+        token === 'valid-token' ? { identity: { subject: 'user-1' } } : null,
+    })
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (request) => {
+        const session = await provider.getSession(request)
+        if (!session) throw new Error('Unauthorized')
+        return { identityUserId: session.identity.subject }
+      },
+    })
+
+    try {
+      const ordinaryHttp = await fetch(
+        `http://localhost:${authServer.port}/wystack/listTodos?token=valid-token`,
+      )
+      expect(ordinaryHttp.status).toBe(401)
+
+      const ws = new WebSocket(`ws://localhost:${authServer.port}/wystack/ws?token=valid-token`)
+      const result = await new Promise<any>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({ type: 'subscribe', id: 'sub-auth', path: 'listTodos', args: {} }),
+          )
+        }
+        ws.onmessage = (event) => {
+          resolve(JSON.parse(event.data))
+          ws.close()
+        }
+        ws.onerror = reject
+        setTimeout(() => reject(new Error('timeout')), 5000)
+      })
+
+      expect(result).toMatchObject({ type: 'subscribed', id: 'sub-auth' })
     } finally {
       authServer.stop(true)
     }
