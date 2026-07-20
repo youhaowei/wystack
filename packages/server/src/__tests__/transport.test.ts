@@ -19,10 +19,7 @@ const schema = defineSchema({
 // via `functions` when a test needs something specific.
 type AuthTestFunctions = NonNullable<Parameters<typeof createWyStack>[0]['functions']>
 type CheckPermission = NonNullable<Parameters<typeof createWyStack>[0]['checkPermission']>
-async function makeAuthApp(
-  functions?: AuthTestFunctions,
-  checkPermission?: CheckPermission,
-) {
+async function makeAuthApp(functions?: AuthTestFunctions, checkPermission?: CheckPermission) {
   const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
@@ -204,16 +201,14 @@ describe('HTTP transport', () => {
     })
 
     try {
-      const denied = await fetch(
-        `http://localhost:${authServer.port}/api/protectedQuery`,
-        { headers: { Authorization: 'Bearer denied-user' } },
-      )
+      const denied = await fetch(`http://localhost:${authServer.port}/api/protectedQuery`, {
+        headers: { Authorization: 'Bearer denied-user' },
+      })
       expect(denied.status).toBe(403)
 
-      const allowed = await fetch(
-        `http://localhost:${authServer.port}/api/protectedQuery`,
-        { headers: { Authorization: 'Bearer allowed-user' } },
-      )
+      const allowed = await fetch(`http://localhost:${authServer.port}/api/protectedQuery`, {
+        headers: { Authorization: 'Bearer allowed-user' },
+      })
       expect(allowed.status).toBe(200)
 
       const deniedMutation = await fetch(

@@ -1,9 +1,6 @@
 import type { FunctionDef } from './types'
 
-export type CheckPermission = (
-  userId: string,
-  permission: string,
-) => boolean | Promise<boolean>
+export type CheckPermission = (userId: string, permission: string) => boolean | Promise<boolean>
 
 export class PermissionDeniedError extends Error {
   constructor(readonly permission: string) {

@@ -266,9 +266,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(
-          err instanceof ValidationError || err instanceof PermissionDeniedError
-        ),
+        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -300,9 +298,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(
-          err instanceof ValidationError || err instanceof PermissionDeniedError
-        ),
+        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues

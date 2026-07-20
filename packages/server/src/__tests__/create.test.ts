@@ -92,18 +92,20 @@ describe('createWyStack', () => {
   })
 
   test('call() enforces a function permission before dispatch', async () => {
-    await expect(app.call('protectedListTodos', {})).rejects.toBeInstanceOf(
-      PermissionDeniedError,
-    )
+    await expect(app.call('protectedListTodos', {})).rejects.toBeInstanceOf(PermissionDeniedError)
 
-    const { result } = await app.call('protectedListTodos', {}, {
-      userId: 'user-1',
-    })
+    const { result } = await app.call(
+      'protectedListTodos',
+      {},
+      {
+        userId: 'user-1',
+      },
+    )
     expect(result).toEqual([])
 
-    await expect(
-      app.call('protectedListTodos', {}, { userId: 'user-2' }),
-    ).rejects.toBeInstanceOf(PermissionDeniedError)
+    await expect(app.call('protectedListTodos', {}, { userId: 'user-2' })).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    )
   })
 
   test('call() surfaces tablesWritten from a committed tracked transaction', async () => {

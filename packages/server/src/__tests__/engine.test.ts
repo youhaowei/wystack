@@ -183,9 +183,7 @@ describe('Engine — RPC tier (AC #1)', () => {
     clientPipe.send({ type: 'call', id: 'c5', path: 'listTodos', args: {} })
     await until(() => received.length > 0, 'permission error')
 
-    expect(received).toEqual([
-      { type: 'error', kind: 'call', id: 'c5', error: 'Forbidden' },
-    ])
+    expect(received).toEqual([{ type: 'error', kind: 'call', id: 'c5', error: 'Forbidden' }])
   })
 })
 
