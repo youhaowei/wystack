@@ -18,7 +18,8 @@ const schema = defineSchema({
 // Default functions cover the common cases (listTodos + whoami); override
 // via `functions` when a test needs something specific.
 type AuthTestFunctions = NonNullable<Parameters<typeof createWyStack>[0]['functions']>
-async function makeAuthApp(functions?: AuthTestFunctions) {
+type CheckPermission = NonNullable<Parameters<typeof createWyStack>[0]['checkPermission']>
+async function makeAuthApp(functions?: AuthTestFunctions, checkPermission?: CheckPermission) {
   const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
@@ -32,7 +33,7 @@ async function makeAuthApp(functions?: AuthTestFunctions) {
         ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
     }),
   }
-  return createWyStack({ db, functions: functions ?? defaults })
+  return createWyStack({ db, functions: functions ?? defaults, checkPermission })
 }
 
 let server: ReturnType<typeof serve>
@@ -171,6 +172,67 @@ describe('HTTP transport', () => {
     const json = await res.json()
     expect(json.data).toHaveLength(1)
     expect(json.data[0].title).toBe('Hello')
+  })
+
+  test('returns 403 when the authenticated user lacks the function permission', async () => {
+    const app = await makeAuthApp(
+      {
+        protectedQuery: query({
+          permission: 'reports.read',
+          args: {},
+          handler: async () => ({ ok: true }),
+        }),
+        protectedMutation: mutation({
+          permission: 'reports.write',
+          args: {},
+          handler: async () => ({ ok: true }),
+        }),
+      },
+      async (userId, permission) =>
+        userId === 'allowed-user' &&
+        (permission === 'reports.read' || permission === 'reports.write'),
+    )
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => ({
+        userId: req.headers.get('authorization')?.replace('Bearer ', ''),
+      }),
+    })
+
+    try {
+      const denied = await fetch(`http://localhost:${authServer.port}/api/protectedQuery`, {
+        headers: { Authorization: 'Bearer denied-user' },
+      })
+      expect(denied.status).toBe(403)
+
+      const allowed = await fetch(`http://localhost:${authServer.port}/api/protectedQuery`, {
+        headers: { Authorization: 'Bearer allowed-user' },
+      })
+      expect(allowed.status).toBe(200)
+
+      const deniedMutation = await fetch(
+        `http://localhost:${authServer.port}/api/protectedMutation`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer denied-user' },
+          body: JSON.stringify({}),
+        },
+      )
+      expect(deniedMutation.status).toBe(403)
+
+      const allowedMutation = await fetch(
+        `http://localhost:${authServer.port}/api/protectedMutation`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer allowed-user' },
+          body: JSON.stringify({}),
+        },
+      )
+      expect(allowedMutation.status).toBe(200)
+    } finally {
+      authServer.stop(true)
+    }
   })
 
   test('resolveContext is called per request', async () => {

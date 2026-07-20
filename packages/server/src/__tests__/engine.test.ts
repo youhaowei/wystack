@@ -170,6 +170,21 @@ describe('Engine — RPC tier (AC #1)', () => {
 
     expect(h.received).toEqual([{ type: 'error', kind: 'call', id: 'c4', error: 'kaboom' }])
   })
+
+  test('call permission failure emits an error frame carrying the call id', async () => {
+    const app = await makeApp()
+    const fn = app.functions.get('listTodos')
+    if (fn) fn.permission = 'todos.read'
+    const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const received: ServerMessage[] = []
+    clientPipe.onMessage((message) => received.push(message))
+    attachEngine(serverPipe, { app })
+
+    clientPipe.send({ type: 'call', id: 'c5', path: 'listTodos', args: {} })
+    await until(() => received.length > 0, 'permission error')
+
+    expect(received).toEqual([{ type: 'error', kind: 'call', id: 'c5', error: 'Forbidden' }])
+  })
 })
 
 describe('Engine — auth handshake parity (AC #2)', () => {
@@ -637,6 +652,26 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
         id: 's1',
         retryable: true,
         error: 'kaboom',
+      },
+    ])
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe permission failure emits a durable subscription error', async () => {
+    const h = await reactiveHarness(undefined, (app) => {
+      const fn = app.functions.get('listTodos')
+      if (fn) fn.permission = 'todos.read'
+    })
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'permission error')
+
+    expect(h.received).toEqual([
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: false,
+        error: 'Forbidden',
       },
     ])
     expect(h.subscriptionStore.size()).toBe(0)

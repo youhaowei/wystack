@@ -3,6 +3,7 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
 import { createWyStack } from '../create'
+import { PermissionDeniedError } from '../permissions'
 import { query, mutation } from '../functions'
 
 const schema = defineSchema({
@@ -28,6 +29,8 @@ beforeEach(async () => {
 
   app = await createWyStack({
     db,
+    checkPermission: async (userId, permission) =>
+      userId === 'user-1' && permission === 'todos.read',
     functions: {
       listTodos: query({
         args: {},
@@ -55,6 +58,11 @@ beforeEach(async () => {
             throw new Error('handler boom')
           }),
       }),
+      protectedListTodos: query({
+        permission: 'todos.read',
+        args: {},
+        handler: async (ctx) => ctx.db.from(schema.todos).all(),
+      }),
     },
   })
 })
@@ -81,6 +89,23 @@ describe('createWyStack', () => {
 
   test('call() throws for unknown function', async () => {
     expect(app.call('unknown', {})).rejects.toThrow('Unknown function: unknown')
+  })
+
+  test('call() enforces a function permission before dispatch', async () => {
+    await expect(app.call('protectedListTodos', {})).rejects.toBeInstanceOf(PermissionDeniedError)
+
+    const { result } = await app.call(
+      'protectedListTodos',
+      {},
+      {
+        userId: 'user-1',
+      },
+    )
+    expect(result).toEqual([])
+
+    await expect(app.call('protectedListTodos', {}, { userId: 'user-2' })).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    )
   })
 
   test('call() surfaces tablesWritten from a committed tracked transaction', async () => {

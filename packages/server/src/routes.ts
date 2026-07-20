@@ -45,6 +45,7 @@ import {
 import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
+import { PermissionDeniedError } from './permissions'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
@@ -283,6 +284,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       const { result } = await app.call(functionPath, args, context)
       return c.json({ data: result })
     } catch (err: unknown) {
+      if (err instanceof PermissionDeniedError) {
+        return c.json({ error: err.message }, 403)
+      }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)
       }
@@ -332,6 +336,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
       return c.json({ data: callResult.result })
     } catch (err: unknown) {
+      if (err instanceof PermissionDeniedError) {
+        return c.json({ error: err.message }, 403)
+      }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)
       }
