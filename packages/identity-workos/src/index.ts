@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
 import { createBearerSessionProvider, type SessionProvider } from '@wystack/identity'
 
 export interface WorkOSSessionProviderOptions {
@@ -8,6 +8,19 @@ export interface WorkOSSessionProviderOptions {
   clientId: string
   /** Expected token issuer, including a configured custom AuthKit domain. */
   issuer: string
+}
+
+function isInvalidCredentialError(error: unknown): boolean {
+  return (
+    error instanceof errors.JWTClaimValidationFailed ||
+    error instanceof errors.JWTExpired ||
+    error instanceof errors.JOSEAlgNotAllowed ||
+    error instanceof errors.JWSInvalid ||
+    error instanceof errors.JWTInvalid ||
+    error instanceof errors.JWKSNoMatchingKey ||
+    error instanceof errors.JWKSMultipleMatchingKeys ||
+    error instanceof errors.JWSSignatureVerificationFailed
+  )
 }
 
 /**
@@ -26,15 +39,24 @@ export function createWorkOSSessionProvider(
         const { payload } = await jwtVerify(token, jwks, {
           algorithms: ['RS256'],
           issuer: options.issuer,
+          requiredClaims: ['sub', 'client_id', 'exp'],
         })
-        if (!payload.sub || payload.client_id !== options.clientId) return null
+        if (
+          typeof payload.sub !== 'string' ||
+          payload.sub.length === 0 ||
+          payload.client_id !== options.clientId ||
+          typeof payload.exp !== 'number'
+        ) {
+          return null
+        }
 
         return {
           identity: { subject: payload.sub },
-          ...(payload.exp ? { expiresAt: new Date(payload.exp * 1_000) } : {}),
+          expiresAt: new Date(payload.exp * 1_000),
         }
-      } catch {
-        return null
+      } catch (error) {
+        if (isInvalidCredentialError(error)) return null
+        throw error
       }
     },
   })
