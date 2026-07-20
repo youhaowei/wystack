@@ -58,6 +58,13 @@
         "postgres",
       ],
     },
+    "packages/identity": {
+      "name": "@wystack/identity",
+      "version": "0.0.1",
+      "devDependencies": {
+        "typescript": "^5.8.3",
+      },
+    },
     "packages/log": {
       "name": "@wystack/log",
       "version": "0.1.0",
@@ -181,6 +188,8 @@
     "@wystack/client": ["@wystack/client@workspace:packages/client"],
 
     "@wystack/db": ["@wystack/db@workspace:packages/db"],
+
+    "@wystack/identity": ["@wystack/identity@workspace:packages/identity"],
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
 

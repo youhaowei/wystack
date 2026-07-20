@@ -1,7 +1,14 @@
 # WyStack
 
-Full-stack reactive data framework built on open standards.
-"Convex-level reactivity, your own Postgres, deploy anywhere."
+Internal shared infrastructure — substrate, not a framework. It backs exactly two
+consumer applications, DashFrame and workhub, which vendor it as a git submodule.
+Nothing in this repo is published to npm, so there are no external users and no
+compatibility obligation before 1.0: change signatures outright and update the two
+consumers rather than adding shims or deprecation paths.
+
+(`@wystack/ui`, `@wystack/icons`, and `@wystack/agent` are published packages, but
+they are built and released from the separate stdui and unifai repos and merely
+share the `@wystack` npm scope. No package in this repo ships to a registry.)
 
 ## Architecture
 
