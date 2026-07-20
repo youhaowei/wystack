@@ -21,6 +21,8 @@ share the `@wystack` npm scope. No package in this repo ships to a registry.)
 - `@wystack/server` -- Function registry, reactive engine, transports (WS/REST)
 - `@wystack/client` -- Typed function refs, Convex-style hooks (useQuery/useMutation), TanStack Query, WS reactivity
 - `@wystack/transport` -- Transport substrate: per-connection `Pipe` interface + in-memory loopback adapter + typed wire-protocol contract (shared by server and client)
+- `@wystack/identity` -- Provider-neutral identity, session, and principal contracts
+- `@wystack/identity-workos` -- WorkOS access-token adapter for the identity seam
 - `@wystack/log` -- Structured logging (pino, wide events, ring buffer)
 - `@wystack/types` -- Branded primitive types
 - `@wystack/version` -- Semver utilities
