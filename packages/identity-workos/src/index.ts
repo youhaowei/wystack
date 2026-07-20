@@ -10,16 +10,17 @@ export interface WorkOSSessionProviderOptions {
   issuer: string
 }
 
-function isInvalidCredentialError(error: unknown): boolean {
+function requireNonBlank(name: string, value: string): string {
+  if (value.trim().length === 0) throw new TypeError(`${name} must not be blank`)
+  return value
+}
+
+function isJwksInfrastructureError(error: unknown): boolean {
   return (
-    error instanceof errors.JWTClaimValidationFailed ||
-    error instanceof errors.JWTExpired ||
-    error instanceof errors.JOSEAlgNotAllowed ||
-    error instanceof errors.JWSInvalid ||
-    error instanceof errors.JWTInvalid ||
-    error instanceof errors.JWKSNoMatchingKey ||
-    error instanceof errors.JWKSMultipleMatchingKeys ||
-    error instanceof errors.JWSSignatureVerificationFailed
+    error instanceof errors.JWKSTimeout ||
+    error instanceof errors.JWKSInvalid ||
+    error instanceof errors.JWKInvalid ||
+    (error instanceof errors.JOSEError && error.constructor === errors.JOSEError)
   )
 }
 
@@ -31,20 +32,22 @@ function isInvalidCredentialError(error: unknown): boolean {
 export function createWorkOSSessionProvider(
   options: WorkOSSessionProviderOptions,
 ): SessionProvider {
-  const jwks = createRemoteJWKSet(new URL(options.jwksUrl))
+  const jwks = createRemoteJWKSet(new URL(requireNonBlank('jwksUrl', options.jwksUrl)))
+  const clientId = requireNonBlank('clientId', options.clientId)
+  const issuer = requireNonBlank('issuer', options.issuer)
 
   return createBearerSessionProvider({
     async verify(token) {
       try {
         const { payload } = await jwtVerify(token, jwks, {
           algorithms: ['RS256'],
-          issuer: options.issuer,
+          issuer,
           requiredClaims: ['sub', 'client_id', 'exp'],
         })
         if (
           typeof payload.sub !== 'string' ||
           payload.sub.length === 0 ||
-          payload.client_id !== options.clientId ||
+          payload.client_id !== clientId ||
           typeof payload.exp !== 'number'
         ) {
           return null
@@ -55,7 +58,7 @@ export function createWorkOSSessionProvider(
           expiresAt: new Date(payload.exp * 1_000),
         }
       } catch (error) {
-        if (isInvalidCredentialError(error)) return null
+        if (error instanceof errors.JOSEError && !isJwksInfrastructureError(error)) return null
         throw error
       }
     },

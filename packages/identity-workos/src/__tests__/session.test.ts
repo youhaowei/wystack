@@ -21,6 +21,7 @@ async function createSignedToken(
     expirationTime?: number
     includeExpiration?: boolean
     jwksStatus?: number
+    unsupportedCriticalHeader?: boolean
   } = {},
 ) {
   const { publicKey, privateKey } = await generateKeyPair('RS256')
@@ -46,14 +47,21 @@ async function createSignedToken(
 
   const expirationTime = options.expirationTime ?? Math.floor(Date.now() / 1_000) + 3_600
 
+  const protectedHeader = options.unsupportedCriticalHeader
+    ? { alg: 'RS256', kid, crit: ['unsupported'], unsupported: true }
+    : { alg: 'RS256', kid }
+
   let jwt = new SignJWT(payload)
-    .setProtectedHeader({ alg: 'RS256', kid })
+    .setProtectedHeader(protectedHeader)
     .setIssuer(options.issuer ?? issuer)
     .setIssuedAt()
 
   if (options.includeExpiration !== false) jwt = jwt.setExpirationTime(expirationTime)
 
-  const token = await jwt.sign(privateKey)
+  const token = await jwt.sign(
+    privateKey,
+    options.unsupportedCriticalHeader ? { crit: { unsupported: true } } : undefined,
+  )
 
   return {
     token,
@@ -63,6 +71,20 @@ async function createSignedToken(
 }
 
 describe('createWorkOSSessionProvider', () => {
+  test('rejects blank security configuration at construction', () => {
+    const base = { jwksUrl: 'https://api.workos.com/sso/jwks/client_test', clientId, issuer }
+
+    expect(() => createWorkOSSessionProvider({ ...base, issuer: ' ' })).toThrow(
+      'issuer must not be blank',
+    )
+    expect(() => createWorkOSSessionProvider({ ...base, clientId: ' ' })).toThrow(
+      'clientId must not be blank',
+    )
+    expect(() => createWorkOSSessionProvider({ ...base, jwksUrl: ' ' })).toThrow(
+      'jwksUrl must not be blank',
+    )
+  })
+
   test('returns a provider-neutral session for a valid WorkOS access token', async () => {
     const { token, jwksUrl, expirationTime } = await createSignedToken()
     const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
@@ -192,6 +214,19 @@ describe('createWorkOSSessionProvider', () => {
       provider.getSession(
         new Request('https://app.example.test/api', {
           headers: { authorization: 'Bearer not-a-jwt' },
+        }),
+      ),
+    ).resolves.toBeNull()
+  })
+
+  test('fails closed for an unsupported critical JWT header', async () => {
+    const { token, jwksUrl } = await createSignedToken({ unsupportedCriticalHeader: true })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
         }),
       ),
     ).resolves.toBeNull()
