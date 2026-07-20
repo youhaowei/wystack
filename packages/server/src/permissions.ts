@@ -42,13 +42,19 @@ export async function assertFunctionPermission(
   if (!fn.permission) return
 
   // Fail closed on every path: an absent or malformed principal, an unwired
-  // checkPermission, and a falsy check all deny. A checkPermission that throws
-  // also denies — the rejection propagates and the call never dispatches.
+  // checkPermission, and anything but an explicit `true` all deny. A
+  // checkPermission that throws also denies — the rejection propagates and the
+  // call never dispatches.
+  //
+  // The `=== true` is deliberate. The declared return type is boolean, but the
+  // hook is application-supplied and reaches this boundary from untyped
+  // JavaScript too; a truthy sentinel returned by mistake — a user record, a
+  // non-empty reason string — must not read as a grant.
   const principal = context.principal
   if (
     !isPrincipal(principal) ||
     !checkPermission ||
-    !(await checkPermission(principal, fn.permission))
+    (await checkPermission(principal, fn.permission)) !== true
   ) {
     throw new PermissionDeniedError(fn.permission)
   }

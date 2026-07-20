@@ -172,6 +172,32 @@ describe('createWyStack', () => {
     )
   })
 
+  // The hook is application-supplied and reaches the boundary from untyped
+  // JavaScript too, so only an explicit `true` grants. A truthy sentinel
+  // returned by mistake must not read as an allow.
+  test('call() denies a truthy non-boolean checkPermission result', async () => {
+    for (const truthy of ['yes', 1, {}, [], { allowed: true }]) {
+      const pg = new PGlite()
+      const sloppy = await createWyStack({
+        db: drizzle(pg),
+        checkPermission: (async () => truthy) as unknown as Parameters<
+          typeof createWyStack
+        >[0]['checkPermission'],
+        functions: {
+          protectedListTodos: query({
+            permission: 'todos.read',
+            args: {},
+            handler: async () => [],
+          }),
+        },
+      })
+
+      await expect(
+        sloppy.call('protectedListTodos', {}, { principal: { kind: 'user', userId: 'user-1' } }),
+      ).rejects.toBeInstanceOf(PermissionDeniedError)
+    }
+  })
+
   test('call() denies when checkPermission is unwired', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
