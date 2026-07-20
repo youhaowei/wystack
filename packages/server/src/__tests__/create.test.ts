@@ -122,6 +122,26 @@ describe('createWyStack', () => {
     ).rejects.toBeInstanceOf(PermissionDeniedError)
   })
 
+  // A recognized kind alone is not a principal. The identifier is what the
+  // application's checkPermission keys off, so a principal missing it must
+  // never reach the hook — an app that grants by kind would authorize nobody.
+  test('call() denies a principal whose kind is recognized but whose identifier is missing', async () => {
+    const malformed = [
+      { kind: 'user' },
+      { kind: 'user', userId: '' },
+      { kind: 'user', userId: 42 },
+      { kind: 'service' },
+      { kind: 'service', credentialId: '' },
+      { kind: 'service', credentialId: null },
+    ]
+
+    for (const principal of malformed) {
+      await expect(
+        app.call('protectedListTodos', {}, { principal }),
+      ).rejects.toBeInstanceOf(PermissionDeniedError)
+    }
+  })
+
   test('call() denies a bare userId context — a userId is not a principal', async () => {
     await expect(app.call('protectedListTodos', {}, { userId: 'user-1' })).rejects.toBeInstanceOf(
       PermissionDeniedError,

@@ -13,6 +13,27 @@ export class PermissionDeniedError extends Error {
   }
 }
 
+/**
+ * Narrows an untrusted context value to a Principal.
+ *
+ * `context.principal` is populated by an application-supplied resolver, so at
+ * this boundary it is genuinely unknown — a cast would let `{ kind: 'user' }`
+ * with no `userId` reach the application's `checkPermission`, which may grant
+ * by kind alone. The identifier each kind carries is what makes it a principal,
+ * so both the discriminant and its payload are validated here.
+ */
+function isPrincipal(value: unknown): value is Principal {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as { kind?: unknown; userId?: unknown; credentialId?: unknown }
+  if (candidate.kind === 'user') {
+    return typeof candidate.userId === 'string' && candidate.userId.length > 0
+  }
+  if (candidate.kind === 'service') {
+    return typeof candidate.credentialId === 'string' && candidate.credentialId.length > 0
+  }
+  return false
+}
+
 export async function assertFunctionPermission(
   fn: FunctionDef,
   context: Record<string, unknown>,
@@ -20,12 +41,12 @@ export async function assertFunctionPermission(
 ): Promise<void> {
   if (!fn.permission) return
 
-  // Fail closed on every path: an absent principal, a principal whose kind we
-  // don't recognize, an unwired checkPermission, and a falsy check all deny.
-  const principal = context.principal as Principal | undefined
+  // Fail closed on every path: an absent or malformed principal, an unwired
+  // checkPermission, and a falsy check all deny. A checkPermission that throws
+  // also denies — the rejection propagates and the call never dispatches.
+  const principal = context.principal
   if (
-    !principal ||
-    (principal.kind !== 'user' && principal.kind !== 'service') ||
+    !isPrincipal(principal) ||
     !checkPermission ||
     !(await checkPermission(principal, fn.permission))
   ) {
