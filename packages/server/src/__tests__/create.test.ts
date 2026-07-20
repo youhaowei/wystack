@@ -29,8 +29,8 @@ beforeEach(async () => {
 
   app = await createWyStack({
     db,
-    checkPermission: async (userId, permission) =>
-      userId === 'user-1' && permission === 'todos.read',
+    checkPermission: async (principal, permission) =>
+      principal.kind === 'user' && principal.userId === 'user-1' && permission === 'todos.read',
     functions: {
       listTodos: query({
         args: {},
@@ -98,14 +98,53 @@ describe('createWyStack', () => {
       'protectedListTodos',
       {},
       {
-        userId: 'user-1',
+        principal: { kind: 'user', userId: 'user-1' },
       },
     )
     expect(result).toEqual([])
 
-    await expect(app.call('protectedListTodos', {}, { userId: 'user-2' })).rejects.toBeInstanceOf(
+    await expect(
+      app.call('protectedListTodos', {}, { principal: { kind: 'user', userId: 'user-2' } }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError)
+  })
+
+  // Enforcement reads context.principal and nothing else. Every way that read
+  // can come up short is a deny, not a fallback — these pin that shut.
+  test('call() denies when the context carries no principal', async () => {
+    await expect(app.call('protectedListTodos', {}, {})).rejects.toBeInstanceOf(
       PermissionDeniedError,
     )
+  })
+
+  test('call() denies a principal with an unrecognized kind', async () => {
+    await expect(
+      app.call('protectedListTodos', {}, { principal: { kind: 'robot', userId: 'user-1' } }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError)
+  })
+
+  test('call() denies a bare userId context — a userId is not a principal', async () => {
+    await expect(app.call('protectedListTodos', {}, { userId: 'user-1' })).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    )
+  })
+
+  test('call() denies when checkPermission is unwired', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    const unguarded = await createWyStack({
+      db,
+      functions: {
+        protectedListTodos: query({
+          permission: 'todos.read',
+          args: {},
+          handler: async () => [],
+        }),
+      },
+    })
+
+    await expect(
+      unguarded.call('protectedListTodos', {}, { principal: { kind: 'user', userId: 'user-1' } }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError)
   })
 
   test('call() surfaces tablesWritten from a committed tracked transaction', async () => {
