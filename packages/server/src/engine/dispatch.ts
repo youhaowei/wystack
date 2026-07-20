@@ -33,8 +33,9 @@ export interface DispatchResult {
 /**
  * The pure dispatch function: `dispatch(path, args, context) -> result + tags`.
  * No side effects beyond running the registered handler against a fresh
- * DrizzleTracker. Throws what `app.call` throws — `Unknown function`, `ValidationError`,
- * or any handler error — for the caller (Session/adapter) to map to the wire.
+ * DrizzleTracker. Throws what `app.call` throws — `Unknown function`,
+ * `PermissionDeniedError`, `ValidationError`, or any handler error — for the
+ * caller (Session/adapter) to map to the wire.
  */
 export type Dispatch = (
   path: string,
