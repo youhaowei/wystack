@@ -1,6 +1,10 @@
+import type { Principal } from '@wystack/identity'
 import type { FunctionDef } from './types'
 
-export type CheckPermission = (userId: string, permission: string) => boolean | Promise<boolean>
+export type CheckPermission = (
+  principal: Principal,
+  permission: string,
+) => boolean | Promise<boolean>
 
 export class PermissionDeniedError extends Error {
   constructor(readonly permission: string) {
@@ -16,11 +20,14 @@ export async function assertFunctionPermission(
 ): Promise<void> {
   if (!fn.permission) return
 
-  const userId = context.userId
+  // Fail closed on every path: an absent principal, a principal whose kind we
+  // don't recognize, an unwired checkPermission, and a falsy check all deny.
+  const principal = context.principal as Principal | undefined
   if (
-    typeof userId !== 'string' ||
+    !principal ||
+    (principal.kind !== 'user' && principal.kind !== 'service') ||
     !checkPermission ||
-    !(await checkPermission(userId, fn.permission))
+    !(await checkPermission(principal, fn.permission))
   ) {
     throw new PermissionDeniedError(fn.permission)
   }

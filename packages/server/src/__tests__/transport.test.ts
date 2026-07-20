@@ -188,16 +188,18 @@ describe('HTTP transport', () => {
           handler: async () => ({ ok: true }),
         }),
       },
-      async (userId, permission) =>
-        userId === 'allowed-user' &&
+      async (principal, permission) =>
+        principal.kind === 'user' &&
+        principal.userId === 'allowed-user' &&
         (permission === 'reports.read' || permission === 'reports.write'),
     )
     const authServer = serve({
       app,
       port: 0,
-      resolveContext: async (req) => ({
-        userId: req.headers.get('authorization')?.replace('Bearer ', ''),
-      }),
+      resolveContext: async (req) => {
+        const userId = req.headers.get('authorization')?.replace('Bearer ', '')
+        return { principal: userId ? { kind: 'user', userId } : undefined }
+      },
     })
 
     try {
