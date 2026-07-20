@@ -5,6 +5,7 @@
 import { createDrizzleTracker, createDb } from '@wystack/db'
 import type { DbConfig, DrizzleTracker, DraftDrizzleTracker } from '@wystack/db'
 import type { FunctionDef, FunctionContext, DbInput } from './types'
+import { assertFunctionPermission, type CheckPermission } from './permissions'
 import { createSubscriptionManager } from './subscriptions'
 import { buildArgsSchema, ValidationError } from './validation'
 
@@ -79,6 +80,7 @@ export async function createWyStack(opts: {
   db: DbInput
   dialect?: 'postgres'
   functions: Record<string, FunctionDef>
+  checkPermission?: CheckPermission
 }): Promise<WyStackApp> {
   const functions = new Map<string, FunctionDef>()
   const subscriptions = createSubscriptionManager()
@@ -98,10 +100,13 @@ export async function createWyStack(opts: {
   // Validate args against the cached Zod schema — produces validated + stripped
   // output. Shared by `call` (fresh tracker) and `runHandler` (supplied tracker)
   // so a path validates identically however it is dispatched.
-  function validateAndGetHandler(path: string, args: unknown) {
+  function getFunction(path: string) {
     const fn = functions.get(path)
     if (!fn) throw new Error(`Unknown function: ${path}`)
+    return fn
+  }
 
+  function validateArgs(path: string, args: unknown) {
     const schema = argsSchemas.get(path)
     let validatedArgs = args
     if (schema) {
@@ -109,7 +114,7 @@ export async function createWyStack(opts: {
       if (!parsed.success) throw new ValidationError(parsed.error.issues)
       validatedArgs = parsed.data
     }
-    return { fn, validatedArgs }
+    return validatedArgs
   }
 
   const app: WyStackApp = {
@@ -138,7 +143,9 @@ export async function createWyStack(opts: {
       tracked: DrizzleTracker | DraftDrizzleTracker,
       context: Record<string, unknown> = {},
     ) {
-      const { fn, validatedArgs } = validateAndGetHandler(path, args)
+      const fn = getFunction(path)
+      await assertFunctionPermission(fn, context, opts.checkPermission)
+      const validatedArgs = validateArgs(path, args)
       // A DraftDrizzleTracker shares the from/into/where/all/insert/update/delete
       // surface handlers use; the cast bridges the structural difference in
       // builder return types (DraftSelectBuilder vs SelectBuilder) that handlers

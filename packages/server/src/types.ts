@@ -5,6 +5,8 @@ import type { DrizzleTracker, AnyColumnDef, ColumnDef, DbConfig } from '@wystack
  *  App-defined context (auth, tenant info) is merged in via createWyStack's generic. */
 export interface FunctionContext {
   db: DrizzleTracker
+  /** Authenticated application user. Credentials resolve to this identity. */
+  userId?: string
   [key: string]: unknown
 }
 
@@ -20,6 +22,7 @@ export type InferArgs<T extends Record<string, AnyColumnDef>> = {
 export interface QueryDef<TArgs = any, TReturn = any> {
   type: 'query'
   path: string
+  permission?: string
   args: Record<string, AnyColumnDef>
   handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>
 }
@@ -28,6 +31,7 @@ export interface QueryDef<TArgs = any, TReturn = any> {
 export interface MutationDef<TArgs = any, TReturn = any> {
   type: 'mutation'
   path: string
+  permission?: string
   args: Record<string, AnyColumnDef>
   handler: (ctx: FunctionContext, args: TArgs) => Promise<TReturn>
 }

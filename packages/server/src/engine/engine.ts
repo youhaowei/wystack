@@ -10,6 +10,7 @@ import {
 } from '@wystack/transport'
 import type { WyStackApp } from '../create'
 import { ValidationError } from '../validation'
+import { PermissionDeniedError } from '../permissions'
 import { createDispatch, type Dispatch } from './dispatch'
 import { Session, type CloseReason, type SessionOptions } from './session'
 import type { SubscriptionStore } from './subscription-store'
@@ -265,7 +266,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError),
+        retryable: !(
+          err instanceof ValidationError || err instanceof PermissionDeniedError
+        ),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -297,7 +300,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError),
+        retryable: !(
+          err instanceof ValidationError || err instanceof PermissionDeniedError
+        ),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues

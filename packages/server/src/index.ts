@@ -8,6 +8,8 @@ export { createDraftLifecycle, compactLog } from './draft-lifecycle'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
+export { PermissionDeniedError } from './permissions'
+export type { CheckPermission } from './permissions'
 // Engine: `attachEngine` is the consumer entry point. Reactive port types and
 // in-process factories are public so external adapters can implement the same
 // transport-neutral contracts without importing transport internals.

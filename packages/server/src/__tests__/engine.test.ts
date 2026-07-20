@@ -642,6 +642,26 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     expect(h.subscriptionStore.size()).toBe(0)
   })
 
+  test('subscribe permission failure emits a durable subscription error', async () => {
+    const h = await reactiveHarness(undefined, (app) => {
+      const fn = app.functions.get('listTodos')
+      if (fn) fn.permission = 'todos.read'
+    })
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'permission error')
+
+    expect(h.received).toEqual([
+      {
+        type: 'error',
+        kind: 'subscription',
+        id: 's1',
+        retryable: false,
+        error: 'Forbidden',
+      },
+    ])
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
   test('subscribe validation failure emits durable subscription error with issues', async () => {
     const h = await reactiveHarness()
     h.send({ type: 'subscribe', id: 's1', path: 'todoByTitle', args: {} })
