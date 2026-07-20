@@ -30,7 +30,9 @@ beforeEach(async () => {
   app = await createWyStack({
     db,
     checkPermission: async (principal, permission) =>
-      principal.kind === 'user' && principal.userId === 'user-1' && permission === 'todos.read',
+      permission === 'todos.read' &&
+      ((principal.kind === 'user' && principal.userId === 'user-1') ||
+        (principal.kind === 'service' && principal.credentialId === 'cred-1')),
     functions: {
       listTodos: query({
         args: {},
@@ -122,6 +124,28 @@ describe('createWyStack', () => {
     ).rejects.toBeInstanceOf(PermissionDeniedError)
   })
 
+  // The service kind exists so non-human callers have somewhere to live, so it
+  // needs a positive case: without one, a regression that made the service
+  // branch of isPrincipal always deny would pass every negative test below.
+  test('call() authorizes a well-formed service principal', async () => {
+    const { result } = await app.call(
+      'protectedListTodos',
+      {},
+      { principal: { kind: 'service', credentialId: 'cred-1' } },
+    )
+    expect(result).toEqual([])
+  })
+
+  test('call() denies a service principal the check does not grant', async () => {
+    await expect(
+      app.call(
+        'protectedListTodos',
+        {},
+        { principal: { kind: 'service', credentialId: 'cred-2' } },
+      ),
+    ).rejects.toBeInstanceOf(PermissionDeniedError)
+  })
+
   // A recognized kind alone is not a principal. The identifier is what the
   // application's checkPermission keys off, so a principal missing it must
   // never reach the hook — an app that grants by kind would authorize nobody.
@@ -136,9 +160,9 @@ describe('createWyStack', () => {
     ]
 
     for (const principal of malformed) {
-      await expect(
-        app.call('protectedListTodos', {}, { principal }),
-      ).rejects.toBeInstanceOf(PermissionDeniedError)
+      await expect(app.call('protectedListTodos', {}, { principal })).rejects.toBeInstanceOf(
+        PermissionDeniedError,
+      )
     }
   })
 
