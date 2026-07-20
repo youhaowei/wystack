@@ -31,8 +31,8 @@ export interface WyStackApp {
    * Validation (the cached Zod schema) runs here exactly as in `call`, so a
    * batch command and a plain RPC to the same path validate identically. The
    * caller owns the DrizzleTracker lifecycle (creation, transaction, tracking-set
-   * collection); this method only validates args and invokes the handler with
-   * `{ ...context, db: tracked }`.
+   * collection); this method authorizes the function, validates its args, and
+   * invokes the handler with `{ ...context, db: tracked }`.
    *
    * This is a LOW-LEVEL escape hatch, reachable on the exported `WyStackApp`
    * type but not part of the intended public API — prefer `applyCommands` or

@@ -185,9 +185,15 @@ describe('HTTP transport', () => {
           args: {},
           handler: async () => ({ ok: true }),
         }),
+        protectedMutation: mutation({
+          permission: 'reports.write',
+          args: {},
+          handler: async () => ({ ok: true }),
+        }),
       },
       async (userId, permission) =>
-        userId === 'allowed-user' && permission === 'reports.read',
+        userId === 'allowed-user' &&
+        (permission === 'reports.read' || permission === 'reports.write'),
     )
     const authServer = serve({
       app,
@@ -209,6 +215,26 @@ describe('HTTP transport', () => {
         { headers: { Authorization: 'Bearer allowed-user' } },
       )
       expect(allowed.status).toBe(200)
+
+      const deniedMutation = await fetch(
+        `http://localhost:${authServer.port}/api/protectedMutation`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer denied-user' },
+          body: JSON.stringify({}),
+        },
+      )
+      expect(deniedMutation.status).toBe(403)
+
+      const allowedMutation = await fetch(
+        `http://localhost:${authServer.port}/api/protectedMutation`,
+        {
+          method: 'POST',
+          headers: { Authorization: 'Bearer allowed-user' },
+          body: JSON.stringify({}),
+        },
+      )
+      expect(allowedMutation.status).toBe(200)
     } finally {
       authServer.stop(true)
     }
