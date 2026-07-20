@@ -45,15 +45,25 @@ export function createBearerSessionProvider(
   return {
     async getSession(request) {
       const authorization = request.headers.get('authorization')
-      const headerToken = authorization?.startsWith('Bearer ')
-        ? authorization.slice('Bearer '.length).trim()
-        : null
+      const scheme = 'Bearer '
+      // RFC 7235: the auth scheme is case-insensitive. `bearer` and `BEARER`
+      // are standards-compliant and must not be read as "no credential".
+      const isBearer = authorization?.slice(0, scheme.length).toLowerCase() === scheme.toLowerCase()
+      const headerToken = isBearer ? authorization!.slice(scheme.length).trim() : null
+
+      // A bearer-shaped Authorization header is an explicit assertion of scheme,
+      // so its token decides the outcome — including when it is empty. Falling
+      // through to the query token here would let a malformed header silently
+      // downgrade to a weaker credential path instead of denying.
+      if (headerToken !== null) {
+        return headerToken ? options.verify(headerToken) : null
+      }
+
       const queryToken = options.allowQueryToken?.(request)
         ? new URL(request.url).searchParams.get('token')
         : null
-      const token = headerToken || queryToken
 
-      return token ? options.verify(token) : null
+      return queryToken ? options.verify(queryToken) : null
     },
   }
 }
