@@ -10,20 +10,22 @@ function isPermission(value: unknown): value is Permission<unknown> {
   )
 }
 
-function collectPermissionIds(value: unknown, ids: string[]): void {
+function collectPermissionIds(value: unknown, ids: Set<string>, visited: Set<object>): void {
+  if (typeof value !== 'object' || value === null || visited.has(value)) return
+  visited.add(value)
+
   if (isPermission(value)) {
-    ids.push(value.id)
+    ids.add(value.id)
     return
   }
-  if (typeof value !== 'object' || value === null) return
-  for (const child of Object.values(value)) collectPermissionIds(child, ids)
+  for (const child of Object.values(value)) collectPermissionIds(child, ids, visited)
 }
 
 export function assertPermissionIds(permissions: unknown, expectedIds: readonly string[]): void {
-  const actual = [] as string[]
-  collectPermissionIds(permissions, actual)
-  actual.sort()
-  const expected = [...expectedIds].sort()
+  const ids = new Set<string>()
+  collectPermissionIds(permissions, ids, new Set())
+  const actual = [...ids].sort()
+  const expected = [...new Set(expectedIds)].sort()
 
   if (
     actual.length !== expected.length ||

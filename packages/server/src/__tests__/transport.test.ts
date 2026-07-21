@@ -661,7 +661,8 @@ describe('WebSocket transport', () => {
     const app = await makeAuthApp({
       whoami: wy.procedure.input({}).query(async (ctx) => {
         handlerCalls.push({ userId: ctx.userId as string })
-        return { userId: ctx.userId as string, todos: ctx.db.from(schema.todos).all() }
+        await ctx.db.from(schema.todos).all()
+        return { userId: ctx.userId as string }
       }),
       addTodo: wy.procedure
         .input({ title: text })

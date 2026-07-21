@@ -3,7 +3,7 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
-import { defineApp, PermissionDeniedError } from '../index'
+import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
 const schema = defineSchema({
   todos: {
@@ -210,5 +210,12 @@ describe('defineApp().build()', () => {
         expectedPermissionIds: ['todos.read'],
       }),
     ).resolves.toBeDefined()
+  })
+
+  test('permission id collection tolerates cycles and repeated tree references', () => {
+    const circular: Record<string, unknown> = { permissions, alias: permissions }
+    circular.self = circular
+
+    expect(() => assertPermissionIds(circular, ['todos.read'])).not.toThrow()
   })
 })
