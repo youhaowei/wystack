@@ -26,9 +26,7 @@ describe('requireSecureJwksUrl', () => {
     // The distinction that matters: private does not mean local. Traffic to 10.0.0.5
     // or 192.168.1.10 crosses a network someone can be on, which is the threat.
     for (const host of ['10.0.0.5', '192.168.1.10', '172.16.0.1']) {
-      expect(() => requireSecureJwksUrl('jwksUrl', `http://${host}/jwks`)).toThrow(
-        'must use https',
-      )
+      expect(() => requireSecureJwksUrl('jwksUrl', `http://${host}/jwks`)).toThrow('must use https')
     }
   })
 
@@ -36,18 +34,14 @@ describe('requireSecureJwksUrl', () => {
     // Substring matching would accept all of these. `localhost.evil.com` resolves
     // wherever the attacker points it, and `127.0.0.1.evil.com` is an ordinary domain.
     for (const host of ['localhost.evil.com', '127.0.0.1.evil.com', 'notlocalhost']) {
-      expect(() => requireSecureJwksUrl('jwksUrl', `http://${host}/jwks`)).toThrow(
-        'must use https',
-      )
+      expect(() => requireSecureJwksUrl('jwksUrl', `http://${host}/jwks`)).toThrow('must use https')
     }
   })
 
   test('rejects non-http protocols', () => {
     // `file:` would read keys off local disk and `ftp:` is unauthenticated too; neither
     // is a transport this should silently accept.
-    expect(() => requireSecureJwksUrl('jwksUrl', 'file:///etc/keys.json')).toThrow(
-      'must use https',
-    )
+    expect(() => requireSecureJwksUrl('jwksUrl', 'file:///etc/keys.json')).toThrow('must use https')
   })
 
   test('rejects a relative or malformed URL with a distinct message', () => {

@@ -135,7 +135,11 @@ describe('createWorkOSSessionProvider', () => {
     // mints tokens that satisfy every other check, because they hold the private half
     // of the key this verifier is told to trust.
     expect(() =>
-      createWorkOSSessionProvider({ jwksUrl: 'http://api.workos.com/sso/jwks/x', clientId, issuer }),
+      createWorkOSSessionProvider({
+        jwksUrl: 'http://api.workos.com/sso/jwks/x',
+        clientId,
+        issuer,
+      }),
     ).toThrow('jwksUrl must use https')
 
     // Loopback stays permitted — this is the exemption the fixtures rely on, so it is
