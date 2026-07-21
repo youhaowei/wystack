@@ -1,11 +1,9 @@
-/**
- * createWyStack — the main entry point that wires DB, functions, and
- * reactive subscriptions together into a running app.
- */
+/** Wires DB, functions, and reactive subscriptions into a running app. */
 import { createDrizzleTracker, createDb } from '@wystack/db'
 import type { DbConfig, DrizzleTracker, DraftDrizzleTracker } from '@wystack/db'
+import { evaluate, type Permission } from '@wystack/permissions'
 import type { FunctionDef, FunctionContext, DbInput } from './types'
-import { assertFunctionPermission, type CheckPermission } from './permissions'
+import { assertPermissionIds } from './permissions'
 import { createSubscriptionManager } from './subscriptions'
 import { buildArgsSchema, ValidationError } from './validation'
 
@@ -31,8 +29,8 @@ export interface WyStackApp {
    * Validation (the cached Zod schema) runs here exactly as in `call`, so a
    * batch command and a plain RPC to the same path validate identically. The
    * caller owns the DrizzleTracker lifecycle (creation, transaction, tracking-set
-   * collection); this method authorizes the function, validates its args, and
-   * invokes the handler with `{ ...context, db: tracked }`.
+   * collection); this method validates args, injects runtime context, and
+   * invokes the composed handler with `{ ...context, db: tracked, can }`.
    *
    * This is a LOW-LEVEL escape hatch, reachable on the exported `WyStackApp`
    * type but not part of the intended public API — prefer `applyCommands` or
@@ -76,12 +74,17 @@ function resolveDbConfig(db: DbInput): DbConfig | null {
   return null // Pre-built Drizzle instance
 }
 
-export async function createWyStack(opts: {
+export async function buildWyStack(opts: {
   db: DbInput
   dialect?: 'postgres'
   functions: Record<string, FunctionDef>
-  checkPermission?: CheckPermission
+  permissions: unknown
+  expectedPermissionIds?: readonly string[]
 }): Promise<WyStackApp> {
+  if (opts.expectedPermissionIds) {
+    assertPermissionIds(opts.permissions, opts.expectedPermissionIds)
+  }
+
   const functions = new Map<string, FunctionDef>()
   const subscriptions = createSubscriptionManager()
 
@@ -144,14 +147,15 @@ export async function createWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      await assertFunctionPermission(fn, context, opts.checkPermission)
       const validatedArgs = validateArgs(path, args)
       // A DraftDrizzleTracker shares the from/into/where/all/insert/update/delete
       // surface handlers use; the cast bridges the structural difference in
       // builder return types (DraftSelectBuilder vs SelectBuilder) that handlers
       // never observe. The draft handle has no `transaction` (publish owns the
       // atomic boundary), which a command handler must not call directly.
-      const ctx: FunctionContext = { ...context, db: tracked as DrizzleTracker }
+      const ctx = { ...context, db: tracked as DrizzleTracker } as FunctionContext
+      // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
+      ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
       return fn.handler(ctx, validatedArgs)
     },
   }

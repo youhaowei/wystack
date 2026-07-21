@@ -2,9 +2,10 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
 import { buildArgsSchema, ValidationError } from '../validation'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 // --- Unit tests: buildArgsSchema ---
 
@@ -104,7 +105,7 @@ describe('validation in call()', () => {
     },
   })
 
-  let app: Awaited<ReturnType<typeof createWyStack>>
+  let app: Awaited<ReturnType<typeof wy.build>>
 
   beforeEach(async () => {
     const pg = new PGlite()
@@ -117,27 +118,17 @@ describe('validation in call()', () => {
       )
     `)
 
-    app = await createWyStack({
+    app = await wy.build({
       db,
       functions: {
-        listTodos: query({
-          args: {},
-          handler: async (ctx) => ctx.db.from(schema.todos).all(),
+        listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+        getTodo: wy.procedure.input({ id: int }).query(async (ctx, args) => ({ id: args.id })),
+        addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+          return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
         }),
-        getTodo: query({
-          args: { id: int },
-          handler: async (ctx, args) => ({ id: args.id }),
-        }),
-        addTodo: mutation({
-          args: { title: text },
-          handler: async (ctx, args) => {
-            return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
-          },
-        }),
-        searchTodos: query({
-          args: { query: text.optional(), limit: int.default(10) },
-          handler: async (_ctx, _args) => [],
-        }),
+        searchTodos: wy.procedure
+          .input({ query: text.optional(), limit: int.default(10) })
+          .query(async (_ctx, _args) => []),
       },
     })
   })

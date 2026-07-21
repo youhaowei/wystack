@@ -1,9 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
+import { definePermissions } from '@wystack/permissions'
 import { buildAuthRequest } from '../routes'
 import { serve } from '../serve-bun'
+import { defineApp } from '../define-app'
+import type { FunctionDef } from '../types'
 
 const schema = defineSchema({
   todos: {
@@ -13,27 +14,46 @@ const schema = defineSchema({
   },
 })
 
+function isAllowedUser(ctx: { principal?: unknown }): boolean {
+  const principal = ctx.principal
+  return (
+    typeof principal === 'object' &&
+    principal !== null &&
+    'kind' in principal &&
+    principal.kind === 'user' &&
+    'userId' in principal &&
+    principal.userId === 'allowed-user'
+  )
+}
+
+const permissions = definePermissions<{ principal?: unknown }>()({
+  reports: {
+    read: { description: 'Read reports', check: isAllowedUser },
+    write: { description: 'Write reports', check: isAllowedUser },
+  },
+})
+const wy = defineApp<Record<string, unknown>>({ permissions })
+
 // Per-test app factory for auth scenarios: each test creates its own
-// PGlite + createWyStack + serve so resolveContext can vary freely.
+// PGlite + wy.build + serve so resolveContext can vary freely.
 // Default functions cover the common cases (listTodos + whoami); override
 // via `functions` when a test needs something specific.
-type AuthTestFunctions = NonNullable<Parameters<typeof createWyStack>[0]['functions']>
-type CheckPermission = NonNullable<Parameters<typeof createWyStack>[0]['checkPermission']>
-async function makeAuthApp(functions?: AuthTestFunctions, checkPermission?: CheckPermission) {
+type AuthTestFunctions = Record<string, FunctionDef>
+async function makeAuthApp(functions?: AuthTestFunctions) {
   const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
   const defaults = {
-    listTodos: query({ args: {}, handler: async (_ctx) => [] }),
-    whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId as string }) }),
-    addTodo: mutation({
-      args: { title: text },
-      handler: async (ctx, args) =>
+    listTodos: wy.procedure.input({}).query(async (_ctx) => []),
+    whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId as string })),
+    addTodo: wy.procedure
+      .input({ title: text })
+      .mutation(async (ctx, args) =>
         ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
-    }),
+      ),
   }
-  return createWyStack({ db, functions: functions ?? defaults, checkPermission })
+  return wy.build({ db, functions: functions ?? defaults })
 }
 
 let server: ReturnType<typeof serve>
@@ -65,18 +85,12 @@ beforeEach(async () => {
     )
   `)
 
-  const app = await createWyStack({
+  const app = await wy.build({
     db,
     functions: {
-      listTodos: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
-      }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) => {
-          return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
-        },
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+        return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
       }),
     },
   })
@@ -175,24 +189,16 @@ describe('HTTP transport', () => {
   })
 
   test('returns 403 when the authenticated user lacks the function permission', async () => {
-    const app = await makeAuthApp(
-      {
-        protectedQuery: query({
-          permission: 'reports.read',
-          args: {},
-          handler: async () => ({ ok: true }),
-        }),
-        protectedMutation: mutation({
-          permission: 'reports.write',
-          args: {},
-          handler: async () => ({ ok: true }),
-        }),
-      },
-      async (principal, permission) =>
-        principal.kind === 'user' &&
-        principal.userId === 'allowed-user' &&
-        (permission === 'reports.read' || permission === 'reports.write'),
-    )
+    const app = await makeAuthApp({
+      protectedQuery: wy.procedure
+        .authorize(permissions.reports.read)
+        .input({})
+        .query(async () => ({ ok: true })),
+      protectedMutation: wy.procedure
+        .authorize(permissions.reports.write)
+        .input({})
+        .mutation(async () => ({ ok: true })),
+    })
     const authServer = serve({
       app,
       port: 0,
@@ -243,13 +249,10 @@ describe('HTTP transport', () => {
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
     )
 
-    const app = await createWyStack({
+    const app = await wy.build({
       db,
       functions: {
-        whoami: query({
-          args: {},
-          handler: async (ctx) => ({ userId: ctx.userId }),
-        }),
+        whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId })),
       },
     })
 
@@ -614,12 +617,9 @@ describe('WebSocket transport', () => {
   test('WS auth frame on no-auth server does not adopt token into subscription context', async () => {
     const observedContexts: Record<string, unknown>[] = []
     const app = await makeAuthApp({
-      whoami: query({
-        args: {},
-        handler: async (ctx) => {
-          observedContexts.push(ctx)
-          return { userId: ctx.userId ?? null }
-        },
+      whoami: wy.procedure.input({}).query(async (ctx) => {
+        observedContexts.push(ctx)
+        return { userId: ctx.userId ?? null }
       }),
     })
     const noAuthServer = serve({ app, port: 0 }) // no resolveContext: trusted/no-auth mode
@@ -659,18 +659,15 @@ describe('WebSocket transport', () => {
     const handlerCalls: Array<{ userId: string }> = []
 
     const app = await makeAuthApp({
-      whoami: query({
-        args: {},
-        handler: async (ctx) => {
-          handlerCalls.push({ userId: ctx.userId as string })
-          return { userId: ctx.userId as string, todos: ctx.db.from(schema.todos).all() }
-        },
+      whoami: wy.procedure.input({}).query(async (ctx) => {
+        handlerCalls.push({ userId: ctx.userId as string })
+        return { userId: ctx.userId as string, todos: ctx.db.from(schema.todos).all() }
       }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) =>
+      addTodo: wy.procedure
+        .input({ title: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
-      }),
+        ),
     })
     const authServer = serve({
       app,

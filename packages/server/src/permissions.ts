@@ -1,61 +1,36 @@
-import type { Principal } from '@wystack/identity'
-import type { FunctionDef } from './types'
+import type { Permission } from '@wystack/permissions'
 
-export type CheckPermission = (
-  principal: Principal,
-  permission: string,
-) => boolean | Promise<boolean>
-
-export class PermissionDeniedError extends Error {
-  constructor(readonly permission: string) {
-    super('Forbidden')
-    this.name = 'PermissionDeniedError'
-  }
-}
-
-/**
- * Narrows an untrusted context value to a Principal.
- *
- * `context.principal` is populated by an application-supplied resolver, so at
- * this boundary it is genuinely unknown — a cast would let `{ kind: 'user' }`
- * with no `userId` reach the application's `checkPermission`, which may grant
- * by kind alone. The identifier each kind carries is what makes it a principal,
- * so both the discriminant and its payload are validated here.
- */
-function isPrincipal(value: unknown): value is Principal {
+function isPermission(value: unknown): value is Permission<unknown> {
   if (typeof value !== 'object' || value === null) return false
-  const candidate = value as { kind?: unknown; userId?: unknown; credentialId?: unknown }
-  if (candidate.kind === 'user') {
-    return typeof candidate.userId === 'string' && candidate.userId.length > 0
-  }
-  if (candidate.kind === 'service') {
-    return typeof candidate.credentialId === 'string' && candidate.credentialId.length > 0
-  }
-  return false
+  const candidate = value as { id?: unknown; description?: unknown; check?: unknown }
+  return (
+    typeof candidate.id === 'string' &&
+    typeof candidate.description === 'string' &&
+    typeof candidate.check === 'function'
+  )
 }
 
-export async function assertFunctionPermission(
-  fn: FunctionDef,
-  context: Record<string, unknown>,
-  checkPermission: CheckPermission | undefined,
-): Promise<void> {
-  if (!fn.permission) return
+function collectPermissionIds(value: unknown, ids: string[]): void {
+  if (isPermission(value)) {
+    ids.push(value.id)
+    return
+  }
+  if (typeof value !== 'object' || value === null) return
+  for (const child of Object.values(value)) collectPermissionIds(child, ids)
+}
 
-  // Fail closed on every path: an absent or malformed principal, an unwired
-  // checkPermission, and anything but an explicit `true` all deny. A
-  // checkPermission that throws also denies — the rejection propagates and the
-  // call never dispatches.
-  //
-  // The `=== true` is deliberate. The declared return type is boolean, but the
-  // hook is application-supplied and reaches this boundary from untyped
-  // JavaScript too; a truthy sentinel returned by mistake — a user record, a
-  // non-empty reason string — must not read as a grant.
-  const principal = context.principal
+export function assertPermissionIds(permissions: unknown, expectedIds: readonly string[]): void {
+  const actual = [] as string[]
+  collectPermissionIds(permissions, actual)
+  actual.sort()
+  const expected = [...expectedIds].sort()
+
   if (
-    !isPrincipal(principal) ||
-    !checkPermission ||
-    (await checkPermission(principal, fn.permission)) !== true
+    actual.length !== expected.length ||
+    actual.some((permissionId, index) => permissionId !== expected[index])
   ) {
-    throw new PermissionDeniedError(fn.permission)
+    throw new Error(
+      `Permission ids differ from snapshot. Expected [${expected.join(', ')}], received [${actual.join(', ')}]`,
+    )
   }
 }

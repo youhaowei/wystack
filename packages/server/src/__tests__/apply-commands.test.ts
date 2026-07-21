@@ -2,9 +2,10 @@ import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean, eq } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
 import { applyCommands } from '../apply-commands'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
   todos: {
@@ -18,7 +19,7 @@ const schema = defineSchema({
   },
 })
 
-let app: Awaited<ReturnType<typeof createWyStack>>
+let app: Awaited<ReturnType<typeof wy.build>>
 
 beforeEach(async () => {
   const pg = new PGlite()
@@ -40,40 +41,31 @@ beforeEach(async () => {
     )
   `)
 
-  app = await createWyStack({
+  app = await wy.build({
     db,
     functions: {
-      listTodos: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
-      }),
-      listTags: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.tags).all(),
-      }),
-      addTodo: mutation({
-        args: { id: int, title: text },
-        handler: async (ctx, args) =>
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      listTags: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.tags).all()),
+      addTodo: wy.procedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
-      }),
-      addTag: mutation({
-        args: { id: int, label: text },
-        handler: async (ctx, args) =>
+        ),
+      addTag: wy.procedure
+        .input({ id: int, label: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.tags).insert({ id: args.id, label: args.label }),
-      }),
+        ),
       // Marks a todo done — used to prove a later command can read/write an
       // entity an earlier command in the same batch created.
-      markDone: mutation({
-        args: { id: int },
-        handler: async (ctx, args) =>
+      markDone: wy.procedure
+        .input({ id: int })
+        .mutation(async (ctx, args) =>
           ctx.db.from(schema.todos).where(eq('id', args.id)).update({ done: true }),
-      }),
+        ),
       // Always throws — used to prove mid-batch failure rolls the whole batch back.
-      boom: mutation({
-        args: {},
-        handler: async () => {
-          throw new Error('command boom')
-        },
+      boom: wy.procedure.input({}).mutation(async () => {
+        throw new Error('command boom')
       }),
     },
   })

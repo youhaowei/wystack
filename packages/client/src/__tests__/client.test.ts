@@ -18,9 +18,11 @@ import { Hono } from 'hono'
 import { upgradeWebSocket, websocket } from 'hono/bun'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { createWyStack, createRoutes, mutation, query } from '@wystack/server'
+import { createRoutes, defineApp } from '@wystack/server'
 import { createClient } from '../client'
 import type { QueryRef, MutationRef } from '../refs'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 function queryRef<TArgs, TReturn>(path: string): QueryRef<TArgs, TReturn> {
   return { _path: path } as unknown as QueryRef<TArgs, TReturn>
@@ -40,20 +42,14 @@ describe('createClient — non-2xx error body handling', () => {
     const db = drizzle(pg)
     await db.execute(`CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, name TEXT NOT NULL)`)
 
-    const app = await createWyStack({
+    const app = await wy.build({
       db,
       functions: {
-        alwaysFails: query({
-          args: {},
-          handler: async () => {
-            throw new Error('The draft changed since review — refresh and try again.')
-          },
+        alwaysFails: wy.procedure.input({}).query(async () => {
+          throw new Error('The draft changed since review — refresh and try again.')
         }),
-        alwaysFailsMutation: mutation({
-          args: {},
-          handler: async () => {
-            throw new Error('The draft changed since review — refresh and try again.')
-          },
+        alwaysFailsMutation: wy.procedure.input({}).mutation(async () => {
+          throw new Error('The draft changed since review — refresh and try again.')
         }),
       },
     })

@@ -14,9 +14,10 @@ import { upgradeWebSocket, websocket } from 'hono/bun'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
-import { createWyStack } from '../create'
 import { createRoutes } from '../routes'
-import { query, mutation } from '../functions'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
   items: {
@@ -40,18 +41,12 @@ beforeEach(async () => {
     )
   `)
 
-  const app = await createWyStack({
+  const app = await wy.build({
     db,
     functions: {
-      listItems: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.items).all(),
-      }),
-      addItem: mutation({
-        args: { name: text },
-        handler: async (ctx, args) => {
-          return ctx.db.into(schema.items).insert({ name: args.name, active: true })
-        },
+      listItems: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.items).all()),
+      addItem: wy.procedure.input({ name: text }).mutation(async (ctx, args) => {
+        return ctx.db.into(schema.items).insert({ name: args.name, active: true })
       }),
     },
   })
@@ -169,13 +164,10 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
       `CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`,
     )
 
-    const app = await createWyStack({
+    const app = await wy.build({
       db,
       functions: {
-        whoami: query({
-          args: {},
-          handler: async (ctx) => ({ tenant: ctx.tenantId }),
-        }),
+        whoami: wy.procedure.input({}).query(async (ctx) => ({ tenant: ctx.tenantId })),
       },
     })
 

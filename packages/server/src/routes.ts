@@ -35,6 +35,7 @@
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { Pipe } from '@wystack/transport'
+import { PermissionDeniedError } from '@wystack/permissions'
 import {
   attachEngine,
   type AttachEngineOptions,
@@ -45,7 +46,6 @@ import {
 import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
-import { PermissionDeniedError } from './permissions'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
