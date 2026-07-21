@@ -46,9 +46,24 @@ export interface WorkOSSessionProviderOptions {
   clockSkewInMs?: number
 }
 
+/**
+ * Returns the trimmed value, rejecting one that is blank.
+ *
+ * Trimming rather than preserving the input, because every option here is a copy-paste
+ * from a dashboard and surrounding whitespace is never meaningful in any of them. It is
+ * also not harmless: `clientId` is percent-encoded into the JWKS path, so a trailing
+ * newline derives `.../client_01ABC%0A`, which 404s. The resulting failure is a key-set
+ * error on every single verification — an outage that reads as a WorkOS problem rather
+ * than as a typo in configuration. `issuer` fails the same way, silently, by never
+ * matching the `iss` claim.
+ *
+ * Validating on the trimmed form while returning the raw one would be the worst of both:
+ * the check passes, then the untrimmed value is used anyway.
+ */
 function requireNonBlank(name: string, value: string): string {
-  if (value.trim().length === 0) throw new TypeError(`${name} must not be blank`)
-  return value
+  const trimmed = value.trim()
+  if (trimmed.length === 0) throw new TypeError(`${name} must not be blank`)
+  return trimmed
 }
 
 function isJwksInfrastructureError(error: unknown): boolean {
