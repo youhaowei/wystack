@@ -1,0 +1,28 @@
+{
+  "name": "@wystack/identity-clerk",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Clerk session-token adapter for @wystack/identity",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@wystack/identity": "workspace:*",
+    "jose": "^6.1.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
