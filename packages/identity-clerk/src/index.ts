@@ -78,10 +78,14 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
           requiredClaims: ['sub', 'exp', 'sid'],
           clockTolerance: clockSkewInMs / 1_000,
         })
-        // `sid` is what makes this a *session* token. Clerk signs custom JWT templates
-        // with the same key and issuer, and they carry `sub`, `exp`, and `azp` — but
-        // deliberately omit `sid`, because they are not bound to a session. Without this
-        // check a token minted for some other service replays here as a login.
+        // `sid` is what makes this a *session* token, and it is an enforced discriminator
+        // rather than a convention: Clerk signs custom JWT templates with the same key and
+        // issuer, and they carry `sub`, `exp`, and `azp` — but Clerk refuses to mint one
+        // carrying `sid`, which is reserved to session-bound tokens. Without this check a
+        // token minted for some other service replays here as a login. The type check is
+        // the load-bearing half; `requiredClaims` above states the intent but adds no
+        // behavior, so do not trim this for looking redundant — a non-string `sid` would
+        // then pass.
         if (
           typeof payload.sub !== 'string' ||
           payload.sub.length === 0 ||
