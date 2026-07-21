@@ -4,8 +4,15 @@ import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
 import { buildArgsSchema, ValidationError } from '../validation'
 import { defineApp } from '../define-app'
+import { PermissionDeniedError } from '../index'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
+
+const protectedPermission = {
+  id: 'todos.read',
+  description: 'Read protected todos',
+  check: (ctx: { granted?: unknown }) => ctx.granted === true,
+}
 
 // --- Unit tests: buildArgsSchema ---
 
@@ -129,6 +136,10 @@ describe('validation in call()', () => {
         searchTodos: wy.procedure
           .input({ query: text.optional(), limit: int.default(10) })
           .query(async (_ctx, _args) => []),
+        protectedTodo: wy.procedure
+          .authorize(protectedPermission)
+          .input({ id: int })
+          .query(async (_ctx, args) => ({ id: args.id })),
       },
     })
   })
@@ -177,5 +188,19 @@ describe('validation in call()', () => {
       expect(ve.issues[0].path).toBeDefined()
       expect(ve.message).toContain('Validation failed')
     }
+  })
+
+  test('authorization runs before argument validation for protected procedures', async () => {
+    await expect(app.call('protectedTodo', { id: 'invalid' })).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    )
+
+    await expect(
+      app.call(
+        'protectedTodo',
+        { id: 'invalid' },
+        { principal: { kind: 'user', userId: 'user-1' }, granted: true },
+      ),
+    ).rejects.toBeInstanceOf(ValidationError)
   })
 })

@@ -11,6 +11,7 @@ import {
   type QueryDef,
   type StageOk,
 } from './types'
+import { buildArgsSchema, ValidationError } from './validation'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- middleware stages deliberately change context shape
 type AnyMiddleware = MiddlewareFn<any, any>
@@ -58,6 +59,8 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
   middleware: readonly AnyMiddleware[],
   handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
 ): QueryDef<InferArgs<TArgSchema>, TReturn> | MutationDef<InferArgs<TArgSchema>, TReturn> {
+  const argsSchema = buildArgsSchema(args)
+
   return {
     type,
     path: '',
@@ -65,7 +68,7 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
     // Keep the stored context deliberately broad: client inference only needs
     // FunctionDef assignability, while the builder type-checks the user handler.
     // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing public FunctionDef shape
-    async handler(ctx: any, validatedArgs: InferArgs<TArgSchema>): Promise<TReturn> {
+    async handler(ctx: any, rawArgs: InferArgs<TArgSchema>): Promise<TReturn> {
       let currentContext = ctx
 
       for (const stage of middleware) {
@@ -82,7 +85,10 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
         currentContext = nextContext
       }
 
-      return handler(currentContext, validatedArgs)
+      const parsed = argsSchema.safeParse(rawArgs)
+      if (!parsed.success) throw new ValidationError(parsed.error.issues)
+
+      return handler(currentContext, parsed.data as InferArgs<TArgSchema>)
     },
   }
 }
@@ -142,6 +148,7 @@ export function authorize<TContext>(
 
 export const requireAuth: MiddlewareFn<unknown, { principal: Principal }> = ({ ctx, next }) => {
   const principal = (ctx as { principal?: unknown }).principal
+  // A typed authentication error with explicit 401 semantics is a deliberate follow-up.
   if (!isPrincipal(principal)) throw new Error('Authentication required')
   return next({ principal })
 }
