@@ -234,23 +234,29 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     const realWarn = console.warn
     console.warn = (...args: unknown[]) => void warnings.push(args.join(' '))
 
-    const h = await harness({
-      resolveContext: async () => {
-        throw new IdentityProviderUnavailableError('key set unreachable')
-      },
-    })
-    h.send({ type: 'auth', token: 'good' })
-    await until(() => h.closeReasons.length > 0, 'close')
+    // `finally`, not a trailing restore: a failing assertion below would otherwise
+    // abandon the patched `console.warn` and silently swallow output for every later
+    // test in this file, turning one red test into a confusing suite.
+    try {
+      const h = await harness({
+        resolveContext: async () => {
+          throw new IdentityProviderUnavailableError('key set unreachable')
+        },
+      })
+      h.send({ type: 'auth', token: 'good' })
+      await until(() => h.closeReasons.length > 0, 'close')
 
-    expect(h.closeReasons).toEqual(['transient'])
-    expect(h.handle.session.authenticated).toBe(false)
+      expect(h.closeReasons).toEqual(['transient'])
+      expect(h.handle.session.authenticated).toBe(false)
 
-    // The log line is the only signal this path emits — the HTTP 503 path logs nothing
-    // at all — so a hardcoded "auth failed" here would misattribute the outage on the
-    // one surface an operator greps mid-incident.
-    expect(warnings.some((line) => line.includes('transient'))).toBe(true)
-    expect(warnings.some((line) => line.includes('auth failed'))).toBe(false)
-    console.warn = realWarn
+      // The log line is the only signal this path emits — the HTTP 503 path logs
+      // nothing at all — so a hardcoded "auth failed" here would misattribute the
+      // outage on the one surface an operator greps mid-incident.
+      expect(warnings.some((line) => line.includes('transient'))).toBe(true)
+      expect(warnings.some((line) => line.includes('auth failed'))).toBe(false)
+    } finally {
+      console.warn = realWarn
+    }
   })
 
   test('bad token → terminal close (auth-failed), no authenticated frame', async () => {
