@@ -385,13 +385,20 @@ describe('createWorkOSSessionProvider', () => {
       issuer,
     })
 
-    await expect(
-      provider.getSession(
+    const error = await provider
+      .getSession(
         new Request('https://app.example.test/api', {
           headers: { authorization: `Bearer ${token}` },
         }),
-      ),
-    ).rejects.toBeInstanceOf(IdentityProviderUnavailableError)
+      )
+      .catch((err: unknown) => err)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    // The message, not only the class: if this port were reused by anything answering
+    // non-200, jose would raise its base `JOSEError` and the post-hoc branch would wrap
+    // it into the *same* class — so a class-only assertion would pass while exercising
+    // the old path instead of the new one. The message pins the `customFetch` site.
+    expect((error as Error).message).toContain('could not be reached')
   })
 
   test('preserves the underlying jose error as the cause', async () => {

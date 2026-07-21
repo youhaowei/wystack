@@ -89,6 +89,17 @@ function requireClientPath(clientId: string, value: string): string {
   return value
 }
 
+/**
+ * Classifies a jose error raised *after* a key set was successfully fetched — a malformed
+ * key, an unusable key set, a non-200 response.
+ *
+ * Transport failures do not reach here; `customFetch` above intercepts them at the fetch.
+ * That makes the `JWKSTimeout` clause unreachable today, since jose constructs that type
+ * only when converting a fetch rejection it never gets to see. It is kept deliberately:
+ * it costs nothing, and it is what this function would need if the `customFetch` wrapper
+ * were ever removed — leaving it out would turn that removal into a silent
+ * misclassification rather than a loud one.
+ */
 function isJwksInfrastructureError(error: unknown): boolean {
   return (
     error instanceof errors.JWKSTimeout ||
