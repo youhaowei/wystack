@@ -130,6 +130,27 @@ describe('createWorkOSSessionProvider', () => {
     })
   })
 
+  test('rejects a non-loopback http JWKS URL at construction', () => {
+    // Key retrieval is the root of trust: an attacker who can substitute the key set
+    // mints tokens that satisfy every other check, because they hold the private half
+    // of the key this verifier is told to trust.
+    expect(() =>
+      createWorkOSSessionProvider({ jwksUrl: 'http://api.workos.com/sso/jwks/x', clientId, issuer }),
+    ).toThrow('jwksUrl must use https')
+
+    // Loopback stays permitted — this is the exemption the fixtures rely on, so it is
+    // pinned rather than left as an accident of the implementation.
+    expect(() =>
+      createWorkOSSessionProvider({ jwksUrl: 'http://127.0.0.1:1234/jwks', clientId, issuer }),
+    ).not.toThrow()
+
+    // A private-range address is not loopback: it is still a network hop someone can
+    // sit on, which is the threat being closed.
+    expect(() =>
+      createWorkOSSessionProvider({ jwksUrl: 'http://10.0.0.5/jwks', clientId, issuer }),
+    ).toThrow('jwksUrl must use https')
+  })
+
   test('derives the client-specific JWKS URL from clientId', () => {
     // The JWKS path is the client binding, so `clientId` has to reach it. Previously
     // `jwksUrl` was required separately and `clientId` was only compared against a

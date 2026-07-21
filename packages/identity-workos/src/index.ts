@@ -1,5 +1,9 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
-import { createBearerSessionProvider, type SessionProvider } from '@wystack/identity'
+import {
+  createBearerSessionProvider,
+  requireSecureJwksUrl,
+  type SessionProvider,
+} from '@wystack/identity'
 
 export interface WorkOSSessionProviderOptions {
   /**
@@ -127,10 +131,17 @@ export function createWorkOSSessionProvider(
   // override would reintroduce exactly the mismatch this derivation exists to remove,
   // and the resulting misconfiguration is invisible: every other setting is correct, and
   // tokens from the wrong application verify cleanly.
-  const jwksUrl =
+  //
+  // Two independent guards, both applied to the *effective* URL: `requireClientPath`
+  // keeps it bound to this client, `requireSecureJwksUrl` keeps it off an interceptable
+  // channel. Neither implies the other — `https://api.workos.com/sso/jwks/someone-else`
+  // is secure and wrong, `http://host/sso/jwks/<clientId>` is correct and interceptable.
+  const jwksUrl = requireSecureJwksUrl(
+    'jwksUrl',
     options.jwksUrl === undefined
       ? `https://api.workos.com/sso/jwks/${encodeURIComponent(clientId)}`
-      : requireClientPath(clientId, requireNonBlank('jwksUrl', options.jwksUrl))
+      : requireClientPath(clientId, requireNonBlank('jwksUrl', options.jwksUrl)),
+  )
 
   // Validated at construction rather than trusted, because the failure is silent and
   // inverted: `clockTolerance: NaN` makes both `exp <= now - NaN` and `nbf > now + NaN`

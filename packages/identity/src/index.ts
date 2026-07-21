@@ -13,3 +13,4 @@ export {
   createBearerSessionProvider,
 } from './session'
 export { type Principal, type PrincipalKind, isPrincipal } from './principal'
+export { requireSecureJwksUrl } from './jwks-url'
