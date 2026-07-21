@@ -1,14 +1,15 @@
 /**
  * E2E Integration Test — proves the full vertical slice:
- * Schema DSL → DrizzleTracker → createWyStack → serve → WS subscribe → HTTP mutate → invalidation
+ * Schema DSL → DrizzleTracker → wy.build → serve → WS subscribe → HTTP mutate → invalidation
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean, eq } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
 import { serve } from '../serve-bun'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
   todos: {
@@ -32,24 +33,15 @@ beforeEach(async () => {
     )
   `)
 
-  const app = await createWyStack({
+  const app = await wy.build({
     db,
     functions: {
-      listTodos: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+        return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
       }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) => {
-          return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
-        },
-      }),
-      toggleTodo: mutation({
-        args: { id: int },
-        handler: async (ctx, args) => {
-          return ctx.db.from(schema.todos).where(eq('id', args.id)).update({ done: true })
-        },
+      toggleTodo: wy.procedure.input({ id: int }).mutation(async (ctx, args) => {
+        return ctx.db.from(schema.todos).where(eq('id', args.id)).update({ done: true })
       }),
     },
   })
@@ -148,13 +140,12 @@ describe('E2E: full reactive lifecycle', () => {
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
     )
 
-    const app = await createWyStack({
+    const app = await wy.build({
       db,
       functions: {
-        getContext: query({
-          args: {},
-          handler: async (ctx) => ({ orgId: ctx.orgId, userId: ctx.userId }),
-        }),
+        getContext: wy.procedure
+          .input({})
+          .query(async (ctx) => ({ orgId: ctx.orgId, userId: ctx.userId })),
       },
     })
 

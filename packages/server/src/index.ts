@@ -1,15 +1,15 @@
 // @wystack/server
 // Reactive data engine with function registry, subscriptions, and multi-runtime transport
 
-export { query, mutation } from './functions'
-export { createWyStack } from './create'
+export { defineApp } from './define-app'
+export { authorize, requireAuth } from './functions'
+export { assertPermissionIds } from './permissions'
 export { applyCommands } from './apply-commands'
 export { createDraftLifecycle, compactLog } from './draft-lifecycle'
 export { createRoutes } from './routes'
 export { createSubscriptionManager } from './subscriptions'
 export { ValidationError } from './validation'
-export { PermissionDeniedError } from './permissions'
-export type { CheckPermission } from './permissions'
+export { PermissionDeniedError } from '@wystack/permissions'
 // Engine: `attachEngine` is the consumer entry point. Reactive port types and
 // in-process factories are public so external adapters can implement the same
 // transport-neutral contracts without importing transport internals.
@@ -29,7 +29,12 @@ export type {
   InferArg,
   DbInput,
   WyStackServer,
+  MiddlewareFn,
+  StageOk,
+  Overwrite,
 } from './types'
+export type { DefineAppOptions, BuildOptions } from './define-app'
+export type { ProcedureBuilder } from './functions'
 export type { WyStackApp } from './create'
 export type {
   Command,

@@ -29,8 +29,6 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '@wystack/transport'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
 import { ValidationError } from '../validation'
 import {
   attachEngine,
@@ -39,35 +37,50 @@ import {
   createDispatchInvalidationSource,
   createInvalidationRouter,
 } from '../engine'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
   todos: { id: int.primaryKey(), title: text, done: boolean },
 })
+
+const deniedPermission = {
+  id: 'todos.read',
+  description: 'Read todos',
+  check: () => false,
+}
+
+function protectListTodos(app: Awaited<ReturnType<typeof makeApp>>): void {
+  app.functions.set(
+    'listTodos',
+    wy.procedure
+      .authorize(deniedPermission)
+      .input({})
+      .query(async (ctx) => ctx.db.from(schema.todos).all()),
+  )
+}
 
 async function makeApp() {
   const db = await createDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
-  return createWyStack({
+  return wy.build({
     db,
     functions: {
-      listTodos: query({ args: {}, handler: async (ctx) => ctx.db.from(schema.todos).all() }),
-      whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId ?? null }) }),
-      todoByTitle: query({
-        args: { title: text },
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
-      }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) =>
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId ?? null })),
+      todoByTitle: wy.procedure
+        .input({ title: text })
+        .query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure
+        .input({ title: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
-      }),
-      boom: query({
-        args: {},
-        handler: async () => {
-          throw new Error('kaboom')
-        },
+        ),
+      boom: wy.procedure.input({}).query(async () => {
+        throw new Error('kaboom')
       }),
     },
   })
@@ -173,8 +186,7 @@ describe('Engine — RPC tier (AC #1)', () => {
 
   test('call permission failure emits an error frame carrying the call id', async () => {
     const app = await makeApp()
-    const fn = app.functions.get('listTodos')
-    if (fn) fn.permission = 'todos.read'
+    protectListTodos(app)
     const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
     const received: ServerMessage[] = []
     clientPipe.onMessage((message) => received.push(message))
@@ -183,7 +195,14 @@ describe('Engine — RPC tier (AC #1)', () => {
     clientPipe.send({ type: 'call', id: 'c5', path: 'listTodos', args: {} })
     await until(() => received.length > 0, 'permission error')
 
-    expect(received).toEqual([{ type: 'error', kind: 'call', id: 'c5', error: 'Forbidden' }])
+    expect(received).toEqual([
+      {
+        type: 'error',
+        kind: 'call',
+        id: 'c5',
+        error: 'Permission denied: todos.read',
+      },
+    ])
   })
 })
 
@@ -658,10 +677,7 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
   })
 
   test('subscribe permission failure emits a durable subscription error', async () => {
-    const h = await reactiveHarness(undefined, (app) => {
-      const fn = app.functions.get('listTodos')
-      if (fn) fn.permission = 'todos.read'
-    })
+    const h = await reactiveHarness(undefined, protectListTodos)
     h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
     await until(() => h.received.some((m) => m.type === 'error'), 'permission error')
 
@@ -671,7 +687,7 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
         kind: 'subscription',
         id: 's1',
         retryable: false,
-        error: 'Forbidden',
+        error: 'Permission denied: todos.read',
       },
     ])
     expect(h.subscriptionStore.size()).toBe(0)
@@ -773,10 +789,7 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
     const h = await reactiveHarness(undefined, (app) => {
       app.functions.set(
         'delayedBoom',
-        query({
-          args: {},
-          handler: async () => olderQuery,
-        }),
+        wy.procedure.input({}).query(async () => olderQuery),
       )
     })
 

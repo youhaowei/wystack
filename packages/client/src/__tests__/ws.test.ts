@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
-import { createWyStack, query, mutation } from '@wystack/server'
+import { defineApp } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
 import { createClient } from '../client'
 import { createWsManager } from '../ws'
@@ -12,6 +12,8 @@ const schema = defineSchema({
     done: boolean,
   },
 })
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 // Track every PGlite handle opened in this file so afterEach can close them
 // all. PGlite WASM instances that are never closed accumulate memory and WASM
@@ -32,7 +34,7 @@ async function openDrizzleTracker() {
 }
 
 // Per-test app factory for auth scenarios — each test creates its own
-// PGlite + createWyStack so resolveContext can vary freely.
+// PGlite + wy.build so resolveContext can vary freely.
 // Returns both the WyStack app and the db handle so callers can close the
 // underlying PGlite instance (via the pgliteHandles registry above).
 async function makeAuthApp() {
@@ -40,18 +42,15 @@ async function makeAuthApp() {
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
-  return createWyStack({
+  return wy.build({
     db,
     functions: {
-      listTodos: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
-      }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) =>
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure
+        .input({ title: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
-      }),
+        ),
     },
   })
 }
@@ -59,7 +58,7 @@ async function makeAuthApp() {
 let server: ReturnType<typeof serve>
 let wsUrl: string
 let baseUrl: string
-let app: Awaited<ReturnType<typeof createWyStack>>
+let app: Awaited<ReturnType<typeof wy.build>>
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -211,18 +210,12 @@ beforeEach(async () => {
     )
   `)
 
-  app = await createWyStack({
+  app = await wy.build({
     db,
     functions: {
-      listTodos: query({
-        args: {},
-        handler: async (ctx) => ctx.db.from(schema.todos).all(),
-      }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) => {
-          return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
-        },
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+        return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
       }),
     },
   })

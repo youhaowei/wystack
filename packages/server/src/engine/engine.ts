@@ -10,7 +10,7 @@ import {
 } from '@wystack/transport'
 import type { WyStackApp } from '../create'
 import { ValidationError } from '../validation'
-import { PermissionDeniedError } from '../permissions'
+import { PermissionDeniedError } from '@wystack/permissions'
 import { createDispatch, type Dispatch } from './dispatch'
 import { Session, type CloseReason, type SessionOptions } from './session'
 import type { SubscriptionStore } from './subscription-store'

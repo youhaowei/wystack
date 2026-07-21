@@ -15,9 +15,10 @@
 import { describe, test, expect } from 'bun:test'
 import type { UpgradeWebSocket, WSContext, WSEvents } from 'hono/ws'
 import { createDb } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query } from '../functions'
 import { createRoutes, type RouteOptions } from '../routes'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 /** Poll until predicate holds — the engine's auth chain is async (microtasks). */
 async function until(predicate: () => boolean, label: string, ms = 2000): Promise<void> {
@@ -38,9 +39,9 @@ async function makeApp() {
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
-  return createWyStack({
+  return wy.build({
     db,
-    functions: { listTodos: query({ args: {}, handler: async () => [] }) },
+    functions: { listTodos: wy.procedure.input({}).query(async () => []) },
   })
 }
 

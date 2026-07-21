@@ -26,10 +26,11 @@
 
 import { describe, test, expect } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
-import { createWyStack } from '../create'
-import { query, mutation } from '../functions'
 import { attachElectronTransport } from '../electron'
 import type { IpcMainEventLike, IpcMainLike, WebContentsLike } from '../electron'
+import { defineApp } from '../define-app'
+
+const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const C2S = 'wystack:c2s'
 const S2C = 'wystack:s2c'
@@ -47,16 +48,16 @@ async function makeApp() {
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
-  return createWyStack({
+  return wy.build({
     db,
     functions: {
-      listTodos: query({ args: {}, handler: async (ctx) => ctx.db.from(schema.todos).all() }),
-      addTodo: mutation({
-        args: { title: text },
-        handler: async (ctx, args) =>
+      listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      addTodo: wy.procedure
+        .input({ title: text })
+        .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ title: args.title, done: false }),
-      }),
-      whoami: query({ args: {}, handler: async (ctx) => ({ userId: ctx.userId ?? null }) }),
+        ),
+      whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId ?? null })),
     },
   })
 }
