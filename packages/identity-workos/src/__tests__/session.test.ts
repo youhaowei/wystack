@@ -89,6 +89,28 @@ describe('createWorkOSSessionProvider', () => {
     )
   })
 
+  test('trims configuration rather than validating a trimmed copy', async () => {
+    // Every option here is a copy-paste from a dashboard, so a trailing newline is a
+    // realistic input. It has to be dropped, not merely tolerated by the blank check:
+    // an untrimmed `issuer` never matches the `iss` claim, and an untrimmed `clientId`
+    // is percent-encoded into the JWKS path as `%0A` and 404s. Verifying a real token
+    // with padded configuration is what proves the trimmed value is the one used.
+    const { token, jwksUrl } = await createSignedToken()
+    const provider = createWorkOSSessionProvider({
+      jwksUrl,
+      clientId: `  ${clientId}\n`,
+      issuer: `  ${issuer}\n`,
+    })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.not.toBeNull()
+  })
+
   test('returns a provider-neutral session for a valid WorkOS access token', async () => {
     const { token, jwksUrl, expirationTime } = await createSignedToken()
     const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
