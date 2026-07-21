@@ -181,31 +181,26 @@ describe('createClerkSessionProvider', () => {
     await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
   })
 
-  test('rejects a missing or non-string azp when origins are configured', async () => {
-    const missing = await createSignedToken({ claims: { azp: undefined } })
-    const missingProvider = makeProvider({
-      issuer: missing.issuer,
-      authorizedParties: [origin],
-    })
+  test('accepts a session token that carries no azp at all', async () => {
+    // Clerk documents `azp` as omissible: it echoes the `Origin` header of the
+    // originating Frontend API request, and Clerk drops the claim when that header is
+    // empty or null. Rejecting here would permanently 401 real users behind sandboxed
+    // iframes, some native webviews, and privacy-hardened browsers — and no
+    // configuration could accept them, since the allowlist is mandatory. Development
+    // never sees it, because dev browsers always send `Origin`.
+    //
+    // This test previously asserted the opposite. It passed, which is the lesson: a
+    // test that encodes the wrong behavior confirms it rather than catching it.
+    const { token, issuer } = await createSignedToken({ claims: { azp: undefined } })
 
-    await expect(missingProvider.getSession(authorized(missing.token))).resolves.toBeNull()
-
-    stopServer()
-
-    const nonString = await createSignedToken({ claims: { azp: 123 } })
-    const nonStringProvider = makeProvider({
-      issuer: nonString.issuer,
-      authorizedParties: [origin],
-    })
-
-    await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
+    await expect(makeProvider({ issuer }).getSession(authorized(token))).resolves.not.toBeNull()
   })
 
-  test('has no configuration that accepts an unlisted origin', async () => {
-    // Replaces an earlier test that pinned the opposite behavior, when an omitted or
-    // empty allowlist disabled the check. There is now no way to construct a provider
-    // that accepts this token, which is the point of making the option required.
-    const { token, issuer } = await createSignedToken({ claims: { azp: 'https://evil.example' } })
+  test('rejects a non-string azp rather than treating it as absent', async () => {
+    // The skip above is for an *omitted* claim. A numeric `azp` is malformed, not
+    // omitted, so it must not inherit the exemption — guarding on
+    // `typeof azp === 'string'` instead of on absence would accept this token.
+    const { token, issuer } = await createSignedToken({ claims: { azp: 123 } })
 
     await expect(makeProvider({ issuer }).getSession(authorized(token))).resolves.toBeNull()
   })

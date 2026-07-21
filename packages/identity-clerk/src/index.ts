@@ -12,10 +12,15 @@ export interface ClerkSessionProviderOptions {
    * single expected value.
    *
    * Required, and must list at least one origin. An optional origin check would
-   * default to off, which is the wrong default for a security control and would
-   * make this adapter weaker than `identity-workos`, where the corresponding
-   * `clientId` is mandatory. A deployment that genuinely cannot enumerate its
-   * origins should be made to say so rather than get there by omission.
+   * default to off, which is the wrong default for a security control. A deployment
+   * that genuinely cannot enumerate its origins should be made to say so rather than
+   * get there by omission.
+   *
+   * Note this makes *configuration* mandatory, not the claim. Tokens that omit `azp`
+   * skip the check, because Clerk documents the claim as omissible — see the
+   * verification path. `identity-workos` requires its `clientId` for a superficially
+   * similar reason, but `client_id` is guaranteed on every WorkOS token, so the
+   * parity only holds on the configuration axis, not the claim-presence one.
    */
   authorizedParties: readonly string[]
   /**
@@ -107,14 +112,32 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
         ) {
           return null
         }
-        // An unrecognized `azp` means the token was minted for a different origin
-        // than the ones this deployment trusts, so it is a rejected credential
-        // rather than an infrastructure fault.
-        if (
-          authorizedParties.size > 0 &&
-          (typeof payload.azp !== 'string' || !authorizedParties.has(payload.azp))
-        ) {
-          return null
+        // A *present* `azp` outside the allowlist means the token was minted for an
+        // origin this deployment does not trust, so it is a rejected credential rather
+        // than an infrastructure fault.
+        //
+        // An *absent* `azp` is skipped rather than rejected, which is the one place this
+        // provider is deliberately lenient. Clerk documents `azp` as omissible — it
+        // carries the `Origin` header of the originating Frontend API request, and Clerk
+        // drops the claim entirely when that header is empty or null (sandboxed iframes,
+        // some native webviews, privacy-hardened browsers). Clerk's own verification
+        // guidance and backend SDK skip the check when the claim is absent, so rejecting
+        // here would 401 genuine session tokens permanently, with no configuration that
+        // could accept them. That failure is invisible in development, where browsers
+        // always send `Origin`.
+        //
+        // What keeps this safe is that `azp` is not the discriminator. `sid` above is —
+        // it is platform-enforced and carries no omission caveat. `azp` adds origin
+        // binding on top, best-effort by design, and the attack it defends against
+        // (a token minted for an untrusted origin) still carries an `azp` and is still
+        // rejected by the branch below.
+        // Absence is `undefined`/`null` specifically, not "fails a type check". A
+        // numeric or object `azp` is malformed rather than omitted, and skipping on
+        // `typeof !== 'string'` would accept it — so those still fall through to the
+        // reject. Clerk's own guard has the same shape.
+        const azp = payload.azp
+        if (azp !== undefined && azp !== null) {
+          if (typeof azp !== 'string' || !authorizedParties.has(azp)) return null
         }
 
         // `exp` being numeric and unexpired does not make it representable as a Date.
