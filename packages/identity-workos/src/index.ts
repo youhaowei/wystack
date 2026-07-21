@@ -9,8 +9,14 @@ export interface WorkOSSessionProviderOptions {
   /** Expected token issuer, including a configured custom AuthKit domain. */
   issuer: string
   /**
-   * Permitted clock difference against `exp`, `nbf`, and `iat`, in milliseconds.
-   * Defaults to 5000 ms.
+   * Permitted clock difference against `exp` and `nbf`, in milliseconds. Defaults to
+   * 5000 ms.
+   *
+   * `iat` is deliberately not covered. jose's `clockTolerance` only participates in
+   * `iat` validation when `maxTokenAge` is set, which this verifier does not set, and
+   * there is no separate future-`iat` check — so a token with an arbitrarily future
+   * `iat` is accepted. That is not a forgery path (the signature and `exp` still bind),
+   * but naming `iat` here would promise a check that does not exist.
    *
    * jose allows none, so an application server a few seconds ahead of WorkOS rejects
    * tokens the moment they are minted — and the failure scales with drift rather than
