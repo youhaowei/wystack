@@ -55,6 +55,7 @@ import {
 import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
+import { AuthenticationRequiredError } from './functions'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
@@ -302,6 +303,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       if (err instanceof PermissionDeniedError) {
         return c.json({ error: err.message }, 403)
       }
+      if (err instanceof AuthenticationRequiredError) {
+        // Not signed in is a 401, not a server fault. Left untyped it fell through to
+        // the generic branch below and answered 500, which reads as "the server broke"
+        // and hides an ordinary sign-in prompt inside the error budget.
+        return c.json({ error: err.message }, 401)
+      }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)
       }
@@ -359,6 +366,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     } catch (err: unknown) {
       if (err instanceof PermissionDeniedError) {
         return c.json({ error: err.message }, 403)
+      }
+      if (err instanceof AuthenticationRequiredError) {
+        // Not signed in is a 401, not a server fault. Left untyped it fell through to
+        // the generic branch below and answered 500, which reads as "the server broke"
+        // and hides an ordinary sign-in prompt inside the error budget.
+        return c.json({ error: err.message }, 401)
       }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)

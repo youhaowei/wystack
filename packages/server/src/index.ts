@@ -2,7 +2,7 @@
 // Reactive data engine with function registry, subscriptions, and multi-runtime transport
 
 export { defineApp } from './define-app'
-export { authorize, requireAuth } from './functions'
+export { authorize, AuthenticationRequiredError, requireAuth } from './functions'
 export { assertPermissionIds } from './permissions'
 export { applyCommands } from './apply-commands'
 export { createDraftLifecycle, compactLog } from './draft-lifecycle'

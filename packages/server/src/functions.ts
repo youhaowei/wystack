@@ -146,9 +146,27 @@ export function authorize<TContext>(
   }
 }
 
+/**
+ * The request carried no usable principal where one was required.
+ *
+ * Typed rather than a bare `Error` because the transport has to answer 401 for it. An
+ * untyped throw falls through every classification branch to the generic handler and
+ * becomes a 500 — which tells the client the server broke, when in fact the client
+ * simply is not signed in, and buries a routine sign-in prompt in the error budget.
+ *
+ * Distinct from `PermissionDeniedError` (403 — authenticated, but not allowed) and from
+ * `IdentityProviderUnavailableError` (503 — we could not determine either way).
+ */
+export class AuthenticationRequiredError extends Error {
+  override readonly name = 'AuthenticationRequiredError'
+
+  constructor(message = 'Authentication required') {
+    super(message)
+  }
+}
+
 export const requireAuth: MiddlewareFn<unknown, { principal: Principal }> = ({ ctx, next }) => {
   const principal = (ctx as { principal?: unknown }).principal
-  // A typed authentication error with explicit 401 semantics is a deliberate follow-up.
-  if (!isPrincipal(principal)) throw new Error('Authentication required')
+  if (!isPrincipal(principal)) throw new AuthenticationRequiredError()
   return next({ principal })
 }

@@ -4,6 +4,7 @@ import { definePermissions } from '@wystack/permissions'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { buildAuthRequest } from '../routes'
 import { serve } from '../serve-bun'
+import { requireAuth } from '../functions'
 import { defineApp } from '../define-app'
 import type { FunctionDef } from '../types'
 
@@ -293,6 +294,38 @@ describe('HTTP transport', () => {
       // be a 401, or the fix would be satisfied by calling everything retryable.
       const rejected = await fetch(`${base}/whoami`)
       expect(rejected.status).toBe(401)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('requireAuth without a principal answers 401, not 500', async () => {
+    // The middleware threw a bare `Error`, which fell through every classification
+    // branch to the generic handler and became a 500. That reads as "the server broke"
+    // for what is an ordinary not-signed-in request, and buries a sign-in prompt in the
+    // error budget where nobody looks for it.
+    const db = await createDb({ dev: 'pglite://' })
+    const app = await wy.build({
+      db,
+      functions: {
+        me: wy.procedure
+          .use(requireAuth)
+          .input({})
+          .query(async () => ({ ok: true })),
+        touch: wy.procedure
+          .use(requireAuth)
+          .input({})
+          .mutation(async () => ({ ok: true })),
+      },
+    })
+
+    const authServer = serve({ app, port: 0 })
+    try {
+      const base = `http://localhost:${authServer.port}/api`
+      expect((await fetch(`${base}/me`)).status).toBe(401)
+      expect(
+        (await fetch(`${base}/touch`, { method: 'POST', body: JSON.stringify({}) })).status,
+      ).toBe(401)
     } finally {
       authServer.stop(true)
     }
