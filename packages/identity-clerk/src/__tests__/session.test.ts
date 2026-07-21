@@ -57,6 +57,7 @@ async function createSignedToken(
 
   const payload = {
     sub: 'user_01TEST',
+    sid: 'sess_01TEST',
     azp: origin,
     ...options.claims,
   }
@@ -217,6 +218,74 @@ describe('createClerkSessionProvider', () => {
     // it, a string `exp` must resolve null rather than an Invalid Date expiry.
     const { token, issuer } = await createSignedToken({
       claims: { exp: 'not-a-number' },
+      includeExpiration: false,
+    })
+    const provider = createClerkSessionProvider({ issuer })
+
+    await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('rejects a custom JWT template token that carries no session id', async () => {
+    // Clerk signs custom JWT templates with the same key and issuer as session tokens
+    // and gives them `sub`, `exp`, and `azp` — but not `sid`, because they are not bound
+    // to a session. Accepting one would let a token minted for another service log in.
+    const { token, issuer } = await createSignedToken({ claims: { sid: undefined } })
+    const provider = createClerkSessionProvider({ issuer })
+
+    await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('rejects a non-string or empty session id', async () => {
+    const nonString = await createSignedToken({ claims: { sid: 123 } })
+    const nonStringProvider = createClerkSessionProvider({ issuer: nonString.issuer })
+
+    await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
+
+    stopServer()
+
+    const empty = await createSignedToken({ claims: { sid: '' } })
+    const emptyProvider = createClerkSessionProvider({ issuer: empty.issuer })
+
+    await expect(emptyProvider.getSession(authorized(empty.token))).resolves.toBeNull()
+  })
+
+  test('tolerates Clerk-sized clock skew by default but not unbounded drift', async () => {
+    // Clerk's own middleware allows 5000 ms of skew; jose allows none. A server clock a
+    // few seconds fast would otherwise reject sessions Clerk considers valid.
+    const justExpired = await createSignedToken({
+      expirationTime: Math.floor(Date.now() / 1_000) - 2,
+    })
+    const tolerant = createClerkSessionProvider({ issuer: justExpired.issuer })
+
+    await expect(tolerant.getSession(authorized(justExpired.token))).resolves.not.toBeNull()
+
+    stopServer()
+
+    const longExpired = await createSignedToken({
+      expirationTime: Math.floor(Date.now() / 1_000) - 60,
+    })
+    const strict = createClerkSessionProvider({ issuer: longExpired.issuer })
+
+    await expect(strict.getSession(authorized(longExpired.token))).resolves.toBeNull()
+  })
+
+  test('rejects an invalid clock skew at construction', () => {
+    expect(() =>
+      createClerkSessionProvider({ issuer: 'https://clerk.example.test', clockSkewInMs: -1 }),
+    ).toThrow('clockSkewInMs must be a non-negative finite number')
+    expect(() =>
+      createClerkSessionProvider({
+        issuer: 'https://clerk.example.test',
+        clockSkewInMs: Number.NaN,
+      }),
+    ).toThrow(TypeError)
+  })
+
+  test('rejects an expiration outside the representable Date range', async () => {
+    // Numeric and unexpired is not the same as representable: `Date`'s ceiling is
+    // 8.64e15 ms, so this overflows to an Invalid Date rather than a far-future expiry.
+    const { token, issuer } = await createSignedToken({
+      claims: { exp: 8_640_000_000_001 },
       includeExpiration: false,
     })
     const provider = createClerkSessionProvider({ issuer })

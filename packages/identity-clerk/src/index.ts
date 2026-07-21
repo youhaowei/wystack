@@ -12,6 +12,12 @@ export interface ClerkSessionProviderOptions {
    * expected value. Omitted or empty disables the check.
    */
   authorizedParties?: readonly string[]
+  /**
+   * Permitted clock difference against Clerk's `exp`/`nbf`, matching the
+   * `clockSkewInMs` option Clerk's own middleware exposes. Defaults to Clerk's
+   * default of 5000 ms; jose would otherwise allow none.
+   */
+  clockSkewInMs?: number
 }
 
 function requireNonBlank(name: string, value: string): string {
@@ -56,6 +62,11 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
     ),
   )
 
+  const clockSkewInMs = options.clockSkewInMs ?? 5_000
+  if (!Number.isFinite(clockSkewInMs) || clockSkewInMs < 0) {
+    throw new TypeError('clockSkewInMs must be a non-negative finite number')
+  }
+
   const jwks = createRemoteJWKSet(new URL(jwksUrl))
 
   return createBearerSessionProvider({
@@ -64,11 +75,18 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
         const { payload } = await jwtVerify(token, jwks, {
           algorithms: ['RS256'],
           issuer,
-          requiredClaims: ['sub', 'exp'],
+          requiredClaims: ['sub', 'exp', 'sid'],
+          clockTolerance: clockSkewInMs / 1_000,
         })
+        // `sid` is what makes this a *session* token. Clerk signs custom JWT templates
+        // with the same key and issuer, and they carry `sub`, `exp`, and `azp` — but
+        // deliberately omit `sid`, because they are not bound to a session. Without this
+        // check a token minted for some other service replays here as a login.
         if (
           typeof payload.sub !== 'string' ||
           payload.sub.length === 0 ||
+          typeof payload.sid !== 'string' ||
+          payload.sid.length === 0 ||
           typeof payload.exp !== 'number'
         ) {
           return null
@@ -83,9 +101,16 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
           return null
         }
 
+        // `exp` being numeric and unexpired does not make it representable as a Date.
+        // A far-future value overflows into an Invalid Date, which serializes to null
+        // and compares false against every other date — the credential would look valid
+        // while carrying an expiry no consumer can act on. Reject it instead.
+        const expiresAt = new Date(payload.exp * 1_000)
+        if (Number.isNaN(expiresAt.getTime())) return null
+
         return {
           identity: { subject: payload.sub },
-          expiresAt: new Date(payload.exp * 1_000),
+          expiresAt,
         }
       } catch (error) {
         if (error instanceof errors.JOSEError && !isJwksInfrastructureError(error)) return null
