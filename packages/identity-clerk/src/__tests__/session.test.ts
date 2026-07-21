@@ -196,6 +196,16 @@ describe('createClerkSessionProvider', () => {
     await expect(makeProvider({ issuer }).getSession(authorized(token))).resolves.not.toBeNull()
   })
 
+  test('treats a null azp as absent rather than malformed', async () => {
+    // `undefined` disappears during JSON serialization, so the test above never
+    // actually puts an `azp` key in the payload. An explicit `null` does survive, and
+    // it is the shape a JSON-producing minter is most likely to emit for "no origin".
+    // The guard checks both; only `undefined` was pinned.
+    const { token, issuer } = await createSignedToken({ claims: { azp: null } })
+
+    await expect(makeProvider({ issuer }).getSession(authorized(token))).resolves.not.toBeNull()
+  })
+
   test('rejects a non-string azp rather than treating it as absent', async () => {
     // The skip above is for an *omitted* claim. A numeric `azp` is malformed, not
     // omitted, so it must not inherit the exemption — guarding on
