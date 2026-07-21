@@ -244,4 +244,73 @@ describe('createWorkOSSessionProvider', () => {
       ),
     ).rejects.toBeInstanceOf(errors.JOSEError)
   })
+
+  test('rejects an exp that is unexpired but not representable as a Date', async () => {
+    // Passes `requiredClaims`, passes the `typeof === 'number'` check, and is not
+    // expired — but `new Date(exp * 1000)` overflows `Date`'s 8.64e15 ms ceiling.
+    // Returning it would hand the caller a session whose `expiresAt` is an Invalid
+    // Date: it serializes to null and compares false against every other date, so a
+    // caller deciding re-authentication by comparison never re-authenticates.
+    const { token, jwksUrl } = await createSignedToken({ expirationTime: 8.64e15 })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.toBeNull()
+  })
+
+  test('tolerates a server clock ahead of the token by less than the skew allowance', async () => {
+    // The real shape of this failure is a freshly minted token, not a nearly-expired
+    // one: with zero tolerance an application server a few seconds fast rejects tokens
+    // WorkOS considers valid, and the rejection scales with drift rather than with how
+    // close `exp` is. Modelled here by an `exp` a second in the past, which stands in
+    // for a server one second ahead.
+    const { token, jwksUrl } = await createSignedToken({
+      expirationTime: Math.floor(Date.now() / 1_000) - 1,
+    })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.not.toBeNull()
+  })
+
+  test('still rejects tokens expired beyond the skew allowance', async () => {
+    // The allowance widens the window; it must not remove it. Without this the test
+    // above could be satisfied by disabling the expiry check entirely.
+    const { token, jwksUrl } = await createSignedToken({
+      expirationTime: Math.floor(Date.now() / 1_000) - 60,
+    })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.toBeNull()
+  })
+
+  test('rejects a non-finite or negative clock skew at construction', () => {
+    // `NaN` is the case that matters, and it fails *open*: jose compares
+    // `exp <= now - tolerance`, and every comparison against NaN is false, so both the
+    // expiry and not-before checks stop rejecting anything. A token that expired in
+    // 1970 would verify. Asserting the throw is what keeps that unreachable.
+    const base = { jwksUrl: 'https://api.workos.com/sso/jwks/client_test', clientId, issuer }
+
+    for (const clockSkewInMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(() => createWorkOSSessionProvider({ ...base, clockSkewInMs })).toThrow(
+        'clockSkewInMs must be a non-negative finite number',
+      )
+    }
+  })
 })
