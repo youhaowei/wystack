@@ -64,11 +64,17 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
         const { payload } = await jwtVerify(token, jwks, {
           algorithms: ['RS256'],
           issuer,
-          requiredClaims: ['sub', 'exp'],
+          requiredClaims: ['sub', 'exp', 'sid'],
         })
+        // `sid` is what makes this a *session* token. Clerk signs custom JWT templates
+        // with the same key and issuer, and they carry `sub`, `exp`, and `azp` — but
+        // deliberately omit `sid`, because they are not bound to a session. Without this
+        // check a token minted for some other service replays here as a login.
         if (
           typeof payload.sub !== 'string' ||
           payload.sub.length === 0 ||
+          typeof payload.sid !== 'string' ||
+          payload.sid.length === 0 ||
           typeof payload.exp !== 'number'
         ) {
           return null

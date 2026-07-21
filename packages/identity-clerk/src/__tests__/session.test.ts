@@ -57,6 +57,7 @@ async function createSignedToken(
 
   const payload = {
     sub: 'user_01TEST',
+    sid: 'sess_01TEST',
     azp: origin,
     ...options.claims,
   }
@@ -222,6 +223,30 @@ describe('createClerkSessionProvider', () => {
     const provider = createClerkSessionProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('rejects a custom JWT template token that carries no session id', async () => {
+    // Clerk signs custom JWT templates with the same key and issuer as session tokens
+    // and gives them `sub`, `exp`, and `azp` — but not `sid`, because they are not bound
+    // to a session. Accepting one would let a token minted for another service log in.
+    const { token, issuer } = await createSignedToken({ claims: { sid: undefined } })
+    const provider = createClerkSessionProvider({ issuer })
+
+    await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('rejects a non-string or empty session id', async () => {
+    const nonString = await createSignedToken({ claims: { sid: 123 } })
+    const nonStringProvider = createClerkSessionProvider({ issuer: nonString.issuer })
+
+    await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
+
+    stopServer()
+
+    const empty = await createSignedToken({ claims: { sid: '' } })
+    const emptyProvider = createClerkSessionProvider({ issuer: empty.issuer })
+
+    await expect(emptyProvider.getSession(authorized(empty.token))).resolves.toBeNull()
   })
 
   test('rejects a non-string or empty subject', async () => {
