@@ -1,8 +1,21 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { errors, exportJWK, generateKeyPair, SignJWT } from 'jose'
-import { createClerkSessionProvider } from '../index'
+import { type ClerkSessionProviderOptions, createClerkSessionProvider } from '../index'
 
 const origin = 'https://app.example.test'
+
+/**
+ * `authorizedParties` is required, so every test that exercises verification has to
+ * supply one to reach the behavior it actually covers. Defaulting it here keeps those
+ * tests about their own subject; the construction-validation tests call
+ * `createClerkSessionProvider` directly so the argument under test stays visible.
+ */
+function makeProvider(
+  options: Omit<ClerkSessionProviderOptions, 'authorizedParties'> &
+    Partial<Pick<ClerkSessionProviderOptions, 'authorizedParties'>>,
+) {
+  return createClerkSessionProvider({ authorizedParties: [origin], ...options })
+}
 
 let server: ReturnType<typeof Bun.serve> | null = null
 
@@ -85,13 +98,19 @@ async function createSignedToken(
 
 describe('createClerkSessionProvider', () => {
   test('rejects blank security configuration at construction', () => {
-    expect(() => createClerkSessionProvider({ issuer: ' ' })).toThrow('issuer must not be blank')
+    const valid = { authorizedParties: [origin] }
+
+    expect(() => createClerkSessionProvider({ ...valid, issuer: ' ' })).toThrow(
+      'issuer must not be blank',
+    )
     // Asserting only `TypeError` here would not isolate the blank guard: with it removed,
     // an empty issuer reaches `new URL('/.well-known/jwks.json')`, which throws a
     // TypeError of its own and would keep this green.
-    expect(() => createClerkSessionProvider({ issuer: '' })).toThrow('issuer must not be blank')
+    expect(() => createClerkSessionProvider({ ...valid, issuer: '' })).toThrow(
+      'issuer must not be blank',
+    )
     expect(() =>
-      createClerkSessionProvider({ issuer: 'https://clerk.example.test', jwksUrl: ' ' }),
+      createClerkSessionProvider({ ...valid, issuer: 'https://clerk.example.test', jwksUrl: ' ' }),
     ).toThrow('jwksUrl must not be blank')
     expect(() =>
       createClerkSessionProvider({
@@ -101,9 +120,17 @@ describe('createClerkSessionProvider', () => {
     ).toThrow('authorizedParties[0] must not be blank')
   })
 
+  test('requires at least one authorized origin at construction', () => {
+    // The empty list is the case types cannot catch: omitting the option is a compile
+    // error, but `[]` type-checks and would silently restore an unconditional accept.
+    expect(() =>
+      createClerkSessionProvider({ issuer: 'https://clerk.example.test', authorizedParties: [] }),
+    ).toThrow('authorizedParties must list at least one origin')
+  })
+
   test('returns a provider-neutral session for a valid Clerk session token', async () => {
     const { token, issuer, expirationTime, requestedPaths } = await createSignedToken()
-    const provider = createClerkSessionProvider({ issuer, authorizedParties: [origin] })
+    const provider = makeProvider({ issuer, authorizedParties: [origin] })
 
     const session = await provider.getSession(authorized(token))
 
@@ -116,7 +143,7 @@ describe('createClerkSessionProvider', () => {
 
   test('derives the default key set URL without doubling a trailing slash', async () => {
     const { token, issuer, requestedPaths } = await createSignedToken()
-    const provider = createClerkSessionProvider({ issuer: `${issuer}///` })
+    const provider = makeProvider({ issuer: `${issuer}///` })
 
     await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
     expect(requestedPaths).toEqual(['/.well-known/jwks.json'])
@@ -124,7 +151,7 @@ describe('createClerkSessionProvider', () => {
 
   test('uses an explicitly configured key set URL', async () => {
     const { token, issuer, requestedPaths } = await createSignedToken()
-    const provider = createClerkSessionProvider({ issuer, jwksUrl: `${issuer}/custom/jwks.json` })
+    const provider = makeProvider({ issuer, jwksUrl: `${issuer}/custom/jwks.json` })
 
     await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
     expect(requestedPaths).toEqual(['/custom/jwks.json'])
@@ -132,21 +159,21 @@ describe('createClerkSessionProvider', () => {
 
   test('rejects tokens from another issuer', async () => {
     const { token, issuer } = await createSignedToken({ issuer: 'https://other.example.test' })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('rejects tokens whose azp is outside the authorized origins', async () => {
     const { token, issuer } = await createSignedToken({ claims: { azp: 'https://evil.example' } })
-    const provider = createClerkSessionProvider({ issuer, authorizedParties: [origin] })
+    const provider = makeProvider({ issuer, authorizedParties: [origin] })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('accepts any authorized origin in the allowlist', async () => {
     const { token, issuer } = await createSignedToken({ claims: { azp: 'https://alt.example' } })
-    const provider = createClerkSessionProvider({
+    const provider = makeProvider({
       issuer,
       authorizedParties: [origin, 'https://alt.example'],
     })
@@ -156,7 +183,7 @@ describe('createClerkSessionProvider', () => {
 
   test('rejects a missing or non-string azp when origins are configured', async () => {
     const missing = await createSignedToken({ claims: { azp: undefined } })
-    const missingProvider = createClerkSessionProvider({
+    const missingProvider = makeProvider({
       issuer: missing.issuer,
       authorizedParties: [origin],
     })
@@ -166,7 +193,7 @@ describe('createClerkSessionProvider', () => {
     stopServer()
 
     const nonString = await createSignedToken({ claims: { azp: 123 } })
-    const nonStringProvider = createClerkSessionProvider({
+    const nonStringProvider = makeProvider({
       issuer: nonString.issuer,
       authorizedParties: [origin],
     })
@@ -174,33 +201,25 @@ describe('createClerkSessionProvider', () => {
     await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
   })
 
-  test('ignores azp when no authorized origins are configured', async () => {
+  test('has no configuration that accepts an unlisted origin', async () => {
+    // Replaces an earlier test that pinned the opposite behavior, when an omitted or
+    // empty allowlist disabled the check. There is now no way to construct a provider
+    // that accepts this token, which is the point of making the option required.
     const { token, issuer } = await createSignedToken({ claims: { azp: 'https://evil.example' } })
-    const provider = createClerkSessionProvider({ issuer })
 
-    await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
-
-    stopServer()
-
-    const missing = await createSignedToken({ claims: { azp: undefined } })
-    const emptyListProvider = createClerkSessionProvider({
-      issuer: missing.issuer,
-      authorizedParties: [],
-    })
-
-    await expect(emptyListProvider.getSession(authorized(missing.token))).resolves.not.toBeNull()
+    await expect(makeProvider({ issuer }).getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('rejects expired tokens and tokens without required claims', async () => {
     const expired = await createSignedToken({ expirationTime: 1 })
-    const expiredProvider = createClerkSessionProvider({ issuer: expired.issuer })
+    const expiredProvider = makeProvider({ issuer: expired.issuer })
 
     await expect(expiredProvider.getSession(authorized(expired.token))).resolves.toBeNull()
 
     stopServer()
 
     const expirationless = await createSignedToken({ includeExpiration: false })
-    const expirationlessProvider = createClerkSessionProvider({ issuer: expirationless.issuer })
+    const expirationlessProvider = makeProvider({ issuer: expirationless.issuer })
 
     await expect(
       expirationlessProvider.getSession(authorized(expirationless.token)),
@@ -209,7 +228,7 @@ describe('createClerkSessionProvider', () => {
     stopServer()
 
     const subjectless = await createSignedToken({ claims: { sub: undefined } })
-    const subjectlessProvider = createClerkSessionProvider({ issuer: subjectless.issuer })
+    const subjectlessProvider = makeProvider({ issuer: subjectless.issuer })
 
     await expect(subjectlessProvider.getSession(authorized(subjectless.token))).resolves.toBeNull()
   })
@@ -223,7 +242,7 @@ describe('createClerkSessionProvider', () => {
       claims: { exp: 'not-a-number' },
       includeExpiration: false,
     })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
@@ -233,21 +252,21 @@ describe('createClerkSessionProvider', () => {
     // and gives them `sub`, `exp`, and `azp` — but not `sid`, because they are not bound
     // to a session. Accepting one would let a token minted for another service log in.
     const { token, issuer } = await createSignedToken({ claims: { sid: undefined } })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('rejects a non-string or empty session id', async () => {
     const nonString = await createSignedToken({ claims: { sid: 123 } })
-    const nonStringProvider = createClerkSessionProvider({ issuer: nonString.issuer })
+    const nonStringProvider = makeProvider({ issuer: nonString.issuer })
 
     await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
 
     stopServer()
 
     const empty = await createSignedToken({ claims: { sid: '' } })
-    const emptyProvider = createClerkSessionProvider({ issuer: empty.issuer })
+    const emptyProvider = makeProvider({ issuer: empty.issuer })
 
     await expect(emptyProvider.getSession(authorized(empty.token))).resolves.toBeNull()
   })
@@ -258,7 +277,7 @@ describe('createClerkSessionProvider', () => {
     const justExpired = await createSignedToken({
       expirationTime: Math.floor(Date.now() / 1_000) - 2,
     })
-    const tolerant = createClerkSessionProvider({ issuer: justExpired.issuer })
+    const tolerant = makeProvider({ issuer: justExpired.issuer })
 
     await expect(tolerant.getSession(authorized(justExpired.token))).resolves.not.toBeNull()
 
@@ -267,17 +286,17 @@ describe('createClerkSessionProvider', () => {
     const longExpired = await createSignedToken({
       expirationTime: Math.floor(Date.now() / 1_000) - 60,
     })
-    const strict = createClerkSessionProvider({ issuer: longExpired.issuer })
+    const strict = makeProvider({ issuer: longExpired.issuer })
 
     await expect(strict.getSession(authorized(longExpired.token))).resolves.toBeNull()
   })
 
   test('rejects an invalid clock skew at construction', () => {
+    expect(() => makeProvider({ issuer: 'https://clerk.example.test', clockSkewInMs: -1 })).toThrow(
+      'clockSkewInMs must be a non-negative finite number',
+    )
     expect(() =>
-      createClerkSessionProvider({ issuer: 'https://clerk.example.test', clockSkewInMs: -1 }),
-    ).toThrow('clockSkewInMs must be a non-negative finite number')
-    expect(() =>
-      createClerkSessionProvider({
+      makeProvider({
         issuer: 'https://clerk.example.test',
         clockSkewInMs: Number.NaN,
       }),
@@ -291,28 +310,28 @@ describe('createClerkSessionProvider', () => {
       claims: { exp: 8_640_000_000_001 },
       includeExpiration: false,
     })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('rejects a non-string or empty subject', async () => {
     const nonString = await createSignedToken({ claims: { sub: 123 } })
-    const nonStringProvider = createClerkSessionProvider({ issuer: nonString.issuer })
+    const nonStringProvider = makeProvider({ issuer: nonString.issuer })
 
     await expect(nonStringProvider.getSession(authorized(nonString.token))).resolves.toBeNull()
 
     stopServer()
 
     const empty = await createSignedToken({ claims: { sub: '' } })
-    const emptyProvider = createClerkSessionProvider({ issuer: empty.issuer })
+    const emptyProvider = makeProvider({ issuer: empty.issuer })
 
     await expect(emptyProvider.getSession(authorized(empty.token))).resolves.toBeNull()
   })
 
   test('accepts bearer credentials only, never URL query credentials', async () => {
     const { token, issuer } = await createSignedToken()
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(
       provider.getSession(
@@ -323,7 +342,7 @@ describe('createClerkSessionProvider', () => {
 
   test('fails closed for a malformed bearer token', async () => {
     const { issuer } = await createSignedToken()
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(
       provider.getSession(
@@ -336,28 +355,28 @@ describe('createClerkSessionProvider', () => {
 
   test('fails closed for a token signed with an algorithm other than RS256', async () => {
     const { token, issuer } = await createSignedToken({ algorithm: 'PS256' })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('fails closed for an unsupported critical JWT header', async () => {
     const { token, issuer } = await createSignedToken({ unsupportedCriticalHeader: true })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('fails closed when the key set no longer carries the signing key', async () => {
     const { token, issuer } = await createSignedToken({ jwksBody: { keys: [] } })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
   test('surfaces JWKS infrastructure failures', async () => {
     const { token, issuer } = await createSignedToken({ jwksStatus: 503 })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     // Pin the generic-error code, not just `JOSEError` — every error jose throws satisfies
     // the instance check, including the credential rejections that must resolve null.
@@ -368,7 +387,7 @@ describe('createClerkSessionProvider', () => {
 
   test('surfaces a malformed key set as an infrastructure failure', async () => {
     const { token, issuer } = await createSignedToken({ jwksBody: { not: 'a key set' } })
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).rejects.toBeInstanceOf(errors.JWKSInvalid)
   })
@@ -376,7 +395,7 @@ describe('createClerkSessionProvider', () => {
   test('surfaces an unreachable key server rather than denying the credential', async () => {
     const { token, issuer } = await createSignedToken()
     stopServer()
-    const provider = createClerkSessionProvider({ issuer })
+    const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).rejects.toThrow()
   })

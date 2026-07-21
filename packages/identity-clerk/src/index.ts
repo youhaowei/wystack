@@ -8,10 +8,16 @@ export interface ClerkSessionProviderOptions {
   jwksUrl?: string
   /**
    * Origins permitted in Clerk's `azp` claim. Clerk sets `azp` to the requesting
-   * origin rather than a client identifier, so this is an allowlist, not a single
-   * expected value. Omitted or empty disables the check.
+   * origin rather than a client identifier, so this is an allowlist rather than a
+   * single expected value.
+   *
+   * Required, and must list at least one origin. An optional origin check would
+   * default to off, which is the wrong default for a security control and would
+   * make this adapter weaker than `identity-workos`, where the corresponding
+   * `clientId` is mandatory. A deployment that genuinely cannot enumerate its
+   * origins should be made to say so rather than get there by omission.
    */
-  authorizedParties?: readonly string[]
+  authorizedParties: readonly string[]
   /**
    * Permitted clock difference against Clerk's `exp`/`nbf`, matching the
    * `clockSkewInMs` option Clerk's own middleware exposes. Defaults to Clerk's
@@ -57,10 +63,16 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
       ? `${issuer}/.well-known/jwks.json`
       : requireNonBlank('jwksUrl', options.jwksUrl)
   const authorizedParties = new Set(
-    (options.authorizedParties ?? []).map((party, index) =>
+    options.authorizedParties.map((party, index) =>
       requireNonBlank(`authorizedParties[${index}]`, party),
     ),
   )
+  // Rejecting the empty list is what makes the option required in practice. Accepting
+  // it would restore the silent-off default under a different spelling, and TypeScript
+  // cannot catch `[]` the way it catches omission.
+  if (authorizedParties.size === 0) {
+    throw new TypeError('authorizedParties must list at least one origin')
+  }
 
   const clockSkewInMs = options.clockSkewInMs ?? 5_000
   if (!Number.isFinite(clockSkewInMs) || clockSkewInMs < 0) {
