@@ -86,7 +86,10 @@ async function createSignedToken(
 describe('createClerkSessionProvider', () => {
   test('rejects blank security configuration at construction', () => {
     expect(() => createClerkSessionProvider({ issuer: ' ' })).toThrow('issuer must not be blank')
-    expect(() => createClerkSessionProvider({ issuer: '' })).toThrow(TypeError)
+    // Asserting only `TypeError` here would not isolate the blank guard: with it removed,
+    // an empty issuer reaches `new URL('/.well-known/jwks.json')`, which throws a
+    // TypeError of its own and would keep this green.
+    expect(() => createClerkSessionProvider({ issuer: '' })).toThrow('issuer must not be blank')
     expect(() =>
       createClerkSessionProvider({ issuer: 'https://clerk.example.test', jwksUrl: ' ' }),
     ).toThrow('jwksUrl must not be blank')
@@ -356,7 +359,11 @@ describe('createClerkSessionProvider', () => {
     const { token, issuer } = await createSignedToken({ jwksStatus: 503 })
     const provider = createClerkSessionProvider({ issuer })
 
-    await expect(provider.getSession(authorized(token))).rejects.toBeInstanceOf(errors.JOSEError)
+    // Pin the generic-error code, not just `JOSEError` — every error jose throws satisfies
+    // the instance check, including the credential rejections that must resolve null.
+    await expect(provider.getSession(authorized(token))).rejects.toMatchObject({
+      code: 'ERR_JOSE_GENERIC',
+    })
   })
 
   test('surfaces a malformed key set as an infrastructure failure', async () => {
