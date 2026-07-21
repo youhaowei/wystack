@@ -12,4 +12,4 @@ export {
   type BearerSessionProviderOptions,
   createBearerSessionProvider,
 } from './session'
-export { type Principal } from './principal'
+export { type Principal, type PrincipalKind, isPrincipal } from './principal'

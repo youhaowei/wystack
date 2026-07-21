@@ -94,6 +94,16 @@
         "pino-pretty",
       ],
     },
+    "packages/permissions": {
+      "name": "@wystack/permissions",
+      "version": "0.0.1",
+      "dependencies": {
+        "@wystack/identity": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5.8.3",
+      },
+    },
     "packages/secret-vault": {
       "name": "@wystack/secret-vault",
       "version": "0.0.1",
@@ -206,6 +216,8 @@
     "@wystack/identity-workos": ["@wystack/identity-workos@workspace:packages/identity-workos"],
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
+
+    "@wystack/permissions": ["@wystack/permissions@workspace:packages/permissions"],
 
     "@wystack/secret-vault": ["@wystack/secret-vault@workspace:packages/secret-vault"],
 
