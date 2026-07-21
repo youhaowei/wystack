@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { buildAuthRequest } from '../routes'
 import { serve } from '../serve-bun'
 import { defineApp } from '../define-app'
@@ -238,6 +239,60 @@ describe('HTTP transport', () => {
         },
       )
       expect(allowedMutation.status).toBe(200)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('an unreachable identity provider answers 503, not 401', async () => {
+    // 401 says "your credential was rejected" — it invites the client to sign in
+    // again, and monitoring reads it as an authentication problem. A key endpoint
+    // that is down is a dependency failure of ours, so it has to answer 5xx or the
+    // outage presents as every user's token going bad at once.
+    const db = await createDb({ dev: 'pglite://' })
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await wy.build({
+      db,
+      functions: {
+        whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId })),
+        noop: wy.procedure.input({}).mutation(async () => ({ ok: true })),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (token === 'outage') {
+          throw new IdentityProviderUnavailableError('key set unreachable')
+        }
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const base = `http://localhost:${authServer.port}/api`
+      const outage = await fetch(`${base}/whoami`, {
+        headers: { Authorization: 'Bearer outage' },
+      })
+      expect(outage.status).toBe(503)
+
+      const outagePost = await fetch(`${base}/noop`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer outage' },
+        body: JSON.stringify({}),
+      })
+      expect(outagePost.status).toBe(503)
+
+      // The other half of the contract: a genuinely rejected credential must still
+      // be a 401, or the fix would be satisfied by calling everything retryable.
+      const rejected = await fetch(`${base}/whoami`)
+      expect(rejected.status).toBe(401)
     } finally {
       authServer.stop(true)
     }

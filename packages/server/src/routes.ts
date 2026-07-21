@@ -26,12 +26,21 @@
  *
  * Close codes:
  *   4001 — auth failed / missing / protocol violation (client does not retry)
- *   4002 — transient: handshake timed out within `authTimeoutMs`, or server
- *          failed to send the `authenticated` ack (client retries with backoff)
+ *   4002 — transient: handshake timed out within `authTimeoutMs`, the server
+ *          failed to send the `authenticated` ack, or the identity provider
+ *          could not be consulted (client retries with backoff)
+ *
+ * The last case is why `resolveContext` throwing is not uniformly 4001: a key
+ * endpoint that is down is our dependency failing, not the client's credential
+ * being bad, and 4001 would tell every connected client to stop retrying for the
+ * duration of an outage that resolves on its own. The same split applies to the
+ * HTTP handlers below, which answer 503 rather than 401. See
+ * `IdentityProviderUnavailableError` in `@wystack/identity`.
  *
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
  */
+import { isIdentityProviderUnavailable } from '@wystack/identity'
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { Pipe } from '@wystack/transport'
@@ -267,6 +276,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
+      // An unreachable identity provider is a dependency failure, not a rejected
+      // credential. Answering 401 would blame the user's token for an upstream outage
+      // and, on the WebSocket path, tell clients not to retry.
+      if (isIdentityProviderUnavailable(err)) {
+        return c.json({ error: 'identity provider unavailable' }, 503)
+      }
       return c.json({ error: errorMessage(err) }, 401)
     }
 
@@ -312,6 +327,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
+      // An unreachable identity provider is a dependency failure, not a rejected
+      // credential. Answering 401 would blame the user's token for an upstream outage
+      // and, on the WebSocket path, tell clients not to retry.
+      if (isIdentityProviderUnavailable(err)) {
+        return c.json({ error: 'identity provider unavailable' }, 503)
+      }
       return c.json({ error: errorMessage(err) }, 401)
     }
 

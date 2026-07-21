@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { errors, exportJWK, generateKeyPair, SignJWT } from 'jose'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { createWorkOSSessionProvider } from '../index'
 
 const issuer = 'https://api.workos.com/'
@@ -360,7 +361,25 @@ describe('createWorkOSSessionProvider', () => {
           headers: { authorization: `Bearer ${token}` },
         }),
       ),
-    ).rejects.toBeInstanceOf(errors.JOSEError)
+    ).rejects.toBeInstanceOf(IdentityProviderUnavailableError)
+  })
+
+  test('preserves the underlying jose error as the cause', async () => {
+    // Wrapping must not destroy the diagnosis. The seam-level type tells the caller how
+    // to respond; `cause` tells an operator what actually broke.
+    const { token, jwksUrl } = await createSignedToken({ jwksStatus: 503 })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    const error = await provider
+      .getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      )
+      .catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    expect((error as Error).cause).toBeInstanceOf(errors.JOSEError)
   })
 
   test('rejects an exp that is unexpired but not representable as a Date', async () => {

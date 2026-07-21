@@ -22,6 +22,7 @@
 //   8. handshake timeout → transient close.
 
 import { describe, test, expect } from 'bun:test'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import {
   createLoopbackPair,
@@ -219,6 +220,22 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     h.send({ type: 'call', id: 'c1', path: 'whoami', args: {} })
     await until(() => h.received.length > 1, 'result')
     expect(h.received.at(-1)).toEqual({ type: 'result', id: 'c1', data: { userId: 'u1' } })
+  })
+
+  test('identity provider outage → transient close, not auth-failed', async () => {
+    // A key server that is down is not a bad credential. Closing `auth-failed` maps to
+    // WS 4001, documented as "client does not retry", so a transient upstream incident
+    // would latch a terminal auth failure that resolves only by user action.
+    const h = await harness({
+      resolveContext: async () => {
+        throw new IdentityProviderUnavailableError('key set unreachable')
+      },
+    })
+    h.send({ type: 'auth', token: 'good' })
+    await until(() => h.closeReasons.length > 0, 'close')
+
+    expect(h.closeReasons).toEqual(['transient'])
+    expect(h.handle.session.authenticated).toBe(false)
   })
 
   test('bad token → terminal close (auth-failed), no authenticated frame', async () => {

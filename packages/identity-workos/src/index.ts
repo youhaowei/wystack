@@ -1,6 +1,7 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
+  IdentityProviderUnavailableError,
   representableExpiry,
   requireClockSkewInMs,
   requireNonBlank,
@@ -164,7 +165,14 @@ export function createWorkOSSessionProvider(
         }
       } catch (error) {
         if (error instanceof errors.JOSEError && !isJwksInfrastructureError(error)) return null
-        throw error
+        // Re-raise infrastructure faults as a seam-level type so callers can tell an
+        // upstream outage from a rejected credential without importing jose and
+        // reimplementing this classification. Without it the distinction is drawn
+        // correctly here and then lost by every consumer.
+        throw new IdentityProviderUnavailableError(
+          'WorkOS key set could not be retrieved or used',
+          { cause: error },
+        )
       }
     },
   })

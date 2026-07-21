@@ -15,3 +15,4 @@ export {
 export { type Principal, type PrincipalKind, isPrincipal } from './principal'
 export { requireSecureJwksUrl } from './jwks-url'
 export { requireNonBlank, requireClockSkewInMs, representableExpiry } from './config'
+export { IdentityProviderUnavailableError, isIdentityProviderUnavailable } from './errors'

@@ -22,13 +22,16 @@
 // beside the live routes). YW-57 rewires `routes.ts` through this Session and
 // removes the duplication. Editing `routes.ts` here is out of scope.
 
+import { isIdentityProviderUnavailable } from '@wystack/identity'
+
 /**
  * Transport-neutral reason a Session asks the connection to close. The adapter
  * maps it to a wire-level code:
  *   - `auth-failed` — terminal. Bad/missing token, non-auth first frame, or a
  *     protocol violation. The client must NOT retry (WS 4001).
- *   - `transient` — recoverable. Handshake timed out, or the ack send failed
- *     after auth succeeded. The client retries with backoff (WS 4002).
+ *   - `transient` — recoverable. Handshake timed out, the ack send failed after
+ *     auth succeeded, or the identity provider could not be consulted. The
+ *     client retries with backoff (WS 4002).
  */
 export type CloseReason = 'auth-failed' | 'transient'
 
@@ -163,7 +166,7 @@ export class Session {
     try {
       const req = buildAuthRequest(this.baseRequest, token)
       await this.resolveContext(req)
-    } catch {
+    } catch (error) {
       // Auth failed. Re-check after the await BEFORE closing: a concurrent frame
       // (e.g. a valid token immediately followed by an invalid one) may have
       // authenticated the connection while this resolve was rejecting. Tearing
@@ -172,6 +175,13 @@ export class Session {
       // routes.ts:284 (`if (... && !conn.authenticated) ws.close(4001)`).
       if (this.authenticated) {
         return { kind: 'authenticated', committed: false }
+      }
+      // The identity provider being unreachable is not a failed credential. Closing
+      // 4001 here would tell a well-behaved client not to retry — latching a terminal
+      // auth failure for the duration of an upstream incident that resolves on its
+      // own. `transient` maps to 4002, which clients retry with backoff.
+      if (isIdentityProviderUnavailable(error)) {
+        return { kind: 'close', reason: 'transient' }
       }
       // Genuinely failed — terminal. The Engine logs the message only (never the
       // token/header values that may be embedded in the thrown error) and closes.
