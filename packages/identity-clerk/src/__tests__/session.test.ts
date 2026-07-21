@@ -211,8 +211,10 @@ describe('createClerkSessionProvider', () => {
   })
 
   test('rejects a non-numeric expiration', async () => {
-    // jose's `requiredClaims` only proves `exp` is present; a string `exp` would
-    // otherwise reach `new Date(exp * 1_000)` and produce an Invalid Date expiry.
+    // jose rejects a non-numeric `exp` during claim validation, so this never reaches
+    // the provider's own type guard — verified by removing that guard and watching this
+    // still pass. The test pins the contract, not the mechanism: whichever layer enforces
+    // it, a string `exp` must resolve null rather than an Invalid Date expiry.
     const { token, issuer } = await createSignedToken({
       claims: { exp: 'not-a-number' },
       includeExpiration: false,
