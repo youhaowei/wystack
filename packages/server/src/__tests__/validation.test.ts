@@ -5,6 +5,7 @@ import { defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wysta
 import { buildArgsSchema, ValidationError } from '../validation'
 import { defineApp } from '../define-app'
 import { PermissionDeniedError } from '../index'
+import { applyCommands } from '../apply-commands'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -201,6 +202,21 @@ describe('validation in call()', () => {
         { id: 'invalid' },
         { principal: { kind: 'user', userId: 'user-1' }, granted: true },
       ),
+    ).rejects.toBeInstanceOf(ValidationError)
+  })
+
+  test('authorization runs before argument validation for batched procedures', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'protectedTodo', args: { id: 'invalid' } }], {
+        mode: 'commit',
+      }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError)
+
+    await expect(
+      applyCommands(app, [{ path: 'protectedTodo', args: { id: 'invalid' } }], {
+        mode: 'commit',
+        context: { principal: { kind: 'user', userId: 'user-1' }, granted: true },
+      }),
     ).rejects.toBeInstanceOf(ValidationError)
   })
 })

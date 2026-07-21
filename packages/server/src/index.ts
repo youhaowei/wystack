@@ -33,7 +33,7 @@ export type {
   StageOk,
   Overwrite,
 } from './types'
-export type { ContextFactory, DefineAppOptions, BuildOptions } from './define-app'
+export type { DefineAppOptions, BuildOptions } from './define-app'
 export type { ProcedureBuilder } from './functions'
 export type { WyStackApp } from './create'
 export type {

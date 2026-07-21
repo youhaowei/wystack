@@ -90,17 +90,4 @@ describe('procedure builder', () => {
 
     await expect(definition.handler({}, {})).rejects.toThrow('stage boom')
   })
-
-  test('defineApp exposes its optional request context factory', async () => {
-    const withContext = defineApp<{ requestUrl: string }>({
-      permissions: {},
-      context: async (request) => ({ requestUrl: request.url }),
-    })
-
-    const resolved = await withContext.resolveContext?.(new Request('https://example.test/path'), {
-      // oxlint-disable-next-line typescript/no-explicit-any -- context factory unit-test service stub
-      db: {} as any,
-    })
-    expect(resolved).toEqual({ requestUrl: 'https://example.test/path' })
-  })
 })
