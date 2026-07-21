@@ -164,15 +164,27 @@ export function createWorkOSSessionProvider(
           expiresAt,
         }
       } catch (error) {
-        if (error instanceof errors.JOSEError && !isJwksInfrastructureError(error)) return null
         // Re-raise infrastructure faults as a seam-level type so callers can tell an
         // upstream outage from a rejected credential without importing jose and
         // reimplementing this classification. Without it the distinction is drawn
         // correctly here and then lost by every consumer.
-        throw new IdentityProviderUnavailableError(
-          'WorkOS key set could not be retrieved or used',
-          { cause: error },
-        )
+        if (isJwksInfrastructureError(error)) {
+          throw new IdentityProviderUnavailableError(
+            'WorkOS key set could not be retrieved or used',
+            { cause: error },
+          )
+        }
+
+        // Any other jose error is the token failing verification — a rejected
+        // credential, which the interface expresses as `null`.
+        if (error instanceof errors.JOSEError) return null
+
+        // Anything else is a defect in this closure, not a statement about the token or
+        // about WorkOS. Rethrown unchanged so it surfaces as a server fault: labelling
+        // it as provider-unavailable would make callers answer 503 and mark it
+        // retryable, so clients would keep retrying a deterministic bug that never
+        // clears.
+        throw error
       }
     },
   })

@@ -15,7 +15,16 @@
  * The identity provider could not be reached or answered unusably.
  *
  * Thrown for infrastructure faults — an unreachable key endpoint, a timeout, a 5xx, a
- * malformed key set. Never for a bad credential: a rejected token resolves `null`.
+ * malformed key set. A rejected token resolves `null`.
+ *
+ * A bogus token can still reach this error, and that is correct rather than a leak in
+ * the classification: verifiers refetch the key set when a token names an unknown key,
+ * so a token that would be rejected by a healthy provider raises a fetch failure against
+ * a broken one. While the key set is unreachable the token is *unadjudicable*, not
+ * rejected — the honest answer is "ask again", and it becomes `null` as soon as the
+ * provider recovers. What this type promises is the direction of the mistake, not that
+ * the input was well-formed: nothing resolves `null` because of an outage, and nothing
+ * throws this because a credential was merely wrong.
  *
  * Callers should treat this as a dependency failure (5xx, retryable close) rather than
  * as an authentication failure (401, terminal close). The distinction is what keeps a

@@ -10,6 +10,7 @@ import {
 } from '@wystack/transport'
 import type { WyStackApp } from '../create'
 import { ValidationError } from '../validation'
+import { AuthenticationRequiredError } from '../functions'
 import { PermissionDeniedError } from '@wystack/permissions'
 import { createDispatch, type Dispatch } from './dispatch'
 import { Session, type CloseReason, type SessionOptions } from './session'
@@ -176,10 +177,16 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     const outcome = await session.handleAuth(rawToken)
     if (closed) return
     if (outcome.kind === 'close') {
-      // TODO: replace with @wystack/log once server logging lands. Log only that
-      // auth failed — never the token — to avoid leaking credentials.
+      // TODO: replace with @wystack/log once server logging lands. Log the reason
+      // but never the token, to avoid leaking credentials.
+      //
+      // The reason has to be interpolated rather than hardcoded: this branch now
+      // carries `transient` as well as `auth-failed`, so a fixed "auth failed" string
+      // would report an identity-provider outage as a credential problem — which is
+      // the exact misattribution this classification exists to prevent, on the one
+      // surface that carries any signal. Operators grep this line during an incident.
       // eslint-disable-next-line no-console
-      console.warn('[wystack/server] engine auth failed')
+      console.warn(`[wystack/server] engine auth closed: ${outcome.reason}`)
       closeWith(outcome.reason)
       return
     }
@@ -266,7 +273,11 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
+        retryable: !(
+          err instanceof ValidationError ||
+          err instanceof PermissionDeniedError ||
+          err instanceof AuthenticationRequiredError
+        ),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -298,7 +309,11 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
+        retryable: !(
+          err instanceof ValidationError ||
+          err instanceof PermissionDeniedError ||
+          err instanceof AuthenticationRequiredError
+        ),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues

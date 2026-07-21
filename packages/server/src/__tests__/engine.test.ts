@@ -20,6 +20,10 @@
 //   6. double auth frame race → exactly one identity committed.
 //   7. malformed first frame pre-auth → terminal close.
 //   8. handshake timeout → transient close.
+//
+// Beyond parity (new behavior, not present in routes.ts's original handshake):
+//   9. identity-provider outage → transient close, NOT auth-failed. A key server
+//      that is down is not a bad credential, and 4001 tells clients not to retry.
 
 import { describe, test, expect } from 'bun:test'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
@@ -226,6 +230,10 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     // A key server that is down is not a bad credential. Closing `auth-failed` maps to
     // WS 4001, documented as "client does not retry", so a transient upstream incident
     // would latch a terminal auth failure that resolves only by user action.
+    const warnings: string[] = []
+    const realWarn = console.warn
+    console.warn = (...args: unknown[]) => void warnings.push(args.join(' '))
+
     const h = await harness({
       resolveContext: async () => {
         throw new IdentityProviderUnavailableError('key set unreachable')
@@ -236,6 +244,13 @@ describe('Engine — auth handshake parity (AC #2)', () => {
 
     expect(h.closeReasons).toEqual(['transient'])
     expect(h.handle.session.authenticated).toBe(false)
+
+    // The log line is the only signal this path emits — the HTTP 503 path logs nothing
+    // at all — so a hardcoded "auth failed" here would misattribute the outage on the
+    // one surface an operator greps mid-incident.
+    expect(warnings.some((line) => line.includes('transient'))).toBe(true)
+    expect(warnings.some((line) => line.includes('auth failed'))).toBe(false)
+    console.warn = realWarn
   })
 
   test('bad token → terminal close (auth-failed), no authenticated frame', async () => {
