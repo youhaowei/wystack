@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
+import { createRemoteJWKSet, customFetch, errors, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
   IdentityProviderUnavailableError,
@@ -130,7 +130,29 @@ export function createWorkOSSessionProvider(
 
   const clockSkewInMs = requireClockSkewInMs(options.clockSkewInMs)
 
-  const jwks = createRemoteJWKSet(new URL(jwksUrl))
+  // `customFetch` rather than classifying the thrown error afterwards, because the
+  // classification is not expressible after the fact. jose converts only a timeout into
+  // a `JWKSTimeout`; connection refused, DNS failure, TLS failure and network partition
+  // are rethrown as whatever the platform's `fetch` produced — a bare `Error` on Bun, a
+  // `TypeError` on Node — with nothing to distinguish them from a defect in the verify
+  // closure. Those are the *headline* outage shapes, so getting them wrong reinstates
+  // the 401/4001 bug for every case except the one where the key server is healthy
+  // enough to answer with a 5xx.
+  //
+  // Wrapping at the fetch call makes the distinction structural: anything rejecting
+  // here is a transport failure against the key endpoint by construction, and nothing
+  // else in the provider passes through this function.
+  const jwks = createRemoteJWKSet(new URL(jwksUrl), {
+    [customFetch]: async (url, init) => {
+      try {
+        return await fetch(url, init)
+      } catch (error) {
+        throw new IdentityProviderUnavailableError('WorkOS key set endpoint could not be reached', {
+          cause: error,
+        })
+      }
+    },
+  })
 
   return createBearerSessionProvider({
     async verify(token) {
@@ -184,6 +206,10 @@ export function createWorkOSSessionProvider(
         // it as provider-unavailable would make callers answer 503 and mark it
         // retryable, so clients would keep retrying a deterministic bug that never
         // clears.
+        //
+        // Transport failures do not reach here needing a label — `customFetch` above
+        // already threw `IdentityProviderUnavailableError`, and this rethrows it
+        // unchanged.
         throw error
       }
     },

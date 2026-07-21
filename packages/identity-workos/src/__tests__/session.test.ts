@@ -364,6 +364,36 @@ describe('createWorkOSSessionProvider', () => {
     ).rejects.toBeInstanceOf(IdentityProviderUnavailableError)
   })
 
+  test('surfaces an unreachable key endpoint, not only an error response', async () => {
+    // The 503 case above is the *forgiving* outage: the key server is healthy enough to
+    // answer, so jose produces a `JOSEError` that can be classified after the fact. The
+    // common shapes are not — connection refused, DNS failure, TLS failure and network
+    // partition are rethrown as whatever the platform's `fetch` produced, with nothing
+    // marking them as ours. Without a test at this shape, the suite passes while every
+    // real outage answers 401.
+    const dead = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
+    const deadPort = dead.port
+    dead.stop(true)
+
+    const { token } = await createSignedToken()
+    // The path has to name `clientId`: an override may substitute the *host* only, so a
+    // free-form path is rejected at construction and this test would never reach the
+    // fetch it exists to exercise.
+    const provider = createWorkOSSessionProvider({
+      jwksUrl: `http://127.0.0.1:${deadPort}/sso/jwks/${clientId}`,
+      clientId,
+      issuer,
+    })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(IdentityProviderUnavailableError)
+  })
+
   test('preserves the underlying jose error as the cause', async () => {
     // Wrapping must not destroy the diagnosis. The seam-level type tells the caller how
     // to respond; `cause` tells an operator what actually broke.
