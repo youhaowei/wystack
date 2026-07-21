@@ -39,9 +39,13 @@ async function createSignedToken(
     },
   })
 
+  // Modelled on WorkOS's documented access-token claims: `sub`, `sid`, `iss`, `exp`,
+  // `iat`, plus the conditional `org_id`/`role`/`permissions`. Notably there is no
+  // `client_id` — an earlier version of this fixture invented one, which made every
+  // test agree with every other test and none of them with WorkOS.
   const payload = {
     sub: 'user_01TEST',
-    client_id: clientId,
+    sid: 'session_01TEST',
     ...options.claims,
   }
 
@@ -101,10 +105,35 @@ describe('createWorkOSSessionProvider', () => {
     })
   })
 
-  test('rejects tokens issued for another WorkOS application', async () => {
-    const { token, jwksUrl } = await createSignedToken({
-      claims: { client_id: 'client_01OTHER' },
-    })
+  test('derives the client-specific JWKS URL from clientId', () => {
+    // The JWKS path is the client binding, so `clientId` has to reach it. Previously
+    // `jwksUrl` was required separately and `clientId` was only compared against a
+    // claim, which meant the two could name different applications with nothing
+    // catching it.
+    expect(() => createWorkOSSessionProvider({ clientId, issuer })).not.toThrow()
+  })
+
+  test('rejects a non-string sid', async () => {
+    // `requiredClaims` only asserts presence, so it accepts `sid: 123`. The type guard
+    // in the verifier is the half that rejects it — without this case, removing that
+    // guard leaves the suite green.
+    const { token, jwksUrl } = await createSignedToken({ claims: { sid: 123 } })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.toBeNull()
+  })
+
+  test('rejects a token with no sid', async () => {
+    // WorkOS documents `sid` on every access token; it is what makes this a session
+    // credential. Requiring it replaces the old `client_id` equality check, which
+    // required a claim WorkOS does not issue.
+    const { token, jwksUrl } = await createSignedToken({ claims: { sid: undefined } })
     const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
 
     await expect(
