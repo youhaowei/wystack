@@ -6,8 +6,13 @@ export interface WorkOSSessionProviderOptions {
    * WorkOS JSON Web Key Set endpoint. Defaults to
    * `https://api.workos.com/sso/jwks/<clientId>`.
    *
-   * Override only for a custom auth domain. The path is client-specific, and that is
-   * what binds a token to this application — see `clientId`.
+   * Override only to change the *host* — a custom auth domain, or a fixture server in
+   * tests. The path must still end in `/sso/jwks/<clientId>`, and that is enforced at
+   * construction: the path is the client binding (see `clientId`), so an override
+   * naming a different client would accept another application's tokens while every
+   * other setting still looked correct. Restricting the override to the host is what
+   * keeps the binding true in *every* supported configuration rather than only in the
+   * derived one.
    */
   jwksUrl?: string
   /**
@@ -66,6 +71,35 @@ function requireNonBlank(name: string, value: string): string {
   return trimmed
 }
 
+/**
+ * Rejects a `jwksUrl` override whose path does not name `clientId`.
+ *
+ * The override exists so a deployment can point at a custom AuthKit domain, or a test at
+ * a local fixture — that is a *host* substitution. Allowing the path to vary too would
+ * undo the derivation above: `clientId` would become decorative, and the provider would
+ * accept tokens minted for whichever application the URL actually names. Nothing else
+ * would look wrong, because those tokens are genuine and correctly signed.
+ *
+ * Compared against the encoded form, since that is what the derived URL produces, so the
+ * two configurations accept exactly the same set of endpoints.
+ */
+function requireClientPath(clientId: string, value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new TypeError('jwksUrl must be an absolute URL')
+  }
+
+  const expected = `/sso/jwks/${encodeURIComponent(clientId)}`
+  if (url.pathname !== expected) {
+    throw new TypeError(
+      `jwksUrl path must be ${expected} to stay bound to clientId (got ${url.pathname}); override the host only`,
+    )
+  }
+  return value
+}
+
 function isJwksInfrastructureError(error: unknown): boolean {
   return (
     error instanceof errors.JWKSTimeout ||
@@ -88,11 +122,15 @@ export function createWorkOSSessionProvider(
   // Derived from `clientId` rather than required separately, because the two are not
   // independent: the JWKS path *is* the client binding, so a `jwksUrl` naming a
   // different client than `clientId` would silently accept another application's
-  // tokens. Deriving makes that inconsistency unrepresentable in the common case.
+  // tokens. Deriving makes that inconsistency unrepresentable — but only if the
+  // override is constrained too, which is why `requireClientPath` runs on it. A free-form
+  // override would reintroduce exactly the mismatch this derivation exists to remove,
+  // and the resulting misconfiguration is invisible: every other setting is correct, and
+  // tokens from the wrong application verify cleanly.
   const jwksUrl =
     options.jwksUrl === undefined
       ? `https://api.workos.com/sso/jwks/${encodeURIComponent(clientId)}`
-      : requireNonBlank('jwksUrl', options.jwksUrl)
+      : requireClientPath(clientId, requireNonBlank('jwksUrl', options.jwksUrl))
 
   // Validated at construction rather than trusted, because the failure is silent and
   // inverted: `clockTolerance: NaN` makes both `exp <= now - NaN` and `nbf > now + NaN`

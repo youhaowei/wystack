@@ -69,14 +69,17 @@ async function createSignedToken(
 
   return {
     token,
-    jwksUrl: `http://127.0.0.1:${server.port}/jwks`,
+    // Client-specific path, matching what WorkOS serves and what the provider derives.
+    // A fixture at a bare `/jwks` would exercise a configuration the provider no longer
+    // accepts, and would hide the binding check from every test that uses it.
+    jwksUrl: `http://127.0.0.1:${server.port}/sso/jwks/${encodeURIComponent(clientId)}`,
     expirationTime,
   }
 }
 
 describe('createWorkOSSessionProvider', () => {
   test('rejects blank security configuration at construction', () => {
-    const base = { jwksUrl: 'https://api.workos.com/sso/jwks/client_test', clientId, issuer }
+    const base = { jwksUrl: `https://api.workos.com/sso/jwks/${clientId}`, clientId, issuer }
 
     expect(() => createWorkOSSessionProvider({ ...base, issuer: ' ' })).toThrow(
       'issuer must not be blank',
@@ -133,6 +136,35 @@ describe('createWorkOSSessionProvider', () => {
     // claim, which meant the two could name different applications with nothing
     // catching it.
     expect(() => createWorkOSSessionProvider({ clientId, issuer })).not.toThrow()
+  })
+
+  test('rejects a jwksUrl whose path names a different client', async () => {
+    // The whole point of the derivation is that `clientId` reaches the key set. A
+    // free-form override undoes it: the provider would fetch another application's keys,
+    // and that application's genuine, correctly signed tokens would verify. Nothing else
+    // in the configuration would look wrong.
+    const { jwksUrl } = await createSignedToken()
+    const other = jwksUrl.replace(clientId, 'client_01OTHER')
+
+    expect(() => createWorkOSSessionProvider({ jwksUrl: other, clientId, issuer })).toThrow(
+      'jwksUrl path must be /sso/jwks/client_01TEST',
+    )
+  })
+
+  test('accepts a host-only jwksUrl override for a custom auth domain', async () => {
+    // The override has to keep working for a custom AuthKit domain — the guard is meant
+    // to constrain the path, not to remove the option. Without this case, deleting the
+    // override entirely would leave the suite green.
+    const { token, jwksUrl } = await createSignedToken()
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      ),
+    ).resolves.not.toBeNull()
   })
 
   test('rejects a non-string sid', async () => {
@@ -356,7 +388,7 @@ describe('createWorkOSSessionProvider', () => {
     // `exp <= now - tolerance`, and every comparison against NaN is false, so both the
     // expiry and not-before checks stop rejecting anything. A token that expired in
     // 1970 would verify. Asserting the throw is what keeps that unreachable.
-    const base = { jwksUrl: 'https://api.workos.com/sso/jwks/client_test', clientId, issuer }
+    const base = { jwksUrl: `https://api.workos.com/sso/jwks/${clientId}`, clientId, issuer }
 
     for (const clockSkewInMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
       expect(() => createWorkOSSessionProvider({ ...base, clockSkewInMs })).toThrow(
