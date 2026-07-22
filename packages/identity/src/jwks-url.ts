@@ -11,11 +11,18 @@
  * Hosts permitted to serve a key set over plain HTTP.
  *
  * Loopback only, and enumerated rather than pattern-matched: `localhost` resolves
- * through the host's resolver and `127.0.0.1`/`::1` are the literal loopback addresses.
- * Anything else — including a private-range address like `10.0.0.5` — is a network hop
- * an attacker can sit on, which is the entire threat being closed here.
+ * through the host's resolver and `127.0.0.1`/`[::1]` are the literal loopback
+ * addresses. Anything else — including a private-range address like `10.0.0.5` — is a
+ * network hop an attacker can sit on, which is the entire threat being closed here.
+ *
+ * Compared against `URL.hostname`, so every entry must be in the form the WHATWG parser
+ * produces: IPv6 is always bracketed there, which is why `[::1]` appears and a bare
+ * `::1` would be unreachable. Matching the normalized form is what makes the set fail
+ * closed on novel spellings for free — `127.1`, `2130706433` and `0x7f.1` all normalize
+ * to `127.0.0.1` before they are looked up, while `localhost.` and
+ * `localhost@evil.com` do not normalize to anything in the set.
  */
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 function isLoopback(url: URL): boolean {
   return LOOPBACK_HOSTS.has(url.hostname)

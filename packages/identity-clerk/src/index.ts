@@ -26,8 +26,9 @@ export interface ClerkSessionProviderOptions {
    * Note this makes *configuration* mandatory, not the claim. Tokens that omit `azp`
    * skip the check, because Clerk documents the claim as omissible — see the
    * verification path. `identity-workos` requires its `clientId` for a superficially
-   * similar reason, but `client_id` is guaranteed on every WorkOS token, so the
-   * parity only holds on the configuration axis, not the claim-presence one.
+   * similar reason, but it binds the client through the key set rather than a claim:
+   * WorkOS serves a key set per client and issues no `client_id` claim, so there is
+   * nothing there for a claim-presence check to be parity with.
    */
   authorizedParties: readonly string[]
   /**

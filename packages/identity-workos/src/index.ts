@@ -14,7 +14,8 @@ export interface WorkOSSessionProviderOptions {
    * `https://api.workos.com/sso/jwks/<clientId>`.
    *
    * Override only to change the *host* — a custom auth domain, or a fixture server in
-   * tests. The path must still end in `/sso/jwks/<clientId>`, and that is enforced at
+   * tests. The path must be exactly `/sso/jwks/<clientId>` — not merely end in it — and
+   * that is enforced at
    * construction: the path is the client binding (see `clientId`), so an override
    * naming a different client would accept another application's tokens while every
    * other setting still looked correct. Restricting the override to the host is what
