@@ -134,9 +134,11 @@ describe('createWorkOSSessionProvider', () => {
     // Key retrieval is the root of trust: an attacker who can substitute the key set
     // mints tokens that satisfy every other check, because they hold the private half
     // of the key this verifier is told to trust.
+    // Client-correct path throughout, so this isolates the transport guard rather than
+    // tripping the client-binding guard first and passing for the wrong reason.
     expect(() =>
       createWorkOSSessionProvider({
-        jwksUrl: 'http://api.workos.com/sso/jwks/x',
+        jwksUrl: `http://api.workos.com/sso/jwks/${clientId}`,
         clientId,
         issuer,
       }),
@@ -145,13 +147,21 @@ describe('createWorkOSSessionProvider', () => {
     // Loopback stays permitted — this is the exemption the fixtures rely on, so it is
     // pinned rather than left as an accident of the implementation.
     expect(() =>
-      createWorkOSSessionProvider({ jwksUrl: 'http://127.0.0.1:1234/jwks', clientId, issuer }),
+      createWorkOSSessionProvider({
+        jwksUrl: `http://127.0.0.1:1234/sso/jwks/${clientId}`,
+        clientId,
+        issuer,
+      }),
     ).not.toThrow()
 
     // A private-range address is not loopback: it is still a network hop someone can
     // sit on, which is the threat being closed.
     expect(() =>
-      createWorkOSSessionProvider({ jwksUrl: 'http://10.0.0.5/jwks', clientId, issuer }),
+      createWorkOSSessionProvider({
+        jwksUrl: `http://10.0.0.5/sso/jwks/${clientId}`,
+        clientId,
+        issuer,
+      }),
     ).toThrow('jwksUrl must use https')
   })
 

@@ -1,5 +1,9 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
-import { createBearerSessionProvider, type SessionProvider } from '@wystack/identity'
+import {
+  createBearerSessionProvider,
+  requireSecureJwksUrl,
+  type SessionProvider,
+} from '@wystack/identity'
 
 export interface ClerkSessionProviderOptions {
   /** Clerk Frontend API issuer, e.g. `https://<slug>.clerk.accounts.dev`. */
@@ -63,10 +67,18 @@ function normalizeIssuer(issuer: string): string {
  */
 export function createClerkSessionProvider(options: ClerkSessionProviderOptions): SessionProvider {
   const issuer = normalizeIssuer(requireNonBlank('issuer', options.issuer))
+  // Guarded on the *effective* URL, after derivation, so an `http://` issuer is caught
+  // too — otherwise the check would pass on a `jwksUrl` nobody set and the insecure
+  // value would reach the fetch anyway. Key retrieval is the root of trust: an attacker
+  // who substitutes the key set mints tokens that satisfy every other check, because
+  // they hold the private half of the key this verifier is told to trust.
+  //
+  // The name reported is whichever option the operator actually set, so the error points
+  // at `issuer` when the URL was derived from it.
   const jwksUrl =
     options.jwksUrl === undefined
-      ? `${issuer}/.well-known/jwks.json`
-      : requireNonBlank('jwksUrl', options.jwksUrl)
+      ? requireSecureJwksUrl('issuer', `${issuer}/.well-known/jwks.json`)
+      : requireSecureJwksUrl('jwksUrl', requireNonBlank('jwksUrl', options.jwksUrl))
   const authorizedParties = new Set(
     options.authorizedParties.map((party, index) =>
       requireNonBlank(`authorizedParties[${index}]`, party),
