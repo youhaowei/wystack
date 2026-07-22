@@ -15,5 +15,10 @@ build/
 .wystack/
 .wystack.json
 
+# Agent-local instruction files — hold internal URLs (Notion, dashboards) that
+# must never land in this public repo. CLAUDE.md / AGENTS.md stay clean.
+CLAUDE.local.md
+AGENTS.local.md
+
 # Clawpatch local state (first-run seed; map + findings live in the shared state dir)
 .clawpatch/
