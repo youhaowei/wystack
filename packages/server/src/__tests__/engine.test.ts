@@ -35,6 +35,7 @@ import {
   type ServerMessage,
 } from '@wystack/transport'
 import { ValidationError } from '../validation'
+import { AuthenticationRequiredError } from '../functions'
 import {
   attachEngine,
   type AttachEngineOptions,
@@ -693,6 +694,39 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
       retryable: false,
       error: 'Validation failed: token: Required',
       issues,
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe context auth failure emits durable subscription error', async () => {
+    // The counterpart to the outage case above, and the reason `retryable` cannot simply
+    // track "did resolveContext throw". Both arrive here as a rejected context, but an
+    // expired or missing credential fails identically however many times the client
+    // resends it, while a provider outage clears on its own. Reporting this one as
+    // retryable puts the client in a silent reconnect loop against a subscription that
+    // can never succeed until the user re-authenticates — and the loop hides the very
+    // signal that would tell them to.
+    let callCount = 0
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) throw new AuthenticationRequiredError()
+        return {}
+      },
+    })
+
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'context auth error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+      error: 'Authentication required',
     })
     expect(h.subscriptionStore.size()).toBe(0)
   })

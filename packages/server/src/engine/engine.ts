@@ -61,6 +61,28 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * Whether a subscription error is a statement about the *request* rather than about the
+ * server, and so will fail identically however many times the client resends it.
+ *
+ * Named for the failing half rather than the retryable one because the list is
+ * closed-world: everything not enumerated here — an identity-provider outage, a database
+ * blip, a bug — is retryable by default, which is the direction that fails safe. A fault
+ * misreported as permanent strands a client that would have recovered on its own; a
+ * transient error misreported as retryable costs one wasted retry.
+ *
+ * Shared by both subscription error paths (context resolution and the call itself)
+ * because they must agree: the same error reaching a client through two routes with two
+ * different `retryable` verdicts is a bug the client cannot work around.
+ */
+function isPermanentRequestError(err: unknown): boolean {
+  return (
+    err instanceof ValidationError ||
+    err instanceof PermissionDeniedError ||
+    err instanceof AuthenticationRequiredError
+  )
+}
+
+/**
  * Attach the Engine to a Pipe. Returns a handle whose `detach()` removes the
  * inbound handler and closes the pipe (idempotent).
  *
@@ -273,11 +295,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(
-          err instanceof ValidationError ||
-          err instanceof PermissionDeniedError ||
-          err instanceof AuthenticationRequiredError
-        ),
+        retryable: !isPermanentRequestError(err),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -309,11 +327,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(
-          err instanceof ValidationError ||
-          err instanceof PermissionDeniedError ||
-          err instanceof AuthenticationRequiredError
-        ),
+        retryable: !isPermanentRequestError(err),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
