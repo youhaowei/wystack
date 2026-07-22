@@ -1,6 +1,9 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
+  representableExpiry,
+  requireClockSkewInMs,
+  requireNonBlank,
   requireSecureJwksUrl,
   type SessionProvider,
 } from '@wystack/identity'
@@ -53,26 +56,6 @@ export interface WorkOSSessionProviderOptions {
    * the 5000 ms value is the sibling adapter's rather than a vendor recommendation.
    */
   clockSkewInMs?: number
-}
-
-/**
- * Returns the trimmed value, rejecting one that is blank.
- *
- * Trimming rather than preserving the input, because every option here is a copy-paste
- * from a dashboard and surrounding whitespace is never meaningful in any of them. It is
- * also not harmless: `clientId` is percent-encoded into the JWKS path, so a trailing
- * newline derives `.../client_01ABC%0A`, which 404s. The resulting failure is a key-set
- * error on every single verification — an outage that reads as a WorkOS problem rather
- * than as a typo in configuration. `issuer` fails the same way, silently, by never
- * matching the `iss` claim.
- *
- * Validating on the trimmed form while returning the raw one would be the worst of both:
- * the check passes, then the untrimmed value is used anyway.
- */
-function requireNonBlank(name: string, value: string): string {
-  const trimmed = value.trim()
-  if (trimmed.length === 0) throw new TypeError(`${name} must not be blank`)
-  return trimmed
 }
 
 /**
@@ -143,16 +126,7 @@ export function createWorkOSSessionProvider(
       : requireClientPath(clientId, requireNonBlank('jwksUrl', options.jwksUrl)),
   )
 
-  // Validated at construction rather than trusted, because the failure is silent and
-  // inverted: `clockTolerance: NaN` makes both `exp <= now - NaN` and `nbf > now + NaN`
-  // evaluate false, which *disables* the expiry and not-before checks instead of
-  // tightening them. A token that expired years ago would verify. A negative value is
-  // rejected on the same principle — it narrows the window rather than widening it, so
-  // it is far more likely a unit mix-up than an intent.
-  const clockSkewInMs = options.clockSkewInMs ?? 5_000
-  if (!Number.isFinite(clockSkewInMs) || clockSkewInMs < 0) {
-    throw new TypeError('clockSkewInMs must be a non-negative finite number')
-  }
+  const clockSkewInMs = requireClockSkewInMs(options.clockSkewInMs)
 
   const jwks = createRemoteJWKSet(new URL(jwksUrl))
 
@@ -180,14 +154,8 @@ export function createWorkOSSessionProvider(
           return null
         }
 
-        // `exp` being numeric and unexpired does not make it representable as a Date.
-        // `Date`'s ceiling is 8.64e15 ms, so a far-future `exp` overflows into an
-        // Invalid Date — which serializes to null and compares false against every
-        // other date. The credential would look valid while carrying an expiry no
-        // consumer can act on, including any caller that decides re-authentication by
-        // comparing against it. Reject it instead.
-        const expiresAt = new Date(payload.exp * 1_000)
-        if (Number.isNaN(expiresAt.getTime())) return null
+        const expiresAt = representableExpiry(payload.exp)
+        if (expiresAt === null) return null
 
         return {
           identity: { subject: payload.sub },

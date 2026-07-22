@@ -1,6 +1,9 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
+  representableExpiry,
+  requireClockSkewInMs,
+  requireNonBlank,
   requireSecureJwksUrl,
   type SessionProvider,
 } from '@wystack/identity'
@@ -33,11 +36,6 @@ export interface ClerkSessionProviderOptions {
    * default of 5000 ms; jose would otherwise allow none.
    */
   clockSkewInMs?: number
-}
-
-function requireNonBlank(name: string, value: string): string {
-  if (value.trim().length === 0) throw new TypeError(`${name} must not be blank`)
-  return value
 }
 
 function isJwksInfrastructureError(error: unknown): boolean {
@@ -91,10 +89,7 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
     throw new TypeError('authorizedParties must list at least one origin')
   }
 
-  const clockSkewInMs = options.clockSkewInMs ?? 5_000
-  if (!Number.isFinite(clockSkewInMs) || clockSkewInMs < 0) {
-    throw new TypeError('clockSkewInMs must be a non-negative finite number')
-  }
+  const clockSkewInMs = requireClockSkewInMs(options.clockSkewInMs)
 
   const jwks = createRemoteJWKSet(new URL(jwksUrl))
 
@@ -152,12 +147,8 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
           if (typeof azp !== 'string' || !authorizedParties.has(azp)) return null
         }
 
-        // `exp` being numeric and unexpired does not make it representable as a Date.
-        // A far-future value overflows into an Invalid Date, which serializes to null
-        // and compares false against every other date — the credential would look valid
-        // while carrying an expiry no consumer can act on. Reject it instead.
-        const expiresAt = new Date(payload.exp * 1_000)
-        if (Number.isNaN(expiresAt.getTime())) return null
+        const expiresAt = representableExpiry(payload.exp)
+        if (expiresAt === null) return null
 
         return {
           identity: { subject: payload.sub },

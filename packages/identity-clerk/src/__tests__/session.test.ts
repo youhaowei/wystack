@@ -412,6 +412,19 @@ describe('createClerkSessionProvider', () => {
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
   })
 
+  test('trims configuration rather than validating a trimmed copy', async () => {
+    // Every option here is a copy-paste from the Clerk dashboard, so a trailing newline
+    // is a realistic input. It has to be dropped, not merely tolerated by the blank
+    // check: `normalizeIssuer` strips trailing slashes but not whitespace, so a padded
+    // `issuer` reaches `jwtVerify` unmodified and never matches a real token's `iss`.
+    // Every request then 401s with nothing pointing at the whitespace. Verifying a real
+    // token with padded configuration is what proves the trimmed value is the one used.
+    const { token, issuer } = await createSignedToken()
+    const provider = makeProvider({ issuer: `  ${issuer}\n` })
+
+    await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
+  })
+
   test('surfaces JWKS infrastructure failures', async () => {
     const { token, issuer } = await createSignedToken({ jwksStatus: 503 })
     const provider = makeProvider({ issuer })
