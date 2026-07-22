@@ -1,6 +1,6 @@
 // Acceptance-criteria tests for the SecretVault composition surface.
 //
-// Each numbered section corresponds to a specific AC from the YW-261 brief.
+// Each numbered section corresponds to a specific acceptance criterion.
 // These are load-bearing contract tests — not glue.
 
 import { describe, test, expect } from 'bun:test'

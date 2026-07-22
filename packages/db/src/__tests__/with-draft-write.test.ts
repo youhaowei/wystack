@@ -1,7 +1,7 @@
 /**
- * Tests for the `withDraft(draftId)` WRITE path (YW-121).
+ * Tests for the `withDraft(draftId)` WRITE path.
  *
- * YW-120 added the READ coalesce (`from(table).all()`). This adds the write side:
+ * The READ coalesce (`from(table).all()`) landed earlier. This adds the write side:
  *   - `into(table).insert(row)`             → sparse upsert into `<table>__draft`
  *   - `from(table).where(eqPk).update(vals)` → sparse cell edit in the shadow
  *   - `from(table).where(eqPk).delete()`     → tombstone row in the shadow

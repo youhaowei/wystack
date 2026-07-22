@@ -2,7 +2,7 @@
  * Embedded mount test — proves createRoutes() can be mounted into
  * a consumer's existing Hono app via .route().
  *
- * This is the pattern TASK-453 (Workforce adoption) depends on:
+ * This is the pattern Workforce's adoption depends on:
  *   const wyRoutes = createRoutes({ app: wyApp, prefix: '/api' }, upgradeWebSocket)
  *   consumerApp.route('/wystack', wyRoutes)
  *

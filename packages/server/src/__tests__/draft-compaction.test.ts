@@ -1,5 +1,5 @@
 /**
- * Tests for the bounded + compacted command log (YW-121).
+ * Tests for the bounded + compacted command log.
  *
  * `compactLog` collapses runs that share a `compactionKey` to NET EFFECT:
  *   - create then delete (same key)        → both removed (never existed)

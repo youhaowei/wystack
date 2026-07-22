@@ -5,7 +5,7 @@
 // gate, the captured auth token, the handshake timeout, and teardown. It does
 // NOT own sockets or close codes — it runs over any `Pipe`, and emits a
 // transport-neutral `CloseReason` that the adapter maps to a wire close (the
-// Hono WS adapter maps `auth-failed → 4001`, `transient → 4002`; YW-57).
+// Hono WS adapter maps `auth-failed → 4001`, `transient → 4002`).
 //
 // Auth parity with the shipped `routes.ts` handshake is the contract (AC #2).
 // The non-obvious behaviors preserved here:
@@ -18,9 +18,9 @@
 //   - the synthetic Bearer `Request` is rebuilt per resolve so adapters see a
 //     fresh identity (no cross-call mutation).
 //
-// Duplicated from `routes.ts` on purpose: YW-56 is additive (the Engine sits
-// beside the live routes). YW-57 rewires `routes.ts` through this Session and
-// removes the duplication. Editing `routes.ts` here is out of scope.
+// Duplicated from `routes.ts` on purpose: this Engine is additive (it sits
+// beside the live routes). A later change rewires `routes.ts` through this Session
+// and removes the duplication. Editing `routes.ts` here is out of scope.
 
 import { isIdentityProviderUnavailable } from '@wystack/identity'
 
@@ -128,8 +128,8 @@ export class Session {
   /**
    * Resolve a fresh context for a request on this connection, layering the
    * connection's captured token onto a freshly built synthetic Request. Called
-   * per request — RPC `call` today (the reactive `subscribe` path lands in
-   * YW-62, which reuses this same method). The Bearer/anonymous invariants live
+   * per request — RPC `call` today (the reactive `subscribe` path lands
+   * later, reusing this same method). The Bearer/anonymous invariants live
    * in `buildAuthRequest`. The `Sub` in the name is "sub-context", not
    * "subscribe" — it mirrors the shipped `routes.ts:resolveSubContext`.
    */
