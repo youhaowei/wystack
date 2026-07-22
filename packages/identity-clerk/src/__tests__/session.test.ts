@@ -120,6 +120,39 @@ describe('createClerkSessionProvider', () => {
     ).toThrow('authorizedParties[0] must not be blank')
   })
 
+  test('rejects a JWKS endpoint reachable over plain http', () => {
+    // Key retrieval is the root of trust: an attacker who substitutes the key set mints
+    // tokens that satisfy every other check — issuer, azp, expiry, subject — because they
+    // hold the private half of the key this verifier is told to trust.
+    expect(() =>
+      createClerkSessionProvider({
+        issuer: 'https://clerk.example.test',
+        jwksUrl: 'http://clerk.example.test/.well-known/jwks.json',
+        authorizedParties: ['https://app.example.test'],
+      }),
+    ).toThrow('jwksUrl must use https')
+
+    // The derived case matters more than the explicit one, because it is the path nobody
+    // configures: with the guard applied only to an explicit `jwksUrl`, an `http://`
+    // issuer would sail through and the insecure URL would reach the fetch anyway. The
+    // error names `issuer`, since that is the option the operator actually set.
+    expect(() =>
+      createClerkSessionProvider({
+        issuer: 'http://clerk.example.test',
+        authorizedParties: ['https://app.example.test'],
+      }),
+    ).toThrow('issuer must use https')
+
+    // Loopback stays permitted — the fixtures in this file depend on it, so it is pinned
+    // rather than left as an accident of the implementation.
+    expect(() =>
+      createClerkSessionProvider({
+        issuer: 'http://127.0.0.1:1234',
+        authorizedParties: ['https://app.example.test'],
+      }),
+    ).not.toThrow()
+  })
+
   test('requires at least one authorized origin at construction', () => {
     // The empty list is the case types cannot catch: omitting the option is a compile
     // error, but `[]` type-checks and would silently restore an unconditional accept.
@@ -377,6 +410,19 @@ describe('createClerkSessionProvider', () => {
     const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('trims configuration rather than validating a trimmed copy', async () => {
+    // Every option here is a copy-paste from the Clerk dashboard, so a trailing newline
+    // is a realistic input. It has to be dropped, not merely tolerated by the blank
+    // check: `normalizeIssuer` strips trailing slashes but not whitespace, so a padded
+    // `issuer` reaches `jwtVerify` unmodified and never matches a real token's `iss`.
+    // Every request then 401s with nothing pointing at the whitespace. Verifying a real
+    // token with padded configuration is what proves the trimmed value is the one used.
+    const { token, issuer } = await createSignedToken()
+    const provider = makeProvider({ issuer: `  ${issuer}\n` })
+
+    await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
   })
 
   test('surfaces JWKS infrastructure failures', async () => {

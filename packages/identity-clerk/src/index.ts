@@ -1,5 +1,12 @@
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
-import { createBearerSessionProvider, type SessionProvider } from '@wystack/identity'
+import {
+  createBearerSessionProvider,
+  representableExpiry,
+  requireClockSkewInMs,
+  requireNonBlank,
+  requireSecureJwksUrl,
+  type SessionProvider,
+} from '@wystack/identity'
 
 export interface ClerkSessionProviderOptions {
   /** Clerk Frontend API issuer, e.g. `https://<slug>.clerk.accounts.dev`. */
@@ -19,8 +26,9 @@ export interface ClerkSessionProviderOptions {
    * Note this makes *configuration* mandatory, not the claim. Tokens that omit `azp`
    * skip the check, because Clerk documents the claim as omissible — see the
    * verification path. `identity-workos` requires its `clientId` for a superficially
-   * similar reason, but `client_id` is guaranteed on every WorkOS token, so the
-   * parity only holds on the configuration axis, not the claim-presence one.
+   * similar reason, but it binds the client through the key set rather than a claim:
+   * WorkOS serves a key set per client and issues no `client_id` claim, so there is
+   * nothing there for a claim-presence check to be parity with.
    */
   authorizedParties: readonly string[]
   /**
@@ -29,11 +37,6 @@ export interface ClerkSessionProviderOptions {
    * default of 5000 ms; jose would otherwise allow none.
    */
   clockSkewInMs?: number
-}
-
-function requireNonBlank(name: string, value: string): string {
-  if (value.trim().length === 0) throw new TypeError(`${name} must not be blank`)
-  return value
 }
 
 function isJwksInfrastructureError(error: unknown): boolean {
@@ -63,10 +66,18 @@ function normalizeIssuer(issuer: string): string {
  */
 export function createClerkSessionProvider(options: ClerkSessionProviderOptions): SessionProvider {
   const issuer = normalizeIssuer(requireNonBlank('issuer', options.issuer))
+  // Guarded on the *effective* URL, after derivation, so an `http://` issuer is caught
+  // too — otherwise the check would pass on a `jwksUrl` nobody set and the insecure
+  // value would reach the fetch anyway. Key retrieval is the root of trust: an attacker
+  // who substitutes the key set mints tokens that satisfy every other check, because
+  // they hold the private half of the key this verifier is told to trust.
+  //
+  // The name reported is whichever option the operator actually set, so the error points
+  // at `issuer` when the URL was derived from it.
   const jwksUrl =
     options.jwksUrl === undefined
-      ? `${issuer}/.well-known/jwks.json`
-      : requireNonBlank('jwksUrl', options.jwksUrl)
+      ? requireSecureJwksUrl('issuer', `${issuer}/.well-known/jwks.json`)
+      : requireSecureJwksUrl('jwksUrl', requireNonBlank('jwksUrl', options.jwksUrl))
   const authorizedParties = new Set(
     options.authorizedParties.map((party, index) =>
       requireNonBlank(`authorizedParties[${index}]`, party),
@@ -79,10 +90,7 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
     throw new TypeError('authorizedParties must list at least one origin')
   }
 
-  const clockSkewInMs = options.clockSkewInMs ?? 5_000
-  if (!Number.isFinite(clockSkewInMs) || clockSkewInMs < 0) {
-    throw new TypeError('clockSkewInMs must be a non-negative finite number')
-  }
+  const clockSkewInMs = requireClockSkewInMs(options.clockSkewInMs)
 
   const jwks = createRemoteJWKSet(new URL(jwksUrl))
 
@@ -140,12 +148,8 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
           if (typeof azp !== 'string' || !authorizedParties.has(azp)) return null
         }
 
-        // `exp` being numeric and unexpired does not make it representable as a Date.
-        // A far-future value overflows into an Invalid Date, which serializes to null
-        // and compares false against every other date — the credential would look valid
-        // while carrying an expiry no consumer can act on. Reject it instead.
-        const expiresAt = new Date(payload.exp * 1_000)
-        if (Number.isNaN(expiresAt.getTime())) return null
+        const expiresAt = representableExpiry(payload.exp)
+        if (expiresAt === null) return null
 
         return {
           identity: { subject: payload.sub },
