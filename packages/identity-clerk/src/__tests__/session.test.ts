@@ -42,6 +42,8 @@ async function createSignedToken(
     includeExpiration?: boolean
     jwksStatus?: number
     jwksBody?: unknown
+    /** Merged onto the served key, to make the *matching* key unusable rather than absent. */
+    jwksKeyExtra?: Record<string, unknown>
     unsupportedCriticalHeader?: boolean
   } = {},
 ) {
@@ -59,7 +61,7 @@ async function createSignedToken(
       if (options.jwksStatus) return new Response(null, { status: options.jwksStatus })
       if (options.jwksBody !== undefined) return Response.json(options.jwksBody)
       return Response.json({
-        keys: [{ ...publicJwk, kid, alg: algorithm, use: 'sig' }],
+        keys: [{ ...publicJwk, ...options.jwksKeyExtra, kid, alg: algorithm, use: 'sig' }],
       })
     },
   })
@@ -404,6 +406,42 @@ describe('createClerkSessionProvider', () => {
     const provider = makeProvider({ issuer })
 
     await expect(provider.getSession(authorized(token))).resolves.toBeNull()
+  })
+
+  test('surfaces an unusable signing key as an infrastructure failure', async () => {
+    // A reachable, well-formed key set whose *matching* key this runtime cannot import:
+    // `oth` marks a multi-prime RSA key, which WebCrypto does not implement. Nothing is
+    // wrong with the credential, so answering `null` would 401 every valid token in the
+    // deployment while reporting it as an authentication problem.
+    const { token, issuer } = await createSignedToken({
+      jwksKeyExtra: { oth: [{ r: 'AQAB', d: 'AQAB', t: 'AQAB' }] },
+    })
+    const provider = makeProvider({ issuer })
+
+    const error = await provider.getSession(authorized(token)).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    expect((error as Error).message).toContain('cannot use')
+    expect((error as Error).cause).toBeInstanceOf(errors.JOSENotSupported)
+  })
+
+  test('denies a forged algorithm rather than reporting itself unavailable', async () => {
+    // The other half of the test above, and the reason the fix is a wrapper around key
+    // resolution rather than a clause in the catch. An unimplemented algorithm raises the
+    // same `JOSENotSupported` as the unusable key — but from attacker-controlled input, so
+    // faulting on it would let anyone drive the server into reporting an outage. The
+    // `algorithms` allowlist is what keeps them apart: jose applies it before resolving a
+    // key, so this never reaches the wrapper.
+    const { token, issuer } = await createSignedToken()
+    const [, payload, signature] = token.split('.')
+    const forgedHeader = Buffer.from(
+      JSON.stringify({ alg: 'UNSUPPORTED-ALG', kid: 'clerk-test-key' }),
+    ).toString('base64url')
+    const provider = makeProvider({ issuer })
+
+    await expect(
+      provider.getSession(authorized(`${forgedHeader}.${payload}.${signature}`)),
+    ).resolves.toBeNull()
   })
 
   test('fails closed when the key set no longer carries the signing key', async () => {

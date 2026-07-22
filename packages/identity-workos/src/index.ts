@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, customFetch, errors, jwtVerify } from 'jose'
+import { createRemoteJWKSet, customFetch, errors, type JWTVerifyGetKey, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
   IdentityProviderUnavailableError,
@@ -153,7 +153,7 @@ export function createWorkOSSessionProvider(
   // Wrapping at the fetch call makes the distinction structural: anything rejecting
   // here is a transport failure against the key endpoint by construction, and nothing
   // else in the provider passes through this function.
-  const jwks = createRemoteJWKSet(new URL(jwksUrl), {
+  const remoteJwks = createRemoteJWKSet(new URL(jwksUrl), {
     [customFetch]: async (url, init) => {
       try {
         return await fetch(url, init)
@@ -164,6 +164,34 @@ export function createWorkOSSessionProvider(
       }
     },
   })
+
+  // A reachable key set can still be unusable: importing a matching key raises
+  // `JOSENotSupported` when it carries something this runtime cannot represent — a
+  // multi-prime RSA key with an `oth` parameter, for instance. That is a provider
+  // incompatibility, but the surrounding catch reads a bare `JOSENotSupported` as a
+  // rejected credential, so the whole deployment would answer 401 to every valid token
+  // with nothing indicating the key set as the cause.
+  //
+  // It cannot be classified after the fact, because the *token* produces the same error
+  // type: a header naming an algorithm jose does not implement raises `JOSENotSupported`
+  // too, and that one is attacker-controlled. Faulting on it would let anyone make the
+  // server report itself unavailable. What separates them is the `algorithms` allowlist
+  // on `jwtVerify` below — jose checks it before resolving a key, so a forged algorithm
+  // is already `JOSEAlgNotAllowed` and never reaches this wrapper. Inside it, the only
+  // remaining source is the key material itself.
+  const jwks: JWTVerifyGetKey = async (protectedHeader, token) => {
+    try {
+      return await remoteJwks(protectedHeader, token)
+    } catch (error) {
+      if (error instanceof errors.JOSENotSupported) {
+        throw new IdentityProviderUnavailableError(
+          'WorkOS key set contains a key this runtime cannot use',
+          { cause: error },
+        )
+      }
+      throw error
+    }
+  }
 
   return createBearerSessionProvider({
     async verify(token) {
