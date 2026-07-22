@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { errors, exportJWK, generateKeyPair, SignJWT } from 'jose'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { type ClerkSessionProviderOptions, createClerkSessionProvider } from '../index'
 
 const origin = 'https://app.example.test'
@@ -425,29 +426,46 @@ describe('createClerkSessionProvider', () => {
     await expect(provider.getSession(authorized(token))).resolves.not.toBeNull()
   })
 
-  test('surfaces JWKS infrastructure failures', async () => {
+  test('surfaces JWKS infrastructure failures as a seam-level fault', async () => {
     const { token, issuer } = await createSignedToken({ jwksStatus: 503 })
     const provider = makeProvider({ issuer })
 
-    // Pin the generic-error code, not just `JOSEError` — every error jose throws satisfies
-    // the instance check, including the credential rejections that must resolve null.
-    await expect(provider.getSession(authorized(token))).rejects.toMatchObject({
-      code: 'ERR_JOSE_GENERIC',
-    })
+    const error = await provider.getSession(authorized(token)).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    // Wrapping must not destroy the diagnosis. The seam-level type tells the caller how
+    // to respond; `cause` tells an operator what actually broke.
+    expect((error as Error).cause).toBeInstanceOf(errors.JOSEError)
   })
 
   test('surfaces a malformed key set as an infrastructure failure', async () => {
     const { token, issuer } = await createSignedToken({ jwksBody: { not: 'a key set' } })
     const provider = makeProvider({ issuer })
 
-    await expect(provider.getSession(authorized(token))).rejects.toBeInstanceOf(errors.JWKSInvalid)
+    const error = await provider.getSession(authorized(token)).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    expect((error as Error).cause).toBeInstanceOf(errors.JWKSInvalid)
   })
 
   test('surfaces an unreachable key server rather than denying the credential', async () => {
+    // The 503 case above is the *forgiving* outage: the key server is healthy enough to
+    // answer, so jose produces a `JOSEError` that can be classified after the fact. The
+    // common shapes are not — connection refused, DNS failure, TLS failure and network
+    // partition are rethrown as whatever the platform's `fetch` produced, with nothing
+    // marking them as ours. Without a test at this shape, the suite passes while every
+    // real outage answers 401.
     const { token, issuer } = await createSignedToken()
     stopServer()
     const provider = makeProvider({ issuer })
 
-    await expect(provider.getSession(authorized(token))).rejects.toThrow()
+    const error = await provider.getSession(authorized(token)).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    // The message, not only the class: if this port were reused by anything answering
+    // non-200, jose would raise its base `JOSEError` and the post-hoc branch would wrap
+    // it into the *same* class — so a class-only assertion would pass while exercising
+    // the old path instead of the new one. The message pins the `customFetch` site.
+    expect((error as Error).message).toContain('could not be reached')
   })
 })
