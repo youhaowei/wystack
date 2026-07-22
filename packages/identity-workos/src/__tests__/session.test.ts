@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { errors, exportJWK, generateKeyPair, SignJWT } from 'jose'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { createWorkOSSessionProvider } from '../index'
 
 const issuer = 'https://api.workos.com/'
@@ -21,6 +22,8 @@ async function createSignedToken(
     expirationTime?: number
     includeExpiration?: boolean
     jwksStatus?: number
+    /** Merged onto the served key, to make the *matching* key unusable rather than absent. */
+    jwksKeyExtra?: Record<string, unknown>
     unsupportedCriticalHeader?: boolean
   } = {},
 ) {
@@ -34,7 +37,7 @@ async function createSignedToken(
     fetch: () => {
       if (options.jwksStatus) return new Response(null, { status: options.jwksStatus })
       return Response.json({
-        keys: [{ ...publicJwk, kid, alg: 'RS256', use: 'sig' }],
+        keys: [{ ...publicJwk, ...options.jwksKeyExtra, kid, alg: 'RS256', use: 'sig' }],
       })
     },
   })
@@ -350,6 +353,52 @@ describe('createWorkOSSessionProvider', () => {
     ).resolves.toBeNull()
   })
 
+  test('surfaces an unusable signing key as an infrastructure failure', async () => {
+    // A reachable, well-formed key set whose *matching* key this runtime cannot import:
+    // `oth` marks a multi-prime RSA key, which WebCrypto does not implement. Nothing is
+    // wrong with the credential, so answering `null` would 401 every valid token in the
+    // deployment while reporting it as an authentication problem.
+    const { token, jwksUrl } = await createSignedToken({
+      jwksKeyExtra: { oth: [{ r: 'AQAB', d: 'AQAB', t: 'AQAB' }] },
+    })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    const error = await provider
+      .getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      )
+      .catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    expect((error as Error).message).toContain('cannot use')
+    expect((error as Error).cause).toBeInstanceOf(errors.JOSENotSupported)
+  })
+
+  test('denies a forged algorithm rather than reporting itself unavailable', async () => {
+    // The other half of the test above, and the reason the fix is a wrapper around key
+    // resolution rather than a clause in the catch. An unimplemented algorithm raises the
+    // same `JOSENotSupported` as the unusable key — but from attacker-controlled input, so
+    // faulting on it would let anyone drive the server into reporting an outage. The
+    // `algorithms` allowlist is what keeps them apart: jose applies it before resolving a
+    // key, so this never reaches the wrapper.
+    const { token, jwksUrl } = await createSignedToken()
+    const [, payload, signature] = token.split('.')
+    const forgedHeader = Buffer.from(
+      JSON.stringify({ alg: 'UNSUPPORTED-ALG', kid: 'workos-test-key' }),
+    ).toString('base64url')
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    await expect(
+      provider.getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${forgedHeader}.${payload}.${signature}` },
+        }),
+      ),
+    ).resolves.toBeNull()
+  })
+
   test('surfaces JWKS infrastructure failures', async () => {
     const { token, jwksUrl } = await createSignedToken({ jwksStatus: 503 })
     const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
@@ -360,7 +409,62 @@ describe('createWorkOSSessionProvider', () => {
           headers: { authorization: `Bearer ${token}` },
         }),
       ),
-    ).rejects.toBeInstanceOf(errors.JOSEError)
+    ).rejects.toBeInstanceOf(IdentityProviderUnavailableError)
+  })
+
+  test('surfaces an unreachable key endpoint, not only an error response', async () => {
+    // The 503 case above is the *forgiving* outage: the key server is healthy enough to
+    // answer, so jose produces a `JOSEError` that can be classified after the fact. The
+    // common shapes are not — connection refused, DNS failure, TLS failure and network
+    // partition are rethrown as whatever the platform's `fetch` produced, with nothing
+    // marking them as ours. Without a test at this shape, the suite passes while every
+    // real outage answers 401.
+    const dead = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
+    const deadPort = dead.port
+    dead.stop(true)
+
+    const { token } = await createSignedToken()
+    // The path has to name `clientId`: an override may substitute the *host* only, so a
+    // free-form path is rejected at construction and this test would never reach the
+    // fetch it exists to exercise.
+    const provider = createWorkOSSessionProvider({
+      jwksUrl: `http://127.0.0.1:${deadPort}/sso/jwks/${clientId}`,
+      clientId,
+      issuer,
+    })
+
+    const error = await provider
+      .getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      )
+      .catch((err: unknown) => err)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    // The message, not only the class: if this port were reused by anything answering
+    // non-200, jose would raise its base `JOSEError` and the post-hoc branch would wrap
+    // it into the *same* class — so a class-only assertion would pass while exercising
+    // the old path instead of the new one. The message pins the `customFetch` site.
+    expect((error as Error).message).toContain('could not be reached')
+  })
+
+  test('preserves the underlying jose error as the cause', async () => {
+    // Wrapping must not destroy the diagnosis. The seam-level type tells the caller how
+    // to respond; `cause` tells an operator what actually broke.
+    const { token, jwksUrl } = await createSignedToken({ jwksStatus: 503 })
+    const provider = createWorkOSSessionProvider({ jwksUrl, clientId, issuer })
+
+    const error = await provider
+      .getSession(
+        new Request('https://app.example.test/api', {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      )
+      .catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(IdentityProviderUnavailableError)
+    expect((error as Error).cause).toBeInstanceOf(errors.JOSEError)
   })
 
   test('rejects an exp that is unexpired but not representable as a Date', async () => {

@@ -1,6 +1,7 @@
-import { createRemoteJWKSet, errors, jwtVerify } from 'jose'
+import { createRemoteJWKSet, customFetch, errors, type JWTVerifyGetKey, jwtVerify } from 'jose'
 import {
   createBearerSessionProvider,
+  IdentityProviderUnavailableError,
   representableExpiry,
   requireClockSkewInMs,
   requireNonBlank,
@@ -39,6 +40,17 @@ export interface ClerkSessionProviderOptions {
   clockSkewInMs?: number
 }
 
+/**
+ * Classifies a jose error raised *after* a key set was successfully fetched — a malformed
+ * key, an unusable key set, a non-200 response.
+ *
+ * Transport failures do not reach here; `customFetch` below intercepts them at the fetch.
+ * That makes the `JWKSTimeout` clause unreachable today, since jose constructs that type
+ * only when converting a fetch rejection it never gets to see. It is kept deliberately:
+ * it costs nothing, and it is what this function would need if the `customFetch` wrapper
+ * were ever removed — leaving it out would turn that removal into a silent
+ * misclassification rather than a loud one.
+ */
 function isJwksInfrastructureError(error: unknown): boolean {
   return (
     error instanceof errors.JWKSTimeout ||
@@ -92,7 +104,56 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
 
   const clockSkewInMs = requireClockSkewInMs(options.clockSkewInMs)
 
-  const jwks = createRemoteJWKSet(new URL(jwksUrl))
+  // `customFetch` rather than classifying the thrown error afterwards, because the
+  // classification is not expressible after the fact. jose converts only a timeout into
+  // a `JWKSTimeout`; connection refused, DNS failure, TLS failure and network partition
+  // are rethrown as whatever the platform's `fetch` produced — a bare `Error` on Bun, a
+  // `TypeError` on Node — with nothing to distinguish them from a defect in the verify
+  // closure. Those are the *headline* outage shapes, so classifying only after the throw
+  // would leave every case except a 5xx from a healthy-enough key server unlabelled.
+  //
+  // Wrapping at the fetch call makes the distinction structural: anything rejecting here
+  // is a transport failure against the key endpoint by construction, and nothing else in
+  // the provider passes through this function.
+  const remoteJwks = createRemoteJWKSet(new URL(jwksUrl), {
+    [customFetch]: async (url, init) => {
+      try {
+        return await fetch(url, init)
+      } catch (error) {
+        throw new IdentityProviderUnavailableError('Clerk key set endpoint could not be reached', {
+          cause: error,
+        })
+      }
+    },
+  })
+
+  // A reachable key set can still be unusable: importing a matching key raises
+  // `JOSENotSupported` when it carries something this runtime cannot represent — a
+  // multi-prime RSA key with an `oth` parameter, for instance. That is a provider
+  // incompatibility, but the surrounding catch reads a bare `JOSENotSupported` as a
+  // rejected credential, so the whole deployment would answer 401 to every valid token
+  // with nothing indicating the key set as the cause.
+  //
+  // It cannot be classified after the fact, because the *token* produces the same error
+  // type: a header naming an algorithm jose does not implement raises `JOSENotSupported`
+  // too, and that one is attacker-controlled. Faulting on it would let anyone make the
+  // server report itself unavailable. What separates them is the `algorithms` allowlist
+  // on `jwtVerify` below — jose checks it before resolving a key, so a forged algorithm
+  // is already `JOSEAlgNotAllowed` and never reaches this wrapper. Inside it, the only
+  // remaining source is the key material itself.
+  const jwks: JWTVerifyGetKey = async (protectedHeader, token) => {
+    try {
+      return await remoteJwks(protectedHeader, token)
+    } catch (error) {
+      if (error instanceof errors.JOSENotSupported) {
+        throw new IdentityProviderUnavailableError(
+          'Clerk key set contains a key this runtime cannot use',
+          { cause: error },
+        )
+      }
+      throw error
+    }
+  }
 
   return createBearerSessionProvider({
     async verify(token) {
@@ -156,7 +217,31 @@ export function createClerkSessionProvider(options: ClerkSessionProviderOptions)
           expiresAt,
         }
       } catch (error) {
-        if (error instanceof errors.JOSEError && !isJwksInfrastructureError(error)) return null
+        // Re-raise infrastructure faults as a seam-level type so callers can tell an
+        // upstream outage from a rejected credential without importing jose and
+        // reimplementing this classification. Without it the distinction is drawn
+        // correctly here and then lost by every consumer.
+        if (isJwksInfrastructureError(error)) {
+          throw new IdentityProviderUnavailableError(
+            'Clerk key set could not be retrieved or used',
+            {
+              cause: error,
+            },
+          )
+        }
+
+        // Any other jose error is the token failing verification — a rejected
+        // credential, which the interface expresses as `null`.
+        if (error instanceof errors.JOSEError) return null
+
+        // Anything else is a defect in this closure, not a statement about the token or
+        // about Clerk. Rethrown unchanged so it surfaces as a server fault: labelling it
+        // as provider-unavailable would make callers answer 503 and mark it retryable, so
+        // clients would keep retrying a deterministic bug that never clears.
+        //
+        // Transport failures do not reach here needing a label — `customFetch` above
+        // already threw `IdentityProviderUnavailableError`, and this rethrows it
+        // unchanged.
         throw error
       }
     },

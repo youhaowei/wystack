@@ -20,8 +20,13 @@
 //   6. double auth frame race → exactly one identity committed.
 //   7. malformed first frame pre-auth → terminal close.
 //   8. handshake timeout → transient close.
+//
+// Beyond parity (new behavior, not present in routes.ts's original handshake):
+//   9. identity-provider outage → transient close, NOT auth-failed. A key server
+//      that is down is not a bad credential, and 4001 tells clients not to retry.
 
 import { describe, test, expect } from 'bun:test'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import {
   createLoopbackPair,
@@ -30,6 +35,7 @@ import {
   type ServerMessage,
 } from '@wystack/transport'
 import { ValidationError } from '../validation'
+import { AuthenticationRequiredError } from '../functions'
 import {
   attachEngine,
   type AttachEngineOptions,
@@ -219,6 +225,39 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     h.send({ type: 'call', id: 'c1', path: 'whoami', args: {} })
     await until(() => h.received.length > 1, 'result')
     expect(h.received.at(-1)).toEqual({ type: 'result', id: 'c1', data: { userId: 'u1' } })
+  })
+
+  test('identity provider outage → transient close, not auth-failed', async () => {
+    // A key server that is down is not a bad credential. Closing `auth-failed` maps to
+    // WS 4001, documented as "client does not retry", so a transient upstream incident
+    // would latch a terminal auth failure that resolves only by user action.
+    const warnings: string[] = []
+    const realWarn = console.warn
+    console.warn = (...args: unknown[]) => void warnings.push(args.join(' '))
+
+    // `finally`, not a trailing restore: a failing assertion below would otherwise
+    // abandon the patched `console.warn` and silently swallow output for every later
+    // test in this file, turning one red test into a confusing suite.
+    try {
+      const h = await harness({
+        resolveContext: async () => {
+          throw new IdentityProviderUnavailableError('key set unreachable')
+        },
+      })
+      h.send({ type: 'auth', token: 'good' })
+      await until(() => h.closeReasons.length > 0, 'close')
+
+      expect(h.closeReasons).toEqual(['transient'])
+      expect(h.handle.session.authenticated).toBe(false)
+
+      // The log line is the only signal this path emits — the HTTP 503 path logs
+      // nothing at all — so a hardcoded "auth failed" here would misattribute the
+      // outage on the one surface an operator greps mid-incident.
+      expect(warnings.some((line) => line.includes('transient'))).toBe(true)
+      expect(warnings.some((line) => line.includes('auth failed'))).toBe(false)
+    } finally {
+      console.warn = realWarn
+    }
   })
 
   test('bad token → terminal close (auth-failed), no authenticated frame', async () => {
@@ -655,6 +694,39 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
       retryable: false,
       error: 'Validation failed: token: Required',
       issues,
+    })
+    expect(h.subscriptionStore.size()).toBe(0)
+  })
+
+  test('subscribe context auth failure emits durable subscription error', async () => {
+    // The counterpart to the outage case above, and the reason `retryable` cannot simply
+    // track "did resolveContext throw". Both arrive here as a rejected context, but an
+    // expired or missing credential fails identically however many times the client
+    // resends it, while a provider outage clears on its own. Reporting this one as
+    // retryable puts the client in a silent reconnect loop against a subscription that
+    // can never succeed until the user re-authenticates — and the loop hides the very
+    // signal that would tell them to.
+    let callCount = 0
+    const h = await reactiveHarness({
+      resolveContext: async () => {
+        callCount++
+        if (callCount > 1) throw new AuthenticationRequiredError()
+        return {}
+      },
+    })
+
+    h.send({ type: 'auth', token: 'tok' })
+    await until(() => h.received.some((m) => m.type === 'authenticated'), 'authenticated')
+
+    h.send({ type: 'subscribe', id: 's1', path: 'listTodos', args: {} })
+    await until(() => h.received.some((m) => m.type === 'error'), 'context auth error')
+
+    expect(h.received[h.received.length - 1]).toEqual({
+      type: 'error',
+      kind: 'subscription',
+      id: 's1',
+      retryable: false,
+      error: 'Authentication required',
     })
     expect(h.subscriptionStore.size()).toBe(0)
   })

@@ -1,8 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
+import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { buildAuthRequest } from '../routes'
 import { serve } from '../serve-bun'
+import { requireAuth } from '../functions'
 import { defineApp } from '../define-app'
 import type { FunctionDef } from '../types'
 
@@ -238,6 +240,92 @@ describe('HTTP transport', () => {
         },
       )
       expect(allowedMutation.status).toBe(200)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('an unreachable identity provider answers 503, not 401', async () => {
+    // 401 says "your credential was rejected" — it invites the client to sign in
+    // again, and monitoring reads it as an authentication problem. A key endpoint
+    // that is down is a dependency failure of ours, so it has to answer 5xx or the
+    // outage presents as every user's token going bad at once.
+    const db = await createDb({ dev: 'pglite://' })
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
+    )
+
+    const app = await wy.build({
+      db,
+      functions: {
+        whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId })),
+        noop: wy.procedure.input({}).mutation(async () => ({ ok: true })),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        if (token === 'outage') {
+          throw new IdentityProviderUnavailableError('key set unreachable')
+        }
+        if (!token) throw new Error('Unauthorized')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const base = `http://localhost:${authServer.port}/api`
+      const outage = await fetch(`${base}/whoami`, {
+        headers: { Authorization: 'Bearer outage' },
+      })
+      expect(outage.status).toBe(503)
+
+      const outagePost = await fetch(`${base}/noop`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer outage' },
+        body: JSON.stringify({}),
+      })
+      expect(outagePost.status).toBe(503)
+
+      // The other half of the contract: a genuinely rejected credential must still
+      // be a 401, or the fix would be satisfied by calling everything retryable.
+      const rejected = await fetch(`${base}/whoami`)
+      expect(rejected.status).toBe(401)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('requireAuth without a principal answers 401, not 500', async () => {
+    // The middleware threw a bare `Error`, which fell through every classification
+    // branch to the generic handler and became a 500. That reads as "the server broke"
+    // for what is an ordinary not-signed-in request, and buries a sign-in prompt in the
+    // error budget where nobody looks for it.
+    const db = await createDb({ dev: 'pglite://' })
+    const app = await wy.build({
+      db,
+      functions: {
+        me: wy.procedure
+          .use(requireAuth)
+          .input({})
+          .query(async () => ({ ok: true })),
+        touch: wy.procedure
+          .use(requireAuth)
+          .input({})
+          .mutation(async () => ({ ok: true })),
+      },
+    })
+
+    const authServer = serve({ app, port: 0 })
+    try {
+      const base = `http://localhost:${authServer.port}/api`
+      expect((await fetch(`${base}/me`)).status).toBe(401)
+      expect(
+        (await fetch(`${base}/touch`, { method: 'POST', body: JSON.stringify({}) })).status,
+      ).toBe(401)
     } finally {
       authServer.stop(true)
     }

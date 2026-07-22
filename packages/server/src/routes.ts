@@ -26,12 +26,21 @@
  *
  * Close codes:
  *   4001 — auth failed / missing / protocol violation (client does not retry)
- *   4002 — transient: handshake timed out within `authTimeoutMs`, or server
- *          failed to send the `authenticated` ack (client retries with backoff)
+ *   4002 — transient: handshake timed out within `authTimeoutMs`, the server
+ *          failed to send the `authenticated` ack, or the identity provider
+ *          could not be consulted (client retries with backoff)
+ *
+ * The last case is why `resolveContext` throwing is not uniformly 4001: a key
+ * endpoint that is down is our dependency failing, not the client's credential
+ * being bad, and 4001 would tell every connected client to stop retrying for the
+ * duration of an outage that resolves on its own. The same split applies to the
+ * HTTP handlers below, which answer 503 rather than 401. See
+ * `IdentityProviderUnavailableError` in `@wystack/identity`.
  *
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
  */
+import { isIdentityProviderUnavailable } from '@wystack/identity'
 import { Hono } from 'hono'
 import type { UpgradeWebSocket, WSContext } from 'hono/ws'
 import type { Pipe } from '@wystack/transport'
@@ -46,6 +55,7 @@ import {
 import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
+import { AuthenticationRequiredError } from './functions'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
@@ -267,6 +277,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
+      // An unreachable identity provider is a dependency failure, not a rejected
+      // credential. Answering 401 would blame the user's token for an upstream outage
+      // and, on the WebSocket path, tell clients not to retry.
+      if (isIdentityProviderUnavailable(err)) {
+        return c.json({ error: 'identity provider unavailable' }, 503)
+      }
       return c.json({ error: errorMessage(err) }, 401)
     }
 
@@ -286,6 +302,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     } catch (err: unknown) {
       if (err instanceof PermissionDeniedError) {
         return c.json({ error: err.message }, 403)
+      }
+      if (err instanceof AuthenticationRequiredError) {
+        // Not signed in is a 401, not a server fault. Left untyped it fell through to
+        // the generic branch below and answered 500, which reads as "the server broke"
+        // and hides an ordinary sign-in prompt inside the error budget.
+        return c.json({ error: err.message }, 401)
       }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)
@@ -312,6 +334,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     try {
       context = await httpResolveContext(c.req.raw)
     } catch (err: unknown) {
+      // An unreachable identity provider is a dependency failure, not a rejected
+      // credential. Answering 401 would blame the user's token for an upstream outage
+      // and, on the WebSocket path, tell clients not to retry.
+      if (isIdentityProviderUnavailable(err)) {
+        return c.json({ error: 'identity provider unavailable' }, 503)
+      }
       return c.json({ error: errorMessage(err) }, 401)
     }
 
@@ -338,6 +366,12 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     } catch (err: unknown) {
       if (err instanceof PermissionDeniedError) {
         return c.json({ error: err.message }, 403)
+      }
+      if (err instanceof AuthenticationRequiredError) {
+        // Not signed in is a 401, not a server fault. Left untyped it fell through to
+        // the generic branch below and answered 500, which reads as "the server broke"
+        // and hides an ordinary sign-in prompt inside the error budget.
+        return c.json({ error: err.message }, 401)
       }
       if (err instanceof ValidationError) {
         return c.json({ error: err.message, issues: err.issues }, 400)

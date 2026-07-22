@@ -10,6 +10,7 @@ import {
 } from '@wystack/transport'
 import type { WyStackApp } from '../create'
 import { ValidationError } from '../validation'
+import { AuthenticationRequiredError } from '../functions'
 import { PermissionDeniedError } from '@wystack/permissions'
 import { createDispatch, type Dispatch } from './dispatch'
 import { Session, type CloseReason, type SessionOptions } from './session'
@@ -57,6 +58,28 @@ export interface EngineHandle {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Whether a subscription error is a statement about the *request* rather than about the
+ * server, and so will fail identically however many times the client resends it.
+ *
+ * Named for the failing half rather than the retryable one because the list is
+ * closed-world: everything not enumerated here — an identity-provider outage, a database
+ * blip, a bug — is retryable by default, which is the direction that fails safe. A fault
+ * misreported as permanent strands a client that would have recovered on its own; a
+ * transient error misreported as retryable costs one wasted retry.
+ *
+ * Shared by both subscription error paths (context resolution and the call itself)
+ * because they must agree: the same error reaching a client through two routes with two
+ * different `retryable` verdicts is a bug the client cannot work around.
+ */
+function isPermanentRequestError(err: unknown): boolean {
+  return (
+    err instanceof ValidationError ||
+    err instanceof PermissionDeniedError ||
+    err instanceof AuthenticationRequiredError
+  )
 }
 
 /**
@@ -176,10 +199,16 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     const outcome = await session.handleAuth(rawToken)
     if (closed) return
     if (outcome.kind === 'close') {
-      // TODO: replace with @wystack/log once server logging lands. Log only that
-      // auth failed — never the token — to avoid leaking credentials.
+      // TODO: replace with @wystack/log once server logging lands. Log the reason
+      // but never the token, to avoid leaking credentials.
+      //
+      // The reason has to be interpolated rather than hardcoded: this branch now
+      // carries `transient` as well as `auth-failed`, so a fixed "auth failed" string
+      // would report an identity-provider outage as a credential problem — which is
+      // the exact misattribution this classification exists to prevent, on the one
+      // surface that carries any signal. Operators grep this line during an incident.
       // eslint-disable-next-line no-console
-      console.warn('[wystack/server] engine auth failed')
+      console.warn(`[wystack/server] engine auth closed: ${outcome.reason}`)
       closeWith(outcome.reason)
       return
     }
@@ -266,7 +295,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
+        retryable: !isPermanentRequestError(err),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
@@ -298,7 +327,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         type: 'error',
         kind: 'subscription',
         id,
-        retryable: !(err instanceof ValidationError || err instanceof PermissionDeniedError),
+        retryable: !isPermanentRequestError(err),
         error: errorMessage(err),
       }
       if (err instanceof ValidationError) payload.issues = err.issues
