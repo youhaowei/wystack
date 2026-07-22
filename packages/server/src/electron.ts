@@ -1,4 +1,4 @@
-// @wystack/server/electron — Electron IPC transport adapter (YW-67 / T5)
+// @wystack/server/electron — Electron IPC transport adapter
 //
 // Binds Electron's ipcMain + webContents into a Pipe per BrowserWindow and
 // drives `attachEngine`. Per the pinned IPC transport contract:

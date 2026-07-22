@@ -9,7 +9,7 @@
 // fresh-DrizzleTracker-per-call, and read/write tracking already live there
 // (create.ts). Dispatch does not reimplement them — it names the seam so the
 // Engine's transport adapters route through one pure entry point rather than
-// reaching into `app.call` directly. When YW-62 wires the reactive tier, the
+// reaching into `app.call` directly. When the reactive tier is wired, the
 // invalidation source consumes `tablesWritten` from this same result.
 
 import type { WyStackApp } from '../create'
@@ -19,8 +19,8 @@ import type { WyStackApp } from '../create'
  *
  *   - `result` — the function's return value.
  *   - `tablesRead` — Tracker reads, consumed by the reactive tier to compute a
- *     subscription's watched-table set (YW-62; unused over plain RPC).
- *   - `tablesWritten` — Tracker writes, consumed by invalidation (YW-62; a
+ *     subscription's watched-table set (reactive tier; unused over plain RPC).
+ *   - `tablesWritten` — Tracker writes, consumed by invalidation (reactive tier; a
  *     `call` to a mutation produces this but plain RPC has no SubscriptionStore
  *     to feed, so the Engine drops it — see engine.ts).
  */

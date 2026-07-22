@@ -63,7 +63,7 @@ const widgetsDraft = pgTable('widgets__draft', {
 
 // Draft table Drizzle schemas — not passed to withDraft (the `__draft` suffix
 // is derived from the base table name by convention), but kept here as
-// typed references for future Drizzle-DSL query work (e.g. YW-124).
+// typed references for future Drizzle-DSL query work.
 void todosDraft
 void widgetsDraft
 
