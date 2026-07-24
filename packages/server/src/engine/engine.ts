@@ -133,7 +133,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   //                       terminal error for the superseded attempt.
   //                       known-debt: flag-check cancellation, not AbortSignal.
   //                       The underlying context resolution keeps running to
-  //                       completion; we bail at await boundaries. See YW-63.
+  //                       completion; we bail at await boundaries.
   const mySubIds = new Set<string>()
   const pendingSubAttempts = new Map<string, number>()
   let nextSubAttempt = 0

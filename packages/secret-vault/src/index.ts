@@ -6,7 +6,7 @@
 // store-time routing, a mapping store (ref → backend+locator), and a
 // SecretVault composition surface.
 //
-// No real backends ship here — keychain (YW-262) and cloud backends are
+// No real backends ship here — the keychain and cloud backends are
 // separate packages. The TestBackend is the in-memory double for CI/dev.
 //
 // Public surface — consumers import from "@wystack/secret-vault", not from

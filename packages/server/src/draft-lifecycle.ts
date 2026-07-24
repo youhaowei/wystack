@@ -22,8 +22,8 @@
 // delta tables are the READ overlay; the command log is the PUBLISH source. The
 // two are different artifacts with different jobs.
 //
-// ATOMIC PUBLISH (YW-300): `publish` adopts the `applyCommands` outer-tx seam
-// (added in YW-297) to wrap command-log replay + shadow-sweep in ONE transaction.
+// ATOMIC PUBLISH: `publish` adopts the `applyCommands` outer-tx seam
+// to wrap command-log replay + shadow-sweep in ONE transaction.
 // This eliminates the crash window that previously existed between "canonical
 // committed" and "shadow cleared" — if either step fails, both roll back. The
 // draft stays live and publish is retryable. This is the wystack-internal adoption
@@ -157,7 +157,7 @@ export interface DraftLifecycle {
    * PUBLISH = replay the ordered command log onto canonical via
    * `applyCommands(app, log, {commit})`, calling `resolve(log)` IMMEDIATELY
    * before the commit (the ONLY app injection inside publish — it binds
-   * late-bound operands). Atomic via `applyCommands`'s YW-119 tracked tx; the
+   * late-bound operands). Atomic via `applyCommands`'s tracked tx; the
    * returned `tablesWritten` is what the HOST flushes to invalidation (the
    * lifecycle does not wire invalidation itself — same posture as
    * `applyCommands`). The draft's shadow + registry entry are cleared on success.
@@ -374,7 +374,7 @@ export function createDraftLifecycle(
       const boundLog = resolve ? await resolve([...entry.log]) : [...entry.log]
       const touched = [...entry.touchedTables.values()]
 
-      // ATOMIC PUBLISH (YW-300): open ONE outer transaction so command-log
+      // ATOMIC PUBLISH: open ONE outer transaction so command-log
       // replay and shadow-sweep share a single commit boundary. A crash between
       // the two is no longer possible — if either step fails, both roll back,
       // and the in-memory registry entry stays intact so publish is retryable.
@@ -389,7 +389,7 @@ export function createDraftLifecycle(
       // capture the CommitResult directly rather than via a non-local variable.
       const result = await app.createTracked().transaction(async (tx) => {
         // Replay the command log against the caller-supplied tx handle. The
-        // outer-tx seam (applyCommands opts.tx, added in YW-297) routes all
+        // outer-tx seam (applyCommands opts.tx) routes all
         // command writes through this same handle — no inner transaction is
         // opened; the outer's commit boundary governs.
         const committed = (await applyCommands(app, boundLog, {
@@ -522,7 +522,7 @@ async function enumerateTouchedCells(
  * Accepts a `raw` Drizzle db handle directly (rather than a `WyStackApp`) so
  * the caller can pass a tx-bound handle and share the commit boundary with the
  * command replay. When called from `publish`, `raw` is `tx.raw` inside the outer
- * transaction — sweep and replay commit atomically (YW-300). For `discard`, a
+ * transaction — sweep and replay commit atomically. For `discard`, a
  * fresh connection (`app.createTracked().raw`) is fine since discard has no
  * replay to be atomic with.
  */

@@ -1,4 +1,4 @@
-// @wystack/server/electron — Cross-adapter interop conformance test (YW-67 / T5)
+// @wystack/server/electron — Cross-adapter interop conformance test
 //
 // The contract requires an end-to-end proof that a `call` frame sent from the
 // CLIENT side actually round-trips through the server adapter →
@@ -19,7 +19,7 @@
 // — `authenticated`, `result`, `error`. It does NOT wire the reactive tier, so
 // `invalidate` is never emitted in this engine configuration (`subscribe` →
 // `REACTIVITY_NOT_ENABLED`; mutations drop `tablesWritten`; invalidation lands
-// in YW-62). The genuine server-push proof here is therefore the
+// with the reactive tier). The genuine server-push proof here is therefore the
 // engine-initiated `authenticated` ACK and the `result` frame — both ride the
 // identical `webContents.send('wystack:s2c', …)` path an `invalidate` would
 // use. We assert those.
@@ -253,7 +253,7 @@ describe('Electron adapter — cross-adapter interop (contract conformance)', ()
   test('server push: engine-initiated authenticated frame reaches the client', async () => {
     // The genuine server-initiated s2c push this engine emits. It rides the same
     // webContents.send('wystack:s2c', …) path an invalidate would use (invalidate
-    // itself is not emitted by attachEngine — reactive tier lands in YW-62).
+    // itself is not emitted by attachEngine — reactive tier lands later).
     const app = await makeApp()
     const lb = makeLoopback()
     attachElectronTransport({
