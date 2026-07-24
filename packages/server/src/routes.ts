@@ -49,7 +49,6 @@ import {
   attachEngine,
   type AttachEngineOptions,
   createInMemorySubscriptionStore,
-  createDispatchInvalidationSource,
   createInvalidationRouter,
 } from './engine'
 import type { CloseReason } from './engine'
@@ -108,10 +107,13 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
   const hono = new Hono()
 
-  // --- Shared reactive tier: one store + source per server instance ---
+  // --- Shared reactive tier: one store per server instance, the app's source ---
   //
   // A single SubscriptionStore holds all live subscriptions across every
-  // connection. A single DispatchInvalidationSource fans out write-events.
+  // connection. The write-event stream is the APP's one `invalidationSource`
+  // (create.ts) — this transport does NOT mint its own, so a write on any surface
+  // sharing this app instance (REST caller, WS call-frame) reaches these
+  // subscriptions. Two sources would resurrect the split this collapse removes.
   //
   // ONE InvalidationRouter is registered here (not per-connection) to avoid
   // the double-fan trap: if each attachEngine registered its own onInvalidation
@@ -121,11 +123,9 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   // — it never calls resolveContext again. entry.send is the post-close-safe
   // closure the engine built at subscribe time.
   const subscriptionStore = createInMemorySubscriptionStore()
-  const { source: invalidationSource, emit: publishInvalidation } =
-    createDispatchInvalidationSource()
 
   createInvalidationRouter({
-    source: invalidationSource,
+    source: app.invalidationSource,
     store: subscriptionStore,
     recompute: async (entry) => {
       const { tablesRead } = await app.call(entry.functionPath, entry.args, entry.context)
@@ -213,7 +213,6 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             baseRequest: upgradeRequest,
             onClose: mapCloseCode,
             subscriptionStore,
-            publishInvalidation,
           }
 
           const handle = attachEngine(pipe, engineOpts)
@@ -241,7 +240,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
           // Forward all frames to the engine's inbound handler. The engine now
           // owns auth, call, subscribe, unsubscribe, malformed-frame policy, and
-          // the reactive tier (when subscriptionStore + publishInvalidation are wired).
+          // the reactive tier (when a subscriptionStore is wired; emission is the
+          // app's job via app.call → app.invalidationSource).
           const handler = conn.engineInbound
           if (handler) handler(String(event.data))
         },
@@ -355,13 +355,8 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
     try {
       const callResult = await app.call(functionPath, body, context)
-
-      // Emit write-tags to the shared invalidation channel. The router
-      // (registered once above) fans out re-queries and invalidate signals.
-      if (callResult.tablesWritten.size > 0) {
-        publishInvalidation(callResult.tablesWritten)
-      }
-
+      // No emit here: `app.call` fuses invalidation on the app's source
+      // (create.ts), and the router above is wired to that same source.
       return c.json({ data: callResult.result })
     } catch (err: unknown) {
       if (err instanceof PermissionDeniedError) {
