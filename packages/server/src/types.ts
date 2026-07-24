@@ -1,4 +1,4 @@
-import type { DrizzleTracker, AnyColumnDef, ColumnDef, DbConfig } from '@wystack/db'
+import type { DrizzleTracker, AnyColumnDef, ColumnDef, InferColumn, DbConfig } from '@wystack/db'
 import type { Permission } from '@wystack/permissions'
 
 /** Replaces properties in T with the corresponding properties from U. */
@@ -27,12 +27,28 @@ export type FunctionContext<TAppContext extends object = Record<string, unknown>
   can: Can
 }
 
-/** Maps DSL ColumnDef types to TypeScript types for arg validation */
-// oxlint-disable-next-line typescript/no-explicit-any -- `any` required for `infer` to extract phantom type
-export type InferArg<C> = C extends ColumnDef<infer T, any> ? T : never
+/**
+ * Maps a DSL ColumnDef to its TypeScript arg type, honoring optionality:
+ * `text.optional()` becomes `T | undefined`, not a required `T`. Delegates to
+ * `@wystack/db`'s `InferColumn` so column-type inference has a single source of
+ * truth (the DSL package owns the ColumnDef optional-flag convention).
+ */
+export type InferArg<C> = InferColumn<C>
 
+/** True when a ColumnDef carries the optional flag (`.optional()`). */
+type IsOptionalColumn<C> = C extends ColumnDef<unknown, infer Opt> ? Opt : false
+
+/**
+ * Maps a table of DSL columns to a procedure's arg object, honoring optionality
+ * at the KEY level: `.optional()` columns become omittable (`key?`), not merely
+ * `key: T | undefined`. This lets callers pass `{ id, ...partial }` or omit an
+ * optional arg entirely, matching what runtime validation already accepts —
+ * without an escape hatch that erases the arg type.
+ */
 export type InferArgs<T extends Record<string, AnyColumnDef>> = {
-  [K in keyof T]: InferArg<T[K]>
+  [K in keyof T as IsOptionalColumn<T[K]> extends true ? never : K]: InferArg<T[K]>
+} & {
+  [K in keyof T as IsOptionalColumn<T[K]> extends true ? K : never]?: InferArg<T[K]>
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
