@@ -2,7 +2,7 @@
  * Hono route definitions for WyStack transport.
  *
  * Routes (default prefix /api):
- *   GET  /api/:fn?args=...  — queries (cacheable, SSR-friendly)
+ *   GET  /api/:fn?args=...  — queries (SSR-friendly; see cache note below)
  *   POST /api/:fn           — mutations (JSON body)
  *   WS   /api/ws            — subscribe/unsubscribe/invalidation
  *
@@ -36,6 +36,11 @@
  * duration of an outage that resolves on its own. The same split applies to the
  * HTTP handlers below, which answer 503 rather than 401. See
  * `IdentityProviderUnavailableError` in `@wystack/identity`.
+ *
+ * Cache note: GET responses are only freely cacheable when `resolveContext` is
+ * omitted. With it configured the body is identity-scoped, so the handler sends
+ * `Cache-Control: private, no-store` — a shared cache keys on the URL alone and would
+ * otherwise serve one tenant's response to another.
  *
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
@@ -298,6 +303,14 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
     try {
       const { result } = await app.call(functionPath, args, context)
+      // When `resolveContext` is configured the body is identity-scoped: two tenants
+      // hitting the same URL get different data. A shared cache (CDN, corporate proxy,
+      // reverse proxy) keys only on the URL and would serve one tenant's response to
+      // another. `private, no-store` forbids any shared cache from retaining it; without
+      // `resolveContext` the response is identity-free and left ordinarily cacheable.
+      if (resolveContext) {
+        c.header('Cache-Control', 'private, no-store')
+      }
       return c.json({ data: result })
     } catch (err: unknown) {
       if (err instanceof PermissionDeniedError) {

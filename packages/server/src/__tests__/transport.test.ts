@@ -156,6 +156,14 @@ describe('HTTP transport', () => {
     expect(json.data).toEqual([])
   })
 
+  test('GET without resolveContext leaves the response ordinarily cacheable', async () => {
+    // The default `server` has no resolveContext: the body is identity-free, so the
+    // handler must NOT force `private, no-store` — that would defeat SSR/CDN caching for
+    // the one deployment shape where sharing a response between clients is correct.
+    const res = await fetch(`${baseUrl}/api/listTodos`)
+    expect(res.headers.get('cache-control')).not.toBe('private, no-store')
+  })
+
   test('POST /api/addTodo creates a todo', async () => {
     const res = await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
@@ -240,6 +248,31 @@ describe('HTTP transport', () => {
         },
       )
       expect(allowedMutation.status).toBe(200)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('GET with resolveContext forbids shared caching of the identity-scoped body', async () => {
+    // With resolveContext the same URL yields different bodies per tenant. A shared
+    // cache keys on the URL alone, so without `private, no-store` it can hand tenant A's
+    // response to tenant B. This pins the header the handler must emit to close that leak.
+    const app = await makeAuthApp()
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const userId = req.headers.get('authorization')?.replace('Bearer ', '')
+        return { userId }
+      },
+    })
+
+    try {
+      const res = await fetch(`http://localhost:${authServer.port}/api/listTodos`, {
+        headers: { Authorization: 'Bearer user_123' },
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('cache-control')).toBe('private, no-store')
     } finally {
       authServer.stop(true)
     }
