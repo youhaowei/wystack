@@ -35,19 +35,15 @@ export interface AttachEngineOptions extends SessionOptions {
   /**
    * Shared subscription registry for the reactive tier. Must be the same
    * instance across all connections on a server so `getAffected` queries the
-   * full live set. Supply alongside `publishInvalidation` to enable the
-   * reactive tier; omit either to keep today's RPC-only behaviour.
+   * full live set. Supplying it enables the reactive tier; omit it to keep
+   * today's RPC-only behaviour.
+   *
+   * The engine no longer emits write-events itself: dispatch flows through
+   * `app.call`, which fuses invalidation on `app.invalidationSource`. The
+   * transport wires its router to that same source (see `createRoutes`), so a
+   * subscription store is the only port the engine needs to become reactive.
    */
   subscriptionStore?: SubscriptionStore
-  /**
-   * Emit a write-event into the shared invalidation channel. Called after each
-   * mutation with the set of tables written. This is the producer side of
-   * `DispatchInvalidationSource.emit` — callers own the source and register the
-   * router (e.g. `createInvalidationRouter`) once before attaching connections.
-   *
-   * Supply alongside `subscriptionStore` to enable the reactive tier.
-   */
-  publishInvalidation?: (tables: Set<string>) => void
 }
 
 /** Handle to a running Engine attachment. `detach` tears it down idempotently. */
@@ -93,12 +89,13 @@ function isPermanentRequestError(err: unknown): boolean {
  * with the shipped `routes.ts` pre/post-auth split.
  */
 export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandle {
-  const { app, authTimeoutMs = 10_000, onClose, subscriptionStore, publishInvalidation } = opts
+  const { app, authTimeoutMs = 10_000, onClose, subscriptionStore } = opts
   const dispatch: Dispatch = createDispatch(app)
   const session = new Session(opts)
 
-  // Reactive tier is enabled only when BOTH ports are wired.
-  const reactiveEnabled = subscriptionStore !== undefined && publishInvalidation !== undefined
+  // Reactive tier is enabled when the subscription store is wired. Emission is
+  // the app's job (app.call fuses it on app.invalidationSource), not the engine's.
+  const reactiveEnabled = subscriptionStore !== undefined
 
   let closed = false
   // Set when the inbound handler is registered (below). Held in a mutable ref so
@@ -242,14 +239,11 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     }
     if (closed) return
     try {
-      const { result, tablesWritten } = await dispatch(msg.path, msg.args, context)
+      const { result } = await dispatch(msg.path, msg.args, context)
       if (closed) return
-      // When the reactive tier is wired, emit the write-set to fan out
-      // invalidations to any affected subscriptions. Fire-and-forget: the router
-      // (createInvalidationRouter) handles per-entry re-queries and delivery.
-      if (reactiveEnabled && tablesWritten.size > 0) {
-        publishInvalidation!(tablesWritten)
-      }
+      // No emit here: `dispatch` is `app.call`, which fuses invalidation on the
+      // app's source. The transport's router (createRoutes) is wired to that same
+      // source, so a WS mutation fans out without the engine re-emitting.
       send({ type: 'result', id: msg.id, data: result })
     } catch (err) {
       if (closed) return

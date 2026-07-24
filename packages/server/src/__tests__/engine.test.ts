@@ -40,7 +40,6 @@ import {
   attachEngine,
   type AttachEngineOptions,
   createInMemorySubscriptionStore,
-  createDispatchInvalidationSource,
   createInvalidationRouter,
 } from '../engine'
 import { defineApp } from '../define-app'
@@ -554,12 +553,12 @@ describe('Engine — reactive tier opt-in (AC #3)', () => {
  */
 function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
   const subscriptionStore = createInMemorySubscriptionStore()
-  const { source: invalidationSource, emit: publishInvalidation } =
-    createDispatchInvalidationSource()
 
-  // Single router — NOT per-connection.
+  // Single router — NOT per-connection — wired to the APP's source. `app.call`
+  // fuses invalidation there, and `app.emit` drives it from "outside" (a
+  // runHandler-path writer, or a test simulating a write on another connection).
   createInvalidationRouter({
-    source: invalidationSource,
+    source: app.invalidationSource,
     store: subscriptionStore,
     recompute: async (entry) => {
       const { tablesRead } = await app.call(
@@ -571,7 +570,7 @@ function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
     },
   })
 
-  return { subscriptionStore, publishInvalidation }
+  return { subscriptionStore, publishInvalidation: app.emit }
 }
 
 /**
@@ -595,7 +594,6 @@ async function reactiveHarness(
   const handle = attachEngine(serverPipe, {
     app,
     subscriptionStore,
-    publishInvalidation,
     onClose: (reason) => closeReasons.push(reason),
     ...opts,
   })
@@ -931,7 +929,7 @@ describe('Engine — reactive tier enabled (AC #3 ext)', () => {
       const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
       const received: ServerMessage[] = []
       clientPipe.onMessage((m) => received.push(m))
-      attachEngine(serverPipe, { app, subscriptionStore, publishInvalidation })
+      attachEngine(serverPipe, { app, subscriptionStore })
       return { received, send: (msg: ClientMessage) => clientPipe.send(msg) }
     }
 
