@@ -5,10 +5,31 @@ import { evaluate, type Permission } from '@wystack/permissions'
 import type { FunctionDef, FunctionContext, DbInput } from './types'
 import { assertPermissionIds } from './permissions'
 import { createSubscriptionManager } from './subscriptions'
+import {
+  createDispatchInvalidationSource,
+  type InvalidationSource,
+} from './engine/invalidation-source'
 
 export interface WyStackApp {
   functions: Map<string, FunctionDef>
   subscriptions: ReturnType<typeof createSubscriptionManager>
+  /**
+   * The app's single invalidation source. Every write dispatched through `call`,
+   * and every explicit `emit`, fans out on this one source. Transports wire their
+   * `InvalidationRouter` to it — they must NOT create their own source, or a
+   * write on one surface (REST) would be invisible to subscriptions served by
+   * another (WS). One app instance ⇒ one source ⇒ one live reactive tier.
+   */
+  invalidationSource: InvalidationSource
+  /**
+   * Publish a write-tag set to the app's invalidation source. `call` invokes this
+   * automatically after any dispatch that wrote (guarded on `tablesWritten.size`),
+   * so plain RPC/REST callers never need to. It is the explicit seam for the
+   * runHandler-path writers that bypass `call` — `applyCommands`, draft `publish`,
+   * direct `runHandler` — to flush their merged post-commit tag-set once the
+   * transaction has durably committed. Fire-and-forget.
+   */
+  emit: (tablesWritten: Set<string>) => void
   /** Internal dispatch — resolves DB, creates DrizzleTracker, runs handler with context */
   call: (
     path: string,
@@ -86,6 +107,10 @@ export async function buildWyStack(opts: {
 
   const functions = new Map<string, FunctionDef>()
   const subscriptions = createSubscriptionManager()
+  // The app owns the one invalidation source. `call` emits on it after a write;
+  // transports wire their router to `app.invalidationSource` rather than minting
+  // their own — see the WyStackApp.invalidationSource contract.
+  const invalidation = createDispatchInvalidationSource()
 
   // Resolve DB: either use createDb for config, or treat as raw Drizzle instance
   const dbConfig = resolveDbConfig(opts.db)
@@ -105,6 +130,8 @@ export async function buildWyStack(opts: {
   const app: WyStackApp = {
     functions,
     subscriptions,
+    invalidationSource: invalidation.source,
+    emit: invalidation.emit,
 
     createTracked() {
       return createDrizzleTracker(drizzleDb)
@@ -114,6 +141,13 @@ export async function buildWyStack(opts: {
       // Fresh DrizzleTracker per call — no shared mutable state
       const tracked = app.createTracked()
       const result = await app.runHandler(path, args, tracked, context)
+
+      // Fuse: any write dispatched through `call` fans out on the app's source,
+      // so REST, WS call-frames, and the typed caller all invalidate without the
+      // transport re-emitting. Guarded on write count so a read-only call — most
+      // importantly the router's subscription recompute, which re-runs queries —
+      // never emits, and there is no recompute storm.
+      if (tracked.tablesWritten.size > 0) invalidation.emit(tracked.tablesWritten)
 
       return {
         result,
