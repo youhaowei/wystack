@@ -37,6 +37,13 @@ const functions = {
   addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
     return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
   }),
+  // Writes a row, then throws. The atomic-dispatch guard: the write must roll
+  // back (no durable row) and no Tag must fan out (the emit fuse self-skips
+  // because a rolled-back tx merges nothing into the call's tablesWritten).
+  addThenThrow: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+    await ctx.db.into(schema.todos).insert({ title: args.title, done: false })
+    throw new Error('boom after write')
+  }),
 }
 type Functions = typeof functions
 
@@ -141,6 +148,28 @@ describe('cross-surface invalidation (two-instance-bug regression)', () => {
     await caller.listTodos({})
     await settle()
 
+    expect(delivered.length).toBe(0)
+  })
+
+  test('a write that then throws rolls back and does NOT invalidate (atomic dispatch)', async () => {
+    // The emit contract is "iff a write durably committed". A handler that writes
+    // then throws must leave nothing behind: the dispatch transaction rolls back,
+    // so the row is gone AND no Tag reaches the subscription. Before the atomic
+    // wrap, the insert autocommitted and only the throw-before-emit hid the Tag —
+    // a durable-but-unannounced row. This pins both halves.
+    const app = await makeApp()
+    const store = wireReactive(app)
+    const delivered = subscribeListTodos(store)
+
+    await expect(app.call('addThenThrow', { title: 'ghost' }, {})).rejects.toThrow(
+      'boom after write',
+    )
+    await settle()
+
+    // Rollback: the row never durably landed.
+    const { result } = await app.call('listTodos', {}, {})
+    expect(result).toEqual([])
+    // Emit contract: no write committed ⇒ no Tag ⇒ subscription untouched.
     expect(delivered.length).toBe(0)
   })
 

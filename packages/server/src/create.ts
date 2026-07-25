@@ -140,7 +140,26 @@ export async function buildWyStack(opts: {
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
       // Fresh DrizzleTracker per call — no shared mutable state
       const tracked = app.createTracked()
-      const result = await app.runHandler(path, args, tracked, context)
+      // Atomic dispatch for MUTATIONS only: run the handler inside one transaction
+      // so a handler that writes and then throws rolls the write back instead of
+      // leaving a durable row that no reactive Tag ever announced. The tracker's
+      // `transaction` merges `tablesWritten` up to `tracked` ONLY after the native
+      // COMMIT (merge-after-await) — so on rollback the set below stays empty and
+      // the fuse self-skips; the emit contract becomes "iff a write durably
+      // committed". A handler that opens its own `ctx.db.transaction` nests via
+      // savepoint and flattens up.
+      //
+      // Queries run WITHOUT the wrap: a query never writes, so it needs no
+      // rollback, and wrapping it would hold a DB transaction open for the
+      // handler's entire duration. On a serialized store (PGlite) a slow or hung
+      // query — most importantly the subscription recompute, which awaits real
+      // I/O and can block on an unresolved handler — would then hold the write
+      // mutex and stall every other call. Unknown paths fall through to
+      // `runHandler`, which throws exactly as before.
+      const isMutation = functions.get(path)?.type === 'mutation'
+      const result = isMutation
+        ? await tracked.transaction((tx) => app.runHandler(path, args, tx, context))
+        : await app.runHandler(path, args, tracked, context)
 
       // Fuse: any write dispatched through `call` fans out on the app's source,
       // so REST, WS call-frames, and the typed caller all invalidate without the
