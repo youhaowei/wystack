@@ -125,8 +125,47 @@ interface DraftEntry {
    * write, via a table-recording wrapper around the draft handle.
    */
   touchedTables: Map<string, AnyTable>
+  /**
+   * Invalidation tags for the shadow tables this draft ACTUALLY wrote rows into,
+   * accumulated from what the tracker reported on each `append`.
+   *
+   * Publish and discard both sweep the overlay through `tx.raw` / a raw handle,
+   * which is UNTRACKED — the sweep never lands in any `tablesWritten` set. But a
+   * draft-scoped subscription watches exactly these tags (the draft read coalesce
+   * registers both the canonical and the shadow name in `tablesRead`, so the
+   * router's read∩write intersection can fire), and after a sweep its rows are
+   * gone. Naming them explicitly is what stops a draft-scoped client from sitting
+   * on a swept overlay forever.
+   *
+   * Taken from the tracker rather than rebuilt from `touchedTables`, for two
+   * reasons: `touchedTables` also records tables the draft only READ (a
+   * `from(t)…delete()` routes through `from`, so reads cannot be excluded there),
+   * which would emit tags for shadows that never had a row; and a reconstructed
+   * `${name}__draft` string has to match `@wystack/db`'s own tag format exactly
+   * or it silently matches nothing. Copying the tracker's own tags cannot drift.
+   */
+  shadowWrites: Set<string>
   /** Per-batch context threaded to publish's replay (auth/tenant). */
   context: Record<string, unknown>
+  /**
+   * Serialization chain for this draft — the tail of a promise queue every
+   * mutating entry point (`append`/`publish`/`discard`) chains onto, so two
+   * callers can never interleave their awaits against this entry. Without it,
+   * two concurrent `append`s interleave their overlay writes and splice their
+   * commands into each other's log order. Never rejects (see `withDraftLock`),
+   * so one failed operation cannot wedge the draft.
+   */
+  lock: Promise<void>
+  /**
+   * Non-`'open'` for as long as a TERMINAL operation (publish or discard) is in
+   * flight — both end by removing the entry from `drafts`, so work admitted
+   * while one is running would run against a detached entry and vanish. Set
+   * SYNCHRONOUSLY, before the first await, so a concurrent caller observes the
+   * claim rather than racing into the window. Reset to `'open'` if the terminal
+   * operation fails — a failed publish (or discard) leaves the draft live and
+   * retryable.
+   */
+  state: 'open' | 'publishing' | 'discarding'
 }
 
 export interface OpenOptions {
@@ -151,19 +190,43 @@ export interface DraftLifecycle {
    * `batch` is `DraftCommand[]` so the optional `compactionKey`/`kind` fields
    * are discoverable at the call site — an app that wants net-effect log
    * compaction mints those; a plain `Command` (no key) is never compacted.
+   *
+   * Concurrency: appends on ONE draft are serialized FIFO, so two in-flight
+   * batches cannot interleave their overlay writes or their log positions.
+   * An append that arrives while `publish` is in flight REJECTS (see `publish`).
    */
   append(draftId: string, batch: DraftCommand[]): Promise<CommandResult[]>
   /**
    * PUBLISH = replay the ordered command log onto canonical via
    * `applyCommands(app, log, {commit})`, calling `resolve(log)` IMMEDIATELY
    * before the commit (the ONLY app injection inside publish — it binds
-   * late-bound operands). Atomic via `applyCommands`'s YW-119 tracked tx; the
-   * returned `tablesWritten` is what the HOST flushes to invalidation (the
-   * lifecycle does not wire invalidation itself — same posture as
-   * `applyCommands`). The draft's shadow + registry entry are cleared on success.
+   * late-bound operands). Atomic via `applyCommands`'s YW-119 tracked tx. The
+   * draft's shadow + registry entry are cleared on success.
+   *
+   * Invalidation is the LIFECYCLE's job, not the host's: publish emits the
+   * canonical tags from the replay plus the `<table>__draft` tags for the sweep
+   * (untracked, so `applyCommands` cannot report them), once the transaction has
+   * durably committed. `append` and `discard` emit too — every entry point that
+   * writes announces its own writes, so no consumer can forget to and leave
+   * subscriptions silently stale. `tablesWritten` is still returned for hosts
+   * that want the set for their own bookkeeping.
+   *
+   * Publish CLAIMS the draft for its whole duration: once entered, any further
+   * `append`, `discard`, or `publish` on the same draft rejects rather than
+   * racing the snapshot-then-sweep window (work admitted in that window used to
+   * be applied to the overlay and then silently destroyed). Work already
+   * in flight or queued when the claim is taken still runs first, and publishes
+   * with this batch. On FAILURE the claim is released and the draft stays live
+   * and retryable.
    */
   publish(draftId: string, resolve?: ResolveHook): Promise<CommitResult>
-  /** Drop the draft: clear its shadow rows and forget its registry entry. */
+  /**
+   * Drop the draft: clear its shadow rows and forget its registry entry.
+   * Like `publish`, discard CLAIMS the draft synchronously for its duration —
+   * it too detaches the entry, so later `append`/`discard`/`publish` calls are
+   * rejected rather than racing the sweep. Rejects if the draft is already
+   * mid-publish or mid-discard.
+   */
   discard(draftId: string): Promise<void>
   /**
    * Detect whether canonical moved under the draft. Returns the two generic
@@ -173,7 +236,7 @@ export interface DraftLifecycle {
    */
   detectConflict(draftId: string): Promise<ConflictReport>
   /** Read-only peek at a draft's current command log (post-compaction). */
-  getLog(draftId: string): Command[]
+  getLog(draftId: string): DraftCommand[]
 }
 
 /**
@@ -218,6 +281,12 @@ export interface DraftCommand extends Command {
  *     publish `UPDATE` a row that does not exist in canonical yet, silently
  *     dropping a created-then-edited item.
  *   - **delete of a canonical row** (no prior create) → kept.
+ *   - **delete of a canonical row + a later create on the same key** (a REPLACE)
+ *     → BOTH kept, in order. The canonical row must be removed before the new
+ *     one is inserted; dropping either half publishes a duplicate-key insert or
+ *     silently keeps the stale row. This differs from create + delete + create,
+ *     where the leading create is draft-local and nothing canonical exists to
+ *     remove, so only the final create survives.
  *
  * Commands with no `compactionKey`, or no `kind`, are never compacted and keep
  * their position. Surviving commands keep their original relative ORDER (publish
@@ -231,6 +300,11 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
   // role resolves to exactly one position, so no duplicate is emitted.
   const survivingCreate = new Map<string, number>()
   const lastUpdate = new Map<string, number>()
+  // Only ever set in the else-branch below — i.e. when the key had NO live
+  // draft-local create at that point. So an entry here means, by construction,
+  // "a delete that targets canonical state", and it must survive independently
+  // of anything the draft does to the key afterwards. That set-condition IS the
+  // lineage tracking; no separate draft-local-create flag is needed.
   const survivingDelete = new Map<string, number>()
 
   for (let i = 0; i < log.length; i++) {
@@ -238,19 +312,21 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
     const key = cmd.compactionKey
     if (key === undefined || cmd.kind === undefined) continue
     if (cmd.kind === 'create') {
-      // (Re)open the key: a create after a delete revives it; clear stale update/delete.
+      // (Re)open the key: clear stale updates, which the create supersedes. A
+      // surviving canonical delete is deliberately LEFT IN PLACE — delete-then-
+      // create is a replace, and publish must run both, in order.
       survivingCreate.set(key, i)
       lastUpdate.delete(key)
-      survivingDelete.delete(key)
     } else if (cmd.kind === 'update') {
       lastUpdate.set(key, i)
     } else {
       // delete
       if (survivingCreate.has(key)) {
-        // Cancels a live create — the row never existed canonically. Drop all.
+        // Cancels a live DRAFT-LOCAL create — that row never existed canonically,
+        // so its create and updates drop. An earlier canonical delete on the same
+        // key is untouched: the canonical row still has to go.
         survivingCreate.delete(key)
         lastUpdate.delete(key)
-        survivingDelete.delete(key)
       } else {
         // Delete of a canonical row: it wins, and supersedes any prior updates.
         lastUpdate.delete(key)
@@ -329,6 +405,52 @@ export function createDraftLifecycle(
     return entry
   }
 
+  /**
+   * Resolve a draft that is accepting work. Rejecting while a TERMINAL operation
+   * is in flight is what makes the lost-write window (#88) impossible: both
+   * `publish` and `discard` await (the `resolve` hook and commit transaction;
+   * the shadow sweep) and then delete the entry. Work that landed in that window
+   * used to be applied to the overlay, missed the snapshot, and was then
+   * destroyed along with the entry — silently, with a success returned to its
+   * caller. Now it fails loud instead.
+   */
+  function requireOpen(draftId: string): DraftEntry {
+    const entry = require(draftId)
+    if (entry.state !== 'open') {
+      throw new Error(
+        `draft lifecycle: draft "${draftId}" is ${entry.state} — retry once it settles`,
+      )
+    }
+    return entry
+  }
+
+  /**
+   * Run `fn` with exclusive access to one draft, queued FIFO behind whatever is
+   * already in flight on it. Combined with the `requireOpen` check — which every
+   * caller passes BEFORE queueing — this yields the invariant that makes the
+   * queue safe: anything running or queued when `publish` or `discard` claims
+   * the draft was admitted before the claim and therefore runs BEFORE it, and
+   * anything arriving after is rejected outright. Nothing can ever run against
+   * an entry a terminal operation has already detached from `drafts`.
+   *
+   * Note that a queued `fn` STILL RUNS when the operation ahead of it failed —
+   * the chain deliberately swallows rejections so one failure cannot wedge the
+   * draft. So a publish queued behind a mid-batch-failed append publishes that
+   * append's partially-applied commands. That is the existing append contract
+   * ("the conducting app owns recovery"), just reached without an intervening
+   * app decision; issue the publish after awaiting the append if that matters.
+   */
+  function withDraftLock<T>(entry: DraftEntry, fn: () => Promise<T>): Promise<T> {
+    const run = entry.lock.then(fn)
+    // Swallow on the CHAIN only (the caller still sees the rejection via `run`),
+    // so a failed operation does not poison every operation queued behind it.
+    entry.lock = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
+  }
+
   return {
     open(baseVersion, openOpts = {}) {
       const draftId = mintDraftId()
@@ -336,90 +458,160 @@ export function createDraftLifecycle(
         baseVersion,
         log: [],
         touchedTables: new Map(),
+        shadowWrites: new Set(),
         context: openOpts.context ?? {},
+        lock: Promise.resolve(),
+        state: 'open',
       })
       return draftId
     },
 
     async append(draftId, batch) {
-      const entry = require(draftId)
-      // Route writes through the draft handle so `ctx.db.into/update/delete`
-      // lands in the `<table>__draft` overlay. The recording wrapper captures
-      // the Drizzle table OBJECTS written, keyed by schema-qualified name, so
-      // detection + teardown can introspect schema/PK without a global schema registry.
-      const draftDb: DraftDrizzleTracker = recordTouchedTables(
-        app.createTracked().withDraft(draftId),
-        entry.touchedTables,
-      )
-      const results: CommandResult[] = []
-      for (const cmd of batch) {
-        const value = await app.runHandler(cmd.path, cmd.args, draftDb, entry.context)
-        results.push({ id: cmd.id, value })
-        // Snapshot the command before storing it in the log. The log is the
-        // publish unit (replayed verbatim later); storing the caller's object by
-        // reference would let a post-append mutation of the batch or its `args`
-        // silently change what `publish` replays — diverging the canonical
-        // commit from the draft preview that was executed here.
-        entry.log.push(snapshotCommand(cmd))
-      }
-      // Compact the accumulated log to net effect (no-op for keyless commands).
-      entry.log = compactLog(entry.log)
-      return results
+      const entry = requireOpen(draftId)
+      return withDraftLock(entry, async () => {
+        // Route writes through the draft handle so `ctx.db.into/update/delete`
+        // lands in the `<table>__draft` overlay. The recording wrapper captures
+        // the Drizzle table OBJECTS written, keyed by schema-qualified name, so
+        // detection + teardown can introspect schema/PK without a global schema registry.
+        const draftDb: DraftDrizzleTracker = recordTouchedTables(
+          app.createTracked().withDraft(draftId),
+          entry.touchedTables,
+        )
+        const results: CommandResult[] = []
+        try {
+          for (const cmd of batch) {
+            const value = await app.runHandler(cmd.path, cmd.args, draftDb, entry.context)
+            results.push({ id: cmd.id, value })
+            // Snapshot the command before storing it in the log. The log is the
+            // publish unit (replayed verbatim later); storing the caller's object by
+            // reference would let a post-append mutation of the batch or its `args`
+            // silently change what `publish` replays — diverging the canonical
+            // commit from the draft preview that was executed here.
+            entry.log.push(snapshotCommand(cmd))
+          }
+        } finally {
+          // Announce the overlay writes, and remember them: publish and discard
+          // sweep those same shadow tables through an untracked raw handle, so
+          // this is the only place the tags are ever reported.
+          //
+          // In a `finally` because append is NOT atomic across a batch — each
+          // command auto-commits on its own, so a mid-batch throw still leaves
+          // earlier writes durable, and a draft-scoped subscription must see
+          // them. Guarded on size so a no-write batch never triggers a recompute
+          // storm.
+          if (draftDb.tablesWritten.size > 0) {
+            for (const tag of draftDb.tablesWritten) entry.shadowWrites.add(tag)
+            app.emit(draftDb.tablesWritten)
+          }
+        }
+        // Compact the accumulated log to net effect (no-op for keyless commands).
+        entry.log = compactLog(entry.log)
+        return results
+      })
     },
 
     async publish(draftId, resolve) {
-      const entry = require(draftId)
-      // Bind late-bound operands immediately before commit — the ONLY app
-      // injection inside publish. Identity if no hook supplied.
-      const boundLog = resolve ? await resolve([...entry.log]) : [...entry.log]
-      const touched = [...entry.touchedTables.values()]
+      const entry = requireOpen(draftId)
+      // CLAIM the draft synchronously, before any await: from here on `append`,
+      // `discard`, and a second `publish` are rejected rather than racing the
+      // snapshot-then-delete window below. Ordering matters — a claim taken
+      // after the first await is not a claim.
+      entry.state = 'publishing'
+      try {
+        return await withDraftLock(entry, async () => {
+          // Snapshot INSIDE the lock, so an append admitted before the claim has
+          // already landed its commands and they publish with this batch.
+          //
+          // Bind late-bound operands immediately before commit — the ONLY app
+          // injection inside publish. Identity if no hook supplied.
+          const boundLog = resolve ? await resolve([...entry.log]) : [...entry.log]
+          const touched = [...entry.touchedTables.values()]
 
-      // ATOMIC PUBLISH (YW-300): open ONE outer transaction so command-log
-      // replay and shadow-sweep share a single commit boundary. A crash between
-      // the two is no longer possible — if either step fails, both roll back,
-      // and the in-memory registry entry stays intact so publish is retryable.
-      //
-      // Previously `clearShadow` ran AFTER `applyCommands` returned (two separate
-      // transactions). A process death in that gap left the canonical commit durable
-      // but shadow rows orphaned. While those orphans are inert for the in-memory
-      // lifecycle (the map is gone on restart), the same latent window exists for
-      // any durable consumer that wraps this lifecycle — closing it here at the
-      // framework level is the Rule-of-Three extraction.
-      // `DrizzleTracker.transaction` is generic over its callback return type — we
-      // capture the CommitResult directly rather than via a non-local variable.
-      const result = await app.createTracked().transaction(async (tx) => {
-        // Replay the command log against the caller-supplied tx handle. The
-        // outer-tx seam (applyCommands opts.tx, added in YW-297) routes all
-        // command writes through this same handle — no inner transaction is
-        // opened; the outer's commit boundary governs.
-        const committed = (await applyCommands(app, boundLog, {
-          mode: 'commit',
-          context: entry.context,
-          tx,
-        })) as CommitResult
-        // Shadow-sweep inside the SAME tx: shadow rows disappear atomically
-        // with the canonical commit. On failure the outer tx rolls back both.
-        // `tx.raw` is the native Drizzle handle bound to this transaction.
-        await clearShadow(tx.raw, draftId, touched)
-        return committed
-      })
+          // ATOMIC PUBLISH (YW-300): open ONE outer transaction so command-log
+          // replay and shadow-sweep share a single commit boundary. A crash between
+          // the two is no longer possible — if either step fails, both roll back,
+          // and the in-memory registry entry stays intact so publish is retryable.
+          //
+          // Previously `clearShadow` ran AFTER `applyCommands` returned (two separate
+          // transactions). A process death in that gap left the canonical commit durable
+          // but shadow rows orphaned. While those orphans are inert for the in-memory
+          // lifecycle (the map is gone on restart), the same latent window exists for
+          // any durable consumer that wraps this lifecycle — closing it here at the
+          // framework level is the Rule-of-Three extraction.
+          // `DrizzleTracker.transaction` is generic over its callback return type — we
+          // capture the CommitResult directly rather than via a non-local variable.
+          const result = await app.createTracked().transaction(async (tx) => {
+            // Replay the command log against the caller-supplied tx handle. The
+            // outer-tx seam (applyCommands opts.tx, added in YW-297) routes all
+            // command writes through this same handle — no inner transaction is
+            // opened; the outer's commit boundary governs.
+            const committed = (await applyCommands(app, boundLog, {
+              mode: 'commit',
+              context: entry.context,
+              tx,
+            })) as CommitResult
+            // Shadow-sweep inside the SAME tx: shadow rows disappear atomically
+            // with the canonical commit. On failure the outer tx rolls back both.
+            // `tx.raw` is the native Drizzle handle bound to this transaction.
+            await clearShadow(tx.raw, draftId, touched)
+            return committed
+          })
 
-      // Outer transaction committed. Remove the in-memory registry entry now
-      // that the canonical write is durable and the shadow is swept. This is
-      // post-commit — a crash here is harmless (the map is ephemeral and will
-      // be empty on restart regardless). Deleting AFTER commit (not before)
-      // preserves the entry for a retry if the outer tx rolls back.
-      drafts.delete(draftId)
-      // The host flushes result.tablesWritten to invalidation (the lifecycle
-      // does not, by design — same posture as applyCommands).
-      return result
+          // Outer transaction committed. Remove the in-memory registry entry now
+          // that the canonical write is durable and the shadow is swept. This is
+          // post-commit — a crash here is harmless (the map is ephemeral and will
+          // be empty on restart regardless). Deleting AFTER commit (not before)
+          // preserves the entry for a retry if the outer tx rolls back.
+          drafts.delete(draftId)
+
+          // Fan out AFTER the commit — canonical tags from the replay, shadow
+          // tags for the sweep (untracked, so `applyCommands` cannot report it).
+          //
+          // The lifecycle emits rather than deferring to the host. `applyCommands`
+          // defers because it may run inside a caller-owned transaction and cannot
+          // know when the write became durable; publish OWNS its commit boundary,
+          // so that reason does not apply here — and `app.emit` names draft
+          // publish as an intended caller. Leaving it to the host made a forgotten
+          // flush indistinguishable from success: canonical committed, every live
+          // subscription silently stale.
+          const tags = new Set([...result.tablesWritten, ...entry.shadowWrites])
+          if (tags.size > 0) app.emit(tags)
+          return result
+        })
+      } catch (err) {
+        // A failed publish leaves the draft LIVE and retryable (the outer tx
+        // rolled back and the entry was never deleted) — so hand the claim back,
+        // or the draft would be permanently unappendable and undiscardable.
+        entry.state = 'open'
+        throw err
+      }
     },
 
     async discard(draftId) {
-      const entry = require(draftId)
-      // Discard has no replay to be atomic with — a fresh connection suffices.
-      await clearShadow(app.createTracked().raw, draftId, [...entry.touchedTables.values()])
-      drafts.delete(draftId)
+      const entry = requireOpen(draftId)
+      // CLAIM the draft synchronously, for the same reason `publish` does:
+      // discard also ends by detaching the entry, so an `append` admitted while
+      // the sweep is in flight would write shadow rows for a draft that no
+      // longer exists — and report success. Work admitted BEFORE the claim still
+      // runs first (and is then discarded, which is what the caller asked for).
+      entry.state = 'discarding'
+      try {
+        return await withDraftLock(entry, async () => {
+          // Discard has no replay to be atomic with — a fresh connection suffices.
+          const touched = [...entry.touchedTables.values()]
+          await clearShadow(app.createTracked().raw, draftId, touched)
+          drafts.delete(draftId)
+          // Canonical is untouched, but the overlay rows are gone — draft-scoped
+          // subscriptions are stale and must be told. Empty for a read-only
+          // draft: the sweep found nothing, so nobody's result changed.
+          if (entry.shadowWrites.size > 0) app.emit(entry.shadowWrites)
+        })
+      } catch (err) {
+        // Symmetric with publish: a failed sweep leaves the draft live, so hand
+        // the claim back or it becomes permanently unusable.
+        entry.state = 'open'
+        throw err
+      }
     },
 
     async detectConflict(draftId) {
