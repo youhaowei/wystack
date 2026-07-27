@@ -18,7 +18,7 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean, eq } from '@wystack/db'
+import { defineSchema, text, int, boolean, jsonb, eq } from '@wystack/db'
 import {
   createDraftLifecycle,
   type VersionProbe,
@@ -65,6 +65,14 @@ beforeEach(async () => {
       listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
       addTodo: wy.procedure
         .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      // Writes, and carries a jsonb argument — jsonb validates as `unknown`, so
+      // a non-cloneable value (a function) reaches the lifecycle through ordinary
+      // validation. Used to pin the snapshot-before-write ordering in append.
+      addTodoWithMeta: wy.procedure
+        .input({ id: int, title: text, meta: jsonb })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
@@ -454,6 +462,43 @@ describe('draft lifecycle — discard', () => {
     // oxlint-disable-next-line typescript/no-explicit-any
     expect((shadow as any).rows).toHaveLength(0)
     await expect(lc.detectConflict(draftId)).rejects.toThrow('unknown draft')
+  })
+})
+
+describe('draft lifecycle — a command that cannot be snapshotted', () => {
+  test('an uncloneable command fails BEFORE its write, leaving the draft untouched', async () => {
+    // append clones each command into the log because the log is the publish
+    // unit. When the clone ran AFTER the handler, a non-cloneable argument left
+    // a durable overlay row whose command never reached the log — publish then
+    // silently omitted it. The clone now runs first, so the failure lands ahead
+    // of any write.
+    const lc = createDraftLifecycle(app)
+    const draftId = lc.open(0)
+
+    await expect(
+      lc.append(draftId, [
+        {
+          path: 'addTodoWithMeta',
+          // A function is not structured-cloneable. `meta` is jsonb, which
+          // validates as `unknown`, so nothing rejects it earlier.
+          args: { id: 3, title: 'cherry', meta: { onDone: () => {} } },
+        },
+      ]),
+      // Assert the CLONE is what failed. A plain `rejects.toThrow()` would also
+      // pass if validation had rejected the function first, which would make
+      // this test prove nothing about the ordering.
+    ).rejects.toThrow('can not be cloned')
+
+    // Neither half of the draft moved: no command logged, no overlay row.
+    expect(lc.getLog(draftId)).toHaveLength(0)
+    const shadow = await db.execute(`SELECT * FROM todos__draft WHERE draft_id = '${draftId}'`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((shadow as any).rows).toHaveLength(0)
+
+    // And the draft is still usable — this was a rejected command, not a
+    // poisoned draft.
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    expect(lc.getLog(draftId)).toHaveLength(1)
   })
 })
 

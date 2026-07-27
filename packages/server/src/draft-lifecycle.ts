@@ -480,14 +480,26 @@ export function createDraftLifecycle(
         const results: CommandResult[] = []
         try {
           for (const cmd of batch) {
-            const value = await app.runHandler(cmd.path, cmd.args, draftDb, entry.context)
+            // Snapshot BEFORE running the handler, and run the handler on the
+            // SNAPSHOT. The log is the publish unit (replayed verbatim later);
+            // storing the caller's object by reference would let a post-append
+            // mutation of the batch or its `args` silently change what `publish`
+            // replays — diverging the canonical commit from the draft preview
+            // that was executed here.
+            //
+            // Snapshotting first is what makes the two halves agree even when the
+            // clone FAILS. `structuredClone` throws on a non-cloneable value (a
+            // function, a class instance with a getter that throws), and a jsonb
+            // argument validates as `unknown`, so such a value reaches here
+            // through ordinary validation. Cloning after the handler ran meant a
+            // durable overlay row whose command never reached the log — publish
+            // would then silently omit it. Same defect family as #88: a write
+            // with nothing to replay. Cloning first moves the failure ahead of
+            // any write, so the batch aborts with the draft untouched.
+            const snapshot = snapshotCommand(cmd)
+            const value = await app.runHandler(snapshot.path, snapshot.args, draftDb, entry.context)
             results.push({ id: cmd.id, value })
-            // Snapshot the command before storing it in the log. The log is the
-            // publish unit (replayed verbatim later); storing the caller's object by
-            // reference would let a post-append mutation of the batch or its `args`
-            // silently change what `publish` replays — diverging the canonical
-            // commit from the draft preview that was executed here.
-            entry.log.push(snapshotCommand(cmd))
+            entry.log.push(snapshot)
           }
         } finally {
           // Announce the overlay writes, and remember them: publish and discard
