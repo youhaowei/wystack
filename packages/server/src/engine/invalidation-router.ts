@@ -87,6 +87,18 @@ export function createInvalidationRouter(opts: InvalidationRouterOptions): () =>
    * isolated so the per-sub chain stays alive.
    */
   async function processOne(entry: SubscriptionEntry): Promise<void> {
+    // Liveness re-check. `getAffected` snapshotted this entry when the
+    // invalidation arrived; this link may run much later, behind a queue of
+    // earlier recomputes for the same entry. In that gap the client can
+    // unsubscribe, disconnect, or resubscribe (which REPLACES the entry object
+    // under the same id — see the tail-keying note above). Re-querying a
+    // subscription nobody is listening to costs a real database round-trip per
+    // stale entry per write, which is exactly when the queue is longest.
+    //
+    // Identity, not just presence: `store.get(id)` returning a DIFFERENT object
+    // means this instance was superseded, and the replacement has its own chain.
+    if (store.get(entry.id) !== entry) return
+
     // Re-compute read-tags using the PRESERVED subscription-time context.
     // Any throw keeps the existing tablesWatched — the client will see the
     // error on its own refetch. Do not bail before calling entry.send.

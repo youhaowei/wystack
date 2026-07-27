@@ -207,7 +207,8 @@ describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
       resolveGate = r
     })
 
-    const entry = makeEntry('sub1', ['todos'])
+    const sent: unknown[] = []
+    const entry = makeEntry('sub1', ['todos'], (p) => sent.push(p))
     store.add(entry)
 
     let computedCalls = 0
@@ -221,19 +222,23 @@ describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
       },
     })
 
-    // Emit while the sub is live — recompute starts but blocks on gate.
+    // Emit while the sub is live — the chain link is built synchronously here,
+    // but `processOne` itself does not run until a microtask later.
     emit(new Set(['todos']))
 
-    // Remove the sub BEFORE the gate resolves.
+    // Remove the sub BEFORE that microtask runs.
     store.remove('sub1')
 
-    // Resolve the gate — the in-flight recompute completes.
     resolveGate()
     await flush()
 
-    // Must not crash. The recompute ran (fire-and-forget; started before remove).
-    // The tail self-cleans via the `.finally` drain guard.
-    expect(computedCalls).toBe(1)
+    // The recompute is SKIPPED: `processOne` re-checks liveness before doing any
+    // work, and by the time it ran the sub was gone. Previously it recomputed
+    // anyway — a full database round-trip whose result went to a `send` nobody
+    // was listening on, once per stale entry per write. Must still not crash,
+    // and the tail still self-cleans via the `.finally` drain guard.
+    expect(computedCalls).toBe(0)
+    expect(sent).toHaveLength(0)
   })
 
   // ---------------------------------------------------------------------------
