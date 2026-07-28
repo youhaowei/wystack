@@ -102,12 +102,33 @@ export function createInvalidationRouter(opts: InvalidationRouterOptions): () =>
     // Re-compute read-tags using the PRESERVED subscription-time context.
     // Any throw keeps the existing tablesWatched — the client will see the
     // error on its own refetch. Do not bail before calling entry.send.
+    let tablesRead: Set<string> | undefined
     try {
-      const { tablesRead } = await recompute(entry)
-      entry.tablesWatched = tablesRead
+      ;({ tablesRead } = await recompute(entry))
     } catch {
       // Preserve existing tablesWatched on error.
     }
+
+    // Post-await liveness re-check. `recompute` is an await point, so the
+    // check above only proves the entry was live when the recompute STARTED.
+    // The client can unsubscribe, disconnect, or resubscribe while the query
+    // is in flight, and this continuation still holds the stale instance.
+    //
+    // Both effects below have to be gated, for different reasons:
+    //   - `entry.tablesWatched` would mutate an object the store no longer
+    //     holds — harmless but pointless on a removed entry, and actively
+    //     misleading when a replacement now owns the id.
+    //   - `entry.send` is the real hazard. The frame is stamped with
+    //     `entry.id`, and a resubscribe REUSES that id, so a stale invalidate
+    //     is indistinguishable on the wire from one meant for the live
+    //     subscription. The client would refetch on behalf of a subscription
+    //     whose recompute never ran.
+    //
+    // Placed after the try/catch so it covers the failure path too: a
+    // recompute that threw for a dead entry must not send either.
+    if (store.get(entry.id) !== entry) return
+
+    if (tablesRead) entry.tablesWatched = tablesRead
 
     // Deliver the invalidate signal. entry.send is a closure supplied by
     // the per-connection transport adapter; it is built to swallow
