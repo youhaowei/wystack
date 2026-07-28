@@ -23,6 +23,16 @@ export type CallerFromFunctions<T extends Record<string, FunctionDef>> = {
  * `T` is supplied explicitly (mirroring `createApi<T>()`) because `WyStackApp`
  * erases the registry to `Map<string, FunctionDef>` at runtime. The single
  * `as CallerFromFunctions<T>` cast is the one load-bearing trust boundary.
+ *
+ * Behavior change: the returned object is `Object.create(null)` — a
+ * null-prototype dictionary — not a plain object literal (see the comment in
+ * the implementation for why). `CallerFromFunctions<T>` still types it like a
+ * normal object, so nothing here is caught by the compiler. Concretely, on
+ * the returned `caller`: `String(caller)` and template interpolation
+ * (`` `${caller}` ``) throw `TypeError: No default value`; `caller.toString()`
+ * and any other `Object.prototype` method (including `hasOwnProperty`) throw
+ * `TypeError: ... is not a function`; and `caller instanceof Object` is
+ * `false`. Calling `caller.procedureName(args)` is unaffected.
  */
 export function createCaller<T extends Record<string, FunctionDef>>(
   app: WyStackApp,

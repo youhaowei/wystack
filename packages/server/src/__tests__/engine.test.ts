@@ -500,6 +500,53 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(closeCalls).toBe(1)
   })
 
+  // The declared `onClose` type is `(reason) => void`, but TS's void-return
+  // assignability rule lets a consumer pass an `async` function anyway. Its
+  // rejection does not surface through the synchronous `try/catch` around the
+  // call — only an explicit check of the returned value catches it. Unguarded,
+  // this rejection would become an unhandled rejection rather than a logged,
+  // swallowed failure, same failure class as the synchronous-throw case above.
+  test('an async onClose hook that rejects still closes the pipe (no unhandled rejection)', async () => {
+    const app = await makeApp()
+    const [, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+
+    let closeCalls = 0
+    const spyPipe = {
+      id: serverPipe.id,
+      send: (m: ServerMessage) => serverPipe.send(m),
+      onMessage: (h: (m: ClientMessage) => void) => serverPipe.onMessage(h),
+      close: () => {
+        closeCalls++
+        return serverPipe.close()
+      },
+    }
+
+    const unhandled: unknown[] = []
+    const onUnhandledRejection = (err: unknown) => unhandled.push(err)
+    process.on('unhandledRejection', onUnhandledRejection)
+
+    try {
+      attachEngine(spyPipe, {
+        app,
+        resolveContext: async () => ({}),
+        authTimeoutMs: 10,
+        onClose: async () => {
+          throw new Error('consumer async onClose boom')
+        },
+      })
+
+      // Never send an auth frame; let the handshake timer fire.
+      await new Promise((r) => setTimeout(r, 40))
+      // Give the rejected promise's microtask a turn to (not) escape.
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(closeCalls).toBe(1)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection)
+    }
+  })
+
   test('no-auth server arms no handshake timer', async () => {
     const h = await harness({ authTimeoutMs: 10 })
     await new Promise((r) => setTimeout(r, 30))

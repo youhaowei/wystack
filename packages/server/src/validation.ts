@@ -45,7 +45,12 @@ function columnToZod(col: AnyColumnDef): z.ZodType {
 }
 
 export function buildArgsSchema(args: Record<string, AnyColumnDef>): z.ZodType {
-  const shape: Record<string, z.ZodType> = {}
+  // `Object.create(null)` rather than `{}`: arg names come from the author's
+  // `.input({...})` descriptor, and nothing rejects reserved object names (see
+  // caller.ts for the same defect class — `shape['__proto__'] = ...` on a
+  // normal object invokes the legacy prototype setter instead of creating an
+  // own property).
+  const shape: Record<string, z.ZodType> = Object.create(null)
   for (const [key, col] of Object.entries(args)) {
     shape[key] = columnToZod(col)
   }
