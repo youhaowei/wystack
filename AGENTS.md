@@ -68,5 +68,5 @@ bun run check        # lint + format check + typecheck + test
 ## Design
 
 Design docs (a PRD per package, plus Specs) live in the team's internal Notion
-Wiki. The links are kept out of this public repo — see `CLAUDE.local.md`
+Wiki. The links are kept out of this public repo — see `AGENTS.local.md`
 (gitignored) for them. DESIGN.md was retired.
