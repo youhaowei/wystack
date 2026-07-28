@@ -4,13 +4,29 @@
 // every existing `serve()` test drives the BUN entrypoint, so the Node
 // wrapper's bind timing and teardown were only ever exercised indirectly.
 
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, afterAll } from 'bun:test'
 import { WebSocket } from 'ws'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '../index'
 import { serve } from '../serve-node'
+
+// `@hono/node-server`'s serve() replaces `globalThis.Response` with its own
+// optimised subclass the first time it is called — a process-wide side effect,
+// not a per-server one. Every OTHER test file in this suite serves over
+// `Bun.serve`, which validates the handler's return value by identity and
+// rejects the replacement with "Expected a Response object, but received
+// '_Response'". Bun runs the whole suite in one process, so without this the
+// damage is order-dependent: harmless when this file happens to run last (macOS
+// locally) and five unrelated failures when it does not (Linux CI).
+//
+// Capture the native class at load, before anything here calls serve(), and put
+// it back once this file is done.
+const nativeResponse = globalThis.Response
+afterAll(() => {
+  globalThis.Response = nativeResponse
+})
 
 const schema = defineSchema({
   todos: { id: int.primaryKey(), title: text, done: boolean },
