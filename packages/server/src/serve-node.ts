@@ -2,7 +2,14 @@
  * Node server entrypoint — Hono + @hono/node-server + @hono/node-ws.
  *
  * For Electron main process or any Node.js runtime.
- * Returns a wrapper with .port and .stop() matching the Bun API.
+ * Returns a wrapper with .port, .ready and .stop() matching the Bun API.
+ *
+ * Two places where Node does not behave like Bun, both handled here rather
+ * than pushed onto callers:
+ *   - Binding is asynchronous, so `.port` is not accurate until `.ready`
+ *     resolves. Matters only for ephemeral ports (`port: 0`).
+ *   - `closeAllConnections` does not touch sockets upgraded to WebSocket, so
+ *     `.stop(true)` has to terminate them explicitly.
  */
 import { EventEmitter } from 'node:events'
 import type { IncomingMessage, ServerResponse, Server as HttpServer } from 'node:http'
@@ -28,20 +35,83 @@ export function serve(opts: NodeServeOptions): WyStackServer {
   nodeApp.route('/', routes)
 
   let resolvedPort = port
+  let readySettled = false
+  let markReady!: () => void
+  let failReady!: (err: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    markReady = () => {
+      readySettled = true
+      resolve()
+    }
+    failReady = (err) => {
+      readySettled = true
+      reject(err)
+    }
+  })
+
   const server = nodeServe({ fetch: nodeApp.fetch, port, hostname }, (info) => {
     resolvedPort = info.port
+    markReady()
   })
+
+  // A bind failure (EADDRINUSE) would otherwise leave `ready` pending forever.
+  server.on('error', (err: Error) => failReady(err))
+
+  // `ready` is optional for callers, so nothing may ever attach a handler. Mark
+  // it handled here so a bind failure surfaces through the caller's own `await`
+  // (each `.then` chain settles independently) rather than as an unhandled
+  // rejection that crashes the process.
+  void ready.catch(() => {})
 
   injectWebSocket(server)
 
+  // Track upgraded sockets so `stop(true)` can actually terminate them.
+  //
+  // Node's `closeAllConnections` deliberately skips sockets that have been
+  // upgraded off HTTP, so a WebSocket client survives an immediate stop, holds
+  // its resources, and keeps the event loop alive. We attach our OWN 'upgrade'
+  // listener purely to record the socket: 'upgrade' fans out to every listener,
+  // so this observes without competing with the handler `injectWebSocket`
+  // registered. Sockets that @hono/node-ws rejects still emit 'close', which
+  // unregisters them, so the set does not grow unbounded.
+  const upgraded = new Set<Duplex>()
+  server.on('upgrade', (_req: IncomingMessage, socket: Duplex) => {
+    upgraded.add(socket)
+    socket.on('close', () => upgraded.delete(socket))
+  })
+
+  let closed = false
   return {
     get port() {
       return resolvedPort
     },
+    ready,
     stop(immediate = false) {
-      // oxlint-disable-next-line typescript/no-explicit-any -- @hono/node-server doesn't expose closeAllConnections in its types
-      if (immediate) (server as any).closeAllConnections?.()
-      server.close()
+      // Node cancels a pending listen() on close() without ever invoking the
+      // listening callback or emitting 'error' — shutdown racing init (or a
+      // stop() issued right after a startup that never gets to bind) would
+      // otherwise leave `ready` pending forever. Settle it here so a caller
+      // awaiting `ready` observes a rejection instead of hanging.
+      if (!readySettled) {
+        failReady(new Error('Server stopped before startup completed'))
+      }
+      if (immediate) {
+        // oxlint-disable-next-line typescript/no-explicit-any -- @hono/node-server doesn't expose closeAllConnections in its types
+        ;(server as any).closeAllConnections?.()
+        // Matches Bun's `stop(true)`, which terminates active WebSocket
+        // connections too. Graceful stop deliberately leaves them alone.
+        for (const socket of upgraded) socket.destroy()
+        upgraded.clear()
+      }
+      // `server.close()` throws ERR_SERVER_NOT_RUNNING if it is not currently
+      // listening (including a second call after an earlier stop()), so guard
+      // it — callers may legitimately call stop() more than once, e.g. a
+      // graceful stop() followed by an unconditional stop(true) in test
+      // cleanup.
+      if (!closed) {
+        closed = true
+        server.close()
+      }
     },
   }
 }

@@ -2,7 +2,7 @@
  * Hono route definitions for WyStack transport.
  *
  * Routes (default prefix /api):
- *   GET  /api/:fn?args=...  — queries (cacheable, SSR-friendly)
+ *   GET  /api/:fn?args=...  — queries (SSR-friendly; see cache note below)
  *   POST /api/:fn           — mutations (JSON body)
  *   WS   /api/ws            — subscribe/unsubscribe/invalidation
  *
@@ -36,6 +36,12 @@
  * duration of an outage that resolves on its own. The same split applies to the
  * HTTP handlers below, which answer 503 rather than 401. See
  * `IdentityProviderUnavailableError` in `@wystack/identity`.
+ *
+ * Cache note: GET responses are only freely cacheable when `resolveContext` is
+ * omitted. With it configured the body is identity-scoped, so the handler sets
+ * `Cache-Control: private, no-store` before any other work and every exit carries it
+ * — success and every error branch alike. A shared cache keys on the URL alone and
+ * would otherwise serve one tenant's response to another.
  *
  * GOTCHA: Hono creates a new WSContext per event callback. Use ws.raw
  * (the platform socket) as the stable identity key across events.
@@ -261,6 +267,13 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
   // --- HTTP: queries (GET) ---
   hono.get(`${prefix}/:fn`, async (c) => {
+    // Set before any early return so every exit — success and error — carries it,
+    // including the pre-resolve 404/405 exits; one auditable set point beats
+    // per-branch coverage.
+    if (resolveContext) {
+      c.header('Cache-Control', 'private, no-store')
+    }
+
     const functionPath = c.req.param('fn')
     const fn = app.functions.get(functionPath)
 
