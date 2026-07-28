@@ -35,11 +35,18 @@ export function serve(opts: NodeServeOptions): WyStackServer {
   nodeApp.route('/', routes)
 
   let resolvedPort = port
+  let readySettled = false
   let markReady!: () => void
   let failReady!: (err: Error) => void
   const ready = new Promise<void>((resolve, reject) => {
-    markReady = resolve
-    failReady = reject
+    markReady = () => {
+      readySettled = true
+      resolve()
+    }
+    failReady = (err) => {
+      readySettled = true
+      reject(err)
+    }
   })
 
   const server = nodeServe({ fetch: nodeApp.fetch, port, hostname }, (info) => {
@@ -73,12 +80,21 @@ export function serve(opts: NodeServeOptions): WyStackServer {
     socket.on('close', () => upgraded.delete(socket))
   })
 
+  let closed = false
   return {
     get port() {
       return resolvedPort
     },
     ready,
     stop(immediate = false) {
+      // Node cancels a pending listen() on close() without ever invoking the
+      // listening callback or emitting 'error' — shutdown racing init (or a
+      // stop() issued right after a startup that never gets to bind) would
+      // otherwise leave `ready` pending forever. Settle it here so a caller
+      // awaiting `ready` observes a rejection instead of hanging.
+      if (!readySettled) {
+        failReady(new Error('Server stopped before startup completed'))
+      }
       if (immediate) {
         // oxlint-disable-next-line typescript/no-explicit-any -- @hono/node-server doesn't expose closeAllConnections in its types
         ;(server as any).closeAllConnections?.()
@@ -87,7 +103,15 @@ export function serve(opts: NodeServeOptions): WyStackServer {
         for (const socket of upgraded) socket.destroy()
         upgraded.clear()
       }
-      server.close()
+      // `server.close()` throws ERR_SERVER_NOT_RUNNING if it is not currently
+      // listening (including a second call after an earlier stop()), so guard
+      // it — callers may legitimately call stop() more than once, e.g. a
+      // graceful stop() followed by an unconditional stop(true) in test
+      // cleanup.
+      if (!closed) {
+        closed = true
+        server.close()
+      }
     },
   }
 }

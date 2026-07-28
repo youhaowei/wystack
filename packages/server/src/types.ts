@@ -87,7 +87,8 @@ export interface WyStackServer {
   port: number
   /**
    * Resolves once the server is listening and `port` is accurate; rejects if
-   * binding fails (e.g. the port is already in use).
+   * binding fails (e.g. the port is already in use) or if `stop()` is called
+   * before binding completes (shutdown racing initialization).
    *
    * Exists because the two runtimes disagree on when binding completes — this
    * is the seam that lets a caller be correct on both without branching.

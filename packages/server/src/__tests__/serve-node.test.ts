@@ -5,6 +5,7 @@
 // wrapper's bind timing and teardown were only ever exercised indirectly.
 
 import { describe, test, expect, afterAll } from 'bun:test'
+import { Server } from 'node:http'
 import { WebSocket } from 'ws'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
@@ -110,42 +111,90 @@ describe('serve (Node) — bind readiness', () => {
       first.stop(true)
     }
   })
-})
 
-// COVERAGE CAVEAT — read before trusting these two tests.
-//
-// They pass with OR without the explicit socket teardown in serve-node, so
-// under `bun test` they are not regression tests. Bun's `node:http` shim closes
-// upgraded sockets on `closeAllConnections()`; real Node does not, and real
-// Node is the only runtime `serve-node` exists for (Electron main).
-//
-// The defect and the fix were verified directly against Node v25.8.2:
-//   closeAllConnections() + close()  → websocket still open   (the bug)
-//   explicit destroy of the socket   → websocket closed       (the fix)
-//
-// Kept because they pin intent and would catch a regression if the suite ever
-// runs on Node. They must NOT be read as proof on Bun. Closing this gap needs a
-// real-Node test runner for this file — there is currently none.
-describe('serve (Node) — teardown', () => {
-  test('stop(true) terminates upgraded WebSocket connections', async () => {
+  // Node cancels a pending listen() on close() silently — no listening
+  // callback, no 'error' — so a stop() issued while startup is still in
+  // flight (shutdown racing init, or cleanup after a startup that never
+  // finished binding) would otherwise leave `ready` pending forever. Bounded
+  // by a race against a timer so a regression fails this assertion instead of
+  // hanging the test run.
+  test('ready settles when stop() races startup', async () => {
     const app = await makeApp()
     const server = serve({ app, port: 0 })
-    await server.ready
 
-    const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
-    await new Promise<void>((resolve, reject) => {
-      ws.on('open', () => resolve())
-      ws.on('error', reject)
-    })
-
-    let closed = false
-    ws.on('close', () => {
-      closed = true
-    })
-
+    // Stop immediately — before the async listen() has any chance to land.
     server.stop(true)
 
-    expect(await until(() => closed)).toBe(true)
+    let outcome: 'resolved' | 'rejected' | 'timed-out' = 'timed-out'
+    let rejection: unknown
+    await Promise.race([
+      server.ready.then(
+        () => {
+          outcome = 'resolved'
+        },
+        (err) => {
+          outcome = 'rejected'
+          rejection = err
+        },
+      ),
+      new Promise<void>((resolve) => setTimeout(resolve, 1000)),
+    ])
+
+    expect(outcome).not.toBe('timed-out')
+    // Rejecting (rather than resolving to a "stopped" state) matches the
+    // existing bind-failure path and surfaces at the caller's own `await`.
+    expect(outcome).toBe('rejected')
+    expect(rejection).toBeInstanceOf(Error)
+  })
+})
+
+// Bun's `node:http` shim closes upgraded sockets as a side effect of
+// `closeAllConnections()`; real Node's does not — which is exactly why
+// `stop(true)` has to destroy them itself (see serve-node.ts). Left alone,
+// that means "stop(true) terminates upgraded WebSocket connections" below
+// would pass under `bun test` with or without serve-node's own destroy loop:
+// Bun's shim papers over the bug this suite exists to catch.
+//
+// So that test stubs `Server.prototype.closeAllConnections` to a no-op for
+// its duration, removing Bun's shim from the equation. What is left standing
+// is only serve-node's explicit `socket.destroy()` loop — verified by
+// deleting that loop locally and watching this test fail under `bun test`
+// (previously it would still pass). The complement test (graceful stop) needs
+// no such stub: it asserts the ABSENCE of teardown, which does not depend on
+// which runtime's `closeAllConnections` shim is in play.
+describe('serve (Node) — teardown', () => {
+  test('stop(true) explicitly destroys upgraded sockets', async () => {
+    const app = await makeApp()
+    const server = serve({ app, port: 0 })
+    let ws: WebSocket | undefined
+
+    const originalCloseAllConnections = Server.prototype.closeAllConnections
+    Server.prototype.closeAllConnections = function () {
+      // no-op — see the block comment above.
+    }
+
+    try {
+      await server.ready
+
+      ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
+      await new Promise<void>((resolve, reject) => {
+        ws!.on('open', () => resolve())
+        ws!.on('error', reject)
+      })
+
+      let closed = false
+      ws.on('close', () => {
+        closed = true
+      })
+
+      server.stop(true)
+
+      expect(await until(() => closed)).toBe(true)
+    } finally {
+      Server.prototype.closeAllConnections = originalCloseAllConnections
+      ws?.close()
+      server.stop(true)
+    }
   })
 
   // The complement: graceful stop deliberately leaves live sockets alone, which
@@ -154,26 +203,30 @@ describe('serve (Node) — teardown', () => {
   test('stop() without immediate leaves an open WebSocket connected', async () => {
     const app = await makeApp()
     const server = serve({ app, port: 0 })
-    await server.ready
+    let ws: WebSocket | undefined
 
-    const ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
-    await new Promise<void>((resolve, reject) => {
-      ws.on('open', () => resolve())
-      ws.on('error', reject)
-    })
+    try {
+      await server.ready
 
-    let closed = false
-    ws.on('close', () => {
-      closed = true
-    })
+      ws = new WebSocket(`ws://localhost:${server.port}/api/ws`)
+      await new Promise<void>((resolve, reject) => {
+        ws!.on('open', () => resolve())
+        ws!.on('error', reject)
+      })
 
-    server.stop()
+      let closed = false
+      ws.on('close', () => {
+        closed = true
+      })
 
-    // Give a close a fair chance to arrive before asserting it did not.
-    await new Promise((r) => setTimeout(r, 150))
-    expect(closed).toBe(false)
+      server.stop()
 
-    ws.close()
-    server.stop(true)
+      // Give a close a fair chance to arrive before asserting it did not.
+      await new Promise((r) => setTimeout(r, 150))
+      expect(closed).toBe(false)
+    } finally {
+      ws?.close()
+      server.stop(true)
+    }
   })
 })
