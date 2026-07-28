@@ -27,9 +27,25 @@ export interface AttachEngineOptions extends SessionOptions {
   authTimeoutMs?: number
   /**
    * Invoked just before the Engine closes the pipe, with the transport-neutral
-   * reason. The adapter maps it to a wire close (`auth-failed → 4001`,
-   * `transient → 4002`). Optional — trusted transports may ignore it. The
-   * Engine always also calls `pipe.close()` after this hook.
+   * reason. Not awaited — the Engine does not wait for it to settle before
+   * calling `pipe.close()`, so it must not depend on async work finishing
+   * before the connection closes.
+   *
+   * A synchronous throw is caught and logged (`console.error`). If the hook
+   * returns a promise (the type is `void`, but TS allows passing an `async`
+   * function here), a rejection is caught and logged the same way rather than
+   * surfacing as an unhandled rejection. Either way it is never rethrown and
+   * never blocks or delays the close: the Engine's own `pipe.close()` always
+   * runs synchronously afterward, whether this hook ran cleanly, threw,
+   * rejected later, or was omitted entirely.
+   *
+   * The Engine's own `pipe.close()` call carries no wire close code, so this
+   * hook is where one gets set, via whatever the adapter does before
+   * returning — the shipped WS adapter's `mapCloseCode` calls
+   * `ws.close(code, reason)` here, mapping `auth-failed → 4001`,
+   * `transient → 4002`, which the client depends on to tell a terminal auth
+   * failure from a retryable one. Optional — trusted or non-WS transports may
+   * ignore it and let the Engine's codeless `pipe.close()` be the only close.
    */
   onClose?: (reason: CloseReason) => void
   /**
@@ -182,8 +198,54 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   const closeWith = (reason: CloseReason): void => {
     if (closed) return
     teardown()
-    onClose?.(reason)
-    void pipe.close()
+    // `onClose` is consumer-supplied and may throw. Unguarded, that throw would
+    // skip `pipe.close()` entirely — and `teardown()` has already flipped the
+    // `closed` guard and dropped the inbound handler, so a later `detach()` is a
+    // no-op. The transport would stay open with nothing able to close it, which
+    // contradicts the documented contract that the engine always closes the pipe
+    // after invoking the hook.
+    //
+    // On the auth-timeout path it is worse: `closeWith` runs inside an unguarded
+    // `setTimeout`, so the throw escapes as an uncaught exception and takes down
+    // the host process (the Electron main process, for that adapter).
+    //
+    // The hook is not a mere diagnostic on the shipped WS adapter: `routes.ts`'s
+    // `mapCloseCode` IS the WS `onClose` — it stamps the wire close code
+    // (`auth-failed` → 4001, `transient` → 4002) that the client latches onto to
+    // tell a terminal auth failure from a retryable one (`client/src/engine.ts`).
+    // A throw here that skipped `pipe.close()`, or fell through to a codeless
+    // close, would turn a terminal auth failure into a close the client retries
+    // forever — the exact retry-storm behaviour `eafc468`/`86c0bab` removed.
+    // Swallow the throw and report it; still close.
+    //
+    // The declared signature returns `void`, but TS's void-return assignability
+    // rule lets a consumer pass an `async` function anyway — so a synchronous
+    // throw is not the only failure mode; the returned value (typed `void`,
+    // possibly actually a `Promise`) is checked too, mirroring the `send` guard
+    // above. The Engine does not await it either way: close is not delayed
+    // waiting for the hook to settle, only the failure is caught and logged.
+    try {
+      const result = onClose?.(reason) as unknown
+      if (result instanceof Promise) {
+        result.catch((err: unknown) =>
+          console.error('[wystack/server] engine onClose rejected', err),
+        )
+      }
+    } catch (err) {
+      console.error('[wystack/server] engine onClose threw', err)
+    } finally {
+      // `pipe.close()` is documented as idempotent and never-throwing
+      // (`@wystack/transport`'s `Pipe.close`), and all three in-repo
+      // implementations honor that — so this guard is defence-in-depth against
+      // a hypothetical non-conformant adapter, mirroring the `send` guard above
+      // (catch both a synchronous throw and a rejected promise).
+      try {
+        const r = pipe.close()
+        if (r instanceof Promise) r.catch(() => {})
+      } catch {
+        /* pipe already closed, or a non-conformant adapter threw */
+      }
+    }
   }
 
   // Arm the handshake timer only when auth is required. A client that never
@@ -447,7 +509,15 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     detach() {
       if (closed) return
       teardown()
-      void pipe.close()
+      // Same defence-in-depth guard as `closeWith` (see there for the full
+      // rationale) — no `onClose` hook on this path, just `pipe.close()`
+      // itself against a hypothetical non-conformant adapter.
+      try {
+        const r = pipe.close()
+        if (r instanceof Promise) r.catch(() => {})
+      } catch {
+        /* pipe already closed, or a non-conformant adapter threw */
+      }
     },
   }
 }

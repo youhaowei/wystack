@@ -47,6 +47,40 @@ describe('createCaller', () => {
 
     await expect(caller.whoami({})).resolves.toBe('user-1')
   })
+
+  // Registration accepts any string as a procedure path, including names that
+  // are special on a normal object. `createCaller` built its dictionary with
+  // `{}`, so `caller['__proto__'] = fn` hit the legacy prototype setter: the
+  // property was never created and the object's prototype was replaced instead.
+  // A null-prototype dictionary has no such setter.
+  //
+  // The COMPUTED key matters. A plain `{ __proto__: fn }` literal is itself the
+  // prototype setter, so the procedure would never reach the registry and the
+  // test would pass vacuously; `{ ['__proto__']: fn }` creates a real own
+  // property, which is the only way this reaches `createCaller` at all.
+  //
+  // Red before the fix — but via the LAST assertion, not the obvious one.
+  // `caller['__proto__'] = fn` set the dictionary's prototype to `fn`, and
+  // reading `caller['__proto__']` then returns that same prototype, so the
+  // lookup and the call both appear to work. The visible damage is the
+  // corrupted prototype: every unrelated key now resolves through a function
+  // object. That is why the prototype is asserted explicitly — checking only
+  // callability would have passed against the bug.
+  test('a procedure named __proto__ is callable and does not corrupt the caller', async () => {
+    const reserved = {
+      ['__proto__']: wy.procedure.input({}).query(async () => 'reserved-name-ok'),
+    }
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    const protoApp = await wy.build({ db, functions: reserved })
+    const caller = createCaller<typeof reserved>(protoApp, {})
+
+    const bag = caller as unknown as Record<string, (a: object) => Promise<unknown>>
+    expect(typeof bag['__proto__']).toBe('function')
+    await expect(bag['__proto__']({})).resolves.toBe('reserved-name-ok')
+    // The dictionary itself must be uncorrupted — a null-prototype object.
+    expect(Object.getPrototypeOf(caller)).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------

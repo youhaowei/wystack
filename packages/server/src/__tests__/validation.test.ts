@@ -100,6 +100,22 @@ describe('buildArgsSchema', () => {
     expect(schema.safeParse({ id: 1, title: 'Task', done: true }).success).toBe(true)
     expect(schema.safeParse({ id: 1 }).success).toBe(false) // missing title
   })
+
+  // Same defect class as caller.test.ts's `__proto__` case: an arg named
+  // `__proto__` must reach the schema as a validated field, not silently
+  // vanish into the shape dictionary's prototype. The COMPUTED key matters
+  // here too — a plain `{ __proto__: text }` literal is itself the prototype
+  // setter and would never reach `buildArgsSchema`'s `Object.entries` loop.
+  test('an arg named __proto__ validates like any other field', () => {
+    const schema = buildArgsSchema({ ['__proto__']: text })
+    // The computed key matters on the input too: a plain `{ __proto__: ... }`
+    // literal sets the object's prototype instead of creating an own
+    // property (a string isn't a valid prototype, so it's silently ignored),
+    // which would make this assert against an accidentally-empty object.
+    const withProto = { ['__proto__']: 'hello' } as Record<string, unknown>
+    expect(schema.safeParse(withProto).success).toBe(true)
+    expect(schema.safeParse({} as Record<string, unknown>).success).toBe(false)
+  })
 })
 
 // --- Integration tests: validation in call() ---
