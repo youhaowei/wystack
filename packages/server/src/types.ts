@@ -75,6 +75,23 @@ export type FunctionDef = QueryDef | MutationDef
 export type DbInput = string | DbConfig | object
 
 export interface WyStackServer {
+  /**
+   * The bound port. Only meaningful once `ready` has resolved.
+   *
+   * Bun binds synchronously, so under `serve-bun` this is correct the instant
+   * `serve()` returns. Node does not: `@hono/node-server` reports the assigned
+   * port in an asynchronous `listening` callback, so with `port: 0` (ephemeral)
+   * this reads `0` until that callback runs. Await `ready` before building a
+   * URL from it if the port might be ephemeral.
+   */
   port: number
+  /**
+   * Resolves once the server is listening and `port` is accurate; rejects if
+   * binding fails (e.g. the port is already in use).
+   *
+   * Exists because the two runtimes disagree on when binding completes — this
+   * is the seam that lets a caller be correct on both without branching.
+   */
+  ready: Promise<void>
   stop(immediate?: boolean): void
 }
