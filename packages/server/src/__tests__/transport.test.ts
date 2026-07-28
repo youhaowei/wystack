@@ -156,6 +156,14 @@ describe('HTTP transport', () => {
     expect(json.data).toEqual([])
   })
 
+  test('GET without resolveContext leaves the response ordinarily cacheable', async () => {
+    // The default `server` has no resolveContext: the body is identity-free, so the
+    // handler must NOT force `private, no-store` — that would defeat SSR/CDN caching for
+    // the one deployment shape where sharing a response between clients is correct.
+    const res = await fetch(`${baseUrl}/api/listTodos`)
+    expect(res.headers.get('cache-control')).toBeNull()
+  })
+
   test('POST /api/addTodo creates a todo', async () => {
     const res = await fetch(`${baseUrl}/api/addTodo`, {
       method: 'POST',
@@ -215,6 +223,9 @@ describe('HTTP transport', () => {
         headers: { Authorization: 'Bearer denied-user' },
       })
       expect(denied.status).toBe(403)
+      // resolveContext is configured here, so this 403 is an identity-scoped GET exit —
+      // it must carry the header too, not just the 200 path (see routes.ts cache note).
+      expect(denied.headers.get('cache-control')).toBe('private, no-store')
 
       const allowed = await fetch(`http://localhost:${authServer.port}/api/protectedQuery`, {
         headers: { Authorization: 'Bearer allowed-user' },
@@ -240,6 +251,31 @@ describe('HTTP transport', () => {
         },
       )
       expect(allowedMutation.status).toBe(200)
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('GET with resolveContext forbids shared caching of the identity-scoped body', async () => {
+    // With resolveContext the same URL yields different bodies per tenant. A shared
+    // cache keys on the URL alone, so without `private, no-store` it can hand tenant A's
+    // response to tenant B. This pins the header the handler must emit to close that leak.
+    const app = await makeAuthApp()
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const userId = req.headers.get('authorization')?.replace('Bearer ', '')
+        return { userId }
+      },
+    })
+
+    try {
+      const res = await fetch(`http://localhost:${authServer.port}/api/listTodos`, {
+        headers: { Authorization: 'Bearer user_123' },
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('cache-control')).toBe('private, no-store')
     } finally {
       authServer.stop(true)
     }
@@ -282,6 +318,10 @@ describe('HTTP transport', () => {
         headers: { Authorization: 'Bearer outage' },
       })
       expect(outage.status).toBe(503)
+      // This 503 comes from resolveContext throwing, before app.call ever runs — the
+      // header must still be present, or a shared cache can retain the outage response
+      // and replay it at this URL for a different tenant.
+      expect(outage.headers.get('cache-control')).toBe('private, no-store')
 
       const outagePost = await fetch(`${base}/noop`, {
         method: 'POST',
@@ -294,6 +334,58 @@ describe('HTTP transport', () => {
       // be a 401, or the fix would be satisfied by calling everything retryable.
       const rejected = await fetch(`${base}/whoami`)
       expect(rejected.status).toBe(401)
+      // Same bypass risk as the 503 above: resolveContext's 401 also precedes app.call.
+      expect(rejected.headers.get('cache-control')).toBe('private, no-store')
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
+  test('identity-scoped GET error exits (401 post-resolve, 400, 500) all carry private, no-store', async () => {
+    // The 403 and resolveContext-level 401/503 exits are pinned above. This covers the
+    // remaining identity-scoped GET error branches from routes.ts: AuthenticationRequiredError
+    // (401 after resolveContext succeeds but yields no principal), a malformed `args` query
+    // param (400), and an unclassified throw from the function body (500). All three happen
+    // on a server with resolveContext configured, so all three must carry the header — the
+    // fix sets it once at the top of the handler, before any of these branches run.
+    const db = await createDb({ dev: 'pglite://' })
+    const app = await wy.build({
+      db,
+      functions: {
+        protectedQuery: wy.procedure
+          .use(requireAuth)
+          .input({})
+          .query(async () => ({ ok: true })),
+        whoami: wy.procedure.input({}).query(async (ctx) => ({ userId: ctx.userId })),
+        broken: wy.procedure.input({}).query(async () => {
+          throw new Error('boom')
+        }),
+      },
+    })
+
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const token = req.headers.get('authorization')?.replace('Bearer ', '')
+        return { userId: token }
+      },
+    })
+
+    try {
+      const base = `http://localhost:${authServer.port}/api`
+
+      const unauthenticated = await fetch(`${base}/protectedQuery`)
+      expect(unauthenticated.status).toBe(401)
+      expect(unauthenticated.headers.get('cache-control')).toBe('private, no-store')
+
+      const badArgs = await fetch(`${base}/whoami?args=not-json`)
+      expect(badArgs.status).toBe(400)
+      expect(badArgs.headers.get('cache-control')).toBe('private, no-store')
+
+      const serverError = await fetch(`${base}/broken`)
+      expect(serverError.status).toBe(500)
+      expect(serverError.headers.get('cache-control')).toBe('private, no-store')
     } finally {
       authServer.stop(true)
     }
