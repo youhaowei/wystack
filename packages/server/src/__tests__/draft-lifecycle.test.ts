@@ -785,6 +785,62 @@ describe('draft lifecycle — invalidation fan-out', () => {
     expect(cap.emitted).toEqual([])
     cap.unsubscribe()
   })
+
+  test('atomic discard: a partial-table sweep failure leaves every shadow table untouched (no silent partial invalidation)', async () => {
+    // discard's sweep issues one DELETE per touched table. If a draft touched
+    // MULTIPLE tables and a later delete in that loop fails, an unwrapped sweep
+    // would already have durably committed the earlier deletes (auto-commit
+    // per statement) while throwing before `app.emit` ever runs — a durable
+    // state change with zero invalidation. Subscribers watching the
+    // already-cleared table would keep serving rows that are gone.
+    //
+    // The fix wraps the whole sweep in one transaction: either every touched
+    // table's shadow rows clear (and their tags reach the emit) or none does.
+    // `addTodo` is appended before `addToDashboard`, so `touchedTables` records
+    // `todos` before `dashboards` — the sweep attempts `todos__draft` FIRST.
+    // Dropping `dashboards__draft` makes the SECOND delete in that loop fail;
+    // an unwrapped sweep would have already committed the first.
+    const lc = createDraftLifecycle(app)
+    const draftId = lc.open(0)
+    await lc.append(draftId, [
+      { path: 'addTodo', args: { id: 3, title: 'cherry' } },
+      { path: 'addToDashboard', args: { dashboardId: 1, item: 'x' } },
+    ])
+
+    await db.execute(`DROP TABLE dashboards__draft`)
+
+    const cap = captureEmits()
+    await expect(lc.discard(draftId)).rejects.toThrow()
+
+    // The `todos__draft` row must STILL be present — the sweep must not have
+    // durably deleted it before failing on `dashboards__draft`.
+    const shadow = await db.execute(`SELECT * FROM todos__draft WHERE draft_id = '${draftId}'`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((shadow as any).rows).toHaveLength(1)
+
+    // Nothing durably changed, so nothing should have been announced.
+    expect(cap.emitted).toEqual([])
+    cap.unsubscribe()
+
+    // The draft stays live and retryable, symmetric with a failed publish.
+    expect(lc.getLog(draftId)).toHaveLength(2)
+
+    // Recreate the dropped table and retry: the sweep now succeeds fully and
+    // announces both shadow tags.
+    await db.execute(`
+      CREATE TABLE dashboards__draft (
+        draft_id TEXT NOT NULL, id INTEGER NOT NULL, items TEXT,
+        __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id))
+    `)
+    const cap2 = captureEmits()
+    await lc.discard(draftId)
+    expect(cap2.tags()).toEqual(['dashboards__draft', 'todos__draft'])
+    cap2.unsubscribe()
+
+    const shadowAfter = await db.execute(`SELECT * FROM todos__draft WHERE draft_id = '${draftId}'`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((shadowAfter as any).rows).toHaveLength(0)
+  })
 })
 
 describe('draft lifecycle — replacing a canonical row (#89)', () => {

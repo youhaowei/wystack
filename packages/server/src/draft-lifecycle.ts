@@ -609,9 +609,21 @@ export function createDraftLifecycle(
       entry.state = 'discarding'
       try {
         return await withDraftLock(entry, async () => {
-          // Discard has no replay to be atomic with — a fresh connection suffices.
+          // Discard has no replay to be atomic with, but the sweep itself still
+          // needs a commit boundary: `clearShadow` issues one DELETE per
+          // touched table, and each statement auto-commits on its own
+          // connection. A multi-table draft whose sweep fails partway (a later
+          // DELETE errors) would otherwise leave the EARLIER deletes durably
+          // committed — visible state changed — while the catch below resets
+          // the draft to 'open' and no invalidation is ever emitted for those
+          // tables. Subscribers keep serving rows that are already gone.
+          // Wrapping the sweep in one transaction makes it all-or-nothing:
+          // either every touched shadow table clears (and its tag reaches the
+          // emit below) or none does, and the draft stays live/retryable.
           const touched = [...entry.touchedTables.values()]
-          await clearShadow(app.createTracked().raw, draftId, touched)
+          await app.createTracked().transaction(async (tx) => {
+            await clearShadow(tx.raw, draftId, touched)
+          })
           drafts.delete(draftId)
           // Canonical is untouched, but the overlay rows are gone — draft-scoped
           // subscriptions are stale and must be told. Empty for a read-only
@@ -724,11 +736,14 @@ async function enumerateTouchedCells(
  * Delete a draft's shadow rows across every table it touched. `draftId` bound.
  *
  * Accepts a `raw` Drizzle db handle directly (rather than a `WyStackApp`) so
- * the caller can pass a tx-bound handle and share the commit boundary with the
- * command replay. When called from `publish`, `raw` is `tx.raw` inside the outer
- * transaction — sweep and replay commit atomically. For `discard`, a
- * fresh connection (`app.createTracked().raw`) is fine since discard has no
- * replay to be atomic with.
+ * the caller can pass a tx-bound handle and share a commit boundary. When
+ * called from `publish`, `raw` is `tx.raw` inside the outer transaction —
+ * sweep and replay commit atomically. When called from `discard`, `raw` is
+ * `tx.raw` inside a transaction scoped to the sweep alone (no replay to share
+ * it with) — still required because this function issues one DELETE per
+ * touched table, and without a shared commit boundary a failure partway
+ * through would leave earlier tables' deletes durably committed with no
+ * invalidation ever emitted for them.
  */
 async function clearShadow(
   // oxlint-disable-next-line typescript/no-explicit-any -- DrizzleDb is `any` in @wystack/db
