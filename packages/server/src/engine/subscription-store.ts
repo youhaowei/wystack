@@ -36,6 +36,15 @@ export interface SubscriptionStore {
    */
   add(entry: SubscriptionEntry): void
   remove(id: string): void
+  /**
+   * MUST return the identical object instance previously returned by
+   * `getAffected`/`add` for this id, never a copy or proxy: the invalidation
+   * router compares `store.get(entry.id) !== entry` by reference identity
+   * across an await to detect that an entry was removed or replaced, so any
+   * implementation that hands back a distinct instance per call (e.g. a
+   * distributed store that proxies or deserializes) breaks that check for
+   * every live entry and silently drops every invalidation.
+   */
   get(id: string): SubscriptionEntry | undefined
   getAffected(writtenTables: Set<string>): SubscriptionEntry[]
   size(): number
