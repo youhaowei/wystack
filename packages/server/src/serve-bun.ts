@@ -31,6 +31,10 @@ export function serve(opts: BunServeOptions): WyStackServer {
     get port() {
       return server.port ?? port
     },
+    // Bun.serve binds synchronously — `server.port` is already accurate here,
+    // so readiness is immediate. The field exists for parity with serve-node,
+    // where binding is asynchronous.
+    ready: Promise.resolve(),
     stop(immediate = false) {
       server.stop(immediate)
     },
