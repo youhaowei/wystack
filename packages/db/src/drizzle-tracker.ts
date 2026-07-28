@@ -89,7 +89,7 @@ export interface DrizzleTracker {
    * builds on, but preview is not fully served by this signature alone: rollback
    * only happens via a throw, which destroys the `R` return channel — a preview
    * that must roll back *and* return a diff has to smuggle the diff through a
-   * thrown sentinel. The diff-returning preview contract is YW-124's to design;
+   * thrown sentinel. The diff-returning preview contract is a later layer's to design;
    * this primitive only guarantees the atomicity + no-emit-on-rollback floor.
    *
    * Atomicity is the lowering's native transaction; this only adds Tag-tracking
@@ -266,7 +266,7 @@ export class SelectBuilder<T extends AnyTable> {
  * was row-filtered when it was not (an auth/authz hazard). An UNFILTERED `.all()`
  * returns the full coalesced set, as before.
  *
- * `orderBy`/`limit` still THROW immediately (not yet pushed down; YW-120 scope).
+ * `orderBy`/`limit` still THROW immediately (not yet pushed down).
  *
  * WRITE side (`.where(eqPk).update(vals)` / `.where(eqPk).delete()`): routes the
  * mutation into the `<table>__draft` shadow as a sparse upsert (update) or
@@ -303,14 +303,12 @@ export class DraftSelectBuilder<T extends AnyTable> {
 
   orderBy(_col: string, _dir: 'asc' | 'desc' = 'asc'): this {
     throw new Error(
-      'DraftSelectBuilder.orderBy() is not yet implemented (YW-120 scope: coalesce primitive only).',
+      'DraftSelectBuilder.orderBy() is not yet implemented (coalesce primitive only).',
     )
   }
 
   limit(_n: number): this {
-    throw new Error(
-      'DraftSelectBuilder.limit() is not yet implemented (YW-120 scope: coalesce primitive only).',
-    )
+    throw new Error('DraftSelectBuilder.limit() is not yet implemented (coalesce primitive only).')
   }
 
   /**

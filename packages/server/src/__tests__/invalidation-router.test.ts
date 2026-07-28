@@ -1,4 +1,4 @@
-// Per-sub serialization queue tests — YW-64 / TASK-646 T10
+// Per-sub serialization queue tests
 //
 // Drives the router in isolation (no Engine, no Pipe): custom recompute
 // functions with controlled timing via deferred Promises.
@@ -41,7 +41,7 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 25; i++) await Promise.resolve()
 }
 
-describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
+describe('InvalidationRouter — per-sub serialization queue', () => {
   // ---------------------------------------------------------------------------
   // Race test (the core AC): two invalidations for the SAME subscription with
   // controlled recompute timing. Resolving the deferreds in REVERSE order
@@ -244,7 +244,7 @@ describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
   // stays matched on every `getAffected` call.
   // ---------------------------------------------------------------------------
   // ---------------------------------------------------------------------------
-  // Reused-id replacement (YW-108): a client reconnects and resubscribes with
+  // Reused-id replacement: a client reconnects and resubscribes with
   // the SAME id, producing a fresh entry instance (the store replaces the old
   // one). The replacement's recompute must NOT chain behind the dead
   // predecessor's tail — a hung predecessor must not block its replacement.
@@ -257,7 +257,7 @@ describe('InvalidationRouter — per-sub serialization queue (YW-64)', () => {
   // Critically, the recompute branches on OBJECT IDENTITY (entry === entryA),
   // not on entry.id — both entries share id 's1', so id cannot distinguish them.
   // ---------------------------------------------------------------------------
-  test('reused-id replacement entry does not chain behind a hung predecessor (YW-108)', async () => {
+  test('reused-id replacement entry does not chain behind a hung predecessor', async () => {
     const store = createInMemorySubscriptionStore()
     const { source, emit } = createDispatchInvalidationSource()
 
