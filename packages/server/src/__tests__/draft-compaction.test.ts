@@ -4,6 +4,7 @@
  * `compactLog` collapses runs that share a `compactionKey` to NET EFFECT:
  *   - create then delete (same key)        → both removed (never existed)
  *   - create/update then update (same key) → the LATER kept
+ *   - delete of a CANONICAL row then create → BOTH kept, in order (a replace)
  *   - keyless commands                     → never compacted, order preserved
  *
  * The key is OPAQUE (the app mints it, e.g. `${path}:${args.id}`); compaction is
@@ -126,5 +127,65 @@ describe('compactLog — net-effect collapse', () => {
     const out = compactLog(log)
     expect(out).toHaveLength(1)
     expect((out[0].args as { title: string }).title).toBe('b')
+  })
+
+  // --- replacing a CANONICAL row: delete-then-create (#89) ---------------
+  //
+  // The mirror image of `create → delete → create`. There the leading create is
+  // draft-local, so nothing canonical exists and only the final create survives.
+  // Here the leading DELETE targets a row that already exists canonically, so it
+  // has to survive alongside the create — dropping it publishes an insert onto a
+  // live primary key. The two cases are distinguished by whether the key had a
+  // live draft-local create when the delete was appended.
+
+  test('delete of a CANONICAL row then create on the same key keeps BOTH, in order', () => {
+    const log: DraftCommand[] = [
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      {
+        path: 'addTodo',
+        args: { id: 1, title: 'replacement' },
+        compactionKey: 'todo:1',
+        kind: 'create',
+      },
+    ]
+    const out = compactLog(log)
+    expect(out.map((c) => c.kind)).toEqual(['delete', 'create'])
+    expect((out[1].args as { title: string }).title).toBe('replacement')
+  })
+
+  test('canonical delete + create + update keeps all three, in order', () => {
+    const log: DraftCommand[] = [
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
+    ]
+    expect(compactLog(log).map((c) => c.kind)).toEqual(['delete', 'create', 'update'])
+  })
+
+  test('canonical delete + create + delete collapses to the canonical delete alone', () => {
+    // The second delete cancels the draft-local create (that row never existed
+    // canonically), but must NOT also cancel the FIRST delete — the canonical
+    // row still has to go, and the net effect of the draft is a removal.
+    const log: DraftCommand[] = [
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+    ]
+    const out = compactLog(log)
+    expect(out.map((c) => c.kind)).toEqual(['delete'])
+    expect(out[0]).toBe(log[0]) // the FIRST delete — the one that targets canonical
+  })
+
+  test('compaction is idempotent for the canonical-replace case', () => {
+    // `append` re-compacts the whole accumulated log every batch, so a second
+    // pass over an already-compacted log must be a no-op — otherwise the
+    // surviving delete + create would collapse further on the next append.
+    const log: DraftCommand[] = [
+      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+    ]
+    const once = compactLog(log)
+    expect(compactLog(once)).toEqual(once)
   })
 })

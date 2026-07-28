@@ -207,7 +207,8 @@ describe('InvalidationRouter — per-sub serialization queue', () => {
       resolveGate = r
     })
 
-    const entry = makeEntry('sub1', ['todos'])
+    const sent: unknown[] = []
+    const entry = makeEntry('sub1', ['todos'], (p) => sent.push(p))
     store.add(entry)
 
     let computedCalls = 0
@@ -221,19 +222,120 @@ describe('InvalidationRouter — per-sub serialization queue', () => {
       },
     })
 
-    // Emit while the sub is live — recompute starts but blocks on gate.
+    // Emit while the sub is live — the chain link is built synchronously here,
+    // but `processOne` itself does not run until a microtask later.
     emit(new Set(['todos']))
 
-    // Remove the sub BEFORE the gate resolves.
+    // Remove the sub BEFORE that microtask runs.
     store.remove('sub1')
 
-    // Resolve the gate — the in-flight recompute completes.
     resolveGate()
     await flush()
 
-    // Must not crash. The recompute ran (fire-and-forget; started before remove).
-    // The tail self-cleans via the `.finally` drain guard.
-    expect(computedCalls).toBe(1)
+    // The recompute is SKIPPED: `processOne` re-checks liveness before doing any
+    // work, and by the time it ran the sub was gone. Previously it recomputed
+    // anyway — a full database round-trip whose result went to a `send` nobody
+    // was listening on, once per stale entry per write. Must still not crash,
+    // and the tail still self-cleans via the `.finally` drain guard.
+    expect(computedCalls).toBe(0)
+    expect(sent).toHaveLength(0)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Liveness during the await, not just before it.
+  //
+  // The check above runs before `recompute`, so it only proves the entry was
+  // live when the query STARTED. `recompute` is an await point: the client can
+  // unsubscribe or resubscribe while it is in flight, and the continuation
+  // still holds the stale instance. These two tests pin that window.
+  //
+  // Distinct from 'removed sub queue entry drains without leaking': there the
+  // sub is removed BEFORE processOne runs, so the pre-await check catches it
+  // and the recompute never starts. Here the recompute demonstrably starts.
+  // ---------------------------------------------------------------------------
+  test('removal DURING recompute suppresses the stale invalidate send', async () => {
+    const store = createInMemorySubscriptionStore()
+    const { source, emit } = createDispatchInvalidationSource()
+
+    let resolveGate!: () => void
+    const gate = new Promise<void>((r) => {
+      resolveGate = r
+    })
+
+    const sent: unknown[] = []
+    const entry = makeEntry('sub1', ['todos'], (p) => sent.push(p))
+    store.add(entry)
+
+    let recomputeStarted = false
+    createInvalidationRouter({
+      source,
+      store,
+      recompute: async () => {
+        recomputeStarted = true
+        await gate
+        return { tablesRead: new Set(['todos', 'fresh']) }
+      },
+    })
+
+    emit(new Set(['todos']))
+    await flush()
+
+    // The entry was live when the recompute began — this is precisely the
+    // window the pre-await check cannot cover.
+    expect(recomputeStarted).toBe(true)
+
+    // Client unsubscribes while the query is still in flight.
+    store.remove('sub1')
+    resolveGate()
+    await flush()
+
+    // No frame for a subscription nobody holds.
+    expect(sent).toHaveLength(0)
+    // And no write-back from a result nobody asked for.
+    expect(entry.tablesWatched).toEqual(new Set(['todos']))
+  })
+
+  test('replacement DURING recompute does not send under the live subscription id', async () => {
+    const store = createInMemorySubscriptionStore()
+    const { source, emit } = createDispatchInvalidationSource()
+
+    let resolveGate!: () => void
+    const gate = new Promise<void>((r) => {
+      resolveGate = r
+    })
+
+    const sentA: unknown[] = []
+    const sentB: unknown[] = []
+    // Same id, different instances — id cannot distinguish them, so the router
+    // must branch on object identity.
+    const entryA = makeEntry('s1', ['todos'], (p) => sentA.push(p))
+    const entryB = makeEntry('s1', ['todos'], (p) => sentB.push(p))
+
+    store.add(entryA)
+
+    createInvalidationRouter({
+      source,
+      store,
+      recompute: async (entry) => {
+        if (entry === entryA) await gate
+        return { tablesRead: new Set(['todos']) }
+      },
+    })
+
+    emit(new Set(['todos']))
+    await flush()
+
+    // Client reconnects mid-recompute and resubscribes under the SAME id.
+    store.add(entryB)
+
+    resolveGate()
+    await flush()
+
+    // A's continuation must not fire. Its frame would be stamped `s1` — the id
+    // entryB now owns — so the client would attribute a recompute that ran for
+    // a dead subscription to the live one, and refetch on its behalf.
+    expect(sentA).toHaveLength(0)
+    expect(sentB).toHaveLength(0)
   })
 
   // ---------------------------------------------------------------------------
