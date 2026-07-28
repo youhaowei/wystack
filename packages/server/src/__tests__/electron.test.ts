@@ -1,4 +1,4 @@
-// @wystack/server/electron — Adapter tests (YW-67 / T5)
+// @wystack/server/electron — Adapter tests
 //
 // Tests the `attachElectronTransport` adapter over a fake ipcMain (no real
 // Electron). Covers the contract's acceptance criteria:

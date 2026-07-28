@@ -27,7 +27,7 @@
 //
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
 // command paths, mutation-only validation policy, artifact-grouped PreviewDiff
-// with real compute) is a separate layer (DashFrame's YW-106 / YW-124) that
+// with real compute) is a separate layer (in DashFrame) that
 // supplies the `path`s this engine dispatches. Keeping the seam clean keeps
 // this engine a candidate for promotion to a generic WyStack primitive.
 //
@@ -69,7 +69,7 @@ export interface Command {
  * One command's outcome: its handler return `value` plus the `id` echoed from
  * the source `Command` (undefined when the command carried none). `value` is
  * `unknown` because a vocabulary-free engine cannot know handler return types —
- * the typed vocabulary layer (YW-106/124) narrows it. Same value `app.call`
+ * the typed vocabulary layer narrows it. Same value `app.call`
  * surfaces as `result`, so a batched command and a plain RPC to the same path
  * yield the same `value`.
  */
@@ -111,7 +111,7 @@ export interface CommitResult extends ApplyResultBase {
  * Result of a preview batch. Nothing persisted and no Tags emitted; the fields
  * describe what the commit WOULD have done. The artifact-grouped diff
  * (directNodes / affectedDownstream with real DuckDB compute) is a higher
- * layer's job (YW-124) — this generic result is intentionally vocabulary-free
+ * layer's job — this generic result is intentionally vocabulary-free
  * (no artifact types leak in; a future wire layer picks its own encoding).
  */
 export interface PreviewResult extends ApplyResultBase {

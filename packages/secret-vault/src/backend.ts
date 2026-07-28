@@ -1,6 +1,6 @@
 // SecretBackend — contract that concrete secret stores implement.
 //
-// YW-262 (keychain) and any future cloud/1Password backends implement this
+// The keychain backend and any future cloud/1Password backends implement this
 // interface. Only the test backend ships in this package.
 //
 // Key design constraints:

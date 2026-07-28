@@ -7,7 +7,7 @@
 // prevents tests from depending on synchronous re-entry that production
 // pipes cannot reproduce.
 //
-// Salvaged concept from PR #15 (TASK-548), rebuilt against the real Pipe
+// Salvaged concept from PR #15, rebuilt against the real Pipe
 // interface so engine tests can exercise the full subscription/invalidation
 // path without spinning up a WebSocket server.
 

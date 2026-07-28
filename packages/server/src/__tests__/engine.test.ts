@@ -1,4 +1,4 @@
-// Engine (Session + Dispatch) over a Pipe — YW-56 / TASK-638.
+// Engine (Session + Dispatch) over a Pipe.
 //
 // Drives `attachEngine` over an in-memory loopback pair. The server end runs the
 // Engine; the client end sends raw protocol frames and collects server frames.

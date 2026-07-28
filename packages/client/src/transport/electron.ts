@@ -223,7 +223,7 @@ export interface IpcManagerConfig {
  * Mirrors {@link createWsManager} in `ws.ts` — same connect/disconnect/
  * subscribe/unsubscribe/isConnected surface, backed by `ipcRenderer` instead
  * of a WebSocket. `call` is additive: delegates to engine.call for RPC over
- * the IPC pipe (YW-97 / T3d).
+ * the IPC pipe.
  */
 export interface IpcManager {
   connect(): void

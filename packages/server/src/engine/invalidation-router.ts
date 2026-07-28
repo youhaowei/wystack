@@ -22,14 +22,14 @@
  * without the router needing to know about `app.call`. This keeps the router
  * purely structural — transport-neutral and testable without a real `app`.
  *
- * Per-sub serialization (YW-64): invalidations for the SAME subscription entry
+ * Per-sub serialization: invalidations for the SAME subscription entry
  * are processed in arrival order. Each entry maintains an independent "tail"
  * Promise; each new recompute is chained onto that tail, so same-entry
  * recomputes are strictly sequential while different entries remain concurrent.
  * The tail self-deletes when it drains (via `.finally`), so the map never
  * accumulates stale entries for removed subscriptions.
  *
- * Tail keying (YW-108): the tail chain is keyed by the SubscriptionEntry
+ * Tail keying: the tail chain is keyed by the SubscriptionEntry
  * *instance*, not the bare subscription id. A client that reconnects and
  * resubscribes with the same id produces a FRESH entry object (the store
  * replaces the old one — `subscription-store.ts` `add` overwrites by id, and
@@ -66,7 +66,7 @@ export function createInvalidationRouter(opts: InvalidationRouterOptions): () =>
   // Per-subscription serialization queue.
   //
   // `tails` maps a SubscriptionEntry INSTANCE → the tail Promise of that
-  // entry's recompute chain (YW-108: keyed by instance, not id, so a reused-id
+  // entry's recompute chain (keyed by instance, not id, so a reused-id
   // replacement entry gets a fresh chain — see the module doc). Chaining is
   // done SYNCHRONOUSLY inside the handler (before any await), so two
   // near-simultaneous invalidations are ordered by the first synchronous pass

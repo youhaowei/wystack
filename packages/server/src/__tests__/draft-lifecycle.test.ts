@@ -1,7 +1,7 @@
 /**
- * Tests for the generic draft lifecycle (YW-121) — the third leg of the draft
+ * Tests for the generic draft lifecycle — the third leg of the draft
  * model: open / append / publish / discard + conflict detection, sitting ABOVE
- * the read overlay (YW-120) and the `<table>__draft` write storage.
+ * the read overlay and the `<table>__draft` write storage.
  *
  * Load-bearing contracts under test:
  *   1. append routes UNMODIFIED command handlers' writes into the draft overlay
@@ -92,7 +92,7 @@ beforeEach(async () => {
         .input({ dashboardId: int, item: text })
         .mutation(async (ctx, args) => {
           // Read-modify-write. NOTE: the draft read coalesce does not yet push
-          // `where` down (YW-120 scope), so a draft-safe handler reads the full
+          // `where` down, so a draft-safe handler reads the full
           // coalesced set and filters in JS rather than `.where().all()`.
           const rows = (await ctx.db.from(schema.dashboards).all()) as {
             id: number
@@ -187,7 +187,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
   })
 
   test('atomic publish: clearShadow failure rolls back the canonical commit (no orphan canonical write)', async () => {
-    // YW-300: replay + shadow-sweep now share ONE transaction. If clearShadow
+    // Replay + shadow-sweep now share ONE transaction. If clearShadow
     // fails (e.g. shadow table missing), the outer tx rolls back BOTH the
     // canonical command replay AND the sweep — no "canonical committed but
     // shadow still present" state. The draft stays live and publish is retryable.
@@ -212,7 +212,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
   })
 
   test('atomic publish: replay + sweep commit together — no crash window between them', async () => {
-    // DoD for YW-300: exactly-once publish. Prove that replay and shadow-sweep
+    // Definition of done: exactly-once publish. Prove that replay and shadow-sweep
     // are inseparable — if a failure occurs mid-transaction, canonical has ZERO
     // replayed rows AND the shadow is untouched. This models the crash-window
     // scenario: any code that ran between a separate replay-tx and a separate

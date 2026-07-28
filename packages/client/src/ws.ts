@@ -66,7 +66,7 @@ export interface WsManager {
   /**
    * RPC call over the WebSocket pipe — correlates by id, resolves with
    * result.data. Additive: does not change existing connect/subscribe/etc
-   * signatures (YW-97 / T3d).
+   * signatures.
    *
    * Note: The primary HTTP query path in `client.ts` (`query()`) is unchanged
    * and remains the default for web/WS consumers. This `call` surface enables
