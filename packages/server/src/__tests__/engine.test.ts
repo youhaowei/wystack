@@ -461,6 +461,45 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(h.closeReasons).toEqual(['transient'])
   })
 
+  // `onClose` is a consumer-supplied diagnostic, not a participant in teardown.
+  // Unguarded, a throw from it skipped `pipe.close()` — and since `teardown()`
+  // had already flipped the closed guard and dropped the inbound handler, no
+  // later `detach()` could close it either. The transport leaked with nothing
+  // able to shut it.
+  //
+  // The auth-timeout path is chosen deliberately: `closeWith` runs inside an
+  // unguarded `setTimeout` there, so before the fix the throw ALSO escaped as an
+  // uncaught exception rather than merely being swallowed by a caller.
+  test('a throwing onClose hook still closes the pipe', async () => {
+    const app = await makeApp()
+    const [, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+
+    let closeCalls = 0
+    const spyPipe = {
+      id: serverPipe.id,
+      send: (m: ServerMessage) => serverPipe.send(m),
+      onMessage: (h: (m: ClientMessage) => void) => serverPipe.onMessage(h),
+      close: () => {
+        closeCalls++
+        return serverPipe.close()
+      },
+    }
+
+    attachEngine(spyPipe, {
+      app,
+      resolveContext: async () => ({}),
+      authTimeoutMs: 10,
+      onClose: () => {
+        throw new Error('consumer onClose boom')
+      },
+    })
+
+    // Never send an auth frame; let the handshake timer fire.
+    await new Promise((r) => setTimeout(r, 40))
+
+    expect(closeCalls).toBe(1)
+  })
+
   test('no-auth server arms no handshake timer', async () => {
     const h = await harness({ authTimeoutMs: 10 })
     await new Promise((r) => setTimeout(r, 30))

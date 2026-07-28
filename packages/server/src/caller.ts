@@ -28,7 +28,16 @@ export function createCaller<T extends Record<string, FunctionDef>>(
   app: WyStackApp,
   context: Record<string, unknown>,
 ): CallerFromFunctions<T> {
-  const caller: Record<string, (args: never) => Promise<unknown>> = {}
+  // `Object.create(null)` rather than `{}`: procedure paths are registry keys,
+  // and registration does not reject reserved object names. On a normal object
+  // `caller['__proto__'] = fn` invokes the legacy prototype setter instead of
+  // creating an own property — the procedure would silently not exist AND the
+  // caller's prototype would be replaced. A null-prototype dictionary has no
+  // such setter, so every path becomes a plain own property.
+  //
+  // Fixing it here rather than by rejecting reserved names at registration
+  // keeps the constraint off the app author: no procedure name is special.
+  const caller: Record<string, (args: never) => Promise<unknown>> = Object.create(null)
   for (const path of app.functions.keys()) {
     caller[path] = async (args) => {
       const { result } = await app.call(path, args, context)

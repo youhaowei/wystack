@@ -254,14 +254,14 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
       // teardown is idempotent and the engine has flipped its closed guard
       // before calling this, so the detach() inside is a safe no-op.
       //
-      // The consumer callback runs inside the engine's `closeWith`, which does
-      // NOT guard it: `teardown() → onClose?.(reason) → void pipe.close()`. A
-      // throw here would (a) skip the engine's own `pipe.close()`, corrupting
-      // its close path, and (b) on the auth-timeout path escape an unguarded
-      // `setTimeout` and crash the Electron main process. Neither is fixable
-      // from the adapter without touching the engine (off-limits). Contain it:
-      // teardown already ran (map is clean — the invariant holds), so we log and
-      // drop the consumer's throw. A buggy close handler must not kill the app.
+      // The consumer callback runs inside the engine's `closeWith`, which now
+      // guards it (`closeWith` wraps the hook in try/catch/finally), so a
+      // throw can no longer skip `pipe.close()` or escape the auth-timeout
+      // `setTimeout`. This catch is kept as defence in depth: it keeps the
+      // adapter correct against an older engine, and it attributes the failure
+      // to the Electron consumer's handler specifically, which the engine's
+      // generic message cannot. teardown already ran (map is clean — the
+      // invariant holds), so logging and dropping the throw is safe here too.
       onClose: (reason) => {
         teardown(wc.id, true)
         if (onClose === undefined) return

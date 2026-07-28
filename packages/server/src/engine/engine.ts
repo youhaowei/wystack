@@ -182,8 +182,25 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   const closeWith = (reason: CloseReason): void => {
     if (closed) return
     teardown()
-    onClose?.(reason)
-    void pipe.close()
+    // `onClose` is consumer-supplied and may throw. Unguarded, that throw would
+    // skip `pipe.close()` entirely — and `teardown()` has already flipped the
+    // `closed` guard and dropped the inbound handler, so a later `detach()` is a
+    // no-op. The transport would stay open with nothing able to close it, which
+    // contradicts the documented contract that the engine always closes the pipe
+    // after invoking the hook.
+    //
+    // On the auth-timeout path it is worse: `closeWith` runs inside an unguarded
+    // `setTimeout`, so the throw escapes as an uncaught exception and takes down
+    // the host process (the Electron main process, for that adapter).
+    //
+    // A hook is a diagnostic, not a participant in teardown — swallow and report.
+    try {
+      onClose?.(reason)
+    } catch (err) {
+      console.error('[wystack/server] engine onClose threw', err)
+    } finally {
+      void pipe.close()
+    }
   }
 
   // Arm the handshake timer only when auth is required. A client that never
