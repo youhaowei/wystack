@@ -5,6 +5,7 @@ import { defineSchema } from '../schema'
 import { text, int, boolean } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
+import { pgTable, text as pgText, integer } from 'drizzle-orm/pg-core'
 
 const schema = defineSchema({
   todos: {
@@ -268,5 +269,171 @@ describe('DrizzleTracker.transaction', () => {
     // Both levels' writes surface on the single outermost tracker.
     expect(tracked.tablesWritten.has('todos')).toBe(true)
     expect(tracked.tablesWritten.has('tags')).toBe(true)
+  })
+})
+
+/**
+ * A table whose SQL column names differ from its JS property keys — the shape a
+ * migration-managed consumer already has. Projection names JS keys and must
+ * lower to the SQL names, so this table is what proves the two vocabularies are
+ * kept distinct rather than accidentally coinciding (as they do under
+ * `defineSchema`, where every SQL name equals its JS key).
+ */
+const snakeTodos = pgTable('snake_todos', {
+  id: integer('id').primaryKey(),
+  todoTitle: pgText('todo_title').notNull(),
+  ownerName: pgText('owner_name').notNull(),
+})
+
+describe('SelectBuilder projection', () => {
+  test('select() narrows the returned columns', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    const rows = await tracked.from(schema.todos).select('title').all()
+
+    expect(rows).toHaveLength(1)
+    expect(Object.keys(rows[0]).sort()).toEqual(['title'])
+    expect(rows[0].title).toBe('A')
+  })
+
+  test('select() accepts multiple columns and keeps the named order', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: true })
+    const rows = await tracked.from(schema.todos).select('id', 'done').all()
+
+    expect(Object.keys(rows[0])).toEqual(['id', 'done'])
+    expect(rows[0].done).toBe(true)
+  })
+
+  test('a projected read still tags the whole TABLE, not the columns', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    tracked = resetTracking(tracked)
+
+    await tracked.from(schema.todos).select('id').all()
+
+    // The invalidation model is read∩write over table names. A projected read
+    // must still invalidate when a NON-projected column is written, so the tag
+    // stays the table — narrowing it to columns would be a different model.
+    expect(tracked.tablesRead.has('todos')).toBe(true)
+  })
+
+  test('projection composes with where, orderBy and limit', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    await tracked.into(schema.todos).insert({ title: 'B', done: true })
+    await tracked.into(schema.todos).insert({ title: 'C', done: true })
+
+    const rows = await tracked
+      .from(schema.todos)
+      .select('title')
+      .where(eq('done', true))
+      .orderBy('title', 'desc')
+      .limit(1)
+      .all()
+
+    expect(rows).toEqual([{ title: 'C' }])
+  })
+
+  test('first() returns a projected row', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    const row = await tracked.from(schema.todos).select('title').first()
+
+    expect(row).toEqual({ title: 'A' })
+  })
+
+  test('first() on a projected read with no match returns null', async () => {
+    const row = await tracked.from(schema.todos).select('title').where(eq('id', 999)).first()
+    expect(row).toBeNull()
+  })
+
+  test('an unknown projected column throws rather than dropping the field', async () => {
+    expect(() =>
+      // oxlint-disable-next-line typescript/no-explicit-any -- deliberately bypassing the key constraint to reach the runtime guard
+      (tracked.from(schema.todos) as any).select('nope').toSql(),
+    ).toThrow('Unknown column: nope')
+  })
+
+  test('select() with no columns throws', () => {
+    // oxlint-disable-next-line typescript/no-explicit-any -- the tuple type forbids this at compile time; this is the untyped-caller path
+    expect(() => (tracked.from(schema.todos) as any).select()).toThrow(
+      'select() requires at least one column',
+    )
+  })
+
+  test('projection names JS keys and lowers to the column SQL names', async () => {
+    await tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS snake_todos (
+        id INTEGER PRIMARY KEY,
+        todo_title TEXT NOT NULL,
+        owner_name TEXT NOT NULL
+      )
+    `)
+    await tracked.into(snakeTodos).insert({ id: 1, todoTitle: 'A', ownerName: 'yh' })
+    tracked = resetTracking(tracked)
+
+    const rows = await tracked.from(snakeTodos).select('todoTitle').all()
+
+    expect(rows).toEqual([{ todoTitle: 'A' }])
+    // The tag is the SQL table name, so it matches a raw write's manual tag.
+    expect(tracked.tablesRead.has('snake_todos')).toBe(true)
+  })
+
+  test('a draft read projects the coalesce, matching the canonical builder', async () => {
+    await tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS todos__draft (
+        id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        title TEXT,
+        done BOOLEAN,
+        __tombstone BOOLEAN DEFAULT false,
+        PRIMARY KEY (id, draft_id)
+      )
+    `)
+    await tracked.into(schema.todos).insert({ title: 'base', done: false })
+    await tracked.raw.execute(
+      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'overridden')`,
+    )
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
+
+    // Projected to `title` alone, and still coalesced (draft wins over base).
+    expect(rows).toEqual([{ title: 'overridden' }])
+  })
+
+  test('a draft projection omitting the PK still joins, orders and suppresses tombstones', async () => {
+    await tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS todos__draft (
+        id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        title TEXT,
+        done BOOLEAN,
+        __tombstone BOOLEAN DEFAULT false,
+        PRIMARY KEY (id, draft_id)
+      )
+    `)
+    await tracked.into(schema.todos).insert({ title: 'kept', done: false })
+    await tracked.into(schema.todos).insert({ title: 'deleted', done: false })
+    await tracked.raw.execute(
+      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (2, 'd1', true)`,
+    )
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
+
+    // The ORDER BY and tombstone WHERE name the PK directly, so dropping it from
+    // the SELECT list changes the output shape only.
+    expect(rows).toEqual([{ title: 'kept' }])
+  })
+
+  test('an unknown column in a draft projection throws', async () => {
+    await expect(
+      // oxlint-disable-next-line typescript/no-explicit-any -- reaching the runtime guard past the key constraint
+      (tracked.withDraft('d1').from(schema.todos) as any).select('nope').all(),
+    ).rejects.toThrow('Unknown column: nope')
+  })
+
+  test('toSql() lowers the projection and stays in lockstep with all()', async () => {
+    const { sql: projected } = tracked.from(schema.todos).select('title').toSql()
+    const { sql: fullRow } = tracked.from(schema.todos).toSql()
+
+    expect(projected).toContain('"title"')
+    expect(projected).not.toContain('"done"')
+    expect(fullRow).toContain('"done"')
   })
 })

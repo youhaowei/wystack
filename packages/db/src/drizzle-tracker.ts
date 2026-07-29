@@ -132,7 +132,12 @@ export interface TransactionOptions {
   accessMode?: 'read write' | 'read only'
 }
 
-export class SelectBuilder<T extends AnyTable> {
+/**
+ * `TRow` is the shape `all()`/`first()` resolve to. It defaults to the full row
+ * and narrows to a `Pick` once `select()` names columns — the projection is a
+ * type-level fact, so a projected read cannot be mistaken for a full row.
+ */
+export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   private _table: T
   private _db: DrizzleDb
   private _tracker: DrizzleTracker
@@ -140,11 +145,34 @@ export class SelectBuilder<T extends AnyTable> {
   private _orderByCol?: string
   private _orderDir: 'asc' | 'desc' = 'asc'
   private _limitVal?: number
+  private _projection?: string[]
 
   constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker) {
     this._table = table
     this._db = db
     this._tracker = tracker
+  }
+
+  /**
+   * Narrow the read to `cols`. Column names are the table's JS property keys
+   * (same vocabulary as `where`/`orderBy`), NOT SQL names — Drizzle renders each
+   * column's own SQL name, so a table declaring `clerkUserId: text('clerk_user_id')`
+   * takes `select('clerkUserId')` and emits `"clerk_user_id"`.
+   *
+   * Projection does NOT narrow the read TAG: the tag is the table, and a
+   * subscription that read any column of it must still invalidate when any
+   * column is written. Narrowing tags to columns would be a different (finer)
+   * invalidation model, not an optimization of this one.
+   */
+  select<K extends keyof T['$inferSelect'] & string>(
+    ...cols: [K, ...K[]]
+  ): SelectBuilder<T, Pick<T['$inferSelect'], K>> {
+    // The tuple type already forbids `select()` at compile time; this guards the
+    // untyped-caller path, where an empty projection would silently lower to
+    // `SELECT` with no columns.
+    if (cols.length === 0) throw new Error('select() requires at least one column')
+    this._projection = cols
+    return this as unknown as SelectBuilder<T, Pick<T['$inferSelect'], K>>
   }
 
   where(filters: FilterDescriptor | FilterDescriptor[]) {
@@ -174,16 +202,40 @@ export class SelectBuilder<T extends AnyTable> {
   }
 
   /**
-   * Build the lowered Drizzle select query (where / orderBy / limit applied).
-   * Single source of truth shared by `all()` and `toSql()` so a future clause
-   * (join, group-by, …) is added once and both paths stay in lockstep — the
-   * byte-identical zero-overhead assertion in `toSql()` only stays meaningful
+   * Resolve the projection's JS property keys to Drizzle column objects, in the
+   * order named. Throws on an unknown column for the same reason
+   * `_buildConditions` does — a typo'd name would otherwise vanish from the
+   * projection and yield rows silently missing a field.
+   */
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  private _buildProjection(columns: Record<string, any>) {
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    const projected: Record<string, any> = {}
+    for (const name of this._projection ?? []) {
+      const col = columns[name]
+      if (!col) throw new Error(`Unknown column: ${name}`)
+      projected[name] = col
+    }
+    return projected
+  }
+
+  /**
+   * Build the lowered Drizzle select query (projection / where / orderBy / limit
+   * applied). Single source of truth shared by `all()` and `toSql()` so a future
+   * clause (join, group-by, …) is added once and both paths stay in lockstep —
+   * the byte-identical zero-overhead assertion in `toSql()` only stays meaningful
    * if it lowers the exact same query `all()` executes.
    */
   private _buildSelectQuery() {
-    let q = this._db.select().from(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
+    // Projected and full-row selects are different Drizzle builder types that
+    // accept the same clause chain; `all()`'s return type comes from `TRow`, so
+    // the erasure here costs no caller-visible inference.
+    // oxlint-disable-next-line typescript/no-explicit-any -- see above
+    let q: any = this._projection
+      ? this._db.select(this._buildProjection(columns)).from(this._table)
+      : this._db.select().from(this._table)
     const conditions = this._buildConditions(columns)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
@@ -199,11 +251,11 @@ export class SelectBuilder<T extends AnyTable> {
     return q
   }
 
-  async all() {
+  async all(): Promise<TRow[]> {
     this._tracker.tablesRead.add(getTableName(this._table))
     // Await here (not a bare return) so errors surface in this async frame and
-    // the inferred return type is the row array, not the Drizzle builder.
-    return await this._buildSelectQuery()
+    // the resolved value is the row array, not the Drizzle builder.
+    return (await this._buildSelectQuery()) as TRow[]
   }
 
   /**
@@ -217,7 +269,7 @@ export class SelectBuilder<T extends AnyTable> {
     return this._buildSelectQuery().toSQL()
   }
 
-  async first() {
+  async first(): Promise<TRow | null> {
     this._limitVal = 1
     const rows = await this.all()
     return rows[0] ?? null
@@ -287,12 +339,31 @@ export class DraftSelectBuilder<T extends AnyTable> {
   //     target via `_requirePkFilter` (any other shape throws).
   // The same accumulated filter serves both; only the consumer differs.
   private _filters: FilterDescriptor[] = []
+  private _projection?: string[]
 
   constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
     this._table = table
     this._db = db
     this._draftId = draftId
     this._tracker = tracker
+  }
+
+  /**
+   * Narrow the coalesced read to `cols`, by property key — same vocabulary and
+   * same semantics as `SelectBuilder.select`, which matters because handlers are
+   * authored against `DrizzleTracker` (`create.ts` hands them
+   * `db: tracked as DrizzleTracker`) and cannot see which handle they hold. The
+   * two builders must therefore behave alike, not merely coexist.
+   *
+   * Projection only shrinks the coalesce's SELECT list. The join predicate, the
+   * tombstone filter and the ORDER BY reference their columns directly and do
+   * not read that list, so a projection that omits the primary key still joins,
+   * still suppresses tombstones, and still orders correctly.
+   */
+  select<K extends string>(...cols: [K, ...K[]]): this {
+    if (cols.length === 0) throw new Error('select() requires at least one column')
+    this._projection = cols
+    return this
   }
 
   where(filters: FilterDescriptor | FilterDescriptor[]): this {
@@ -495,7 +566,21 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // This convention must be enforced by the schema (shadow columns default to NULL,
     // tombstone = true captures deletes). Column-drift (base schema evolves under an
     // old draft) is out of scope — see PR body.
-    const colSelects = colEntries
+    //
+    // A projection narrows THIS list and nothing else: the join predicate, the
+    // tombstone WHERE, the pk predicate and the ORDER BY all name their columns
+    // directly below, so omitting the PK from the output leaves them intact.
+    const selectedEntries = this._projection
+      ? this._projection.map((propKey) => {
+          const col = columns[propKey]
+          // Same reason `_buildConditions` throws: a typo'd name would otherwise
+          // drop the column from the result instead of failing.
+          if (!col) throw new Error(`Unknown column: ${propKey}`)
+          return [propKey, col] as const
+        })
+      : colEntries
+
+    const colSelects = selectedEntries
       .map(([propKey, col]) => {
         const sqlName = col.name as string
         return `COALESCE(d."${sqlName}", b."${sqlName}") AS "${propKey}"`
