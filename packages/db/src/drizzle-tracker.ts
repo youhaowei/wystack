@@ -14,6 +14,7 @@ import {
   and,
   sql,
 } from 'drizzle-orm'
+import type { Query } from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
@@ -23,6 +24,20 @@ import { getTableName, getTableColumns } from 'drizzle-orm'
 type DrizzleDb = any
 // oxlint-disable-next-line typescript/no-explicit-any -- PgTableWithColumns requires a config generic; any is needed for polymorphic table usage
 type AnyTable = PgTableWithColumns<any>
+
+/**
+ * The entire surface `_buildSelectQuery`'s callers touch on a lowered Drizzle
+ * select: await it for rows, or lower it to SQL without executing.
+ *
+ * Declared structurally rather than named because the two branches of that
+ * builder — projected and full-row — are different Drizzle types, and because
+ * `DrizzleDb` is `any` anyway, so nothing narrower survives the chain. Stating
+ * the surface is what re-introduces a type at the boundary: it is why `all()`
+ * needs no cast and `toSql()` needs no annotation.
+ */
+interface LoweredSelect<TRow> extends PromiseLike<TRow[]> {
+  toSQL(): Query
+}
 
 const drizzleOpMap = {
   eq: drizzleEq,
@@ -226,14 +241,13 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * the byte-identical zero-overhead assertion in `toSql()` only stays meaningful
    * if it lowers the exact same query `all()` executes.
    */
-  private _buildSelectQuery() {
+  private _buildSelectQuery(): LoweredSelect<TRow> {
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
-    // Projected and full-row selects are different Drizzle builder types that
-    // accept the same clause chain; `all()`'s return type comes from `TRow`, so
-    // the erasure here costs no caller-visible inference.
-    // oxlint-disable-next-line typescript/no-explicit-any -- see above
-    let q: any = this._projection
+    // `DrizzleDb` is `any`, so the whole clause chain below is untyped no matter
+    // how it is written — there is no builder type here to preserve. The type
+    // comes back at the signature, not from inference.
+    let q = this._projection
       ? this._db.select(this._buildProjection(columns)).from(this._table)
       : this._db.select().from(this._table)
     const conditions = this._buildConditions(columns)
@@ -255,7 +269,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     this._tracker.tablesRead.add(getTableName(this._table))
     // Await here (not a bare return) so errors surface in this async frame and
     // the resolved value is the row array, not the Drizzle builder.
-    return (await this._buildSelectQuery()) as TRow[]
+    return await this._buildSelectQuery()
   }
 
   /**
@@ -265,7 +279,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * `_buildSelectQuery()` as `all()`; the only difference is the missing
    * `tablesRead` side-effect and the final `.toSQL()` instead of execute.
    */
-  toSql() {
+  toSql(): Query {
     return this._buildSelectQuery().toSQL()
   }
 
@@ -352,8 +366,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * Narrow the coalesced read to `cols`, by property key — same vocabulary and
    * same semantics as `SelectBuilder.select`, which matters because handlers are
    * authored against `DrizzleTracker` (`create.ts` hands them
-   * `db: tracked as DrizzleTracker`) and cannot see which handle they hold. The
-   * two builders must therefore behave alike, not merely coexist.
+   * `db: tracked as DrizzleTracker`) and cannot see which handle they hold, so
+   * a clause that silently changed meaning under a draft would be undetectable
+   * at the call site. That is why `select` lands on both builders with the same
+   * vocabulary — not a claim the two are at parity. They are not: `orderBy` and
+   * `limit` below still throw, because the coalesce fixes its own ordering.
    *
    * Projection only shrinks the coalesce's SELECT list. The join predicate, the
    * tombstone filter and the ORDER BY reference their columns directly and do
