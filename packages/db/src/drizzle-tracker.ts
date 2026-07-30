@@ -40,6 +40,44 @@ interface LoweredSelect<TRow> extends PromiseLike<TRow[]> {
 }
 
 /**
+ * A builder's accumulated clause state, held as one value.
+ *
+ * Both builders carry this rather than a field each, for two reasons. It is what
+ * makes a builder copyable in one expression (see `_with`), and it is the whole
+ * argument to `assertNoReadClauses` — so adding a clause means adding a field
+ * here, not remembering to thread it through two classes and a guard.
+ */
+interface ReadClauses {
+  filters: FilterDescriptor[]
+  projection?: string[]
+  orderByCol?: string
+  orderDir: 'asc' | 'desc'
+  limitVal?: number
+}
+
+/** Fresh state for a builder with nothing attached. A factory, not a shared
+ *  constant, so no two builders can ever alias one `filters` array. */
+const emptyClauses = (): ReadClauses => ({ filters: [], orderDir: 'asc' })
+
+/**
+ * Resolve a JS property key to its Drizzle column, or throw.
+ *
+ * Uses an own-property check, not truthiness: `columns['constructor']` resolves
+ * up `Object.prototype`, so a truthiness test would accept it and lower a
+ * column-less SELECT — which Postgres accepts, returning fieldless rows instead
+ * of an error.
+ *
+ * Every clause that names a column goes through here. Open-coding the lookup
+ * meant each new clause repeated it, and one copy drifting reintroduces exactly
+ * what all of them exist to prevent: a typo'd column silently dropped.
+ */
+// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+function requireColumn(columns: Record<string, any>, name: string) {
+  if (!Object.hasOwn(columns, name)) throw new Error(`Unknown column: ${name}`)
+  return columns[name]
+}
+
+/**
  * Reject read-terminal clauses on a write terminal.
  *
  * `from(t).where(...)` builds a row scope; the terminal decides read or write.
@@ -59,12 +97,9 @@ interface LoweredSelect<TRow> extends PromiseLike<TRow[]> {
  *
  * Shared by both builders so the canonical and draft write paths cannot drift.
  */
-function assertNoReadClauses(
-  op: 'update' | 'delete',
-  clauses: { projection?: string[]; orderByCol?: string; limitVal?: number },
-): void {
+function assertNoReadClauses(op: 'update' | 'delete', clauses: ReadClauses): void {
   const attached: string[] = []
-  if (clauses.projection) attached.push('select()')
+  if (clauses.projection !== undefined) attached.push('select()')
   if (clauses.orderByCol !== undefined) attached.push('orderBy()')
   if (clauses.limitVal !== undefined) attached.push('limit()')
   if (attached.length === 0) return
@@ -192,16 +227,39 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   private _table: T
   private _db: DrizzleDb
   private _tracker: DrizzleTracker
-  private _filters: FilterDescriptor[] = []
-  private _orderByCol?: string
-  private _orderDir: 'asc' | 'desc' = 'asc'
-  private _limitVal?: number
-  private _projection?: string[]
+  private _clauses: ReadClauses
 
-  constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker) {
+  constructor(
+    table: T,
+    db: DrizzleDb,
+    tracker: DrizzleTracker,
+    clauses: ReadClauses = emptyClauses(),
+  ) {
     this._table = table
     this._db = db
     this._tracker = tracker
+    this._clauses = clauses
+  }
+
+  /**
+   * Return a COPY carrying `patch` on top of this builder's clauses. Every clause
+   * method goes through here; none assigns to `this`.
+   *
+   * A builder that mutated itself and returned itself handed out two names for
+   * one query, and three separate bugs followed from that one fact: a projection
+   * applied through one name silently changed what the other yielded (while
+   * `select()`'s re-typed return made the type disagree with the object), and a
+   * read clause consumed by a finished read stayed attached to reject a later
+   * write. Copying makes the builder a value, so there is nothing to alias.
+   *
+   * `TNext` lets `select()` narrow the row type on the copy while every other
+   * clause keeps `TRow`.
+   */
+  private _with<TNext = TRow>(patch: Partial<ReadClauses>): SelectBuilder<T, TNext> {
+    return new SelectBuilder<T, TNext>(this._table, this._db, this._tracker, {
+      ...this._clauses,
+      ...patch,
+    })
   }
 
   /**
@@ -222,50 +280,46 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     // untyped-caller path, where an empty projection would silently lower to
     // `SELECT` with no columns.
     if (cols.length === 0) throw new Error('select() requires at least one column')
-    this._projection = cols
-    return this as unknown as SelectBuilder<T, Pick<T['$inferSelect'], K>>
+    return this._with<Pick<T['$inferSelect'], K>>({ projection: cols })
   }
 
-  where(filters: FilterDescriptor | FilterDescriptor[]) {
+  where(filters: FilterDescriptor | FilterDescriptor[]): SelectBuilder<T, TRow> {
     const toAdd = Array.isArray(filters) ? filters : [filters]
-    this._filters.push(...toAdd)
-    return this
+    return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
 
-  orderBy(col: string, dir: 'asc' | 'desc' = 'asc') {
-    this._orderByCol = col
-    this._orderDir = dir
-    return this
+  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): SelectBuilder<T, TRow> {
+    // Rejected here rather than at lowering time, for the same reason `select()`
+    // rejects an empty column list: the lowering used to gate on truthiness, so
+    // an empty name silently produced an unordered read that the caller believed
+    // was sorted — while the write guard, testing `!== undefined`, rejected it.
+    if (col === '') throw new Error('orderBy() requires a column name')
+    return this._with({ orderByCol: col, orderDir: dir })
   }
 
-  limit(n: number) {
-    this._limitVal = n
-    return this
+  limit(n: number): SelectBuilder<T, TRow> {
+    return this._with({ limitVal: n })
   }
 
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
   private _buildConditions(columns: Record<string, any>) {
-    return this._filters.map((f) => {
-      const col = columns[f.column]
-      if (!col) throw new Error(`Unknown column: ${f.column}`)
-      return drizzleOpMap[f.op](col, f.value)
-    })
+    return this._clauses.filters.map((f) =>
+      drizzleOpMap[f.op](requireColumn(columns, f.column), f.value),
+    )
   }
 
   /**
    * Resolve the projection's JS property keys to Drizzle column objects, in the
-   * order named. Throws on an unknown column for the same reason
-   * `_buildConditions` does — a typo'd name would otherwise vanish from the
-   * projection and yield rows silently missing a field.
+   * order named. `requireColumn` throws on an unknown name — a typo'd column
+   * would otherwise vanish from the projection and yield rows silently missing a
+   * field.
    */
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
   private _buildProjection(columns: Record<string, any>) {
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const projected: Record<string, any> = {}
-    for (const name of this._projection ?? []) {
-      const col = columns[name]
-      if (!col) throw new Error(`Unknown column: ${name}`)
-      projected[name] = col
+    for (const name of this._clauses.projection ?? []) {
+      projected[name] = requireColumn(columns, name)
     }
     return projected
   }
@@ -283,30 +337,62 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     // `DrizzleDb` is `any`, so the whole clause chain below is untyped no matter
     // how it is written — there is no builder type here to preserve. The type
     // comes back at the signature, not from inference.
-    let q = this._projection
+    let q = this._clauses.projection
       ? this._db.select(this._buildProjection(columns)).from(this._table)
       : this._db.select().from(this._table)
     const conditions = this._buildConditions(columns)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
-    if (this._orderByCol) {
-      const col = columns[this._orderByCol]
-      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
-      q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
+    if (this._clauses.orderByCol !== undefined) {
+      const col = requireColumn(columns, this._clauses.orderByCol)
+      // The primary key trails as a tiebreaker, matching the draft coalesce. SQL
+      // leaves the order of rows equal on the named column unspecified, so
+      // without it the same `orderBy` resolves ties by heap order canonically and
+      // by PK under a draft — and a handler cannot tell which handle it holds.
+      const pkCol = this._pkColumn(columns)
+      const named = this._clauses.orderDir === 'desc' ? desc(col) : asc(col)
+      q = pkCol && pkCol !== col ? q.orderBy(named, asc(pkCol)) : q.orderBy(named)
     }
-    const limit = limitOverride ?? this._limitVal
+    const limit = limitOverride ?? this._clauses.limitVal
     if (limit !== undefined) {
       q = q.limit(limit)
     }
     return q
   }
 
+  /** The table's PK column object, or undefined for a table this resolver cannot
+   *  pin to a single column (a composite PK) — in which case no tiebreaker is
+   *  emitted rather than an arbitrary one. */
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  private _pkColumn(columns: Record<string, any>) {
+    try {
+      const pkName = resolvePkColumnName(this._table, getTableConfig(this._table))
+      return Object.values(columns).find((c) => (c.name as string) === pkName)
+    } catch {
+      return undefined
+    }
+  }
+
   async all(): Promise<TRow[]> {
+    return await this._read()
+  }
+
+  /**
+   * Tag the read, then execute. `all()` and `first()` share this so the tracker
+   * is touched in exactly ONE place: a tag added here (a derived table, an audit
+   * hook) reaches both, where two call sites would let a subscription
+   * established through `first()` silently miss it.
+   *
+   * `limitOverride` is how `first()` lowers `LIMIT 1` without assigning
+   * `_clauses.limitVal` — that field must mean only "the caller attached
+   * `limit()`", because the write guard reads it as intent.
+   */
+  private async _read(limitOverride?: number): Promise<TRow[]> {
     this._tracker.tablesRead.add(getTableName(this._table))
     // Await here (not a bare return) so errors surface in this async frame and
     // the resolved value is the row array, not the Drizzle builder.
-    return await this._buildSelectQuery()
+    return await this._buildSelectQuery(limitOverride)
   }
 
   /**
@@ -320,30 +406,13 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     return this._buildSelectQuery().toSQL()
   }
 
-  /**
-   * Lowers its own `LIMIT 1` as an override rather than assigning `_limitVal`.
-   * That field must mean exactly one thing — the CALLER attached `limit()` —
-   * because `_assertWritable` reads it to reject read clauses on a write. When
-   * `first()` assigned it, reusing a builder for a read and then a write got
-   * rejected for a clause the caller never wrote.
-   */
   async first(): Promise<TRow | null> {
-    this._tracker.tablesRead.add(getTableName(this._table))
-    const rows = (await this._buildSelectQuery(1)) as TRow[]
+    const rows = await this._read(1)
     return rows[0] ?? null
   }
 
-  /** See `assertNoReadClauses`. */
-  private _assertWritable(op: 'update' | 'delete'): void {
-    assertNoReadClauses(op, {
-      projection: this._projection,
-      orderByCol: this._orderByCol,
-      limitVal: this._limitVal,
-    })
-  }
-
   async update(values: Partial<T['$inferInsert']>) {
-    this._assertWritable('update')
+    assertNoReadClauses('update', this._clauses)
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.update(this._table).set(values)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -355,7 +424,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   }
 
   async delete() {
-    this._assertWritable('delete')
+    assertNoReadClauses('delete', this._clauses)
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.delete(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -403,23 +472,36 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _db: DrizzleDb
   private _draftId: string
   private _tracker: DraftDrizzleTracker
-  // Accumulated `where()` predicates. The consuming method decides intent:
+  // `_clauses.filters` accumulates `where()` predicates; the consuming method
+  // decides intent:
   //   - READ (`all`/`first`) interprets a single PK `eq` as a row predicate
   //     pushed into the coalesce SQL (any other shape throws).
   //   - WRITE (`update`/`delete`) interprets a single PK `eq` as the write
   //     target via `_requirePkFilter` (any other shape throws).
   // The same accumulated filter serves both; only the consumer differs.
-  private _filters: FilterDescriptor[] = []
-  private _projection?: string[]
-  private _orderByCol?: string
-  private _orderDir: 'asc' | 'desc' = 'asc'
-  private _limitVal?: number
+  private _clauses: ReadClauses
 
-  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
+  constructor(
+    table: T,
+    db: DrizzleDb,
+    draftId: string,
+    tracker: DraftDrizzleTracker,
+    clauses: ReadClauses = emptyClauses(),
+  ) {
     this._table = table
     this._db = db
     this._draftId = draftId
     this._tracker = tracker
+    this._clauses = clauses
+  }
+
+  /** Copy carrying `patch`. See `SelectBuilder._with` for why no clause method
+   *  assigns to `this`. */
+  private _with(patch: Partial<ReadClauses>): DraftSelectBuilder<T> {
+    return new DraftSelectBuilder<T>(this._table, this._db, this._draftId, this._tracker, {
+      ...this._clauses,
+      ...patch,
+    })
   }
 
   /**
@@ -431,21 +513,23 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * at the call site. Every read clause therefore lands on both builders with the
    * same vocabulary and the same meaning — `select` here, `orderBy`/`limit` below.
    *
+   * The `K` bound matches the canonical builder's. Anything weaker would let code
+   * holding a draft handle directly typo a column that the canonical path rejects
+   * at compile time, which is the same asymmetry this comment claims not to have.
+   *
    * Projection only shrinks the coalesce's SELECT list. The join predicate, the
    * tombstone filter and the ORDER BY reference their columns directly and do
    * not read that list, so a projection that omits the primary key still joins,
    * still suppresses tombstones, and still orders correctly.
    */
-  select<K extends string>(...cols: [K, ...K[]]): this {
+  select<K extends keyof T['$inferSelect'] & string>(...cols: [K, ...K[]]): DraftSelectBuilder<T> {
     if (cols.length === 0) throw new Error('select() requires at least one column')
-    this._projection = cols
-    return this
+    return this._with({ projection: cols })
   }
 
-  where(filters: FilterDescriptor | FilterDescriptor[]): this {
+  where(filters: FilterDescriptor | FilterDescriptor[]): DraftSelectBuilder<T> {
     const toAdd = Array.isArray(filters) ? filters : [filters]
-    this._filters.push(...toAdd)
-    return this
+    return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
 
   /**
@@ -456,14 +540,14 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * would sort as NULL no matter what the draft actually holds. Ordering must
    * see the same value the SELECT list returns.
    *
-   * The primary key stays on as a trailing tiebreaker. The coalesce is a FULL
-   * OUTER JOIN, whose row order is unspecified, so without it two rows equal on
-   * `col` could come back in a different order run to run.
+   * The primary key stays on as a trailing tiebreaker, matching the canonical
+   * builder. The coalesce is a FULL OUTER JOIN, whose row order is unspecified,
+   * so without it two rows equal on `col` could come back in a different order
+   * run to run — and differently from the canonical read of the same table.
    */
-  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): this {
-    this._orderByCol = col
-    this._orderDir = dir
-    return this
+  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): DraftSelectBuilder<T> {
+    if (col === '') throw new Error('orderBy() requires a column name')
+    return this._with({ orderByCol: col, orderDir: dir })
   }
 
   /**
@@ -471,9 +555,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * above always ends in the primary key, so the capped set is a well-defined
    * prefix rather than an arbitrary sample of the join output.
    */
-  limit(n: number): this {
-    this._limitVal = n
-    return this
+  limit(n: number): DraftSelectBuilder<T> {
+    return this._with({ limitVal: n })
   }
 
   /**
@@ -494,7 +577,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * one. Hence the guard rejects rather than honors.
    */
   async update(values: Partial<T['$inferInsert']>): Promise<Record<string, unknown>[]> {
-    this._assertWritable('update')
+    // Same guard as the canonical builder, which is the point: handlers cannot
+    // see which handle they hold.
+    assertNoReadClauses('update', this._clauses)
     const pkValue = this._requirePkFilter('update')
     return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
       pkValue,
@@ -511,7 +596,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * The `where` must pin the primary key with a single `eq`.
    */
   async delete(): Promise<Record<string, unknown>[]> {
-    this._assertWritable('delete')
+    assertNoReadClauses('delete', this._clauses)
     const pkValue = this._requirePkFilter('delete')
     return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
       pkValue,
@@ -537,14 +622,14 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const columns = getTableColumns(this._table) as Record<string, any>
     const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
 
-    if (this._filters.length !== 1) {
+    if (this._clauses.filters.length !== 1) {
       throw new Error(
         `DraftSelectBuilder.${op}() requires exactly one \`where(eq('${pkPropKey ?? pkColName}', value))\` ` +
-          `filter pinning the primary key — got ${this._filters.length}. A draft write addresses ` +
+          `filter pinning the primary key — got ${this._clauses.filters.length}. A draft write addresses ` +
           `a single row by PK (it cannot honor a general predicate against the shadow).`,
       )
     }
-    const f = this._filters[0]
+    const f = this._clauses.filters[0]
     if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
       throw new Error(
         `DraftSelectBuilder.${op}() requires \`where(eq('${pkPropKey ?? pkColName}', value))\` on table ` +
@@ -575,22 +660,22 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _resolvePkReadFilter(
     pkColName: string,
   ): { present: false } | { present: true; value: unknown } {
-    if (this._filters.length === 0) return { present: false }
+    if (this._clauses.filters.length === 0) return { present: false }
 
     const tableName = getTableName(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
 
-    if (this._filters.length !== 1) {
+    if (this._clauses.filters.length !== 1) {
       throw new Error(
         `DraftSelectBuilder.all()/first() after .where() supports exactly one ` +
           `\`where(eq('${pkPropKey ?? pkColName}', value))\` pinning the primary key — got ` +
-          `${this._filters.length} filters. The draft read coalesce can only push a single PK ` +
+          `${this._clauses.filters.length} filters. The draft read coalesce can only push a single PK ` +
           `predicate down (a general predicate is not supported — it would silently return every row).`,
       )
     }
-    const f = this._filters[0]
+    const f = this._clauses.filters[0]
     if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
       throw new Error(
         `DraftSelectBuilder.all()/first() after .where() requires ` +
@@ -615,8 +700,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
 
   /**
    * The coalesce itself. `limitOverride` exists so `first()` can lower `LIMIT 1`
-   * without assigning `_limitVal` — see `first()` for why that field must mean
-   * only "the caller attached `limit()`".
+   * without setting `_clauses.limitVal` — see `first()` for why that field must
+   * mean only "the caller attached `limit()`".
    */
   private async _coalescedRead(limitOverride?: number): Promise<Record<string, unknown>[]> {
     const tableName = getTableName(this._table)
@@ -681,14 +766,13 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // A projection narrows THIS list and nothing else: the join predicate, the
     // tombstone WHERE, the pk predicate and the ORDER BY all name their columns
     // directly below, so omitting the PK from the output leaves them intact.
-    const selectedEntries = this._projection
-      ? this._projection.map((propKey) => {
-          const col = columns[propKey]
-          // Same reason `_buildConditions` throws: a typo'd name would otherwise
-          // drop the column from the result instead of failing.
-          if (!col) throw new Error(`Unknown column: ${propKey}`)
-          return [propKey, col] as const
-        })
+    const selectedEntries = this._clauses.projection
+      ? this._clauses.projection.map(
+          // `requireColumn` throws on an unknown name rather than dropping the
+          // column from the result — and does an own-property check, so a name
+          // like `constructor` cannot resolve up `Object.prototype`.
+          (propKey) => [propKey, requireColumn(columns, propKey)] as const,
+        )
       : colEntries
 
     const colSelects = selectedEntries
@@ -729,18 +813,19 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // trailing tiebreaker — see `orderBy` for why it is never dropped.
     const pkOrder = `COALESCE(d."${pkColName}", b."${pkColName}")`
     let orderByClause = ` ORDER BY ${pkOrder}`
-    if (this._orderByCol) {
-      const col = columns[this._orderByCol]
-      // Same reason the projection and `_buildConditions` throw: a typo'd name
-      // would otherwise silently fall back to pk order.
-      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
+    if (this._clauses.orderByCol !== undefined) {
+      // `!== undefined`, not truthiness, and the same test the write guard uses:
+      // when the two disagreed, `orderBy('')` produced an unordered read the
+      // caller believed was sorted while still blocking a later write. The empty
+      // name is now rejected in the setter; this stays aligned regardless.
+      const col = requireColumn(columns, this._clauses.orderByCol)
       const sqlName = col.name as string
-      const dir = this._orderDir === 'desc' ? ' DESC' : ''
+      const dir = this._clauses.orderDir === 'desc' ? ' DESC' : ''
       orderByClause = ` ORDER BY COALESCE(d."${sqlName}", b."${sqlName}")${dir}, ${pkOrder}`
     }
     const orderBy = sql.raw(orderByClause)
     // Bound param, not interpolated — the value is caller-supplied.
-    const limitVal = limitOverride ?? this._limitVal
+    const limitVal = limitOverride ?? this._clauses.limitVal
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
     // `present` → bound `AND COALESCE(...) = $pkFilterValue`; absent → no fragment.
     const pkPredicate = pkFilter.present
@@ -783,7 +868,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * full coalesced set in PK order. Any non-PK read filter throws in the shared
    * read, so neither read method can be silently unfiltered.
    *
-   * Lowers `LIMIT 1` as an override rather than assigning `_limitVal`, for the
+   * Lowers `LIMIT 1` as an override rather than setting `_clauses.limitVal`, for the
    * same reason as `SelectBuilder.first()` — that field is what the write guard
    * reads to tell a caller-attached `limit()` from an internal one. Before the
    * limit was pushed down at all, this had to fetch the whole coalesced set to
@@ -792,16 +877,6 @@ export class DraftSelectBuilder<T extends AnyTable> {
   async first(): Promise<Record<string, unknown> | null> {
     const rows = await this._coalescedRead(1)
     return rows[0] ?? null
-  }
-
-  /** See `assertNoReadClauses` — same guard as the canonical builder, which is
-   *  the point: handlers cannot see which handle they hold. */
-  private _assertWritable(op: 'update' | 'delete'): void {
-    assertNoReadClauses(op, {
-      projection: this._projection,
-      orderByCol: this._orderByCol,
-      limitVal: this._limitVal,
-    })
   }
 }
 

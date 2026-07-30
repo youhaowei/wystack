@@ -285,6 +285,24 @@ const snakeTodos = pgTable('snake_todos', {
   ownerName: pgText('owner_name').notNull(),
 })
 
+/**
+ * The shadow table the draft coalesce joins against. One definition for the whole
+ * file: three describes needed it, and a copy that drifts from the real shadow
+ * shape produces a `42703` from the emitted SQL — a test failure that reads like a
+ * builder bug when it is only the fixture.
+ */
+const createShadow = () =>
+  tracked.raw.execute(`
+    CREATE TABLE IF NOT EXISTS todos__draft (
+      id INTEGER NOT NULL,
+      draft_id TEXT NOT NULL,
+      title TEXT,
+      done BOOLEAN,
+      __tombstone BOOLEAN DEFAULT false,
+      PRIMARY KEY (id, draft_id)
+    )
+  `)
+
 describe('SelectBuilder projection', () => {
   test('select() narrows the returned columns', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
@@ -439,19 +457,6 @@ describe('SelectBuilder projection', () => {
 })
 
 describe('DraftSelectBuilder orderBy / limit', () => {
-  /** The shadow table the coalesce joins against. */
-  const createShadow = () =>
-    tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS todos__draft (
-        id INTEGER NOT NULL,
-        draft_id TEXT NOT NULL,
-        title TEXT,
-        done BOOLEAN,
-        __tombstone BOOLEAN DEFAULT false,
-        PRIMARY KEY (id, draft_id)
-      )
-    `)
-
   test('orders by the COALESCED value, so a draft override moves the row', async () => {
     await createShadow()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
@@ -581,18 +586,6 @@ describe('DraftSelectBuilder orderBy / limit', () => {
 })
 
 describe('read clauses are rejected on write terminals', () => {
-  const createShadow = () =>
-    tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS todos__draft (
-        id INTEGER NOT NULL,
-        draft_id TEXT NOT NULL,
-        title TEXT,
-        done BOOLEAN,
-        __tombstone BOOLEAN DEFAULT false,
-        PRIMARY KEY (id, draft_id)
-      )
-    `)
-
   beforeEach(async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     await tracked.into(schema.todos).insert({ title: 'B', done: false })
@@ -725,5 +718,163 @@ describe('read clauses are rejected on write terminals', () => {
 
     const remaining = await handle.from(schema.todos).all()
     expect(remaining.map((r) => r.title)).toEqual(['B', 'C'])
+  })
+})
+
+/**
+ * The builder is a VALUE: every clause returns a new instance and no clause
+ * assigns to the receiver.
+ *
+ * Three separately-reported bugs were one defect — a mutable builder returning
+ * `this` handed out two names for one query — so these tests pin the property
+ * rather than the three symptoms. If a future clause is added with
+ * `this._x = …; return this`, one of them fails.
+ */
+describe('clause methods return a copy, not the receiver', () => {
+  beforeEach(async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    await tracked.into(schema.todos).insert({ title: 'B', done: true })
+    tracked = resetTracking(tracked)
+  })
+
+  test('select() does not change what the original builder yields', async () => {
+    const base = tracked.from(schema.todos)
+    const projected = base.select('title')
+
+    expect(projected).not.toBe(base)
+    // Before: `select()` mutated `base` and returned it re-typed, so the object
+    // and its type disagreed and BOTH names yielded `{title}`.
+    expect(Object.keys((await projected.all())[0])).toEqual(['title'])
+    expect(Object.keys((await base.all())[0]).sort()).toEqual(['done', 'id', 'title'])
+  })
+
+  test('where() accumulates on the copy only', async () => {
+    const base = tracked.from(schema.todos)
+    const filtered = base.where(eq('done', true))
+
+    expect(await filtered.all()).toHaveLength(1)
+    expect(await base.all()).toHaveLength(2)
+  })
+
+  test('two branches off one builder do not see each other', async () => {
+    const base = tracked.from(schema.todos)
+    const asc = base.orderBy('title')
+    const desc = base.orderBy('title', 'desc')
+
+    expect((await asc.all()).map((r) => r.title)).toEqual(['A', 'B'])
+    expect((await desc.all()).map((r) => r.title)).toEqual(['B', 'A'])
+  })
+
+  test('a read clause never reaches a write terminal built from the same base', async () => {
+    const base = tracked.from(schema.todos).where(eq('title', 'A'))
+    // The read branch is a different object, so consuming it leaves nothing
+    // attached to `base` for the guard to reject.
+    expect(await base.orderBy('title').limit(1).all()).toHaveLength(1)
+
+    expect(await base.update({ done: true })).toHaveLength(1)
+  })
+
+  test('the draft builder copies too — same property, same reasons', async () => {
+    await createShadow()
+    const base = tracked.withDraft('d1').from(schema.todos)
+    const limited = base.limit(1)
+
+    expect(limited).not.toBe(base)
+    expect(await limited.all()).toHaveLength(1)
+    expect(await base.all()).toHaveLength(2)
+  })
+
+  test('a draft read branch does not block a write off the same base', async () => {
+    await createShadow()
+    const base = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
+
+    expect(await base.orderBy('title').all()).toHaveLength(1)
+    await base.update({ done: true })
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).all()
+    expect(rows[0]?.done).toBe(true)
+  })
+})
+
+describe('clause column resolution is total', () => {
+  test('a projection naming an Object.prototype key throws', () => {
+    // `columns['constructor']` resolves up the prototype chain, so a truthiness
+    // check accepted it and lowered `select  from "todos"` — which Postgres
+    // ACCEPTS, returning fieldless rows. Own-property check, not truthiness.
+    for (const key of ['constructor', 'hasOwnProperty', 'toString']) {
+      expect(() =>
+        // oxlint-disable-next-line typescript/no-explicit-any -- reaching the runtime guard past the key constraint
+        (tracked.from(schema.todos) as any).select(key).toSql(),
+      ).toThrow(`Unknown column: ${key}`)
+    }
+  })
+
+  test('an orderBy naming an Object.prototype key throws', () => {
+    expect(() => tracked.from(schema.todos).orderBy('constructor').toSql()).toThrow(
+      'Unknown column: constructor',
+    )
+  })
+
+  test('orderBy("") is rejected at the call, not silently unordered', () => {
+    // The lowering used to gate on truthiness while the write guard tested
+    // `!== undefined`: an empty name produced an unordered read the caller
+    // believed was sorted, AND still blocked a later write.
+    expect(() => tracked.from(schema.todos).orderBy('')).toThrow('orderBy() requires a column name')
+    expect(() => tracked.withDraft('d1').from(schema.todos).orderBy('')).toThrow(
+      'orderBy() requires a column name',
+    )
+  })
+
+  test('a draft orderBy naming an unknown column throws', async () => {
+    await createShadow()
+    await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
+      'Unknown column: nope',
+    )
+  })
+})
+
+describe('canonical and draft reads agree on tied rows', () => {
+  test('orderBy on a tied column resolves by primary key on both paths', async () => {
+    await createShadow()
+    // Three rows tied on `done` — the only thing that can order them is the
+    // trailing PK tiebreaker. The draft coalesce always emitted one; canonical
+    // did not, so preview and publish could pick different rows under `limit`.
+    await tracked.into(schema.todos).insert({ title: 'x', done: true })
+    await tracked.into(schema.todos).insert({ title: 'y', done: true })
+    await tracked.into(schema.todos).insert({ title: 'z', done: true })
+
+    const canonical = await tracked.from(schema.todos).orderBy('done').all()
+    const draft = await tracked.withDraft('d1').from(schema.todos).orderBy('done').all()
+
+    expect(canonical.map((r) => r.id)).toEqual([1, 2, 3])
+    expect(draft.map((r) => r.id)).toEqual(canonical.map((r) => r.id))
+  })
+
+  test('limit(1) over a tie picks the same row on both paths', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'x', done: true })
+    await tracked.into(schema.todos).insert({ title: 'y', done: true })
+
+    const canonical = await tracked.from(schema.todos).orderBy('done', 'desc').limit(1).first()
+    const draft = await tracked
+      .withDraft('d1')
+      .from(schema.todos)
+      .orderBy('done', 'desc')
+      .limit(1)
+      .first()
+
+    // Without the tiebreaker this is heap order on one side and PK order on the
+    // other — and a handler cannot tell which handle it holds.
+    expect(canonical?.id).toBe(draft?.id)
+  })
+
+  test('the tiebreaker does not displace the named column', async () => {
+    // Ordering must still be BY the named column; the PK only breaks ties.
+    await tracked.into(schema.todos).insert({ title: 'b', done: false })
+    await tracked.into(schema.todos).insert({ title: 'a', done: false })
+
+    const rows = await tracked.from(schema.todos).orderBy('title').all()
+    expect(rows.map((r) => r.title)).toEqual(['a', 'b'])
+    expect(rows.map((r) => r.id)).toEqual([2, 1])
   })
 })
