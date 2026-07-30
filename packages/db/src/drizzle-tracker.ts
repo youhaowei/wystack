@@ -48,6 +48,9 @@ interface LoweredSelect<TRow> extends PromiseLike<TRow[]> {
  * here, not remembering to thread it through two classes and a guard.
  */
 interface ReadClauses {
+  /** Never mutated in place — `where()` REPLACES this array on the copy it
+   *  returns. `_with` spreads the clause object, so a `.push` here would write
+   *  through to every copy sharing the reference. */
   filters: FilterDescriptor[]
   projection?: string[]
   orderByCol?: string

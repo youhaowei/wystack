@@ -5,7 +5,7 @@ import { defineSchema } from '../schema'
 import { text, int, boolean } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
-import { pgTable, text as pgText, integer } from 'drizzle-orm/pg-core'
+import { pgTable, text as pgText, integer, primaryKey } from 'drizzle-orm/pg-core'
 
 const schema = defineSchema({
   todos: {
@@ -833,12 +833,53 @@ describe('clause column resolution is total', () => {
   })
 })
 
+/**
+ * A composite-PK table. `_pkColumn` cannot pin a single column here, so the
+ * tiebreaker is OMITTED rather than guessed — this fixture is what keeps that
+ * branch from being silently untested.
+ */
+const compositeMembers = pgTable(
+  'composite_members',
+  {
+    orgId: integer('org_id').notNull(),
+    userId: integer('user_id').notNull(),
+    role: pgText('role').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.orgId, t.userId] })],
+)
+
 describe('canonical and draft reads agree on tied rows', () => {
-  test('orderBy on a tied column resolves by primary key on both paths', async () => {
+  // Asserted on the LOWERED SQL, not on returned row order. Rows inserted in PK
+  // order into a fresh heap come back in PK order regardless, so a row-order
+  // assertion stays green with the tiebreaker removed — it does not pin anything.
+  test('the canonical ORDER BY carries the primary key as a trailing term', () => {
+    const { sql } = tracked.from(schema.todos).orderBy('done').toSql()
+    expect(sql).toContain('order by "todos"."done" asc, "todos"."id" asc')
+  })
+
+  test('the tiebreaker is not duplicated when the named column IS the primary key', () => {
+    expect(tracked.from(schema.todos).orderBy('id').toSql().sql).toContain(
+      'order by "todos"."id" asc',
+    )
+    // `desc` proves the single term is the CALLER's, not a tiebreaker that
+    // happens to match: a duplicate would append a second, ascending `"id"`.
+    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).toContain(
+      'order by "todos"."id" desc',
+    )
+    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).not.toContain('asc')
+  })
+
+  test('the tiebreaker rides on the caller direction, not the reverse', () => {
+    // The PK term is always ascending — it exists to make the tie DETERMINISTIC,
+    // and the draft coalesce's `pkOrder` is ascending too. If one flipped with
+    // the caller's direction and the other did not, the two paths would disagree
+    // on exactly the reads this pairing exists to keep identical.
+    const { sql } = tracked.from(schema.todos).orderBy('done', 'desc').toSql()
+    expect(sql).toContain('order by "todos"."done" desc, "todos"."id" asc')
+  })
+
+  test('canonical and draft return tied rows in the same order', async () => {
     await createShadow()
-    // Three rows tied on `done` — the only thing that can order them is the
-    // trailing PK tiebreaker. The draft coalesce always emitted one; canonical
-    // did not, so preview and publish could pick different rows under `limit`.
     await tracked.into(schema.todos).insert({ title: 'x', done: true })
     await tracked.into(schema.todos).insert({ title: 'y', done: true })
     await tracked.into(schema.todos).insert({ title: 'z', done: true })
@@ -846,7 +887,6 @@ describe('canonical and draft reads agree on tied rows', () => {
     const canonical = await tracked.from(schema.todos).orderBy('done').all()
     const draft = await tracked.withDraft('d1').from(schema.todos).orderBy('done').all()
 
-    expect(canonical.map((r) => r.id)).toEqual([1, 2, 3])
     expect(draft.map((r) => r.id)).toEqual(canonical.map((r) => r.id))
   })
 
@@ -876,5 +916,14 @@ describe('canonical and draft reads agree on tied rows', () => {
     const rows = await tracked.from(schema.todos).orderBy('title').all()
     expect(rows.map((r) => r.title)).toEqual(['a', 'b'])
     expect(rows.map((r) => r.id)).toEqual([2, 1])
+  })
+
+  test('a composite-PK table emits no tiebreaker rather than an arbitrary one', () => {
+    const { sql } = tracked.from(compositeMembers).orderBy('role').toSql()
+    // Scoped to the ORDER BY — the key's columns are of course in the SELECT
+    // list. No second term there: picking one half of a composite key would be
+    // arbitrary, and the draft coalesce cannot pin a single PK column either.
+    const orderBy = sql.slice(sql.indexOf('order by'))
+    expect(orderBy).toBe('order by "composite_members"."role" asc')
   })
 })
