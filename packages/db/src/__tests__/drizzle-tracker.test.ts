@@ -303,6 +303,32 @@ const createShadow = () =>
     )
   `)
 
+/**
+ * `snakeTodos` and, optionally, its shadow. Paired with `createShadow` above for
+ * the same reason: the DDL must track the Drizzle declaration, and a copy that
+ * drifts fails as a `42703` from the emitted SQL rather than as a fixture error.
+ */
+const createSnakeTodos = async ({ withShadow = false } = {}) => {
+  await tracked.raw.execute(`
+    CREATE TABLE IF NOT EXISTS snake_todos (
+      id INTEGER PRIMARY KEY,
+      todo_title TEXT NOT NULL,
+      owner_name TEXT NOT NULL
+    )
+  `)
+  if (!withShadow) return
+  await tracked.raw.execute(`
+    CREATE TABLE IF NOT EXISTS snake_todos__draft (
+      id INTEGER NOT NULL,
+      draft_id TEXT NOT NULL,
+      todo_title TEXT,
+      owner_name TEXT,
+      __tombstone BOOLEAN DEFAULT false,
+      PRIMARY KEY (id, draft_id)
+    )
+  `)
+}
+
 describe('SelectBuilder projection', () => {
   test('select() narrows the returned columns', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
@@ -376,13 +402,7 @@ describe('SelectBuilder projection', () => {
   })
 
   test('projection names JS keys and lowers to the column SQL names', async () => {
-    await tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS snake_todos (
-        id INTEGER PRIMARY KEY,
-        todo_title TEXT NOT NULL,
-        owner_name TEXT NOT NULL
-      )
-    `)
+    await createSnakeTodos()
     await tracked.into(snakeTodos).insert({ id: 1, todoTitle: 'A', ownerName: 'yh' })
     tracked = resetTracking(tracked)
 
@@ -394,16 +414,7 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft read projects the coalesce, matching the canonical builder', async () => {
-    await tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS todos__draft (
-        id INTEGER NOT NULL,
-        draft_id TEXT NOT NULL,
-        title TEXT,
-        done BOOLEAN,
-        __tombstone BOOLEAN DEFAULT false,
-        PRIMARY KEY (id, draft_id)
-      )
-    `)
+    await createShadow()
     await tracked.into(schema.todos).insert({ title: 'base', done: false })
     await tracked.raw.execute(
       `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'overridden')`,
@@ -416,16 +427,7 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft projection omitting the PK still joins, orders and suppresses tombstones', async () => {
-    await tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS todos__draft (
-        id INTEGER NOT NULL,
-        draft_id TEXT NOT NULL,
-        title TEXT,
-        done BOOLEAN,
-        __tombstone BOOLEAN DEFAULT false,
-        PRIMARY KEY (id, draft_id)
-      )
-    `)
+    await createShadow()
     await tracked.into(schema.todos).insert({ title: 'kept', done: false })
     await tracked.into(schema.todos).insert({ title: 'deleted', done: false })
     await tracked.raw.execute(
@@ -557,23 +559,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('orderBy lowers the JS property key to its SQL column name', async () => {
-    await tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS snake_todos (
-        id INTEGER PRIMARY KEY,
-        todo_title TEXT NOT NULL,
-        owner_name TEXT NOT NULL
-      )
-    `)
-    await tracked.raw.execute(`
-      CREATE TABLE IF NOT EXISTS snake_todos__draft (
-        id INTEGER NOT NULL,
-        draft_id TEXT NOT NULL,
-        todo_title TEXT,
-        owner_name TEXT,
-        __tombstone BOOLEAN DEFAULT false,
-        PRIMARY KEY (id, draft_id)
-      )
-    `)
+    await createSnakeTodos({ withShadow: true })
     await tracked.raw.execute(
       `INSERT INTO snake_todos (id, todo_title, owner_name) VALUES (1, 'bbb', 'x'), (2, 'aaa', 'y')`,
     )
