@@ -332,7 +332,9 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
  * was row-filtered when it was not (an auth/authz hazard). An UNFILTERED `.all()`
  * returns the full coalesced set, as before.
  *
- * `orderBy`/`limit` still THROW immediately (not yet pushed down).
+ * `orderBy`/`limit` are pushed into the coalesce SQL, ordering on the COALESCED
+ * value so draft-inserted rows sort by what the draft holds, with the PK kept as
+ * a tiebreaker (a FULL OUTER JOIN has no inherent row order).
  *
  * WRITE side (`.where(eqPk).update(vals)` / `.where(eqPk).delete()`): routes the
  * mutation into the `<table>__draft` shadow as a sparse upsert (update) or
@@ -354,6 +356,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
   // The same accumulated filter serves both; only the consumer differs.
   private _filters: FilterDescriptor[] = []
   private _projection?: string[]
+  private _orderByCol?: string
+  private _orderDir: 'asc' | 'desc' = 'asc'
+  private _limitVal?: number
 
   constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
     this._table = table
@@ -368,9 +373,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * authored against `DrizzleTracker` (`create.ts` hands them
    * `db: tracked as DrizzleTracker`) and cannot see which handle they hold, so
    * a clause that silently changed meaning under a draft would be undetectable
-   * at the call site. That is why `select` lands on both builders with the same
-   * vocabulary — not a claim the two are at parity. They are not: `orderBy` and
-   * `limit` below still throw, because the coalesce fixes its own ordering.
+   * at the call site. Every read clause therefore lands on both builders with the
+   * same vocabulary and the same meaning — `select` here, `orderBy`/`limit` below.
    *
    * Projection only shrinks the coalesce's SELECT list. The join predicate, the
    * tombstone filter and the ORDER BY reference their columns directly and do
@@ -389,14 +393,32 @@ export class DraftSelectBuilder<T extends AnyTable> {
     return this
   }
 
-  orderBy(_col: string, _dir: 'asc' | 'desc' = 'asc'): this {
-    throw new Error(
-      'DraftSelectBuilder.orderBy() is not yet implemented (coalesce primitive only).',
-    )
+  /**
+   * Order the coalesced read by `col` (a property key, as everywhere else).
+   *
+   * The ordering expression is `COALESCE(d."col", b."col")`, not `b."col"`: a
+   * draft-INSERTED row has no base side, so `b."col"` is NULL there and the row
+   * would sort as NULL no matter what the draft actually holds. Ordering must
+   * see the same value the SELECT list returns.
+   *
+   * The primary key stays on as a trailing tiebreaker. The coalesce is a FULL
+   * OUTER JOIN, whose row order is unspecified, so without it two rows equal on
+   * `col` could come back in a different order run to run.
+   */
+  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): this {
+    this._orderByCol = col
+    this._orderDir = dir
+    return this
   }
 
-  limit(_n: number): this {
-    throw new Error('DraftSelectBuilder.limit() is not yet implemented (coalesce primitive only).')
+  /**
+   * Cap the coalesced read at `n` rows. Safe to compose because the ORDER BY
+   * above always ends in the primary key, so the capped set is a well-defined
+   * prefix rather than an arbitrary sample of the join output.
+   */
+  limit(n: number): this {
+    this._limitVal = n
+    return this
   }
 
   /**
@@ -631,7 +653,23 @@ export class DraftSelectBuilder<T extends AnyTable> {
       `) d ON b."${pkColName}" = d."${pkColName}" ` +
         `WHERE COALESCE(d."__tombstone", false) = false`,
     )
-    const orderBy = sql.raw(` ORDER BY COALESCE(d."${pkColName}", b."${pkColName}")`)
+    // The pk order is both the default and, when a caller names a column, the
+    // trailing tiebreaker — see `orderBy` for why it is never dropped.
+    const pkOrder = `COALESCE(d."${pkColName}", b."${pkColName}")`
+    let orderByClause = ` ORDER BY ${pkOrder}`
+    if (this._orderByCol) {
+      const col = columns[this._orderByCol]
+      // Same reason the projection and `_buildConditions` throw: a typo'd name
+      // would otherwise silently fall back to pk order.
+      if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
+      const sqlName = col.name as string
+      const dir = this._orderDir === 'desc' ? ' DESC' : ''
+      orderByClause = ` ORDER BY COALESCE(d."${sqlName}", b."${sqlName}")${dir}, ${pkOrder}`
+    }
+    const orderBy = sql.raw(orderByClause)
+    // Bound param, not interpolated — `_limitVal` is caller-supplied.
+    const limit =
+      this._limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${this._limitVal}`
     // `present` → bound `AND COALESCE(...) = $pkFilterValue`; absent → no fragment.
     const pkPredicate = pkFilter.present
       ? sql`${sql.raw(` AND COALESCE(d."${pkColName}", b."${pkColName}") = `)}${pkFilterValue}`
@@ -639,7 +677,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
 
     // `this._draftId` and `pkFilterValue` are interpolated as bound parameters by
     // the sql tag; relation/column names are introspected identifiers via sql.raw.
-    const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}`
+    const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}${limit}`
 
     const result = await this._db.execute(query)
     const rows = normalizeExecuteRows(result)
@@ -674,6 +712,10 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * the `all()` guard, so neither read method can be silently unfiltered.
    */
   async first(): Promise<Record<string, unknown> | null> {
+    // Sets the limit rather than slicing in JS, matching `SelectBuilder.first()`.
+    // Before `limit` was pushed down this had to fetch the whole coalesced set to
+    // return one row.
+    this._limitVal = 1
     const rows = await this.all()
     return rows[0] ?? null
   }

@@ -437,3 +437,145 @@ describe('SelectBuilder projection', () => {
     expect(fullRow).toContain('"done"')
   })
 })
+
+describe('DraftSelectBuilder orderBy / limit', () => {
+  /** The shadow table the coalesce joins against. */
+  const createShadow = () =>
+    tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS todos__draft (
+        id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        title TEXT,
+        done BOOLEAN,
+        __tombstone BOOLEAN DEFAULT false,
+        PRIMARY KEY (id, draft_id)
+      )
+    `)
+
+  test('orders by the COALESCED value, so a draft override moves the row', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
+    await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
+    // Row 1 is renamed to sort LAST. Ordering on `b."title"` would still see
+    // 'aaa' and put it first — this is the assertion that pins COALESCE.
+    await tracked.raw.execute(
+      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'zzz')`,
+    )
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
+
+    expect(rows.map((r) => r.title)).toEqual(['bbb', 'zzz'])
+  })
+
+  test('a draft-INSERTED row sorts by its draft value, not as NULL', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'mmm', done: false })
+    // No base row for id 99 — `b."title"` is NULL on this side of the FULL OUTER
+    // JOIN, so only the coalesced expression can place it correctly.
+    await tracked.raw.execute(
+      `INSERT INTO todos__draft (id, draft_id, title, done) VALUES (99, 'd1', 'aaa', false)`,
+    )
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
+
+    expect(rows.map((r) => r.title)).toEqual(['aaa', 'mmm'])
+  })
+
+  test('desc reverses the order', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
+    await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title', 'desc').all()
+
+    expect(rows.map((r) => r.title)).toEqual(['bbb', 'aaa'])
+  })
+
+  test('limit caps the coalesced set, and composes with orderBy as top-N', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'ccc', done: false })
+    await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
+    await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
+
+    const capped = await tracked.withDraft('d1').from(schema.todos).limit(2).all()
+    expect(capped).toHaveLength(2)
+
+    const topOne = await tracked.withDraft('d1').from(schema.todos).orderBy('title').limit(1).all()
+    expect(topOne.map((r) => r.title)).toEqual(['aaa'])
+  })
+
+  test('a tombstoned row does not consume a limit slot', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'first', done: false })
+    await tracked.into(schema.todos).insert({ title: 'second', done: false })
+    await tracked.raw.execute(
+      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (1, 'd1', true)`,
+    )
+
+    // LIMIT applies after the tombstone WHERE. If the order were reversed, the
+    // suppressed row would eat the only slot and this would come back empty.
+    const rows = await tracked.withDraft('d1').from(schema.todos).limit(1).all()
+
+    expect(rows.map((r) => r.title)).toEqual(['second'])
+  })
+
+  test('ties on the ordering column stay deterministic via the PK tiebreaker', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'same', done: false })
+    await tracked.into(schema.todos).insert({ title: 'same', done: false })
+    await tracked.into(schema.todos).insert({ title: 'same', done: false })
+
+    const ids = async () =>
+      (await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()).map((r) => r.id)
+
+    expect(await ids()).toEqual([1, 2, 3])
+    expect(await ids()).toEqual(await ids())
+  })
+
+  test('first() returns one row and no longer fetches the whole set', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
+    await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
+
+    const row = await tracked.withDraft('d1').from(schema.todos).first()
+
+    expect(row?.title).toBe('aaa')
+  })
+
+  test('an unknown orderBy column throws instead of falling back to PK order', async () => {
+    await createShadow()
+    await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
+
+    await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
+      'Unknown column: nope',
+    )
+  })
+
+  test('orderBy lowers the JS property key to its SQL column name', async () => {
+    await tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS snake_todos (
+        id INTEGER PRIMARY KEY,
+        todo_title TEXT NOT NULL,
+        owner_name TEXT NOT NULL
+      )
+    `)
+    await tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS snake_todos__draft (
+        id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        todo_title TEXT,
+        owner_name TEXT,
+        __tombstone BOOLEAN DEFAULT false,
+        PRIMARY KEY (id, draft_id)
+      )
+    `)
+    await tracked.raw.execute(
+      `INSERT INTO snake_todos (id, todo_title, owner_name) VALUES (1, 'bbb', 'x'), (2, 'aaa', 'y')`,
+    )
+
+    // `todoTitle` is the property key; the emitted SQL must say "todo_title".
+    const rows = await tracked.withDraft('d1').from(snakeTodos).orderBy('todoTitle').all()
+
+    expect(rows.map((r) => r.todoTitle)).toEqual(['aaa', 'bbb'])
+  })
+})
