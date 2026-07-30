@@ -39,6 +39,42 @@ interface LoweredSelect<TRow> extends PromiseLike<TRow[]> {
   toSQL(): Query
 }
 
+/**
+ * Reject read-terminal clauses on a write terminal.
+ *
+ * `from(t).where(...)` builds a row scope; the terminal decides read or write.
+ * `where` is a scope modifier and means something to every terminal, but
+ * `select` / `orderBy` / `limit` configure what `all()` / `first()` YIELD and
+ * mean nothing to `update` / `delete`. Silently dropping them is the hazard:
+ *
+ *   from(t).where(gt('age', 30)).limit(1).delete()
+ *
+ * read as "delete one row" and deleted EVERY match. Throwing is the convention
+ * this file already uses for a clause a terminal cannot honor (see the draft
+ * `transaction` guard and `_resolvePkReadFilter`) — silence is what turns a
+ * misread into a wrong result. `select` is included for a second reason:
+ * `update`/`delete` return `Promise<any>`, so a handler that visibly projected
+ * columns away and then forwarded its RETURNING rows would leak them with no
+ * type-level signal at the call site.
+ *
+ * Shared by both builders so the canonical and draft write paths cannot drift.
+ */
+function assertNoReadClauses(
+  op: 'update' | 'delete',
+  clauses: { projection?: string[]; orderByCol?: string; limitVal?: number },
+): void {
+  const attached: string[] = []
+  if (clauses.projection) attached.push('select()')
+  if (clauses.orderByCol !== undefined) attached.push('orderBy()')
+  if (clauses.limitVal !== undefined) attached.push('limit()')
+  if (attached.length === 0) return
+  throw new Error(
+    `${attached.join(' / ')} cannot precede ${op}() — ${attached.length > 1 ? 'they configure' : 'it configures'} what a read returns, ` +
+      `and would be ignored by the write. To ${op} specific rows, pin them with where(); ` +
+      `to ${op} one of many matches, read it first (orderBy/limit/first) and then ${op} by primary key.`,
+  )
+}
+
 const drizzleOpMap = {
   eq: drizzleEq,
   ne: drizzleNe,
@@ -289,7 +325,18 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     return rows[0] ?? null
   }
 
+  /** See `assertNoReadClauses`. Note `first()` sets `_limitVal`, so this must
+   *  run before any write, never after a read on the same builder. */
+  private _assertWritable(op: 'update' | 'delete'): void {
+    assertNoReadClauses(op, {
+      projection: this._projection,
+      orderByCol: this._orderByCol,
+      limitVal: this._limitVal,
+    })
+  }
+
   async update(values: Partial<T['$inferInsert']>) {
+    this._assertWritable('update')
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.update(this._table).set(values)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -301,6 +348,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   }
 
   async delete() {
+    this._assertWritable('delete')
     this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.delete(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -431,8 +479,15 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * The `where` must pin the primary key with a single `eq`. Returns the upserted
    * shadow rows (Drizzle `.returning()` shape) for parity with the canonical
    * builder.
+   *
+   * Note what those shadow rows are, because it is why `select` cannot narrow
+   * them: a shadow row is the sparse OVERRIDE, where NULL means "not edited"
+   * rather than "the value is NULL". Projecting it would answer `{title: null}`
+   * for a row whose coalesced title is real — a wrong answer, not a narrower
+   * one. Hence the guard rejects rather than honors.
    */
   async update(values: Partial<T['$inferInsert']>): Promise<Record<string, unknown>[]> {
+    this._assertWritable('update')
     const pkValue = this._requirePkFilter('update')
     return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
       pkValue,
@@ -449,6 +504,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * The `where` must pin the primary key with a single `eq`.
    */
   async delete(): Promise<Record<string, unknown>[]> {
+    this._assertWritable('delete')
     const pkValue = this._requirePkFilter('delete')
     return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
       pkValue,
@@ -718,6 +774,16 @@ export class DraftSelectBuilder<T extends AnyTable> {
     this._limitVal = 1
     const rows = await this.all()
     return rows[0] ?? null
+  }
+
+  /** See `assertNoReadClauses` — same guard as the canonical builder, which is
+   *  the point: handlers cannot see which handle they hold. */
+  private _assertWritable(op: 'update' | 'delete'): void {
+    assertNoReadClauses(op, {
+      projection: this._projection,
+      orderByCol: this._orderByCol,
+      limitVal: this._limitVal,
+    })
   }
 }
 

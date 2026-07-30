@@ -326,16 +326,22 @@ describe('withDraft edge cases', () => {
     expect(rows[0]['title']).toBe('APPLE-edited')
   })
 
-  test('orderBy() throws (fail-loud, not a silent no-op)', () => {
-    expect(() => tracked.withDraft('d1').from(todos).orderBy('id', 'desc')).toThrow(
-      'DraftSelectBuilder.orderBy() is not yet implemented',
-    )
+  // These two previously asserted a 'not yet implemented' throw. Both clauses are
+  // now pushed into the coalesce SQL, so the contract they pin is the real
+  // behavior — see `DraftSelectBuilder orderBy / limit` in drizzle-tracker.test.ts
+  // for the ordering semantics (COALESCE, PK tiebreaker, tombstone vs limit slot).
+  test('orderBy() sorts the coalesced read', async () => {
+    const rows = await tracked.withDraft('d1').from(todos).orderBy('id', 'desc').all()
+    const ids = rows.map((r) => r['id'])
+    expect(ids).toEqual([...ids].sort((a, b) => Number(b) - Number(a)))
   })
 
-  test('limit() throws (fail-loud, not a silent no-op)', () => {
-    expect(() => tracked.withDraft('d1').from(todos).limit(10)).toThrow(
-      'DraftSelectBuilder.limit() is not yet implemented',
-    )
+  test('limit() caps the coalesced read', async () => {
+    const all = await tracked.withDraft('d1').from(todos).all()
+    expect(all.length).toBeGreaterThan(1)
+
+    const capped = await tracked.withDraft('d1').from(todos).limit(1).all()
+    expect(capped).toHaveLength(1)
   })
 })
 

@@ -579,3 +579,119 @@ describe('DraftSelectBuilder orderBy / limit', () => {
     expect(rows.map((r) => r.todoTitle)).toEqual(['aaa', 'bbb'])
   })
 })
+
+describe('read clauses are rejected on write terminals', () => {
+  const createShadow = () =>
+    tracked.raw.execute(`
+      CREATE TABLE IF NOT EXISTS todos__draft (
+        id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        title TEXT,
+        done BOOLEAN,
+        __tombstone BOOLEAN DEFAULT false,
+        PRIMARY KEY (id, draft_id)
+      )
+    `)
+
+  beforeEach(async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    await tracked.into(schema.todos).insert({ title: 'B', done: false })
+    await tracked.into(schema.todos).insert({ title: 'C', done: false })
+    tracked = resetTracking(tracked)
+  })
+
+  test('limit before delete throws instead of deleting every match', async () => {
+    await expect(
+      tracked.from(schema.todos).where(eq('done', false)).limit(1).delete(),
+    ).rejects.toThrow('limit() cannot precede delete()')
+
+    // The regression this guard exists for: before it, all three were deleted.
+    expect(await resetTracking(tracked).from(schema.todos).all()).toHaveLength(3)
+  })
+
+  test('the write is not tagged when the guard rejects it', async () => {
+    await expect(tracked.from(schema.todos).limit(1).delete()).rejects.toThrow()
+
+    // The guard runs BEFORE `tablesWritten.add`, so a rejected write cannot
+    // invalidate subscriptions for a mutation that never happened.
+    expect(tracked.tablesWritten.has('todos')).toBe(false)
+    expect(tracked.tablesWritten.size).toBe(0)
+  })
+
+  test('orderBy before update throws', async () => {
+    await expect(
+      tracked.from(schema.todos).orderBy('title').update({ done: true }),
+    ).rejects.toThrow('orderBy() cannot precede update()')
+  })
+
+  test('select before update throws', async () => {
+    await expect(tracked.from(schema.todos).select('id').update({ done: true })).rejects.toThrow(
+      'select() cannot precede update()',
+    )
+  })
+
+  test('several attached clauses are all named in one error', async () => {
+    await expect(
+      tracked.from(schema.todos).select('id').orderBy('title').limit(1).delete(),
+    ).rejects.toThrow('select() / orderBy() / limit() cannot precede delete()')
+  })
+
+  test('the message points at the correct alternative', async () => {
+    await expect(tracked.from(schema.todos).limit(1).delete()).rejects.toThrow(
+      /pin them with where\(\).*read it first .*then delete by primary key/s,
+    )
+  })
+
+  test('a plain where-scoped write is unaffected', async () => {
+    const updated = await tracked.from(schema.todos).where(eq('title', 'A')).update({ done: true })
+    expect(updated).toHaveLength(1)
+
+    const deleted = await tracked.from(schema.todos).where(eq('title', 'B')).delete()
+    expect(deleted).toHaveLength(1)
+  })
+
+  test('an unlimited bulk delete is still allowed — it says what it does', async () => {
+    const deleted = await tracked.from(schema.todos).where(eq('done', false)).delete()
+    expect(deleted).toHaveLength(3)
+  })
+
+  test('the draft write path rejects the same clauses', async () => {
+    await createShadow()
+    const draft = () => tracked.withDraft('d1').from(schema.todos)
+
+    await expect(draft().select('title').where(eq('id', 1)).update({ done: true })).rejects.toThrow(
+      'select() cannot precede update()',
+    )
+    await expect(draft().limit(1).where(eq('id', 1)).delete()).rejects.toThrow(
+      'limit() cannot precede delete()',
+    )
+    await expect(
+      draft().orderBy('title').where(eq('id', 1)).update({ done: true }),
+    ).rejects.toThrow('orderBy() cannot precede update()')
+  })
+
+  test('a draft write with no read clauses still lands in the shadow', async () => {
+    await createShadow()
+
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({ done: true })
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).all()
+    expect(rows[0]?.done).toBe(true)
+  })
+
+  test('the prescribed two-step alternative works, in a draft too', async () => {
+    await createShadow()
+    const handle = tracked.withDraft('d1')
+
+    // This is what the error message tells a caller to write.
+    const oldest = await handle.from(schema.todos).orderBy('title').limit(1).first()
+    expect(oldest?.title).toBe('A')
+    await handle
+      .from(schema.todos)
+      .where(eq('id', oldest!.id as number))
+      .delete()
+
+    const remaining = await handle.from(schema.todos).all()
+    expect(remaining.map((r) => r.title)).toEqual(['B', 'C'])
+  })
+})
