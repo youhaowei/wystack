@@ -679,6 +679,38 @@ describe('read clauses are rejected on write terminals', () => {
     expect(rows[0]?.done).toBe(true)
   })
 
+  test('first() then a write on the SAME builder is not rejected', async () => {
+    // Regression: `first()` used to assign `_limitVal`, which the guard reads to
+    // decide whether the CALLER attached `limit()`. A reused builder was then
+    // rejected for a clause it never attached. `first()` now lowers its LIMIT 1
+    // as an override instead.
+    const b = tracked.from(schema.todos).where(eq('title', 'A'))
+
+    const row = await b.first()
+    expect(row?.title).toBe('A')
+
+    const updated = await b.update({ done: true })
+    expect(updated).toHaveLength(1)
+  })
+
+  test('a caller-attached limit is still rejected after a read on the same builder', async () => {
+    // The other half: the override must not mask a real `limit()`.
+    const b = tracked.from(schema.todos).limit(1)
+    expect(await b.all()).toHaveLength(1)
+    await expect(b.delete()).rejects.toThrow('limit() cannot precede delete()')
+  })
+
+  test('draft first() then a write on the same builder is not rejected either', async () => {
+    await createShadow()
+    const b = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
+
+    expect((await b.first())?.id).toBe(1)
+    await b.update({ done: true })
+
+    const rows = await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).all()
+    expect(rows[0]?.done).toBe(true)
+  })
+
   test('the prescribed two-step alternative works, in a draft too', async () => {
     await createShadow()
     const handle = tracked.withDraft('d1')

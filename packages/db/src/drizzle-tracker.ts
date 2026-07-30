@@ -277,7 +277,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * the byte-identical zero-overhead assertion in `toSql()` only stays meaningful
    * if it lowers the exact same query `all()` executes.
    */
-  private _buildSelectQuery(): LoweredSelect<TRow> {
+  private _buildSelectQuery(limitOverride?: number): LoweredSelect<TRow> {
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     // `DrizzleDb` is `any`, so the whole clause chain below is untyped no matter
@@ -295,8 +295,9 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
       if (!col) throw new Error(`Unknown column: ${this._orderByCol}`)
       q = q.orderBy(this._orderDir === 'desc' ? desc(col) : asc(col))
     }
-    if (this._limitVal !== undefined) {
-      q = q.limit(this._limitVal)
+    const limit = limitOverride ?? this._limitVal
+    if (limit !== undefined) {
+      q = q.limit(limit)
     }
     return q
   }
@@ -319,14 +320,20 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     return this._buildSelectQuery().toSQL()
   }
 
+  /**
+   * Lowers its own `LIMIT 1` as an override rather than assigning `_limitVal`.
+   * That field must mean exactly one thing — the CALLER attached `limit()` —
+   * because `_assertWritable` reads it to reject read clauses on a write. When
+   * `first()` assigned it, reusing a builder for a read and then a write got
+   * rejected for a clause the caller never wrote.
+   */
   async first(): Promise<TRow | null> {
-    this._limitVal = 1
-    const rows = await this.all()
+    this._tracker.tablesRead.add(getTableName(this._table))
+    const rows = (await this._buildSelectQuery(1)) as TRow[]
     return rows[0] ?? null
   }
 
-  /** See `assertNoReadClauses`. Note `first()` sets `_limitVal`, so this must
-   *  run before any write, never after a read on the same builder. */
+  /** See `assertNoReadClauses`. */
   private _assertWritable(op: 'update' | 'delete'): void {
     assertNoReadClauses(op, {
       projection: this._projection,
@@ -603,6 +610,15 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   async all(): Promise<Record<string, unknown>[]> {
+    return this._coalescedRead()
+  }
+
+  /**
+   * The coalesce itself. `limitOverride` exists so `first()` can lower `LIMIT 1`
+   * without assigning `_limitVal` — see `first()` for why that field must mean
+   * only "the caller attached `limit()`".
+   */
+  private async _coalescedRead(limitOverride?: number): Promise<Record<string, unknown>[]> {
     const tableName = getTableName(this._table)
     const draftTableName = `${tableName}__draft`
 
@@ -723,9 +739,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
       orderByClause = ` ORDER BY COALESCE(d."${sqlName}", b."${sqlName}")${dir}, ${pkOrder}`
     }
     const orderBy = sql.raw(orderByClause)
-    // Bound param, not interpolated — `_limitVal` is caller-supplied.
-    const limit =
-      this._limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${this._limitVal}`
+    // Bound param, not interpolated — the value is caller-supplied.
+    const limitVal = limitOverride ?? this._limitVal
+    const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
     // `present` → bound `AND COALESCE(...) = $pkFilterValue`; absent → no fragment.
     const pkPredicate = pkFilter.present
       ? sql`${sql.raw(` AND COALESCE(d."${pkColName}", b."${pkColName}") = `)}${pkFilterValue}`
@@ -761,18 +777,20 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * Coalesced first-row read. Mirrors `SelectBuilder.first()` so an UNMODIFIED
    * handler that calls `ctx.db.from(table).where(eq('id', x)).first()` works
    * inside a draft (the `runHandler` widening hides the structural gap from the
-   * typechecker). Delegates to `all()`, so it honors the SAME single-PK read
-   * predicate: `where(eq(pk, x)).first()` returns the one coalesced row (or
-   * null); an unfiltered `first()` returns the first row of the full coalesced
-   * set in PK order. Any non-PK read filter throws in `all()` — the mirror of
-   * the `all()` guard, so neither read method can be silently unfiltered.
+   * typechecker). Shares the coalesce with `all()`, so it honors the SAME
+   * single-PK read predicate: `where(eq(pk, x)).first()` returns the one
+   * coalesced row (or null); an unfiltered `first()` returns the first row of the
+   * full coalesced set in PK order. Any non-PK read filter throws in the shared
+   * read, so neither read method can be silently unfiltered.
+   *
+   * Lowers `LIMIT 1` as an override rather than assigning `_limitVal`, for the
+   * same reason as `SelectBuilder.first()` — that field is what the write guard
+   * reads to tell a caller-attached `limit()` from an internal one. Before the
+   * limit was pushed down at all, this had to fetch the whole coalesced set to
+   * return one row.
    */
   async first(): Promise<Record<string, unknown> | null> {
-    // Sets the limit rather than slicing in JS, matching `SelectBuilder.first()`.
-    // Before `limit` was pushed down this had to fetch the whole coalesced set to
-    // return one row.
-    this._limitVal = 1
-    const rows = await this.all()
+    const rows = await this._coalescedRead(1)
     return rows[0] ?? null
   }
 
