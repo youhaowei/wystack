@@ -68,5 +68,8 @@ bun run check        # lint + format check + typecheck + test
 ## Design
 
 Design docs (a PRD per package, plus Specs) live in the team's internal Notion
-Wiki. The links are kept out of this public repo — see `AGENTS.local.md`
-(gitignored) for them. DESIGN.md was retired.
+Wiki. Those links, and any dashboard or internal-wiki URL, never go in a
+committed file — this repo is public. Keep them in `AGENTS.local.md` or
+`CLAUDE.local.md`; both are gitignored. Which one your harness reads depends on
+the harness: Claude Code loads `CLAUDE.local.md`, Codex loads `AGENTS.local.md`.
+DESIGN.md was retired.

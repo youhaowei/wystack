@@ -182,9 +182,160 @@ describe('withDraft coalesced read', () => {
   })
 
   test('rows are returned in pk order', async () => {
+    // Kept as a shape check, NOT as the proof of ordering. Rows land in the heap
+    // in pk order, so this passes with the ORDER BY deleted — the lowered-SQL
+    // assertions in `draft lowering` are what actually pin the clause.
     const rows = await tracked.withDraft('d1').from(todos).all()
     const ids = rows.map((r) => r['id'] as number)
     expect(ids).toEqual([1, 3, 4])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test 1b: Draft lowering — assertions on emitted SQL, not on returned rows
+//
+// Every test here exists because its row-order equivalent does not discriminate.
+// PGlite returns rows from this FULL OUTER JOIN in pk order regardless of what
+// the builder emits (a heap populated in pk order, joined on that same key), so
+// a `toEqual([1, 3, 4])` passes with the ORDER BY, the tiebreaker, or the LIMIT
+// removed. `DraftSelectBuilder.toSql()` is the seam that makes them observable.
+// ---------------------------------------------------------------------------
+
+describe('draft lowering', () => {
+  test('default read lowers ORDER BY on the coalesced pk', () => {
+    const { sql: lowered } = tracked.withDraft('d1').from(todos).toSql()
+    expect(lowered).toContain('ORDER BY COALESCE(d."id", b."id")')
+  })
+
+  test('orderBy(col) lowers the named column with the pk as trailing tiebreaker', () => {
+    const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title').toSql()
+    expect(lowered).toContain('ORDER BY COALESCE(d."title", b."title"), COALESCE(d."id", b."id")')
+  })
+
+  test('orderBy(col, desc) applies the direction to the named column only', () => {
+    const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title', 'desc').toSql()
+    // DESC binds to the named column; the tiebreaker stays ascending, so a
+    // descending read still resolves ties the same way an ascending one does.
+    expect(lowered).toContain(
+      'ORDER BY COALESCE(d."title", b."title") DESC, COALESCE(d."id", b."id")',
+    )
+  })
+
+  test('PARITY: both builders lower the same trailing pk tiebreaker under orderBy', () => {
+    // The cross-path guarantee, stated as one assertion: when a caller names a
+    // column, the canonical and draft reads resolve ties identically — so a
+    // draft preview and its canonical publish cannot disagree under `limit`.
+    // A handler cannot tell which handle it holds, which is what makes this
+    // load-bearing rather than cosmetic.
+    const canonical = tracked.from(todos).orderBy('title').toSql().sql
+    const draft = tracked.withDraft('d1').from(todos).orderBy('title').toSql().sql
+
+    expect(canonical).toContain('order by "todos"."title" asc, "todos"."id" asc')
+    expect(draft).toContain('ORDER BY COALESCE(d."title", b."title"), COALESCE(d."id", b."id")')
+  })
+
+  test('NO PARITY without orderBy: canonical emits no ORDER BY, draft defaults to pk', () => {
+    // Deliberate asymmetry, pinned so it cannot drift silently in either
+    // direction. The contract is "no order guarantee unless you call
+    // `orderBy()`", so the draft is free to be stronger — and must be, because
+    // a FULL OUTER JOIN's output order is join-algorithm-dependent rather than
+    // heap-stable. Canonical must stay clean to hold the zero-overhead proof.
+    expect(tracked.from(todos).toSql().sql.toLowerCase()).not.toContain('order by')
+    expect(tracked.withDraft('d1').from(todos).toSql().sql).toContain('ORDER BY')
+  })
+
+  test('limit(n) lowers LIMIT as a bound parameter, not an interpolated literal', () => {
+    const { sql: lowered, params } = tracked.withDraft('d1').from(todos).limit(2).toSql()
+    expect(lowered).toContain('LIMIT')
+    expect(lowered).not.toContain('LIMIT 2')
+    expect(params).toContain(2)
+  })
+
+  test('no limit() lowers no LIMIT clause', () => {
+    expect(tracked.withDraft('d1').from(todos).toSql().sql).not.toContain('LIMIT')
+  })
+
+  test('projection lowers only the named columns, in the order named', () => {
+    const { sql: lowered } = tracked.withDraft('d1').from(todos).select('done', 'title').toSql()
+    // Named order, not schema order — asserted on the SELECT list because the
+    // returned row's key order is the same either way when the two coincide.
+    expect(lowered).toContain(
+      'SELECT COALESCE(d."done", b."done") AS "done", COALESCE(d."title", b."title") AS "title" ',
+    )
+    // The pk is absent from the SELECT list but still drives join and ordering.
+    expect(lowered).toContain('b."id" = d."id"')
+    expect(lowered).toContain('ORDER BY COALESCE(d."id", b."id")')
+  })
+
+  test('select() rejects an empty column list', () => {
+    const builder = tracked.withDraft('d1').from(todos)
+    // @ts-expect-error — the tuple type forbids this; the guard is for callers
+    // reaching the draft handle through `runHandler`'s DrizzleTracker widening.
+    expect(() => builder.select()).toThrow('at least one column')
+  })
+
+  test('first() pushes LIMIT 1 into the SQL it actually executes, on both paths', async () => {
+    // `first()` fetches one row rather than the whole set and discarding the
+    // tail. Purely a lowering concern: with the pushdown gone, `first()` still
+    // answers correctly off a larger fetch, so only the emitted SQL shows it.
+    //
+    // Asserted through Drizzle's query logger rather than through `toSql(1)`,
+    // because `toSql(1)` only proves the override plumbing works when someone
+    // passes 1 — it never reaches `first()`'s call site. With `_read(1)`
+    // mutated to `_read()` a `toSql(1)` assertion still passes; this one fails.
+    const seen: string[] = []
+    const spied = createDrizzleTracker(drizzle(pg, { logger: { logQuery: (q) => seen.push(q) } }))
+
+    await spied.from(todos).first()
+    expect(seen.at(-1)).toContain('limit')
+
+    seen.length = 0
+    await spied.withDraft('d1').from(todos).first()
+    expect(seen.at(-1)).toContain('LIMIT')
+  })
+
+  test('first()-style LIMIT 1 composes with a caller limit rather than replacing it', () => {
+    // The override is what keeps `_clauses.limitVal` meaning only "the caller
+    // attached limit()" — the field the write guard reads. If `first()` wrote
+    // into that slot instead, a later write terminal would wrongly reject.
+    const { sql: lowered, params } = tracked.withDraft('d1').from(todos).toSql(1)
+    expect(lowered).toContain('LIMIT')
+    expect(params).toContain(1)
+  })
+
+  test('limit() rejects a negative, fractional or non-finite count on both paths', () => {
+    // `number` admits all of these; Postgres rejects them at execution, naming
+    // neither the builder nor the call site. Same setter-level treatment as
+    // `select()`'s empty list and `orderBy()`'s empty name.
+    for (const bad of [-1, 1.5, NaN, Infinity]) {
+      expect(() => tracked.from(todos).limit(bad)).toThrow('non-negative integer')
+      expect(() => tracked.withDraft('d1').from(todos).limit(bad)).toThrow('non-negative integer')
+    }
+    // 0 is a legitimate cap — it lowers `LIMIT 0`, an empty read, not an error.
+    expect(() => tracked.from(todos).limit(0)).not.toThrow()
+    expect(() => tracked.withDraft('d1').from(todos).limit(0)).not.toThrow()
+  })
+
+  test('canonical projection lowers only the named columns, in the order named', () => {
+    // The draft twin of this lives above; both are asserted on lowered SQL
+    // because a returned row's key order matches schema order by coincidence
+    // whenever the named order does.
+    const { sql: lowered } = tracked.from(todos).select('done', 'title').toSql()
+    expect(lowered).toContain('select "done", "title" from')
+  })
+
+  test('where() does not alias the filters array between builder copies', () => {
+    // Each clause method returns a copy; `where` spreads into a NEW array rather
+    // than pushing into the shared one. Aliasing here would let a filter applied
+    // to one name silently appear in the other — the immutability refactor's
+    // whole point, and invisible in a row-order assertion.
+    const base = tracked.withDraft('d1').from(todos)
+    const filtered = base.where(eq('id', 1))
+
+    expect(base.toSql().sql).not.toContain('AND COALESCE(d."id", b."id") =')
+    expect(filtered.toSql().sql).toContain('AND COALESCE(d."id", b."id") =')
+    // And the original stays reusable after the copy was lowered.
+    expect(base.toSql().sql).not.toContain('AND COALESCE(d."id", b."id") =')
   })
 })
 
@@ -326,16 +477,29 @@ describe('withDraft edge cases', () => {
     expect(rows[0]['title']).toBe('APPLE-edited')
   })
 
-  test('orderBy() throws (fail-loud, not a silent no-op)', () => {
-    expect(() => tracked.withDraft('d1').from(todos).orderBy('id', 'desc')).toThrow(
-      'DraftSelectBuilder.orderBy() is not yet implemented',
-    )
+  // These two previously asserted a 'not yet implemented' throw. Both clauses are
+  // now pushed into the coalesce SQL, so the contract they pin is the real
+  // behavior — see `DraftSelectBuilder orderBy / limit` in drizzle-tracker.test.ts
+  // for the ordering semantics (COALESCE, PK tiebreaker, tombstone vs limit slot).
+  test('orderBy() sorts the coalesced read', async () => {
+    // Asserted against the literal expected order, not against a sorted copy of
+    // the result. Comparing a list to `[...ids].sort()` is a sortedness check
+    // that holds trivially on 0 or 1 row, so a regression collapsing the
+    // coalesce to a single row would keep it green.
+    //
+    // Unlike the other row-order tests here, this one does discriminate: heap
+    // order is ascending, so a dropped ORDER BY yields [1, 3, 4] and fails.
+    const rows = await tracked.withDraft('d1').from(todos).orderBy('id', 'desc').all()
+    const ids = rows.map((r) => r['id'])
+    expect(ids).toEqual([4, 3, 1])
   })
 
-  test('limit() throws (fail-loud, not a silent no-op)', () => {
-    expect(() => tracked.withDraft('d1').from(todos).limit(10)).toThrow(
-      'DraftSelectBuilder.limit() is not yet implemented',
-    )
+  test('limit() caps the coalesced read', async () => {
+    const all = await tracked.withDraft('d1').from(todos).all()
+    expect(all.length).toBeGreaterThan(1)
+
+    const capped = await tracked.withDraft('d1').from(todos).limit(1).all()
+    expect(capped).toHaveLength(1)
   })
 })
 

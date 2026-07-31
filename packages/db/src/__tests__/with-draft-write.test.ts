@@ -231,9 +231,17 @@ describe('withDraft write — read-path guard preserved', () => {
     expect((rows[0] as { title: string }).title).toBe('apple')
   })
 
-  test('.orderBy()/.limit() still throw on a draft read builder', () => {
-    expect(() => tracked.withDraft('d1').from(todos).orderBy('id')).toThrow('not yet implemented')
-    expect(() => tracked.withDraft('d1').from(todos).limit(5)).toThrow('not yet implemented')
+  test('.orderBy()/.limit() are read clauses, so they reject a draft WRITE terminal', async () => {
+    // They used to throw on contact ('not yet implemented'); both are now pushed
+    // into the coalesce read. What must still fail loudly is attaching them and
+    // then writing — the draft write targets one PK'd shadow row, so an ordering
+    // or a cap has nothing to act on and silently dropping it would mislead.
+    await expect(
+      tracked.withDraft('d1').from(todos).orderBy('id').where(eq('id', 1)).update({ done: true }),
+    ).rejects.toThrow('orderBy() cannot precede update()')
+    await expect(
+      tracked.withDraft('d1').from(todos).limit(5).where(eq('id', 1)).delete(),
+    ).rejects.toThrow('limit() cannot precede delete()')
   })
 
   test('draft handle.transaction() throws a named contract error (publish owns atomicity)', () => {
