@@ -14,7 +14,7 @@ import {
   and,
   sql,
 } from 'drizzle-orm'
-import type { Query } from 'drizzle-orm'
+import type { Query, SQL } from 'drizzle-orm'
 import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
@@ -353,6 +353,11 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
       // leaves the order of rows equal on the named column unspecified, so
       // without it the same `orderBy` resolves ties by heap order canonically and
       // by PK under a draft — and a handler cannot tell which handle it holds.
+      //
+      // This is the whole of the cross-path order guarantee: the two builders
+      // agree WHEN A CALLER NAMES A COLUMN. Neither promises anything without
+      // `orderBy()` — see `DraftSelectBuilder._buildCoalesceQuery`, which emits a
+      // default PK order the canonical path deliberately does not.
       const pkCol = this._pkColumn(columns)
       const named = this._clauses.orderDir === 'desc' ? desc(col) : asc(col)
       q = pkCol && pkCol !== col ? q.orderBy(named, asc(pkCol)) : q.orderBy(named)
@@ -404,9 +409,14 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * i.e., zero-overhead is structural, not conditional. Builds via the same
    * `_buildSelectQuery()` as `all()`; the only difference is the missing
    * `tablesRead` side-effect and the final `.toSQL()` instead of execute.
+   *
+   * `limitOverride` mirrors `first()`'s internal `LIMIT 1` pushdown. That
+   * pushdown is a lowering-only optimization — with it removed, `first()` still
+   * returns the same row from a larger fetch — so no behavioral assertion can
+   * catch its loss and this parameter is the only way to pin it.
    */
-  toSql(): Query {
-    return this._buildSelectQuery().toSQL()
+  toSql(limitOverride?: number): Query {
+    return this._buildSelectQuery(limitOverride).toSQL()
   }
 
   async first(): Promise<TRow | null> {
@@ -718,6 +728,63 @@ export class DraftSelectBuilder<T extends AnyTable> {
     this._tracker.tablesRead.add(tableName)
     this._tracker.tablesRead.add(draftTableName)
 
+    const { query, colEntries } = this._buildCoalesceQuery(limitOverride)
+    const result = await this._db.execute(query)
+    const rows = normalizeExecuteRows(result)
+
+    // Decode each returned column value through its Drizzle column codec — the
+    // READ mirror of the write path's `mapColumnValue` (encode). The coalesce
+    // SELECT aliases every column to its Drizzle PROPERTY KEY (`AS "propKey"`),
+    // so `colEntries` (propKey → col) is exactly the map to decode by. Without
+    // this, a non-identity column type (jsonb, timestamp, …) comes back in its
+    // RAW driver representation on the production driver:
+    //   - PGlite auto-parses jsonb → JS object, so the integration tests pass
+    //     even without decode (the bug is invisible to them).
+    //   - postgres-js (the `createDb` production driver) returns a jsonb column
+    //     as a raw JSON STRING. A draft-context read of `insights.definition`
+    //     then hands a string to consumers expecting an object, which silently
+    //     misbehave (`.source` on a string) or throw.
+    // The column's own `mapFromDriverValue` is driver-independent: jsonb's is
+    // guarded with `typeof value === 'string'`, so it JSON.parses the
+    // postgres-js string AND is a no-op on the already-parsed PGlite object — no
+    // double-parse. Columns not in the schema are left untouched.
+    return rows.map((row) => decodeRowFromDriver(row, colEntries))
+  }
+
+  /**
+   * Return the lowered coalesce SQL without executing — the draft twin of
+   * `SelectBuilder.toSql()`, and the seam that lets a test assert what this
+   * builder *emits* rather than what PGlite happens to return.
+   *
+   * That distinction is load-bearing, not stylistic. Draft rows come back from a
+   * FULL OUTER JOIN over a heap populated in primary-key order, so PGlite emits
+   * PK order whether or not an `ORDER BY` was lowered — a returned-row assertion
+   * passes with the clause deleted. The clause is only observable here.
+   *
+   * Like the canonical `toSql()`, this skips the `tablesRead` side-effect: it
+   * lowers a query, it does not perform a read. `limitOverride` mirrors
+   * `first()`'s `LIMIT 1` pushdown for the same reason it does there.
+   */
+  toSql(limitOverride?: number): Query {
+    // The coalesce is a raw `sql` template, not a Drizzle query builder, so it
+    // has no `.toSQL()` of its own — the dialect lowers it instead. Same
+    // parameter binding either way; only the entry point differs.
+    return this._db.dialect.sqlToQuery(this._buildCoalesceQuery(limitOverride).query)
+  }
+
+  /**
+   * Build the coalesce query and the column map its result must be decoded by.
+   * Single source of truth shared by `_coalescedRead()` and `toSql()`, so the
+   * SQL a test asserts is the SQL a read executes.
+   */
+  private _buildCoalesceQuery(limitOverride?: number): {
+    query: SQL
+    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+    colEntries: [string, any][]
+  } {
+    const tableName = getTableName(this._table)
+    const draftTableName = `${tableName}__draft`
+
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const colEntries = Object.entries(columns)
@@ -812,8 +879,21 @@ export class DraftSelectBuilder<T extends AnyTable> {
       `) d ON b."${pkColName}" = d."${pkColName}" ` +
         `WHERE COALESCE(d."__tombstone", false) = false`,
     )
-    // The pk order is both the default and, when a caller names a column, the
-    // trailing tiebreaker — see `orderBy` for why it is never dropped.
+    // The pk order plays two different roles, and only one of them is a promise.
+    //
+    // As the TRAILING TIEBREAKER (when a caller names a column) it is the
+    // cross-path guarantee: canonical lowers the same tiebreaker, so the two
+    // handles resolve ties identically and a preview agrees with its publish.
+    //
+    // As the DEFAULT (no `orderBy()` at all) it is draft-only, and deliberately
+    // NOT matched canonically — canonical emits no ORDER BY there, because
+    // `with-draft.test.ts` pins its lowering as byte-identical to plain Drizzle.
+    // The asymmetry is safe in the direction it runs: the contract is "no order
+    // unless you ask", so the draft is free to be stronger, and a caller relying
+    // on unordered row order is already broken on the canonical path. It is not
+    // safe in the other direction — this is a FULL OUTER JOIN, whose output
+    // order is join-algorithm-dependent rather than heap-stable, so dropping the
+    // default would make an unfiltered `first()` genuinely arbitrary.
     const pkOrder = `COALESCE(d."${pkColName}", b."${pkColName}")`
     let orderByClause = ` ORDER BY ${pkOrder}`
     if (this._clauses.orderByCol !== undefined) {
@@ -839,26 +919,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // the sql tag; relation/column names are introspected identifiers via sql.raw.
     const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}${limit}`
 
-    const result = await this._db.execute(query)
-    const rows = normalizeExecuteRows(result)
-
-    // Decode each returned column value through its Drizzle column codec — the
-    // READ mirror of the write path's `mapColumnValue` (encode). The coalesce
-    // SELECT aliases every column to its Drizzle PROPERTY KEY (`AS "propKey"`),
-    // so `colEntries` (propKey → col) is exactly the map to decode by. Without
-    // this, a non-identity column type (jsonb, timestamp, …) comes back in its
-    // RAW driver representation on the production driver:
-    //   - PGlite auto-parses jsonb → JS object, so the integration tests pass
-    //     even without decode (the bug is invisible to them).
-    //   - postgres-js (the `createDb` production driver) returns a jsonb column
-    //     as a raw JSON STRING. A draft-context read of `insights.definition`
-    //     then hands a string to consumers expecting an object, which silently
-    //     misbehave (`.source` on a string) or throw.
-    // The column's own `mapFromDriverValue` is driver-independent: jsonb's is
-    // guarded with `typeof value === 'string'`, so it JSON.parses the
-    // postgres-js string AND is a no-op on the already-parsed PGlite object — no
-    // double-parse. Columns not in the schema are left untouched.
-    return rows.map((row) => decodeRowFromDriver(row, colEntries))
+    return { query, colEntries }
   }
 
   /**
