@@ -303,6 +303,19 @@ describe('draft lowering', () => {
     expect(params).toContain(1)
   })
 
+  test('limit() rejects a negative, fractional or non-finite count on both paths', () => {
+    // `number` admits all of these; Postgres rejects them at execution, naming
+    // neither the builder nor the call site. Same setter-level treatment as
+    // `select()`'s empty list and `orderBy()`'s empty name.
+    for (const bad of [-1, 1.5, NaN, Infinity]) {
+      expect(() => tracked.from(todos).limit(bad)).toThrow('non-negative integer')
+      expect(() => tracked.withDraft('d1').from(todos).limit(bad)).toThrow('non-negative integer')
+    }
+    // 0 is a legitimate cap — it lowers `LIMIT 0`, an empty read, not an error.
+    expect(() => tracked.from(todos).limit(0)).not.toThrow()
+    expect(() => tracked.withDraft('d1').from(todos).limit(0)).not.toThrow()
+  })
+
   test('canonical projection lowers only the named columns, in the order named', () => {
     // The draft twin of this lives above; both are asserted on lowered SQL
     // because a returned row's key order matches schema order by coincidence
@@ -469,9 +482,16 @@ describe('withDraft edge cases', () => {
   // behavior — see `DraftSelectBuilder orderBy / limit` in drizzle-tracker.test.ts
   // for the ordering semantics (COALESCE, PK tiebreaker, tombstone vs limit slot).
   test('orderBy() sorts the coalesced read', async () => {
+    // Asserted against the literal expected order, not against a sorted copy of
+    // the result. Comparing a list to `[...ids].sort()` is a sortedness check
+    // that holds trivially on 0 or 1 row, so a regression collapsing the
+    // coalesce to a single row would keep it green.
+    //
+    // Unlike the other row-order tests here, this one does discriminate: heap
+    // order is ascending, so a dropped ORDER BY yields [1, 3, 4] and fails.
     const rows = await tracked.withDraft('d1').from(todos).orderBy('id', 'desc').all()
     const ids = rows.map((r) => r['id'])
-    expect(ids).toEqual([...ids].sort((a, b) => Number(b) - Number(a)))
+    expect(ids).toEqual([4, 3, 1])
   })
 
   test('limit() caps the coalesced read', async () => {

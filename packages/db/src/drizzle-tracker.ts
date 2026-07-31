@@ -300,7 +300,19 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     return this._with({ orderByCol: col, orderDir: dir })
   }
 
+  /**
+   * Cap the read at `n` rows.
+   *
+   * Validated at the setter, matching `select()` and `orderBy()`. Postgres
+   * rejects a negative, fractional or non-finite LIMIT anyway, but it does so at
+   * execution — a driver error naming neither the builder nor the call that
+   * produced it. `number` does not narrow to non-negative integers, so this is
+   * the only place the mistake can be caught where it was made.
+   */
   limit(n: number): SelectBuilder<T, TRow> {
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`limit() requires a non-negative integer — got ${n}`)
+    }
     return this._with({ limitVal: n })
   }
 
@@ -569,6 +581,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * prefix rather than an arbitrary sample of the join output.
    */
   limit(n: number): DraftSelectBuilder<T> {
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error(`limit() requires a non-negative integer — got ${n}`)
+    }
     return this._with({ limitVal: n })
   }
 
