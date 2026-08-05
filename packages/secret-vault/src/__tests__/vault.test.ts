@@ -14,24 +14,24 @@ import type { SecretRef } from '../ref'
 
 // ─── Fixture ─────────────────────────────────────────────────────────────────
 
-function makeVault(opts?: { connectorBackend?: TestBackend; serveBackend?: TestBackend }): {
+function makeVault(opts?: { primaryBackend?: TestBackend; secondaryBackend?: TestBackend }): {
   vault: SecretVault
   registry: SecretRegistry
   mapping: InMemoryMappingStore
-  connectorBackend: TestBackend
-  serveBackend: TestBackend
+  primaryBackend: TestBackend
+  secondaryBackend: TestBackend
 } {
-  const connectorBackend = opts?.connectorBackend ?? new TestBackend()
-  const serveBackend = opts?.serveBackend ?? new TestBackend()
+  const primaryBackend = opts?.primaryBackend ?? new TestBackend()
+  const secondaryBackend = opts?.secondaryBackend ?? new TestBackend()
   const registry = new SecretRegistry()
-  registry.register('test-connector', connectorBackend, { fallback: false })
-  registry.register('test-serve', serveBackend)
-  registry.setClassDefault('connector-key', 'test-connector')
-  registry.setClassDefault('serve-token', 'test-serve')
+  registry.register('test-primary', primaryBackend, { fallback: false })
+  registry.register('test-secondary', secondaryBackend)
+  registry.setClassDefault('primary-class', 'test-primary')
+  registry.setClassDefault('secondary-class', 'test-secondary')
 
   const mapping = new InMemoryMappingStore()
   const vault = new SecretVault(registry, mapping)
-  return { vault, registry, mapping, connectorBackend, serveBackend }
+  return { vault, registry, mapping, primaryBackend, secondaryBackend }
 }
 
 // ─── AC 1: store → withSecret → has → delete round-trip ─────────────────────
@@ -39,13 +39,13 @@ function makeVault(opts?: { connectorBackend?: TestBackend; serveBackend?: TestB
 describe('round-trip: store → withSecret → has → delete', () => {
   test('store returns a SecretRef', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('my-api-key', { class: 'connector-key' })
+    const ref = await vault.store('my-api-key', { class: 'primary-class' })
     expect(isSecretRef(ref)).toBe(true)
   })
 
   test('withSecret retrieves the stored plaintext inside the callback', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('super-secret', { class: 'connector-key' })
+    const ref = await vault.store('super-secret', { class: 'primary-class' })
     const result = await vault.withSecret(ref, async (plaintext) => {
       expect(plaintext).toBe('super-secret')
       return 'callback-result'
@@ -56,13 +56,13 @@ describe('round-trip: store → withSecret → has → delete', () => {
 
   test('has returns true after store', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('abc', { class: 'serve-token' })
+    const ref = await vault.store('abc', { class: 'secondary-class' })
     expect(await vault.has(ref)).toBe(true)
   })
 
   test('delete removes the secret; has returns false and withSecret throws', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('ephemeral', { class: 'connector-key' })
+    const ref = await vault.store('ephemeral', { class: 'primary-class' })
 
     await vault.delete(ref)
 
@@ -75,25 +75,25 @@ describe('round-trip: store → withSecret → has → delete', () => {
 
 describe('has() — never decrypts', () => {
   test('has() does not increment resolveCallCount on the backend', async () => {
-    const connectorBackend = new TestBackend()
-    const { vault } = makeVault({ connectorBackend })
+    const primaryBackend = new TestBackend()
+    const { vault } = makeVault({ primaryBackend })
 
-    const ref = await vault.store('key', { class: 'connector-key' })
+    const ref = await vault.store('key', { class: 'primary-class' })
 
     // Reset instrumentation counters post-store
-    connectorBackend.resolveCallCount = 0
+    primaryBackend.resolveCallCount = 0
 
     await vault.has(ref)
 
     // withSecret (decrypt path) must never have been called
-    expect(connectorBackend.resolveCallCount).toBe(0)
+    expect(primaryBackend.resolveCallCount).toBe(0)
     // But has() itself should have been called once on the backend
-    expect(connectorBackend.hasCallCount).toBe(1)
+    expect(primaryBackend.hasCallCount).toBe(1)
   })
 
   test('has() on absent ref returns false without touching any backend', async () => {
-    const connectorBackend = new TestBackend()
-    const { vault } = makeVault({ connectorBackend })
+    const primaryBackend = new TestBackend()
+    const { vault } = makeVault({ primaryBackend })
 
     // Manufacture a ref that has no mapping entry
     const { makeSecretRef } = await import('../ref')
@@ -102,8 +102,8 @@ describe('has() — never decrypts', () => {
     const result = await vault.has(orphanRef)
     expect(result).toBe(false)
     // Backend never consulted — no mapping record
-    expect(connectorBackend.resolveCallCount).toBe(0)
-    expect(connectorBackend.hasCallCount).toBe(0)
+    expect(primaryBackend.resolveCallCount).toBe(0)
+    expect(primaryBackend.hasCallCount).toBe(0)
   })
 })
 
@@ -112,7 +112,7 @@ describe('has() — never decrypts', () => {
 describe('withSecret — scoped lease, plaintext stays in callback', () => {
   test('return value from withSecret is the callback result, not the plaintext', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('top-secret', { class: 'connector-key' })
+    const ref = await vault.store('top-secret', { class: 'primary-class' })
 
     // Attempt to "escape" by capturing inside callback — this is a runtime
     // test that the outer call site only sees the typed callback return.
@@ -127,7 +127,7 @@ describe('withSecret — scoped lease, plaintext stays in callback', () => {
 
   test('withSecret propagates errors thrown inside the callback', async () => {
     const { vault } = makeVault()
-    const ref = await vault.store('key', { class: 'connector-key' })
+    const ref = await vault.store('key', { class: 'primary-class' })
 
     await expect(
       vault.withSecret(ref, async (_plaintext) => {
@@ -140,33 +140,33 @@ describe('withSecret — scoped lease, plaintext stays in callback', () => {
 // ─── AC 4: Registry store-time class-default + fallback routing ──────────────
 
 describe('registry — store-time routing', () => {
-  test('connector-key routes to test-connector backend', async () => {
-    const connectorBackend = new TestBackend()
-    const serveBackend = new TestBackend()
-    const { vault } = makeVault({ connectorBackend, serveBackend })
+  test('an application-defined class routes to its configured backend', async () => {
+    const primaryBackend = new TestBackend()
+    const secondaryBackend = new TestBackend()
+    const { vault } = makeVault({ primaryBackend, secondaryBackend })
 
-    await vault.store('key-a', { class: 'connector-key' })
+    await vault.store('key-a', { class: 'primary-class' })
 
-    expect(connectorBackend.hasCallCount).toBe(0) // stored, not checked yet
-    // Verify it was stored in connector backend by resolving through it
-    connectorBackend.resolveCallCount = 0
-    serveBackend.resolveCallCount = 0
+    expect(primaryBackend.hasCallCount).toBe(0) // stored, not checked yet
+    // Verify it was stored in the configured backend by resolving through it
+    primaryBackend.resolveCallCount = 0
+    secondaryBackend.resolveCallCount = 0
 
-    // store another connector-key and a serve-token
-    const connRef = await vault.store('connector-secret', { class: 'connector-key' })
-    const serveRef = await vault.store('serve-secret', { class: 'serve-token' })
+    // Store another primary-class secret and a secondary-class secret.
+    const primaryRef = await vault.store('primary-secret', { class: 'primary-class' })
+    const secondaryRef = await vault.store('secondary-secret', { class: 'secondary-class' })
 
-    // Check via has — connector ref should be in connector backend
-    await vault.withSecret(connRef, async (p) => {
-      expect(p).toBe('connector-secret')
+    // Resolve both refs to prove routing through their configured backends.
+    await vault.withSecret(primaryRef, async (p) => {
+      expect(p).toBe('primary-secret')
     })
-    await vault.withSecret(serveRef, async (p) => {
-      expect(p).toBe('serve-secret')
+    await vault.withSecret(secondaryRef, async (p) => {
+      expect(p).toBe('secondary-secret')
     })
 
     // resolveCallCount on each backend proves routing
-    expect(connectorBackend.resolveCallCount).toBe(1)
-    expect(serveBackend.resolveCallCount).toBe(1)
+    expect(primaryBackend.resolveCallCount).toBe(1)
+    expect(secondaryBackend.resolveCallCount).toBe(1)
   })
 
   test('fallback backend is used for any class without an explicit default', async () => {
@@ -179,9 +179,9 @@ describe('registry — store-time routing', () => {
     const mapping = new InMemoryMappingStore()
     const vault = new SecretVault(registry, mapping)
 
-    // Both classes should route to the fallback since no class default is set
-    const ref1 = await vault.store('secret1', { class: 'connector-key' })
-    const ref2 = await vault.store('secret2', { class: 'serve-token' })
+    // Both classes should route to the fallback since no class default is set.
+    const ref1 = await vault.store('secret1', { class: 'primary-class' })
+    const ref2 = await vault.store('secret2', { class: 'secondary-class' })
 
     fallback.resolveCallCount = 0
     await vault.withSecret(ref1, async (p) => expect(p).toBe('secret1'))
@@ -199,13 +199,13 @@ describe('read-time resolution follows the mapping record', () => {
     const registry = new SecretRegistry()
     registry.register('backend-1', backend1)
     registry.register('backend-2', backend2)
-    registry.setClassDefault('connector-key', 'backend-1')
+    registry.setClassDefault('primary-class', 'backend-1')
 
     const mapping = new InMemoryMappingStore()
     const vault = new SecretVault(registry, mapping)
 
     // Store a secret while backend-1 is the default
-    const ref = await vault.store('original-secret', { class: 'connector-key' })
+    const ref = await vault.store('original-secret', { class: 'primary-class' })
 
     // Verify it resolves via backend-1
     backend1.resolveCallCount = 0
@@ -213,7 +213,7 @@ describe('read-time resolution follows the mapping record', () => {
     expect(backend1.resolveCallCount).toBe(1)
 
     // NOW change the store-time default to backend-2
-    registry.setClassDefault('connector-key', 'backend-2')
+    registry.setClassDefault('primary-class', 'backend-2')
 
     // The existing ref MUST still resolve via backend-1 (its mapping record)
     backend1.resolveCallCount = 0
@@ -246,7 +246,7 @@ describe('store() — rollback on mapping failure', () => {
 
     const vault = new SecretVault(registry, failingMapping)
 
-    await expect(vault.store('secret', { class: 'connector-key' })).rejects.toThrow('disk full')
+    await expect(vault.store('secret', { class: 'primary-class' })).rejects.toThrow('disk full')
 
     // The backend write must have been rolled back — nothing left behind.
     // (delete() is best-effort; with TestBackend it fully removes the locator,

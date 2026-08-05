@@ -3,7 +3,7 @@
  *
  * The contract WS-consumers rely on: a `.optional()` column becomes an OMITTABLE
  * key (`key?`), a required column stays a required key, and an optional key still
- * constrains its value type. DashFrame calls typed procedures directly against
+ * constrains its value type. Applications call typed procedures directly against
  * this shape — if it silently regressed to "every key required", callers would
  * need an arg-erasing escape hatch again.
  *
