@@ -9,7 +9,8 @@
  *
  * Like backend names passed to {@link SecretRegistry.register}, applications
  * define classes at composition time. Any value used as a class after secrets
- * are stored under it MUST NOT be renamed or repurposed (it is stored in
- * mapping records).
+ * are stored under it MUST NOT be renamed or repurposed: the class selects the
+ * backend at store time, so renaming silently re-routes new secrets while old
+ * refs keep resolving through the backend recorded in their mapping.
  */
 export type CredentialClass = string
