@@ -1,7 +1,7 @@
 // @wystack/server — applyCommands engine (the command MECHANISM)
 //
 // `applyCommands` is the single write entry point for batched mutations. It is
-// the generic substrate under DashFrame's Artifact write-side: a frozen-API
+// the generic substrate under an application's artifact write-side: a frozen-API
 // primitive that knows NOTHING about concrete command types. It composes three
 // existing pieces — `WyStackApp.runHandler` (typed dispatch against a supplied
 // tracker), `DrizzleTracker.transaction` (atomic + Tag-tracked + rollback-emits-
@@ -27,7 +27,7 @@
 //
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
 // command paths, mutation-only validation policy, artifact-grouped PreviewDiff
-// with real compute) is a separate layer (in DashFrame) that
+// with real compute) is a separate application layer that
 // supplies the `path`s this engine dispatches. Keeping the seam clean keeps
 // this engine a candidate for promotion to a generic WyStack primitive.
 //
@@ -188,7 +188,7 @@ class PreviewRollback {
  *   - `ApplyResult` is a discriminated union on `mode`, not a flag, so callers
  *     narrow `CommitResult` vs `PreviewResult` exhaustively.
  *   - The result is generic + vocabulary-free (no artifact types): a future
- *     DashFrame layer wraps it, it does not leak into this primitive.
+ *     application layer wraps it, it does not leak into this primitive.
  */
 export async function applyCommands(
   app: WyStackApp,

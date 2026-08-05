@@ -975,7 +975,7 @@ describe('withDraft coalesce read decode (integration, driver-independent)', () 
     // The overlay path: the jsonb value comes from the DRAFT shadow column, not
     // the base table. write (mapToDriverValue → string) then coalesce-read
     // (mapFromDriverValue → object) must round-trip — the full read/write codec
-    // symmetry on the draft side, the exact shape the DashFrame draft controller
+    // symmetry on the draft side, the exact shape an application draft controller
     // depends on for reading an edited insights.definition.
     const fields = [{ source: 'edited_in_draft' }, { filters: [1, 2, 3] }]
     await jtracked.withDraft('dk').into(reports).insert({ id: 9, title: 'd', fields })

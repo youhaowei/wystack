@@ -5,15 +5,11 @@
 // record written at store time (auth-blind, backend-agnostic resolution).
 
 /**
- * Discriminator for backend routing at store time.
+ * Application-defined string identifier for backend routing at store time.
  *
- * - `"connector-key"` — API keys / OAuth tokens for data-source connectors.
- * - `"serve-token"`   — tokens used by the WyStack serve layer (e.g. signed
- *                       JWTs, service account credentials).
- * - `"assistant-provider"` — API keys / OAuth credentials for assistant model
- *                            providers.
- *
- * Extensible: add new members as new credential classes are introduced.
- * Existing members MUST NOT be renamed (stored in mapping records).
+ * Like backend names passed to {@link SecretRegistry.register}, applications
+ * define classes at composition time. Any value used as a class after secrets
+ * are stored under it MUST NOT be renamed or repurposed (it is stored in
+ * mapping records).
  */
-export type CredentialClass = 'connector-key' | 'serve-token' | 'assistant-provider'
+export type CredentialClass = string

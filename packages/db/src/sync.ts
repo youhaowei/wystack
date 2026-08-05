@@ -21,7 +21,7 @@
  * - Check constraints, policies, enableRLS, generated columns.
  * - Tables in non-default Postgres schemas.
  *
- * For v0.2 DashFrame this is sufficient: first-boot creates tables, subsequent
+ * For development bootstrapping this is sufficient: first boot creates tables, subsequent
  * boots are no-ops. Real schema evolution routes through migrations.
  */
 

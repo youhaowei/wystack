@@ -8,7 +8,7 @@
 //   3. Lifecycle (THIS) — open / append / publish / discard + conflict
 //                          detection. Sits ABOVE the other two.
 //
-// This layer is GENERIC: it knows NOTHING about DashFrame artifacts. It speaks
+// This layer is GENERIC: it knows NOTHING about application artifacts. It speaks
 // `Command` (an opaque `{path,args}` the engine dispatches), `(table, id)` cell
 // coordinates, and an opaque `Version` token. The app conducts (opens drafts,
 // drives append, chooses a conflict POLICY); this layer is the mechanism, a
@@ -27,7 +27,7 @@
 // This eliminates the crash window that previously existed between "canonical
 // committed" and "shadow cleared" — if either step fails, both roll back. The
 // draft stays live and publish is retryable. This is the wystack-internal adoption
-// of the primitive; DashFrame's `DraftController.publishDraft` adopts separately
+// of the primitive; an application's draft controller adopts separately
 // (the durable-log delete is the analogous bookkeeping step there).
 
 import { resolvePkColumnName, type DraftDrizzleTracker } from '@wystack/db'
