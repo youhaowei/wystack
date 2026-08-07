@@ -149,6 +149,25 @@ export async function buildWyStack(opts: {
       // committed". A handler that opens its own `ctx.db.transaction` nests via
       // savepoint and flattens up.
       //
+      // Two consequences a mutation author must design for, since dispatch is
+      // now one transaction rather than a statement-per-autocommit sequence:
+      //
+      //   1. CATCHING a DB error no longer lets the handler continue. The first
+      //      failed statement aborts the whole dispatch transaction, so a
+      //      recovery flow (try insert, catch the uniqueness violation, fall
+      //      back to an update) must wrap the FALLIBLE statement in its own
+      //      `ctx.db.transaction(...)` — that nests as a SAVEPOINT, so rolling
+      //      back to it leaves the outer transaction usable. Without the
+      //      savepoint the fallback statement rejects; it fails loudly rather
+      //      than silently skipping. Pinned by create.test.ts.
+      //   2. IRREVERSIBLE external effects (send a message, release a secret,
+      //      charge a card) written after a `ctx.db.transaction` inside a
+      //      handler are no longer post-commit — the outer COMMIT is still
+      //      pending, and a COMMIT failure rolls the write back after the
+      //      effect already happened. There is no post-commit effect seam yet;
+      //      handlers needing one must not assume an inner transaction is
+      //      durable when it resolves.
+      //
       // Queries run WITHOUT the wrap: a query never writes, so it needs no
       // rollback, and wrapping it would hold a DB transaction open for the
       // handler's entire duration. On a serialized store (PGlite) a slow or hung

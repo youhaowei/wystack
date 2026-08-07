@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
@@ -81,6 +81,33 @@ beforeEach(async () => {
           throw new Error('handler boom')
         }),
       ),
+      // Insert-or-fallback with the fallible statement SAVEPOINTed: rolling back
+      // to the savepoint leaves the dispatch transaction usable, so the fallback
+      // update commits.
+      recoverViaSavepoint: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+        try {
+          await ctx.db.transaction((tx) =>
+            tx.into(schema.todos).insert({ id: 1, title: args.title, done: false }),
+          )
+        } catch {
+          await ctx.db
+            .from(schema.todos)
+            .where(eq('id', 1))
+            .update({ title: `${args.title}-fallback` })
+        }
+      }),
+      // Same flow WITHOUT the savepoint: the failed insert aborts the dispatch
+      // transaction, so the fallback statement rejects.
+      recoverWithoutSavepoint: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
+        try {
+          await ctx.db.into(schema.todos).insert({ id: 1, title: args.title, done: false })
+        } catch {
+          await ctx.db
+            .from(schema.todos)
+            .where(eq('id', 1))
+            .update({ title: `${args.title}-fallback` })
+        }
+      }),
       protectedListTodos: wy.procedure
         .authorize(permissions.todos.read)
         .input({})
@@ -188,6 +215,22 @@ describe('defineApp().build()', () => {
     await expect(app.call('addThenFail', { title: 'ghost' })).rejects.toThrow('handler boom')
     const { result } = await app.call('listTodos', {})
     expect(result as unknown[]).toHaveLength(2)
+  })
+
+  test('a caught DB error recovers only when the fallible statement is savepointed', async () => {
+    // Atomic dispatch means the whole mutation is ONE transaction, so a failed
+    // statement poisons it. Both halves are pinned because the difference is the
+    // contract a mutation author has to design for (see the `call` docblock).
+    await app.call('recoverViaSavepoint', { title: 'first' })
+    await app.call('recoverViaSavepoint', { title: 'second' })
+    const viaSavepoint = await app.call('listTodos', {})
+    expect(viaSavepoint.result).toEqual([{ id: 1, title: 'second-fallback', done: false }])
+
+    // No savepoint: the fallback rejects — loudly, never a silently skipped
+    // recovery — and the dispatch transaction rolls back whole.
+    await expect(app.call('recoverWithoutSavepoint', { title: 'third' })).rejects.toThrow()
+    const noSavepoint = await app.call('listTodos', {})
+    expect(noSavepoint.result).toEqual([{ id: 1, title: 'second-fallback', done: false }])
   })
 
   test('expectedPermissionIds rejects permission tree drift at boot', async () => {
