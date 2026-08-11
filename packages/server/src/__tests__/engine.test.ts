@@ -25,7 +25,7 @@
 //   9. identity-provider outage → transient close, NOT auth-failed. A key server
 //      that is down is not a bad credential, and 4001 tells clients not to retry.
 
-import { describe, test, expect } from 'bun:test'
+import { afterEach, describe, test, expect } from 'bun:test'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import {
@@ -56,6 +56,13 @@ const deniedPermission = {
   check: () => false,
 }
 
+const openDatabases = new Set<{ close(): Promise<void> }>()
+
+afterEach(async () => {
+  await Promise.all([...openDatabases].map((client) => client.close()))
+  openDatabases.clear()
+})
+
 function protectListTodos(app: Awaited<ReturnType<typeof makeApp>>): void {
   app.functions.set(
     'listTodos',
@@ -68,6 +75,7 @@ function protectListTodos(app: Awaited<ReturnType<typeof makeApp>>): void {
 
 async function makeApp() {
   const db = await createDb({ dev: 'pglite://' })
+  openDatabases.add(db.$client)
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )

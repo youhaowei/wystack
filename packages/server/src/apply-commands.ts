@@ -26,7 +26,7 @@
 // crash window between the two. See `ApplyCommandsOptions.tx` for semantics.
 //
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
-// command paths, mutation-only validation policy, artifact-grouped PreviewDiff
+// command paths, Action-exclusion policy, artifact-grouped PreviewDiff
 // with real compute) is a separate application layer that
 // supplies the `path`s this engine dispatches. Keeping the seam clean keeps
 // this engine a candidate for promotion to a generic WyStack primitive.
@@ -196,15 +196,18 @@ export async function applyCommands(
   opts: ApplyCommandsOptions,
 ): Promise<ApplyResult> {
   const { mode, context = {}, tx: outerTx } = opts
+  const commands = batch.map(snapshotCommand)
 
-  // Commands are mutation-only. Validate the whole batch before opening or
-  // joining a transaction so an Action (external I/O/orchestration) can never
-  // accidentally execute while a database transaction is held open.
-  for (const command of batch) {
+  // Reject Actions before opening or joining a transaction so external
+  // I/O/orchestration can never accidentally execute while a database
+  // transaction is held open. Query commands remain supported for backward
+  // compatibility (including authorization-before-validation workflows).
+  // Validate the snapshots, then execute those same snapshots: callers retain
+  // ownership of `batch` and may mutate it while an earlier handler is awaited.
+  for (const command of commands) {
     const definition = app.functions.get(command.path)
-    if (!definition) throw new Error(`Unknown function: ${command.path}`)
-    if (definition.type !== 'mutation') {
-      throw new Error(`Command ${command.path} must reference a mutation`)
+    if (definition?.type === 'action') {
+      throw new Error(`Command ${command.path} cannot reference an action`)
     }
   }
 
@@ -224,13 +227,13 @@ export async function applyCommands(
       // relevant tables to invalidation, not pre-existing bookkeeping writes.
       // The caller must NOT flush this set until AFTER the outer tx resolves.
       const tablesWrittenBefore = new Set(outerTx.tablesWritten)
-      const results = await applyAll(app, batch, outerTx, context)
+      const results = await applyAll(app, commands, outerTx, context)
       const tablesWritten = new Set(
         [...outerTx.tablesWritten].filter((t) => !tablesWrittenBefore.has(t)),
       )
       return {
         mode: 'commit',
-        commands: [...batch],
+        commands,
         results,
         tablesWritten,
       }
@@ -248,17 +251,16 @@ export async function applyCommands(
     // tracked-transaction merge is skipped, so nothing flushes to invalidation.
     let results: CommandResult[] = []
     await outer.transaction(async (tx) => {
-      results = await applyAll(app, batch, tx, context)
+      results = await applyAll(app, commands, tx, context)
     })
 
     // Reached only on commit: `outer.tablesWritten` now holds the merged union
     // (the inner tx tracker's writes were merged up on commit).
     return {
       mode: 'commit',
-      // Snapshot the batch — `results`/`tablesWritten` are defensively copied,
-      // so copy `commands` too; otherwise a caller mutating its `batch` array
-      // after the call would silently mutate `result.commands`.
-      commands: [...batch],
+      // `commands` was deep-snapshotted before validation and async work;
+      // results/tablesWritten are likewise detached from caller-owned state.
+      commands,
       results,
       tablesWritten: new Set(outer.tablesWritten),
     }
@@ -273,7 +275,7 @@ export async function applyCommands(
   const previewOuter = app.createTracked()
   try {
     await previewOuter.transaction(async (tx) => {
-      const results = await applyAll(app, batch, tx, context)
+      const results = await applyAll(app, commands, tx, context)
       // Snapshot the per-command results and the set that WOULD have flushed,
       // then force rollback via the sentinel. We read `tx.tablesWritten` (the
       // INNER tracker) here, not `previewOuter`: the merge into `previewOuter`
@@ -285,7 +287,7 @@ export async function applyCommands(
     if (err instanceof PreviewRollback) {
       return {
         mode: 'preview',
-        commands: [...batch],
+        commands,
         results: err.results,
         tablesWritten: err.tablesWritten,
       }
@@ -299,6 +301,14 @@ export async function applyCommands(
   // so this is reached only if a lowering somehow swallows the throw and commits.
   // Treat that as a contract violation rather than a silent phantom-commit.
   throw new Error('applyCommands: preview transaction did not roll back')
+}
+
+/** Snapshot the caller-owned envelope before validation or asynchronous work. */
+function snapshotCommand(command: Command): Command {
+  return {
+    ...command,
+    args: command.args === undefined ? command.args : structuredClone(command.args),
+  }
 }
 
 /**
@@ -315,6 +325,13 @@ async function applyAll(
 ): Promise<CommandResult[]> {
   const results: CommandResult[] = []
   for (const cmd of batch) {
+    // The public registry is mutable. Recheck immediately before dispatch so
+    // an earlier handler or concurrent owner cannot replace this path with an
+    // Action after the pre-transaction scan and run external work under `tx`.
+    const definition = app.functions.get(cmd.path)
+    if (definition?.type === 'action') {
+      throw new Error(`Command ${cmd.path} cannot reference an action`)
+    }
     const value = await app.runHandler(cmd.path, cmd.args, tx, context)
     // Echo the command's opaque correlation id onto its result; the engine
     // never interprets it, only carries it from input to output.

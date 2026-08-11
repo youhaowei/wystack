@@ -71,6 +71,16 @@ describe('DrizzleTracker', () => {
     expect(rows[0].id).toBeGreaterThan(0)
   })
 
+  test('a failed insert does not record tablesWritten', async () => {
+    await tracked.into(schema.todos).insert({ id: 1, title: 'first', done: false })
+    tracked = resetTracking(tracked)
+
+    await expect(
+      tracked.into(schema.todos).insert({ id: 1, title: 'duplicate', done: false }),
+    ).rejects.toThrow()
+    expect(tracked.tablesWritten.size).toBe(0)
+  })
+
   test('select all records tablesRead', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     tracked = resetTracking(tracked)

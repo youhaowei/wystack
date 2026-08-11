@@ -85,6 +85,9 @@ beforeEach(async () => {
         await ctx.db.into(schema.todos).insert({ title: args.title, done: false })
         throw new Error('external step failed')
       }),
+      actionFailedWrite: wy.procedure.input({}).action(async (ctx) => {
+        await ctx.db.into(schema.todos).insert({ id: 1, title: 'duplicate', done: false })
+      }),
       protectedListTodos: wy.procedure
         .authorize(permissions.todos.read)
         .input({})
@@ -132,6 +135,18 @@ describe('defineApp().build()', () => {
     )
     expect(invalidations).toHaveLength(1)
     expect(invalidations[0]?.has('todos')).toBe(true)
+    unsubscribe()
+  })
+
+  test('Action does not emit invalidation for a failed write', async () => {
+    await app.call('addTodo', { title: 'existing' })
+    const invalidations: Set<string>[] = []
+    const unsubscribe = app.invalidationSource.onInvalidation((tables) => {
+      invalidations.push(new Set(tables))
+    })
+
+    await expect(app.call('actionFailedWrite', {})).rejects.toThrow()
+    expect(invalidations).toEqual([])
     unsubscribe()
   })
 

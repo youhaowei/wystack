@@ -438,26 +438,28 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
 
   async update(values: Partial<T['$inferInsert']>) {
     assertNoReadClauses('update', this._clauses)
-    this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.update(this._table).set(values)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
-    return q.returning()
+    const rows = await q.returning()
+    this._tracker.tablesWritten.add(getTableName(this._table))
+    return rows
   }
 
   async delete() {
     assertNoReadClauses('delete', this._clauses)
-    this._tracker.tablesWritten.add(getTableName(this._table))
     let q = this._db.delete(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
-    return q.returning()
+    const rows = await q.returning()
+    this._tracker.tablesWritten.add(getTableName(this._table))
+    return rows
   }
 }
 
@@ -1178,8 +1180,6 @@ async function writeShadowRow(
   const schema = config.schema
   const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
 
-  tracker.tablesWritten.add(draftTableName)
-
   // Route the PK value through its column codec too, so a PK whose type has a
   // non-identity codec binds identically to the canonical path. PKs are
   // typically uuid/text/serial (identity codec → no-op), but routing rather than
@@ -1223,6 +1223,7 @@ async function writeShadowRow(
   const query = sql.join(parts, sql.raw(''))
 
   const result = await db.execute(query)
+  tracker.tablesWritten.add(draftTableName)
   return normalizeExecuteRows(result)
 }
 
@@ -1291,9 +1292,10 @@ export class InsertBuilder<T extends AnyTable> {
   }
 
   async insert(values: T['$inferInsert'] | T['$inferInsert'][]) {
-    this._tracker.tablesWritten.add(getTableName(this._table))
     const rows = Array.isArray(values) ? values : [values]
-    return this._db.insert(this._table).values(rows).returning()
+    const inserted = await this._db.insert(this._table).values(rows).returning()
+    this._tracker.tablesWritten.add(getTableName(this._table))
+    return inserted
   }
 }
 
