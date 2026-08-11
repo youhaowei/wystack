@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { QueryClient } from '@tanstack/react-query'
-import type { QueryDef, MutationDef } from '@wystack/server'
-import type { QueryRef, MutationRef, ApiFromFunctions } from '../refs'
+import type { QueryDef, MutationDef, ActionDef } from '@wystack/server'
+import type { QueryRef, MutationRef, ActionRef, ApiFromFunctions } from '../refs'
 import { createApi } from '../api'
 import { useQuery } from '../hooks'
 
@@ -15,6 +15,7 @@ type TestFunctions = {
   getTodo: QueryDef<{ id: number }, { id: number; title: string }>
   createTodo: MutationDef<{ title: string }, { id: number }>
   deleteTodo: MutationDef<{ id: number }, void>
+  runReport: ActionDef<{ reportId: string }, { url: string }>
 }
 
 type Api = ApiFromFunctions<TestFunctions>
@@ -29,6 +30,10 @@ const _listTodos: Api['listTodos'] extends QueryRef<
 
 // Mutations map to MutationRef
 const _createTodo: Api['createTodo'] extends MutationRef<{ title: string }, { id: number }>
+  ? true
+  : never = true
+
+const _runReport: Api['runReport'] extends ActionRef<{ reportId: string }, { url: string }>
   ? true
   : never = true
 
@@ -64,6 +69,7 @@ test('maps function definitions to typed refs', () => {
   expect(_createTodo).toBe(true)
   expect(_notMutation).toBe(true)
   expect(_notQuery).toBe(true)
+  expect(_runReport).toBe(true)
 })
 
 // ---------------------------------------------------------------------------
@@ -78,6 +84,7 @@ describe('createApi proxy', () => {
     expect(api.getTodo._path).toBe('getTodo')
     expect(api.createTodo._path).toBe('createTodo')
     expect(api.deleteTodo._path).toBe('deleteTodo')
+    expect(api.runReport._path).toBe('runReport')
   })
 
   test('returns undefined for symbol access', () => {
@@ -143,6 +150,7 @@ describe('createWyStack', () => {
     expect(instance.client.url).toBe('http://localhost:9999')
     expect(typeof instance.client.query).toBe('function')
     expect(typeof instance.client.mutate).toBe('function')
+    expect(typeof instance.client.action).toBe('function')
   })
 
   test('accepts an injected QueryClient', async () => {
@@ -182,13 +190,21 @@ describe('createWyStack', () => {
     const originalFetch = globalThis.fetch
     const requestedUrls: string[] = []
     const requestedBodies: string[] = []
+    const requestedHeaders: HeadersInit[] = []
+    const requestedSignals: (AbortSignal | null | undefined)[] = []
 
     globalThis.fetch = (async (input, init) => {
       requestedUrls.push(String(input))
       if (init?.body) requestedBodies.push(String(init.body))
-      return new Response(
-        JSON.stringify({ data: input.toString().includes('listTodos') ? [] : { id: 1 } }),
-      )
+      if (init?.headers) requestedHeaders.push(init.headers)
+      requestedSignals.push(init?.signal)
+      const url = input.toString()
+      const data = url.includes('listTodos')
+        ? []
+        : url.includes('runReport')
+          ? { url: 'https://example.test/report' }
+          : { id: 1 }
+      return new Response(JSON.stringify({ data }))
     }) as typeof fetch
 
     try {
@@ -198,15 +214,29 @@ describe('createWyStack', () => {
 
       const queryResult = client.query(api.listTodos, { orgId: 'org_123' })
       const mutationResult = client.mutate(api.createTodo, { title: 'Ship typed refs' })
+      const controller = new AbortController()
+      const actionResult = client.action(
+        api.runReport,
+        { reportId: 'report_1' },
+        { signal: controller.signal },
+      )
 
       const _queryPromise: Promise<{ id: number; title: string }[]> = queryResult
       const _mutationPromise: Promise<{ id: number }> = mutationResult
+      const _actionPromise: Promise<{ url: string }> = actionResult
 
       expect(await _queryPromise).toEqual([])
       expect(await _mutationPromise).toEqual({ id: 1 })
+      expect(await _actionPromise).toEqual({ url: 'https://example.test/report' })
       expect(requestedUrls[0]).toContain('/api/listTodos?')
       expect(requestedUrls[1]).toBe('http://localhost:9999/api/createTodo')
-      expect(requestedBodies).toEqual([JSON.stringify({ title: 'Ship typed refs' })])
+      expect(requestedUrls[2]).toBe('http://localhost:9999/api/runReport')
+      expect(requestedBodies).toEqual([
+        JSON.stringify({ title: 'Ship typed refs' }),
+        JSON.stringify({ reportId: 'report_1' }),
+      ])
+      expect(requestedHeaders[2]).toMatchObject({ 'X-WyStack-Function-Kind': 'action' })
+      expect(requestedSignals[2]).toBe(controller.signal)
     } finally {
       globalThis.fetch = originalFetch
     }

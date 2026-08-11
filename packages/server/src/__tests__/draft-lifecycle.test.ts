@@ -105,6 +105,7 @@ beforeEach(async () => {
             .where(eq('id', args.dashboardId))
             .update({ items: next })
         }),
+      externalAction: wy.procedure.input({}).action(async () => 'external'),
     },
   })
 })
@@ -499,6 +500,41 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
     // poisoned draft.
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
     expect(lc.getLog(draftId)).toHaveLength(1)
+  })
+})
+
+describe('draft lifecycle — command envelope ownership', () => {
+  test('rejects an Action before it can execute against the draft tracker', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = lc.open(0)
+
+    await expect(lc.append(draftId, [{ path: 'externalAction', args: {} }])).rejects.toThrow(
+      'Draft command externalAction cannot reference an action',
+    )
+    expect(lc.getLog(draftId)).toEqual([])
+  })
+
+  test('snapshots a mutable batch before validation and queued execution', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = lc.open(0)
+    const batch: Command[] = [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }]
+
+    const appending = lc.append(draftId, batch)
+    batch[0].path = 'externalAction'
+    batch[0].args = {}
+    await appending
+
+    expect(lc.getLog(draftId)).toEqual([{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+  })
+
+  test('rejects a path replaced with an Action while append waits to execute', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = lc.open(0)
+    const appending = lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    app.functions.set('addTodo', app.functions.get('externalAction')!)
+
+    await expect(appending).rejects.toThrow('Draft command addTodo cannot reference an action')
+    expect(lc.getLog(draftId)).toEqual([])
   })
 })
 

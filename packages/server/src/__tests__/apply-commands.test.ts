@@ -67,11 +67,27 @@ beforeEach(async () => {
       boom: wy.procedure.input({}).mutation(async () => {
         throw new Error('command boom')
       }),
+      externalAction: wy.procedure.input({}).action(async () => 'external'),
     },
   })
 })
 
 describe('applyCommands — commit mode', () => {
+  test('rejects an Action before opening the command transaction', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'externalAction', args: {} }], { mode: 'commit' }),
+    ).rejects.toThrow('Command externalAction cannot reference an action')
+  })
+
+  test('rejects a path replaced with an Action after upfront validation', async () => {
+    const applying = applyCommands(app, [{ path: 'addTodo', args: { id: 1, title: 'A' } }], {
+      mode: 'commit',
+    })
+    app.functions.set('addTodo', app.functions.get('externalAction')!)
+
+    await expect(applying).rejects.toThrow('Command addTodo cannot reference an action')
+  })
+
   test('applies all commands atomically and persists them', async () => {
     const result = await applyCommands(
       app,
@@ -277,15 +293,21 @@ describe('applyCommands — preview mode', () => {
 })
 
 describe('applyCommands — result is a snapshot', () => {
-  test('mutating the input batch after the call does not mutate result.commands', async () => {
+  test('mutating the input batch after invocation cannot change execution or result.commands', async () => {
     const batch = [{ path: 'addTodo', args: { id: 1, title: 'A' } }]
-    const result = await applyCommands(app, batch, { mode: 'commit' })
+    const applying = applyCommands(app, batch, { mode: 'commit' })
 
-    // The engine copies the batch (`[...batch]`); a caller reusing its array must
-    // not retroactively alter what the result reports it applied.
-    batch[0] = { path: 'boom', args: {} }
+    // The engine snapshots synchronously before its first await. A caller
+    // retaining the mutable envelope cannot swap in an Action after validation.
+    batch[0].path = 'externalAction'
+    batch[0].args = { id: 99, title: 'changed' }
+    const result = await applying
+
     expect(result.commands).toHaveLength(1)
     expect(result.commands[0].path).toBe('addTodo')
+    expect(result.commands[0].args).toEqual({ id: 1, title: 'A' })
+    const { result: todos } = await app.call('listTodos', {})
+    expect(todos).toEqual([expect.objectContaining({ id: 1, title: 'A' })])
   })
 })
 

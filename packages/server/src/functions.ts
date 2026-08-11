@@ -6,6 +6,7 @@ import {
   stageOkBrand,
   type InferArgs,
   type MiddlewareFn,
+  type ActionDef,
   type MutationDef,
   type Overwrite,
   type QueryDef,
@@ -35,6 +36,9 @@ export interface ProcedureBuilder<
   mutation<TReturn>(
     handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
   ): MutationDef<InferArgs<TArgSchema>, TReturn>
+  action<TReturn>(
+    handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
+  ): ActionDef<InferArgs<TArgSchema>, TReturn>
 }
 
 function stageOk<P>(patch?: P): StageOk<P> {
@@ -54,11 +58,14 @@ function isStageOk(value: unknown): value is StageOk<unknown> {
 }
 
 function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
-  type: 'query' | 'mutation',
+  type: 'query' | 'mutation' | 'action',
   args: TArgSchema,
   middleware: readonly AnyMiddleware[],
   handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
-): QueryDef<InferArgs<TArgSchema>, TReturn> | MutationDef<InferArgs<TArgSchema>, TReturn> {
+):
+  | QueryDef<InferArgs<TArgSchema>, TReturn>
+  | MutationDef<InferArgs<TArgSchema>, TReturn>
+  | ActionDef<InferArgs<TArgSchema>, TReturn> {
   const argsSchema = buildArgsSchema(args)
 
   return {
@@ -126,6 +133,14 @@ export function createProcedure<TContext>(): ProcedureBuilder<TContext> {
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
         return terminal('mutation', args, middleware, handler) as MutationDef<
+          InferArgs<TArgSchema>,
+          TReturn
+        >
+      },
+      action<TReturn>(
+        handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
+      ) {
+        return terminal('action', args, middleware, handler) as ActionDef<
           InferArgs<TArgSchema>,
           TReturn
         >

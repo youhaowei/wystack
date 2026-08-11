@@ -468,6 +468,13 @@ export function createDraftLifecycle(
 
     async append(draftId, batch) {
       const entry = requireOpen(draftId)
+      const commands = batch.map(snapshotCommand)
+      for (const command of commands) {
+        const definition = app.functions.get(command.path)
+        if (definition?.type === 'action') {
+          throw new Error(`Draft command ${command.path} cannot reference an action`)
+        }
+      }
       return withDraftLock(entry, async () => {
         // Route writes through the draft handle so `ctx.db.into/update/delete`
         // lands in the `<table>__draft` overlay. The recording wrapper captures
@@ -479,9 +486,9 @@ export function createDraftLifecycle(
         )
         const results: CommandResult[] = []
         try {
-          for (const cmd of batch) {
-            // Snapshot BEFORE running the handler, and run the handler on the
-            // SNAPSHOT. The log is the publish unit (replayed verbatim later);
+          for (const snapshot of commands) {
+            // Run the handler on the snapshot captured before the lock/await.
+            // The log is the publish unit (replayed verbatim later);
             // storing the caller's object by reference would let a post-append
             // mutation of the batch or its `args` silently change what `publish`
             // replays — diverging the canonical commit from the draft preview
@@ -496,9 +503,14 @@ export function createDraftLifecycle(
             // would then silently omit it. Same defect family as #88: a write
             // with nothing to replay. Cloning first moves the failure ahead of
             // any write, so the batch aborts with the draft untouched.
-            const snapshot = snapshotCommand(cmd)
+            // The registry can also change while this append waits for the
+            // draft lock, so recheck the kind at the dispatch boundary.
+            const definition = app.functions.get(snapshot.path)
+            if (definition?.type === 'action') {
+              throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
+            }
             const value = await app.runHandler(snapshot.path, snapshot.args, draftDb, entry.context)
-            results.push({ id: cmd.id, value })
+            results.push({ id: snapshot.id, value })
             entry.log.push(snapshot)
           }
         } finally {

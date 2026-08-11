@@ -100,6 +100,8 @@ export interface Engine {
    * callers supply only `path` and `args`.
    */
   call(path: string, args: Record<string, unknown>): Promise<unknown>
+  /** Send a distinct Action frame. Message transports do not yet support cancellation. */
+  action(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 const MAX_RECONNECT_DELAY_MS = 30_000
@@ -114,6 +116,7 @@ export class CallNotReadyError extends Error {
 }
 
 interface PendingCall {
+  type: 'call' | 'action'
   resolve: (data: unknown) => void
   reject: (err: unknown) => void
 }
@@ -308,6 +311,15 @@ export function createEngine(config: EngineConfig): Engine {
             pendingCalls.delete(msg.id)
             pending.reject(errorFromMessage(msg))
           }
+        } else if (msg.error === 'invalid message') {
+          // Compatibility with pre-Action servers: they reject the unknown
+          // `action` frame with an uncorrelated connection-level error. Bound
+          // the failure instead of leaving Action promises pending forever.
+          for (const [id, pending] of pendingCalls) {
+            if (pending.type !== 'action') continue
+            pendingCalls.delete(id)
+            pending.reject(new Error('Server does not support Action frames'))
+          }
         }
         // Connection-level errors (no id, or id not in pending): ignored here;
         // the accompanying close event handles reconnect.
@@ -496,7 +508,11 @@ export function createEngine(config: EngineConfig): Engine {
     // If never sent, removing from activeSubs is sufficient.
   }
 
-  function call(path: string, args: Record<string, unknown>): Promise<unknown> {
+  function invoke(
+    type: 'call' | 'action',
+    path: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     // Require a live, authenticated (or no-auth) pipe. Reject immediately if
     // not ready — no buffering (future work: queue-until-ready, see module doc).
     if (pipe === null || !connected) {
@@ -513,7 +529,7 @@ export function createEngine(config: EngineConfig): Engine {
     // newer one a reconnect may have installed by the time the promise settles.
     const generation = connectGeneration
     return new Promise<unknown>((resolve, reject) => {
-      pendingCalls.set(id, { resolve, reject })
+      pendingCalls.set(id, { type, resolve, reject })
       // call() does NOT use sendOrClose: a correlated RPC must NOT tear down the
       // connection on a bad arg. A synchronous encode throw (BigInt/cyclic arg in
       // `JSON.stringify`) is bad caller input, not transport death — reject THIS
@@ -521,12 +537,20 @@ export function createEngine(config: EngineConfig): Engine {
       // leave the connection healthy. An async send rejection IS transport death:
       // route it through closeOnSendRejection (shared with sendOrClose).
       try {
-        closeOnSendRejection(target, target.send({ type: 'call', id, path, args }), generation)
+        closeOnSendRejection(target, target.send({ type, id, path, args }), generation)
       } catch (err) {
         pendingCalls.delete(id)
         reject(err)
       }
     })
+  }
+
+  function call(path: string, args: Record<string, unknown>): Promise<unknown> {
+    return invoke('call', path, args)
+  }
+
+  function action(path: string, args: Record<string, unknown>): Promise<unknown> {
+    return invoke('action', path, args)
   }
 
   return {
@@ -536,5 +560,6 @@ export function createEngine(config: EngineConfig): Engine {
     unsubscribe,
     isConnected: () => connected,
     call,
+    action,
   }
 }

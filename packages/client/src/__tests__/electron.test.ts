@@ -432,6 +432,23 @@ describe('createEngine with ElectronPipe', () => {
 // ─── IpcManager convenience shim ─────────────────────────────────────────────
 
 describe('createIpcManager', () => {
+  test('action preserves its explicit frame kind and correlates the result', async () => {
+    const ipc = makeFakeIpc()
+    const manager = createIpcManager({ ipcRenderer: ipc })
+    manager.connect()
+    await settle()
+
+    const pending = manager.action('reports.run', { id: 7 })
+    await settle()
+    const sent = findSent(ipc, 'action')
+    expect(sent).toBeDefined()
+    const frame = sent![1] as { id: string }
+    ipc.emit('wystack:s2c', { type: 'result', id: frame.id, data: { ok: true } })
+
+    expect(await withTimeout(pending, 'ipc action')).toEqual({ ok: true })
+    manager.disconnect()
+  })
+
   test('connect / isConnected / disconnect', async () => {
     const ipc = makeFakeIpc()
     const manager = createIpcManager({ ipcRenderer: ipc })

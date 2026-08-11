@@ -140,14 +140,17 @@ export async function buildWyStack(opts: {
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
       // Fresh DrizzleTracker per call — no shared mutable state
       const tracked = app.createTracked()
-      const result = await app.runHandler(path, args, tracked, context)
-
-      // Fuse: any write dispatched through `call` fans out on the app's source,
-      // so REST, WS call-frames, and the typed caller all invalidate without the
-      // transport re-emitting. Guarded on write count so a read-only call — most
-      // importantly the router's subscription recompute, which re-runs queries —
-      // never emits, and there is no recompute storm.
-      if (tracked.tablesWritten.size > 0) invalidation.emit(tracked.tablesWritten)
+      let result: unknown
+      try {
+        result = await app.runHandler(path, args, tracked, context)
+      } finally {
+        // Fuse: any COMMITTED tracked write dispatched through `call` fans out
+        // on the app's source. The finally is load-bearing for Actions: a
+        // handler may commit a DB write, then fail during later external I/O.
+        // That durable write must still invalidate. Rolled-back transactions
+        // merge no write Tags, so they emit nothing here.
+        if (tracked.tablesWritten.size > 0) invalidation.emit(tracked.tablesWritten)
+      }
 
       return {
         result,

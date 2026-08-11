@@ -3,7 +3,7 @@
  *
  * Routes (default prefix /api):
  *   GET  /api/:fn?args=...  — queries (SSR-friendly; see cache note below)
- *   POST /api/:fn           — mutations (JSON body)
+ *   POST /api/:fn           — mutations, or actions with X-WyStack-Function-Kind: action
  *   WS   /api/ws            — subscribe/unsubscribe/invalidation
  *
  * Runtime-agnostic: each entrypoint (serve-bun, serve-node) provides its own
@@ -329,7 +329,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
     }
   })
 
-  // --- HTTP: mutations (POST) ---
+  // --- HTTP: mutations and explicitly tagged actions (POST) ---
   hono.post(`${prefix}/:fn`, async (c) => {
     const functionPath = c.req.param('fn')
     const fn = app.functions.get(functionPath)
@@ -338,8 +338,18 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return c.json({ error: `Unknown function: ${functionPath}` }, 404)
     }
 
-    if (fn.type !== 'mutation') {
+    const requestedKind = c.req.header('X-WyStack-Function-Kind')
+    if (fn.type === 'query') {
       return c.json({ error: `${functionPath} is a query — use GET` }, 405)
+    }
+    if (fn.type === 'action' && requestedKind !== 'action') {
+      return c.json(
+        { error: `${functionPath} is an action — set X-WyStack-Function-Kind: action` },
+        405,
+      )
+    }
+    if (fn.type === 'mutation' && requestedKind === 'action') {
+      return c.json({ error: `${functionPath} is a mutation — omit the action header` }, 405)
     }
 
     const httpResolveContext = resolveContext ?? (async () => ({}))

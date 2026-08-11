@@ -11,6 +11,7 @@ const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 const functions = {
   greet: wy.procedure.input({ name: text }).query(async (_ctx, args) => `hello ${args.name}`),
   double: wy.procedure.input({ n: int }).mutation(async (_ctx, args) => args.n * 2),
+  external: wy.procedure.input({ value: text }).action(async (_ctx, args) => args.value.length),
 }
 
 type Functions = typeof functions
@@ -24,11 +25,12 @@ beforeEach(async () => {
 })
 
 describe('createCaller', () => {
-  test('dispatches queries and mutations with typed results', async () => {
+  test('dispatches queries, mutations, and actions with typed results', async () => {
     const caller = createCaller<Functions>(app, {})
 
     await expect(caller.greet({ name: 'wy' })).resolves.toBe('hello wy')
     await expect(caller.double({ n: 21 })).resolves.toBe(42)
+    await expect(caller.external({ value: 'wy' })).resolves.toBe(2)
   })
 
   test('forwards request context through app.call', async () => {
@@ -90,11 +92,14 @@ describe('createCaller', () => {
 function assertCallerTypes(caller: CallerFromFunctions<Functions>) {
   void caller.greet({ name: 'ok' })
   void caller.double({ n: 1 })
+  void caller.external({ value: 'ok' })
 
   // @ts-expect-error — name must be a string, not a number
   void caller.greet({ name: 123 })
   // @ts-expect-error — n must be a number, not a string
   void caller.double({ n: 'nope' })
+  // @ts-expect-error — value must be a string
+  void caller.external({ value: 1 })
 }
 
 void assertCallerTypes

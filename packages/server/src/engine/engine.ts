@@ -292,6 +292,16 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
   }
 
   async function handleCall(msg: Extract<ClientMessage, { type: 'call' }>): Promise<void> {
+    const fn = app.functions.get(msg.path)
+    if (!fn) {
+      send({ type: 'error', kind: 'call', id: msg.id, error: `Unknown function: ${msg.path}` })
+      return
+    }
+    if (fn.type === 'action') {
+      send({ type: 'error', kind: 'call', id: msg.id, error: `${msg.path} is an action` })
+      return
+    }
+
     let context: Record<string, unknown>
     try {
       context = await session.resolveSubContext()
@@ -312,6 +322,38 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
       const payload: ServerMessage = {
         type: 'error',
         kind: 'call',
+        id: msg.id,
+        error: errorMessage(err),
+      }
+      if (err instanceof ValidationError) payload.issues = err.issues
+      send(payload)
+    }
+  }
+
+  async function handleAction(msg: Extract<ClientMessage, { type: 'action' }>): Promise<void> {
+    const fn = app.functions.get(msg.path)
+    if (!fn || fn.type !== 'action') {
+      send({ type: 'error', kind: 'action', id: msg.id, error: `Unknown action: ${msg.path}` })
+      return
+    }
+
+    let context: Record<string, unknown>
+    try {
+      context = await session.resolveSubContext()
+    } catch (err) {
+      send({ type: 'error', kind: 'action', id: msg.id, error: errorMessage(err) })
+      return
+    }
+    if (closed) return
+    try {
+      const { result } = await dispatch(msg.path, msg.args, context)
+      if (closed) return
+      send({ type: 'result', id: msg.id, data: result })
+    } catch (err) {
+      if (closed) return
+      const payload: ServerMessage = {
+        type: 'error',
+        kind: 'action',
         id: msg.id,
         error: errorMessage(err),
       }
@@ -476,6 +518,9 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
         return
       case 'call':
         void handleCall(msg)
+        return
+      case 'action':
+        void handleAction(msg)
         return
       case 'subscribe':
         if (!reactiveEnabled) {

@@ -21,10 +21,10 @@ import { createElement, type ReactNode } from 'react'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { WyStackProvider } from '../provider'
-import { useQuery, useMutation } from '../hooks'
+import { useQuery, useMutation, useAction } from '../hooks'
 import type { WyStackClient } from '../client'
 import type { WsManager } from '../ws'
-import type { QueryRef, MutationRef } from '../refs'
+import type { QueryRef, MutationRef, ActionRef } from '../refs'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,6 +55,7 @@ function makeMockWs(): MockWs {
     disconnect: mock(() => {}),
     isConnected: mock(() => false),
     call: mock(() => Promise.resolve(null)),
+    action: mock(() => Promise.resolve(null)),
     subscribe(id, path, args, onInvalidate, onError) {
       state._subscribeCallCount++
       state._lastSubscribe = { id, path, args, onInvalidate, onError }
@@ -80,6 +81,8 @@ function makeMockClient(
     query: mock(queryImpl ?? (() => Promise.resolve({ id: 1, title: 'test' }))) as any,
     // oxlint-disable-next-line typescript/no-explicit-any -- mock return types are intentionally loose
     mutate: mock(mutateImpl ?? (() => Promise.resolve({ id: 2 }))) as any,
+    // oxlint-disable-next-line typescript/no-explicit-any -- mock return types are intentionally loose
+    action: mock(() => Promise.resolve({ id: 3 })) as any,
   }
 }
 
@@ -110,6 +113,10 @@ function makeQueryRef<TArgs, TReturn>(path: string): QueryRef<TArgs, TReturn> {
 
 function makeMutationRef<TArgs, TReturn>(path: string): MutationRef<TArgs, TReturn> {
   return { _path: path } as unknown as MutationRef<TArgs, TReturn>
+}
+
+function makeActionRef<TArgs, TReturn>(path: string): ActionRef<TArgs, TReturn> {
+  return { _path: path } as unknown as ActionRef<TArgs, TReturn>
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +365,26 @@ describe('useMutation', () => {
     renderHook(() => useMutation(ref), { wrapper })
 
     expect((client.query as ReturnType<typeof mock>).mock.calls.length).toBe(0)
+  })
+})
+
+describe('useAction', () => {
+  test('calls client.action and resolves mutation-style state without subscribing', async () => {
+    const ws = makeMockWs()
+    const client = makeMockClient(ws)
+    client.action = mock(() => Promise.resolve({ jobId: 'job_1' })) as typeof client.action
+    const wrapper = makeWrapper(client)
+    const ref = makeActionRef<{ prompt: string }, { jobId: string }>('runInsight')
+
+    const { result } = renderHook(() => useAction(ref), { wrapper })
+    await act(async () => result.current.mutate({ prompt: 'Summarize' }))
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    expect(result.current.data).toEqual({ jobId: 'job_1' })
+    expect(ws._subscribeCallCount).toBe(0)
+    const actionCall = (client.action as ReturnType<typeof mock>).mock.calls[0]
+    expect(actionCall[0]._path).toBe('runInsight')
+    expect(actionCall[1]).toEqual({ prompt: 'Summarize' })
   })
 })
 

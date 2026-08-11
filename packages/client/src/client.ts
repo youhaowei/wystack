@@ -6,7 +6,7 @@
  * be disabled for trusted transports via `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
-import type { QueryRef, MutationRef, RefArgs, RefReturn } from './refs'
+import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
 export interface WyStackClient {
@@ -17,6 +17,12 @@ export interface WyStackClient {
   query<TRef extends QueryRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
   /** Execute a mutation via POST */
   mutate<TRef extends MutationRef>(ref: TRef, args?: RefArgs<TRef>): Promise<RefReturn<TRef>>
+  /** Execute a non-reactive action via POST. Aborting stops the HTTP request; server cancellation is not guaranteed. */
+  action<TRef extends ActionRef>(
+    ref: TRef,
+    args?: RefArgs<TRef>,
+    options?: { signal?: AbortSignal },
+  ): Promise<RefReturn<TRef>>
 }
 
 /**
@@ -96,6 +102,25 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
       if (!res.ok) {
         throw await readHttpError(res)
       }
+      const json = await res.json()
+      if (json.error) throw new Error(json.error)
+      return json.data
+    },
+
+    async action(ref: ActionRef, args?: unknown, options?: { signal?: AbortSignal }) {
+      const path = ref._path
+      const auth = await getAuthHeaders()
+      const res = await fetch(`${httpUrl}${prefix}/${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-WyStack-Function-Kind': 'action',
+          ...auth,
+        },
+        body: JSON.stringify(args ?? {}),
+        signal: options?.signal,
+      })
+      if (!res.ok) throw await readHttpError(res)
       const json = await res.json()
       if (json.error) throw new Error(json.error)
       return json.data

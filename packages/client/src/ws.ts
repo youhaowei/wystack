@@ -74,6 +74,7 @@ export interface WsManager {
    * route imperative calls over the same connection.
    */
   call(path: string, args: Record<string, unknown>): Promise<unknown>
+  action(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 /**
@@ -100,5 +101,6 @@ export function createWsManager(config: WsManagerConfig): WsManager {
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),
     call: (path, args) => engine.call(path, args),
+    action: (path, args) => engine.action(path, args),
   }
 }

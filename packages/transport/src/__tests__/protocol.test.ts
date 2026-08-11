@@ -8,6 +8,7 @@ import {
   type SubscribeMessage,
   type UnsubscribeMessage,
   type CallMessage,
+  type ActionMessage,
   type AuthenticatedMessage,
   type SubscribedMessage,
   type InvalidateMessage,
@@ -29,7 +30,8 @@ const _typeChecks = (): void => {
   const s: SubscribeMessage = { type: 'subscribe', id: 'x', path: 'p', args: {} }
   const u: UnsubscribeMessage = { type: 'unsubscribe', id: 'x' }
   const c: CallMessage = { type: 'call', id: 'x', path: 'p', args: {} }
-  const _client: ClientMessage[] = [a, s, u, c]
+  const action: ActionMessage = { type: 'action', id: 'x', path: 'p', args: {} }
+  const _client: ClientMessage[] = [a, s, u, c, action]
   void _client
 
   const ack: AuthenticatedMessage = { type: 'authenticated' }
@@ -195,6 +197,24 @@ describe('parseClientMessage — call', () => {
   })
 })
 
+describe('parseClientMessage — action', () => {
+  test('accepts an explicit action frame', () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: 'action', id: 'a1', path: 'reports.run', args: { id: 7 } }),
+      ),
+    ).toEqual({ type: 'action', id: 'a1', path: 'reports.run', args: { id: 7 } })
+  })
+
+  test('rejects malformed action frames', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'action', path: 'p', args: {} }))).toBeNull()
+    expect(parseClientMessage(JSON.stringify({ type: 'action', id: 'a', args: {} }))).toBeNull()
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'action', id: 'a', path: 'p', args: [] })),
+    ).toBeNull()
+  })
+})
+
 // ─── parseServerMessage: envelope rejection ──────────────────────────────────
 
 describe('parseServerMessage — envelope rejection', () => {
@@ -337,6 +357,13 @@ describe('parseServerMessage — error', () => {
     expect(
       parseServerMessage(JSON.stringify({ type: 'error', kind: 'call', id: 'c1', error: 'oops' })),
     ).toEqual({ type: 'error', kind: 'call', id: 'c1', error: 'oops' })
+  })
+  test('accepts kind:action and threads it through', () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({ type: 'error', kind: 'action', id: 'a1', error: 'failed' }),
+      ),
+    ).toEqual({ type: 'error', kind: 'action', id: 'a1', error: 'failed' })
   })
   test('accepts kind:subscription and threads it through', () => {
     expect(

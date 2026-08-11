@@ -5,7 +5,7 @@
  * arg/return signature via phantom type parameters. Refs are data — they can
  * be passed as props, stored in config, or used outside React.
  */
-import type { QueryDef, MutationDef, FunctionDef } from '@wystack/server'
+import type { QueryDef, MutationDef, ActionDef, FunctionDef } from '@wystack/server'
 
 // ---------------------------------------------------------------------------
 // Phantom brands — never exist at runtime, only in the type system
@@ -13,6 +13,7 @@ import type { QueryDef, MutationDef, FunctionDef } from '@wystack/server'
 
 declare const QueryBrand: unique symbol
 declare const MutationBrand: unique symbol
+declare const ActionBrand: unique symbol
 
 /** A typed reference to a server query. Carries arg/return types at compile time. */
 export interface QueryRef<TArgs = unknown, TReturn = unknown> {
@@ -26,8 +27,14 @@ export interface MutationRef<TArgs = unknown, TReturn = unknown> {
   readonly [MutationBrand]: { args: TArgs; return: TReturn }
 }
 
+/** A typed reference to a non-reactive server action. */
+export interface ActionRef<TArgs = unknown, TReturn = unknown> {
+  readonly _path: string
+  readonly [ActionBrand]: { args: TArgs; return: TReturn }
+}
+
 /** Union of all function reference types. */
-export type FunctionRef = QueryRef | MutationRef
+export type FunctionRef = QueryRef | MutationRef | ActionRef
 
 // ---------------------------------------------------------------------------
 // Type utilities — extract args/return from refs
@@ -35,11 +42,23 @@ export type FunctionRef = QueryRef | MutationRef
 
 /** Extract the args type from a function reference. */
 export type RefArgs<T extends FunctionRef> =
-  T extends QueryRef<infer A, unknown> ? A : T extends MutationRef<infer A, unknown> ? A : never
+  T extends QueryRef<infer A, unknown>
+    ? A
+    : T extends MutationRef<infer A, unknown>
+      ? A
+      : T extends ActionRef<infer A, unknown>
+        ? A
+        : never
 
 /** Extract the return type from a function reference. */
 export type RefReturn<T extends FunctionRef> =
-  T extends QueryRef<unknown, infer R> ? R : T extends MutationRef<unknown, infer R> ? R : never
+  T extends QueryRef<unknown, infer R>
+    ? R
+    : T extends MutationRef<unknown, infer R>
+      ? R
+      : T extends ActionRef<unknown, infer R>
+        ? R
+        : never
 
 // ---------------------------------------------------------------------------
 // Mapped type — converts server function registry to client api object
@@ -51,7 +70,9 @@ type ToRef<T> =
     ? QueryRef<A, R>
     : T extends MutationDef<infer A, infer R>
       ? MutationRef<A, R>
-      : never
+      : T extends ActionDef<infer A, infer R>
+        ? ActionRef<A, R>
+        : never
 /* oxlint-enable typescript/no-explicit-any */
 
 /** Maps a server function registry `{ listTodos: QueryDef<A,R>, ... }` to `{ listTodos: QueryRef<A,R>, ... }`. */

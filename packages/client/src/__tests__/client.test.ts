@@ -20,7 +20,7 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { createRoutes, defineApp } from '@wystack/server'
 import { createClient } from '../client'
-import type { QueryRef, MutationRef } from '../refs'
+import type { QueryRef, MutationRef, ActionRef } from '../refs'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -30,6 +30,10 @@ function queryRef<TArgs, TReturn>(path: string): QueryRef<TArgs, TReturn> {
 
 function mutationRef<TArgs, TReturn>(path: string): MutationRef<TArgs, TReturn> {
   return { _path: path } as unknown as MutationRef<TArgs, TReturn>
+}
+
+function actionRef<TArgs, TReturn>(path: string): ActionRef<TArgs, TReturn> {
+  return { _path: path } as unknown as ActionRef<TArgs, TReturn>
 }
 
 describe('createClient — non-2xx error body handling', () => {
@@ -50,6 +54,9 @@ describe('createClient — non-2xx error body handling', () => {
         }),
         alwaysFailsMutation: wy.procedure.input({}).mutation(async () => {
           throw new Error('The draft changed since review — refresh and try again.')
+        }),
+        alwaysFailsAction: wy.procedure.input({}).action(async () => {
+          throw new Error('The external service failed.')
         }),
       },
     })
@@ -82,6 +89,13 @@ describe('createClient — non-2xx error body handling', () => {
     await expect(client.mutate(ref)).rejects.toThrow(
       'The draft changed since review — refresh and try again.',
     )
+  })
+
+  test('action(): server-thrown message survives the RPC boundary', async () => {
+    const client = createClient({ url: baseUrl })
+    await expect(
+      client.action(actionRef<Record<string, never>, unknown>('alwaysFailsAction')),
+    ).rejects.toThrow('The external service failed.')
   })
 
   test('query(): 500 error status is preserved as a `status` property', async () => {
@@ -163,5 +177,33 @@ describe('createClient — non-JSON and empty error bodies', () => {
     const ref = mutationRef<Record<string, never>, unknown>('anything')
 
     await expect(client.mutate(ref)).rejects.toThrow('HTTP 503')
+  })
+})
+
+describe('createClient — Action cancellation', () => {
+  let server: ReturnType<typeof Bun.serve>
+
+  afterEach(() => server?.stop(true))
+
+  test('aborting an in-flight HTTP Action rejects the client request', async () => {
+    server = Bun.serve({
+      fetch: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_000))
+        return Response.json({ data: 'late' })
+      },
+      port: 0,
+    })
+    const client = createClient({ url: `http://localhost:${server.port}` })
+    const controller = new AbortController()
+    const pending = client.action(
+      actionRef<Record<string, never>, string>('slow'),
+      {},
+      {
+        signal: controller.signal,
+      },
+    )
+    controller.abort()
+
+    await expect(pending).rejects.toThrow()
   })
 })

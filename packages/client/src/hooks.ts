@@ -10,7 +10,7 @@ import type {
   UseMutationResult,
   UseMutationOptions,
 } from '@tanstack/react-query'
-import type { QueryRef, MutationRef } from './refs'
+import type { QueryRef, MutationRef, ActionRef } from './refs'
 import { useWyStackClient } from './provider'
 
 function nextSubId() {
@@ -140,5 +140,18 @@ export function useMutation<TArgs, TReturn>(
   return useTanstackMutation<TReturn, Error, TArgs>({
     ...options,
     mutationFn: (args: TArgs) => client.mutate(ref, args),
+  })
+}
+
+/** useAction — invokes a one-shot, non-reactive Action through TanStack Mutation state. */
+export function useAction<TArgs, TReturn>(
+  ref: ActionRef<TArgs, TReturn>,
+  options?: WyMutationOptions<TArgs, TReturn>,
+): UseMutationResult<TReturn, Error, TArgs> {
+  const client = useWyStackClient()
+
+  return useTanstackMutation<TReturn, Error, TArgs>({
+    ...options,
+    mutationFn: (args: TArgs) => client.action(ref, args),
   })
 }

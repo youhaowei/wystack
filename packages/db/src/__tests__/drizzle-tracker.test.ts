@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema } from '../schema'
@@ -57,6 +57,10 @@ beforeEach(async () => {
   tracked = createDrizzleTracker(db)
 })
 
+afterEach(async () => {
+  await pg.close()
+})
+
 describe('DrizzleTracker', () => {
   test('insert records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'Test', done: false })
@@ -69,6 +73,16 @@ describe('DrizzleTracker', () => {
     expect(rows[0].title).toBe('Test')
     expect(rows[0].done).toBe(false)
     expect(rows[0].id).toBeGreaterThan(0)
+  })
+
+  test('a failed insert does not record tablesWritten', async () => {
+    await tracked.into(schema.todos).insert({ id: 1, title: 'first', done: false })
+    tracked = resetTracking(tracked)
+
+    await expect(
+      tracked.into(schema.todos).insert({ id: 1, title: 'duplicate', done: false }),
+    ).rejects.toThrow()
+    expect(tracked.tablesWritten.size).toBe(0)
   })
 
   test('select all records tablesRead', async () => {
