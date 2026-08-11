@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema } from '../schema'
@@ -55,6 +55,10 @@ beforeEach(async () => {
   await db.execute('DELETE FROM deferred_tags')
 
   tracked = createDrizzleTracker(db)
+})
+
+afterEach(async () => {
+  await pg.close()
 })
 
 describe('DrizzleTracker', () => {

@@ -35,6 +35,13 @@ const permissions = definePermissions<{ principal?: unknown }>()({
   },
 })
 const wy = defineApp<Record<string, unknown>>({ permissions })
+const openDatabases = new Set<{ close(): Promise<void> }>()
+
+async function createTestDatabase() {
+  const db = await createDb({ dev: 'pglite://' })
+  openDatabases.add(db.$client)
+  return db
+}
 
 // Per-test app factory for auth scenarios: each test creates its own
 // PGlite + wy.build + serve so resolveContext can vary freely.
@@ -42,7 +49,7 @@ const wy = defineApp<Record<string, unknown>>({ permissions })
 // via `functions` when a test needs something specific.
 type AuthTestFunctions = Record<string, FunctionDef>
 async function makeAuthApp(functions?: AuthTestFunctions) {
-  const db = await createDb({ dev: 'pglite://' })
+  const db = await createTestDatabase()
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
@@ -78,7 +85,7 @@ function withTimeout<T>(promise: Promise<T>, label: string, ms = 5000): Promise<
 }
 
 beforeEach(async () => {
-  const db = await createDb({ dev: 'pglite://' })
+  const db = await createTestDatabase()
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
       id SERIAL PRIMARY KEY,
@@ -104,8 +111,11 @@ beforeEach(async () => {
   baseUrl = `http://localhost:${server.port}`
 })
 
-afterEach(() => {
+afterEach(async () => {
   server.stop(true)
+  const databases = [...openDatabases]
+  openDatabases.clear()
+  await Promise.all(databases.map((client) => client.close()))
 })
 
 describe('buildAuthRequest (unit)', () => {
@@ -321,7 +331,7 @@ describe('HTTP transport', () => {
     // again, and monitoring reads it as an authentication problem. A key endpoint
     // that is down is a dependency failure of ours, so it has to answer 5xx or the
     // outage presents as every user's token going bad at once.
-    const db = await createDb({ dev: 'pglite://' })
+    const db = await createTestDatabase()
     await db.execute(
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
     )
@@ -383,7 +393,7 @@ describe('HTTP transport', () => {
     // param (400), and an unclassified throw from the function body (500). All three happen
     // on a server with resolveContext configured, so all three must carry the header — the
     // fix sets it once at the top of the handler, before any of these branches run.
-    const db = await createDb({ dev: 'pglite://' })
+    const db = await createTestDatabase()
     const app = await wy.build({
       db,
       functions: {
@@ -431,7 +441,7 @@ describe('HTTP transport', () => {
     // branch to the generic handler and became a 500. That reads as "the server broke"
     // for what is an ordinary not-signed-in request, and buries a sign-in prompt in the
     // error budget where nobody looks for it.
-    const db = await createDb({ dev: 'pglite://' })
+    const db = await createTestDatabase()
     const app = await wy.build({
       db,
       functions: {
@@ -459,7 +469,7 @@ describe('HTTP transport', () => {
   })
 
   test('resolveContext is called per request', async () => {
-    const db = await createDb({ dev: 'pglite://' })
+    const db = await createTestDatabase()
     await db.execute(
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
     )

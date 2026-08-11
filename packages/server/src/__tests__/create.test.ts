@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, text, int, boolean } from '@wystack/db'
@@ -50,9 +50,22 @@ const throwingPermission = {
 
 const wy = defineApp<AppContext>({ permissions })
 let app: Awaited<ReturnType<typeof wy.build>>
+const openDatabases = new Set<PGlite>()
+
+function createTestDatabase(): PGlite {
+  const pg = new PGlite()
+  openDatabases.add(pg)
+  return pg
+}
+
+afterEach(async () => {
+  const databases = [...openDatabases]
+  openDatabases.clear()
+  await Promise.all(databases.map((pg) => pg.close()))
+})
 
 beforeEach(async () => {
-  const pg = new PGlite()
+  const pg = createTestDatabase()
   const db = drizzle(pg)
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
@@ -224,7 +237,7 @@ describe('defineApp().build()', () => {
   })
 
   test('expectedPermissionIds rejects permission tree drift at boot', async () => {
-    const pg = new PGlite()
+    const pg = createTestDatabase()
     await expect(
       wy.build({
         db: drizzle(pg),
@@ -235,7 +248,7 @@ describe('defineApp().build()', () => {
   })
 
   test('expectedPermissionIds accepts the canonical snapshot', async () => {
-    const pg = new PGlite()
+    const pg = createTestDatabase()
     await expect(
       wy.build({
         db: drizzle(pg),
