@@ -1,4 +1,4 @@
-import type { QueryDef, MutationDef, FunctionDef } from './types'
+import type { QueryDef, MutationDef, ActionDef, FunctionDef } from './types'
 import type { WyStackApp } from './create'
 
 /** One FunctionDef → its callable signature. Server mirror of client refs.ts ToRef. */
@@ -7,7 +7,9 @@ type ToCaller<T> =
     ? (args: A) => Promise<R>
     : T extends MutationDef<infer A, infer R>
       ? (args: A) => Promise<R>
-      : never
+      : T extends ActionDef<infer A, infer R>
+        ? (args: A) => Promise<R>
+        : never
 
 /** Maps a function registry to a typed caller object. Server mirror of client's ApiFromFunctions. */
 export type CallerFromFunctions<T extends Record<string, FunctionDef>> = {

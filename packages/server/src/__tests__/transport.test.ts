@@ -94,6 +94,9 @@ beforeEach(async () => {
       addTodo: wy.procedure.input({ title: text }).mutation(async (ctx, args) => {
         return ctx.db.into(schema.todos).insert({ title: args.title, done: false })
       }),
+      runExternal: wy.procedure.input({ value: text }).action(async (_ctx, args) => ({
+        echoed: args.value,
+      })),
     },
   })
 
@@ -173,6 +176,38 @@ describe('HTTP transport', () => {
     const json = await res.json()
     expect(json.data).toHaveLength(1)
     expect(json.data[0].title).toBe('Test todo')
+  })
+
+  test('POST action requires and accepts the explicit action kind header', async () => {
+    const missingKind = await fetch(`${baseUrl}/api/runExternal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: 'no' }),
+    })
+    expect(missingKind.status).toBe(405)
+
+    const res = await fetch(`${baseUrl}/api/runExternal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-WyStack-Function-Kind': 'action',
+      },
+      body: JSON.stringify({ value: 'ok' }),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ data: { echoed: 'ok' } })
+  })
+
+  test('action kind header cannot invoke a mutation', async () => {
+    const res = await fetch(`${baseUrl}/api/addTodo`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-WyStack-Function-Kind': 'action',
+      },
+      body: JSON.stringify({ title: 'wrong carrier intent' }),
+    })
+    expect(res.status).toBe(405)
   })
 
   test('POST /api/unknown returns 404', async () => {

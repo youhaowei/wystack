@@ -6,13 +6,14 @@ export { createWyStack } from './setup'
 export type { WyStackInstance } from './setup'
 
 // Standalone hooks — Convex-style
-export { useQuery, useMutation } from './hooks'
+export { useQuery, useMutation, useAction } from './hooks'
 export type { QueryConfig } from './hooks'
 
 // Function reference types
 export type {
   QueryRef,
   MutationRef,
+  ActionRef,
   FunctionRef,
   ApiFromFunctions,
   RefArgs,

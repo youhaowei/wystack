@@ -87,6 +87,12 @@ async function makeApp() {
       boom: wy.procedure.input({}).query(async () => {
         throw new Error('kaboom')
       }),
+      runExternal: wy.procedure.input({ value: text }).action(async (_ctx, args) => ({
+        echoed: args.value,
+      })),
+      actionBoom: wy.procedure.input({}).action(async () => {
+        throw new Error('action kaboom')
+      }),
     },
   })
 }
@@ -157,6 +163,58 @@ describe('Engine — RPC tier (AC #1)', () => {
     const result = h.received.find((m) => m.type === 'result')
     expect(result).toBeDefined()
     expect(h.received.every((m) => m.type !== 'error')).toBe(true)
+  })
+
+  test('action frame dispatches only an ActionDef', async () => {
+    const h = await harness()
+    h.send({ type: 'action', id: 'a1', path: 'runExternal', args: { value: 'ok' } })
+    await until(() => h.received.length > 0, 'action result')
+    expect(h.received).toEqual([{ type: 'result', id: 'a1', data: { echoed: 'ok' } }])
+  })
+
+  test('call cannot silently invoke an ActionDef', async () => {
+    const h = await harness()
+    h.send({ type: 'call', id: 'a2', path: 'runExternal', args: { value: 'no' } })
+    await until(() => h.received.length > 0, 'action kind error')
+    expect(h.received).toEqual([
+      { type: 'error', kind: 'call', id: 'a2', error: 'runExternal is an action' },
+    ])
+  })
+
+  test('action validation errors retain action origin, id, and issues', async () => {
+    const h = await harness()
+    h.send({ type: 'action', id: 'a3', path: 'runExternal', args: { value: 123 } })
+    await until(() => h.received.length > 0, 'action validation error')
+    expect(h.received[0]).toMatchObject({ type: 'error', kind: 'action', id: 'a3' })
+    expect(h.received[0] && 'issues' in h.received[0]).toBe(true)
+  })
+
+  test('action handler errors retain action origin and id', async () => {
+    const h = await harness()
+    h.send({ type: 'action', id: 'a4', path: 'actionBoom', args: {} })
+    await until(() => h.received.length > 0, 'action handler error')
+    expect(h.received).toEqual([
+      { type: 'error', kind: 'action', id: 'a4', error: 'action kaboom' },
+    ])
+  })
+
+  test('action authorization uses the same fail-closed middleware path', async () => {
+    const app = await makeApp()
+    app.functions.set(
+      'protectedAction',
+      wy.procedure
+        .authorize(deniedPermission)
+        .input({})
+        .action(async () => 'should not run'),
+    )
+    const [clientPipe, serverPipe] = createLoopbackPair<ServerMessage, ClientMessage>()
+    const received: ServerMessage[] = []
+    clientPipe.onMessage((message) => received.push(message))
+    attachEngine(serverPipe, { app })
+
+    clientPipe.send({ type: 'action', id: 'a5', path: 'protectedAction', args: {} })
+    await until(() => received.length > 0, 'action permission error')
+    expect(received[0]).toMatchObject({ type: 'error', kind: 'action', id: 'a5' })
   })
 
   test('call to an unknown function → error frame carrying the call id', async () => {

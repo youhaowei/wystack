@@ -28,6 +28,7 @@ export type {
   SubscribeMessage,
   UnsubscribeMessage,
   CallMessage,
+  ActionMessage,
   ClientMessage,
   // Active server → client
   AuthenticatedMessage,

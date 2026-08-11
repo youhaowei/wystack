@@ -67,11 +67,18 @@ beforeEach(async () => {
       boom: wy.procedure.input({}).mutation(async () => {
         throw new Error('command boom')
       }),
+      externalAction: wy.procedure.input({}).action(async () => 'external'),
     },
   })
 })
 
 describe('applyCommands — commit mode', () => {
+  test('rejects an Action before opening the command transaction', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'externalAction', args: {} }], { mode: 'commit' }),
+    ).rejects.toThrow('Command externalAction must reference a mutation')
+  })
+
   test('applies all commands atomically and persists them', async () => {
     const result = await applyCommands(
       app,

@@ -21,7 +21,7 @@ export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
 // oxlint-disable-next-line typescript/no-explicit-any -- permissions remain contravariant over app-specific contexts
 export type Can = (permission: Permission<any>) => Promise<boolean>
 
-/** Function context passed to every query/mutation handler. */
+/** Function context passed to every query/mutation/action handler. */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
   db: DrizzleTracker
   can: Can
@@ -60,16 +60,29 @@ export interface QueryDef<TArgs = any, TReturn = any> {
   handler: (ctx: any, args: TArgs) => Promise<TReturn>
 }
 
-// oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export interface MutationDef<TArgs = any, TReturn = any> {
-  type: 'mutation'
+export interface ActionDef<
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TArgs = any,
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TReturn = any,
+  TType extends 'action' | 'mutation' = 'action',
+> {
+  type: TType
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
   handler: (ctx: any, args: TArgs) => Promise<TReturn>
 }
 
-export type FunctionDef = QueryDef | MutationDef
+// A Mutation is the transaction-eligible database-write specialization of Action.
+// oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+export interface MutationDef<TArgs = any, TReturn = any> extends ActionDef<
+  TArgs,
+  TReturn,
+  'mutation'
+> {}
+
+export type FunctionDef = QueryDef | MutationDef | ActionDef
 
 /** DB connection input — string URL, config object, or pre-built Drizzle instance (for tests) */
 export type DbInput = string | DbConfig | object

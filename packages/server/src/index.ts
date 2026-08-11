@@ -29,6 +29,7 @@ export {
 export type {
   QueryDef,
   MutationDef,
+  ActionDef,
   FunctionContext,
   FunctionDef,
   InferArgs,

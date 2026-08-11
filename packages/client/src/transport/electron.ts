@@ -239,6 +239,7 @@ export interface IpcManager {
   isConnected(): boolean
   /** RPC call over the IPC pipe — correlates by id, resolves with result.data. */
   call(path: string, args: Record<string, unknown>): Promise<unknown>
+  action(path: string, args: Record<string, unknown>): Promise<unknown>
 }
 
 export function createIpcManager(config: IpcManagerConfig): IpcManager {
@@ -259,5 +260,6 @@ export function createIpcManager(config: IpcManagerConfig): IpcManager {
     unsubscribe: (id) => engine.unsubscribe(id),
     isConnected: () => engine.isConnected(),
     call: (path, args) => engine.call(path, args),
+    action: (path, args) => engine.action(path, args),
   }
 }

@@ -468,6 +468,13 @@ export function createDraftLifecycle(
 
     async append(draftId, batch) {
       const entry = requireOpen(draftId)
+      for (const command of batch) {
+        const definition = app.functions.get(command.path)
+        if (!definition) throw new Error(`Unknown function: ${command.path}`)
+        if (definition.type !== 'mutation') {
+          throw new Error(`Draft command ${command.path} must reference a mutation`)
+        }
+      }
       return withDraftLock(entry, async () => {
         // Route writes through the draft handle so `ctx.db.into/update/delete`
         // lands in the `<table>__draft` overlay. The recording wrapper captures

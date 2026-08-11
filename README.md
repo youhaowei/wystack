@@ -41,3 +41,20 @@ bun run check      # lint + format + typecheck + test
 
 See [DESIGN.md](./DESIGN.md) for the full framework design.
 
+## Server functions
+
+WyStack exposes a Query and two one-shot function kinds:
+
+- **Query** — reads data and may be called once or subscribed to reactively.
+- **Action** — performs one-shot, non-reactive external I/O or orchestration.
+- **Mutation** — the database-write specialization: eligible for transactional command/draft
+  workflows and drives invalidation from committed tracked writes.
+
+Define an Action with
+  `wy.procedure.input({...}).action(handler)` and invoke it with `client.action(ref, args)` or
+  `useAction(ref)`. Actions are never subscribable and retain an explicit `action` kind on HTTP,
+  WebSocket, loopback, and Electron IPC carriers.
+
+HTTP callers may pass an `AbortSignal` to `client.action`. This aborts the client request, but
+WyStack does not yet promise server-handler cancellation: message transports need a cancel frame
+and dispatch-owned `AbortController` lifecycle before that guarantee can be made.

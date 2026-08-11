@@ -877,6 +877,42 @@ describe('createEngine', () => {
 // ─── Call / result correlation ────────────────────────────────────────────────
 
 describe('engine.call — call/result correlation', () => {
+  test('action sends a distinct action frame and resolves through result correlation', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.action('reports.run', { id: 7 })
+    await settle()
+    const server = harness.server()
+    const frame = server.received.find((f) => f.type === 'action') as
+      | Extract<ClientMessage, { type: 'action' }>
+      | undefined
+    expect(frame).toBeDefined()
+    expect(frame).toMatchObject({ type: 'action', path: 'reports.run', args: { id: 7 } })
+    server.send({ type: 'result', id: frame!.id, data: { ok: true } })
+
+    expect(await withTimeout(result, 'action round-trip')).toEqual({ ok: true })
+    engine.disconnect()
+  })
+
+  test('action rejects instead of hanging when an older server reports an invalid message', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({ createPipe: harness.createPipe })
+    engine.connect()
+    await settle()
+
+    const result = engine.action('reports.run', {})
+    await settle()
+    harness.server().send({ type: 'error', error: 'invalid message' })
+
+    await expect(withTimeout(result, 'old-server action')).rejects.toThrow(
+      'Server does not support Action frames',
+    )
+    engine.disconnect()
+  })
+
   test('call→result: loopback round-trip resolves with data', async () => {
     const harness = makeServerSide()
     const engine = createEngine({ createPipe: harness.createPipe })

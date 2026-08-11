@@ -27,6 +27,17 @@ describe('procedure builder', () => {
     expect(m.type).toBe('mutation')
   })
 
+  test('creates an ActionDef with validation and middleware parity', async () => {
+    const action = wy.procedure
+      .use(({ next }) => next({ source: 'middleware' }))
+      .input({ prompt: text })
+      .action(async (ctx, args) => `${ctx.source}:${args.prompt}`)
+
+    expect(action.type).toBe('action')
+    await expect(action.handler({}, { prompt: 'run' })).resolves.toBe('middleware:run')
+    await expect(action.handler({}, { prompt: 123 } as never)).rejects.toThrow('Validation failed')
+  })
+
   test('composes minimal middleware patches with Overwrite', async () => {
     const definition = wy.procedure
       .use(({ next }) => next({ count: 1 }))

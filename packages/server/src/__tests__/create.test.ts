@@ -81,6 +81,10 @@ beforeEach(async () => {
           throw new Error('handler boom')
         }),
       ),
+      actionWriteThenFail: wy.procedure.input({ title: text }).action(async (ctx, args) => {
+        await ctx.db.into(schema.todos).insert({ title: args.title, done: false })
+        throw new Error('external step failed')
+      }),
       protectedListTodos: wy.procedure
         .authorize(permissions.todos.read)
         .input({})
@@ -115,6 +119,20 @@ describe('defineApp().build()', () => {
 
   test('call() throws for an unknown function', async () => {
     await expect(app.call('unknown', {})).rejects.toThrow('Unknown function: unknown')
+  })
+
+  test('Action emits invalidation for a committed tracked write even if later external work fails', async () => {
+    const invalidations: Set<string>[] = []
+    const unsubscribe = app.invalidationSource.onInvalidation((tables) => {
+      invalidations.push(new Set(tables))
+    })
+
+    await expect(app.call('actionWriteThenFail', { title: 'durable' })).rejects.toThrow(
+      'external step failed',
+    )
+    expect(invalidations).toHaveLength(1)
+    expect(invalidations[0]?.has('todos')).toBe(true)
+    unsubscribe()
   })
 
   test('authorize() denies malformed, absent, and ungranted principals', async () => {

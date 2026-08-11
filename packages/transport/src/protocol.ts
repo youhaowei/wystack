@@ -83,7 +83,23 @@ export interface CallMessage {
   args: Record<string, unknown>
 }
 
-export type ClientMessage = AuthMessage | SubscribeMessage | UnsubscribeMessage | CallMessage
+/**
+ * One-shot invocation of a registered Action. Kept distinct from `call` so
+ * carriers preserve the server function's non-reactive external-I/O intent.
+ */
+export interface ActionMessage {
+  type: 'action'
+  id: string
+  path: string
+  args: Record<string, unknown>
+}
+
+export type ClientMessage =
+  | AuthMessage
+  | SubscribeMessage
+  | UnsubscribeMessage
+  | CallMessage
+  | ActionMessage
 
 // ─── Server → Client (active) ────────────────────────────────────────────────
 
@@ -123,6 +139,7 @@ export interface InvalidateMessage {
  * `kind` tags the origin of a request-scoped error so the client can
  * route it correctly without inspecting the `id` string:
  *   - `'call'`         — a `call` frame's handler failed or could not run.
+ *   - `'action'`       — an `action` frame's handler failed or could not run.
  *   - `'subscription'` — a `subscribe` frame was rejected.
  *   - absent           — connection-level error (no `id`), or an older
  *                        server that has not yet set the discriminant
@@ -139,16 +156,16 @@ export interface InvalidateMessage {
 export interface ErrorMessage {
   type: 'error'
   id?: string
-  kind?: 'call' | 'subscription'
+  kind?: 'call' | 'action' | 'subscription'
   retryable?: boolean
   error: string
   issues?: unknown[]
 }
 
 /**
- * Response to a `call` message. `data` is the function's return value (the
- * registry resolved query vs mutation; the wire does not distinguish). Errors
- * surface as an `ErrorMessage` carrying the same `id`, not a `result`.
+ * Response to a `call` or `action` message. `data` is the function's return
+ * value. Errors surface as an `ErrorMessage` carrying the same `id`, not a
+ * `result`.
  */
 export interface ResultMessage {
   type: 'result'
@@ -278,6 +295,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       if (!isPlainObject(msg.args)) return null
       return { type: 'call', id: msg.id, path: msg.path, args: msg.args }
     }
+    case 'action': {
+      if (typeof msg.id !== 'string') return null
+      if (typeof msg.path !== 'string') return null
+      if (!isPlainObject(msg.args)) return null
+      return { type: 'action', id: msg.id, path: msg.path, args: msg.args }
+    }
     default:
       return null
   }
@@ -316,7 +339,9 @@ export function parseServerMessage(data: string): ServerMessage | null {
 
       const out: ErrorMessage = { type: 'error', error: msg.error }
       if (typeof msg.id === 'string') out.id = msg.id
-      if (msg.kind === 'call' || msg.kind === 'subscription') out.kind = msg.kind
+      if (msg.kind === 'call' || msg.kind === 'action' || msg.kind === 'subscription') {
+        out.kind = msg.kind
+      }
       if (typeof msg.retryable === 'boolean') out.retryable = msg.retryable
       if (Array.isArray(msg.issues)) out.issues = msg.issues
       return out

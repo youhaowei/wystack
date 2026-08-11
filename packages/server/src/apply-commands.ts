@@ -197,6 +197,17 @@ export async function applyCommands(
 ): Promise<ApplyResult> {
   const { mode, context = {}, tx: outerTx } = opts
 
+  // Commands are mutation-only. Validate the whole batch before opening or
+  // joining a transaction so an Action (external I/O/orchestration) can never
+  // accidentally execute while a database transaction is held open.
+  for (const command of batch) {
+    const definition = app.functions.get(command.path)
+    if (!definition) throw new Error(`Unknown function: ${command.path}`)
+    if (definition.type !== 'mutation') {
+      throw new Error(`Command ${command.path} must reference a mutation`)
+    }
+  }
+
   if (mode === 'commit') {
     if (outerTx !== undefined) {
       // OUTER-TX PATH: the caller already opened a transaction and supplies the
