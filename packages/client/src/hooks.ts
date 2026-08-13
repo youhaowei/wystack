@@ -11,11 +11,7 @@ import type {
   UseMutationOptions,
 } from '@tanstack/react-query'
 import type { QueryRef, MutationRef, ActionRef } from './refs'
-import { useWyStackClient } from './provider'
-
-function nextSubId() {
-  return `wy_${crypto.randomUUID()}`
-}
+import { useWyStackClient } from './react-provider'
 
 type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'queryFn'>
 
@@ -47,8 +43,8 @@ type QueryConfigArg<TArgs, TReturn> = TArgs extends EmptyArgs
     ]
 
 /**
- * useQuery — fetches data via HTTP GET (TanStack Query), subscribes via WS
- * for live invalidation. Accepts a typed QueryRef from the api object.
+ * useQuery — fetches through the configured client (TanStack Query) and
+ * subscribes for live invalidation. Accepts a typed QueryRef from the api object.
  *
  * Args must be JSON-serializable (no Date/Map/Set/BigInt). Object key order
  * matters for cache identity — use a consistent shape per call site.
@@ -84,14 +80,11 @@ export function useQuery<TArgs, TReturn>(
     enabled: !skip && (options?.enabled ?? true),
   })
 
-  // WS subscription for live invalidation
+  // Platform-owned subscription for live invalidation
   useEffect(() => {
     if (skip) return
 
-    const subId = nextSubId()
-
-    client.ws.subscribe(
-      subId,
+    return client.subscribe(
       path,
       stableArgs as Record<string, unknown>,
       () => {
@@ -108,11 +101,7 @@ export function useQuery<TArgs, TReturn>(
         }
       },
     )
-
-    return () => {
-      client.ws.unsubscribe(subId)
-    }
-  }, [client.ws, queryClient, path, stableArgs, skip])
+  }, [client, queryClient, path, stableArgs, skip])
 
   return query
 }
@@ -123,7 +112,7 @@ type WyMutationOptions<TArgs, TReturn> = Omit<
 >
 
 /**
- * useMutation — calls WyStack mutation via HTTP POST.
+ * useMutation — calls a WyStack mutation through the configured client.
  * Accepts a typed MutationRef from the api object.
  *
  * ```ts

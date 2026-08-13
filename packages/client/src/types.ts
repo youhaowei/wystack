@@ -16,4 +16,9 @@ export interface WyStackClientConfig {
    * usage where HTTP may still use `getToken` but WS must not send auth frames.
    */
   requiresAuth?: boolean
+  /**
+   * Override subscription ID creation for a custom web runtime. Defaults to
+   * `globalThis.crypto.randomUUID()` in the web adapter.
+   */
+  createSubscriptionId?: () => string
 }

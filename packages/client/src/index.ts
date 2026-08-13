@@ -5,6 +5,10 @@
 export { createWyStack } from './setup'
 export type { WyStackInstance } from './setup'
 
+// Transport-neutral React composition
+export { createReactBindings } from './bindings'
+export type { CreateReactBindingsOptions, WyStackReactBindings } from './bindings'
+
 // Standalone hooks — Convex-style
 export { useQuery, useMutation, useAction } from './hooks'
 export type { QueryConfig } from './hooks'
@@ -33,7 +37,8 @@ export { createWebSocketPipe } from './transport/websocket'
 export { createElectronPipe, createIpcManager } from './transport/electron'
 export { createEngine, CallNotReadyError } from './engine'
 
-export type { WyStackClient } from './client'
+export type { WebClient, WyStackClient } from './client'
+export type { Client, ActionOptions, LiveUpdatesErrorHandler } from './core-client'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { IpcManager, IpcManagerConfig, IpcRendererLike } from './transport/electron'
 export type { WyStackClientConfig } from './types'

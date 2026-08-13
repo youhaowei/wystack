@@ -4,8 +4,7 @@
  * The `createWebSocketPipe` browser transport adapter has been relocated to
  * `./transport/websocket` (T3b) and is exported from the package root
  * (`@wystack/client`). This module wraps it in the `createWsManager`
- * convenience surface so existing consumers (`client.ts`, `hooks.ts`, app
- * code) continue to work unchanged.
+ * convenience surface for the web client and low-level app code.
  *
  * Public surface (`createWsManager`, `WsManager`, `WsManagerConfig`) is
  * stable — import from `@wystack/client`.

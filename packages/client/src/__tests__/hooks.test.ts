@@ -21,7 +21,9 @@ import { createElement, type ReactNode } from 'react'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { WyStackProvider } from '../provider'
+import { WyStackProvider as ReactWyStackProvider } from '../react-provider'
 import { useQuery, useMutation, useAction } from '../hooks'
+import type { Client } from '../core-client'
 import type { WyStackClient } from '../client'
 import type { WsManager } from '../ws'
 import type { QueryRef, MutationRef, ActionRef } from '../refs'
@@ -106,6 +108,20 @@ function makeWrapper(client: WyStackClient): React.FC<{ children: ReactNode }> {
   }
 }
 
+function makeReactWrapper(client: Client): React.FC<{ children: ReactNode }> {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return createElement(
+      QueryClientProvider,
+      { client: queryClient },
+      createElement(ReactWyStackProvider, { client, children }),
+    )
+  }
+}
+
 // A typed phantom ref factory for tests — matches the shape createApi produces.
 function makeQueryRef<TArgs, TReturn>(path: string): QueryRef<TArgs, TReturn> {
   return { _path: path } as unknown as QueryRef<TArgs, TReturn>
@@ -124,6 +140,38 @@ function makeActionRef<TArgs, TReturn>(path: string): ActionRef<TArgs, TReturn> 
 // ---------------------------------------------------------------------------
 
 describe('useQuery', () => {
+  test('works with a transport-neutral client', async () => {
+    const subscribers: Array<() => void> = []
+    const connect = mock(() => {})
+    const disconnect = mock(() => {})
+    const unsubscribe = mock(() => {})
+    const client: Client = {
+      connect,
+      disconnect,
+      subscribe: mock((_path, _args, onInvalidate) => {
+        subscribers.push(onInvalidate)
+        return unsubscribe
+      }),
+      query: mock(() => Promise.resolve({ title: 'Portable' })) as Client['query'],
+      mutate: mock(() => Promise.resolve(null)) as Client['mutate'],
+      action: mock(() => Promise.resolve(null)) as Client['action'],
+    }
+    const wrapper = makeReactWrapper(client)
+    const ref = makeQueryRef<Record<string, never>, { title: string }>('portableQuery')
+
+    const { result, unmount } = renderHook(() => useQuery(ref), { wrapper })
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(result.current.data).toEqual({ title: 'Portable' })
+    expect(subscribers).toHaveLength(1)
+    expect(connect).toHaveBeenCalledTimes(1)
+
+    unmount()
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(disconnect).toHaveBeenCalledTimes(1)
+  })
+
   test('fetches via client.query and returns data on success', async () => {
     const ws = makeMockWs()
     const client = makeMockClient(ws, () => Promise.resolve([{ id: 1, title: 'Todo' }]))
