@@ -1,5 +1,3 @@
-export { createWyStack } from './setup'
-export type { WyStackInstance } from './setup'
 export { createClient } from './client'
 export type { WebClient, WyStackClient } from './client'
 export { createWsManager } from './ws'

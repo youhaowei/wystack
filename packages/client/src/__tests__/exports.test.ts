@@ -40,7 +40,6 @@ describe('public client entrypoints', () => {
       'createClient',
       'createWebSocketPipe',
       'createWsManager',
-      'createWyStack',
     ])
     expect(Object.keys(electron).sort()).toEqual(['createElectronPipe', 'createIpcManager'])
   })

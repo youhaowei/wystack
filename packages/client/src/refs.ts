@@ -5,8 +5,6 @@
  * arg/return signature via phantom type parameters. Refs are data — they can
  * be passed as props, stored in config, or used outside React.
  */
-import type { QueryDef, MutationDef, ActionDef, FunctionDef } from '@wystack/server'
-
 // ---------------------------------------------------------------------------
 // Phantom brands — never exist at runtime, only in the type system
 // ---------------------------------------------------------------------------
@@ -64,18 +62,27 @@ export type RefReturn<T extends FunctionRef> =
 // Mapped type — converts server function registry to client api object
 // ---------------------------------------------------------------------------
 
-/* oxlint-disable typescript/no-explicit-any -- `any` needed for conditional type variance matching */
-type ToRef<T> =
-  T extends QueryDef<infer A, infer R>
-    ? QueryRef<A, R>
-    : T extends MutationDef<infer A, infer R>
-      ? MutationRef<A, R>
-      : T extends ActionDef<infer A, infer R>
-        ? ActionRef<A, R>
-        : never
-/* oxlint-enable typescript/no-explicit-any */
+type DefinitionArgs<T> = T extends {
+  handler: (...parameters: infer TParameters) => unknown
+}
+  ? TParameters[1]
+  : never
+
+type DefinitionReturn<T> = T extends {
+  handler: (...parameters: infer _TParameters) => infer TReturn
+}
+  ? Awaited<TReturn>
+  : never
+
+type ToRef<T> = T extends { type: 'query' }
+  ? QueryRef<DefinitionArgs<T>, DefinitionReturn<T>>
+  : T extends { type: 'mutation' }
+    ? MutationRef<DefinitionArgs<T>, DefinitionReturn<T>>
+    : T extends { type: 'action' }
+      ? ActionRef<DefinitionArgs<T>, DefinitionReturn<T>>
+      : never
 
 /** Maps a server function registry `{ listTodos: QueryDef<A,R>, ... }` to `{ listTodos: QueryRef<A,R>, ... }`. */
-export type ApiFromFunctions<T extends Record<string, FunctionDef>> = {
+export type ApiFromFunctions<T extends Record<string, unknown>> = {
   [K in keyof T]: ToRef<T[K]>
 }
