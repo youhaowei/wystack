@@ -3,7 +3,7 @@
  *
  * React-agnostic. The api object is portable across platforms.
  */
-import type { ApiFromFunctions } from './refs'
+import type { ApiFromFunctions, FunctionDefinition } from './refs'
 
 /**
  * createApi — builds a runtime Proxy where each property access returns
@@ -27,7 +27,7 @@ const PROBE_KEYS = new Set([
   '$$typeof',
 ])
 
-export function createApi<T extends Record<string, unknown>>(): ApiFromFunctions<T> {
+export function createApi<T extends Record<string, FunctionDefinition>>(): ApiFromFunctions<T> {
   const cache = new Map<string, { _path: string }>()
   return new Proxy({} as ApiFromFunctions<T>, {
     get(_target, prop) {

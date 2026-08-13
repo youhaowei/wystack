@@ -58,6 +58,12 @@ export type RefReturn<T extends FunctionRef> =
         ? R
         : never
 
+/** Portable structural shape shared by client-side function registries. */
+export interface FunctionDefinition {
+  readonly type: 'query' | 'mutation' | 'action'
+  readonly handler: (...parameters: never[]) => unknown
+}
+
 // ---------------------------------------------------------------------------
 // Mapped type — converts server function registry to client api object
 // ---------------------------------------------------------------------------
@@ -83,6 +89,6 @@ type ToRef<T> = T extends { type: 'query' }
       : never
 
 /** Maps a server function registry `{ listTodos: QueryDef<A,R>, ... }` to `{ listTodos: QueryRef<A,R>, ... }`. */
-export type ApiFromFunctions<T extends Record<string, unknown>> = {
+export type ApiFromFunctions<T extends Record<string, FunctionDefinition>> = {
   [K in keyof T]: ToRef<T[K]>
 }

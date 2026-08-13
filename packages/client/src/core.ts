@@ -6,6 +6,7 @@ export type {
   ActionRef,
   FunctionRef,
   ApiFromFunctions,
+  FunctionDefinition,
   RefArgs,
   RefReturn,
 } from './refs'

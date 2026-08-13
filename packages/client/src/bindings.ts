@@ -2,11 +2,11 @@ import { createElement } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createApi } from './api'
 import type { Client } from './core-client'
-import type { ApiFromFunctions } from './refs'
+import type { ApiFromFunctions, FunctionDefinition } from './refs'
 import { WyStackProvider } from './react-provider'
 
 export interface WyStackReactBindings<
-  TFunctions extends Record<string, unknown>,
+  TFunctions extends Record<string, FunctionDefinition>,
   TClient extends Client = Client,
 > {
   Provider: React.FC<{ children: React.ReactNode }>
@@ -21,7 +21,7 @@ export interface CreateReactBindingsOptions {
 
 /** Compose typed React bindings around an already-created platform client. */
 export function createReactBindings<
-  TFunctions extends Record<string, unknown>,
+  TFunctions extends Record<string, FunctionDefinition>,
   TClient extends Client = Client,
 >(
   client: TClient,

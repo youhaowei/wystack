@@ -5,12 +5,12 @@
  * The Provider is pre-bound to the client it creates internally.
  */
 import type { WyStackClientConfig } from './types'
-import type { ApiFromFunctions } from './refs'
+import type { ApiFromFunctions, FunctionDefinition } from './refs'
 import type { WebClient, WyStackClient } from './client'
 import { createClient } from './client'
 import { createReactBindings, type CreateReactBindingsOptions } from './bindings'
 
-export interface WyStackInstance<T extends Record<string, unknown>> {
+export interface WyStackInstance<T extends Record<string, FunctionDefinition>> {
   /** Pre-bound Provider — wraps children in both QueryClientProvider and WyStackProvider. */
   Provider: React.FC<{ children: React.ReactNode }>
   /** Typed api object — each key is a phantom-branded QueryRef or MutationRef. */
@@ -29,7 +29,7 @@ export type CreateWyStackOptions = CreateReactBindingsOptions
  * const { Provider, api, client } = createWyStack<typeof functions>({ url })
  * ```
  */
-export function createWyStack<T extends Record<string, unknown>>(
+export function createWyStack<T extends Record<string, FunctionDefinition>>(
   config: WyStackClientConfig,
   options: CreateWyStackOptions = {},
 ): WyStackInstance<T> {

@@ -20,6 +20,9 @@ type TestFunctions = {
 
 type Api = ApiFromFunctions<TestFunctions>
 
+// @ts-expect-error registry entries must include the callable definition shape
+type _MalformedApi = ApiFromFunctions<{ missingHandler: { type: 'query' } }>
+
 // Queries map to QueryRef
 const _listTodos: Api['listTodos'] extends QueryRef<
   { orgId: string },
