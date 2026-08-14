@@ -50,13 +50,15 @@ export interface EngineConfig {
    * headers.
    */
   getToken?: () => Promise<string | null> | string | null
+  /** Extra context headers to carry in the auth frame on each connection. */
+  getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
   /**
    * Force the auth handshake on or off, overriding the `getToken`-based
    * default. Use `true` for cookie/proxy auth without a bearer token; use
    * `false` for trusted transports (IPC, local-loopback) where the server is
    * configured without `resolveContext`.
    *
-   * Defaults to `true` when `getToken` is set, `false` otherwise.
+   * Defaults to `true` when `getToken` or `getHeaders` is set, `false` otherwise.
    */
   requiresAuth?: boolean
   /**
@@ -122,8 +124,8 @@ interface PendingCall {
 }
 
 export function createEngine(config: EngineConfig): Engine {
-  const { createPipe, getToken, onSubscribed } = config
-  const requiresAuth = config.requiresAuth ?? getToken !== undefined
+  const { createPipe, getToken, getHeaders, onSubscribed } = config
+  const requiresAuth = config.requiresAuth ?? (getToken !== undefined || getHeaders !== undefined)
   const authAckTimeoutMs = config.authAckTimeoutMs ?? DEFAULT_AUTH_ACK_TIMEOUT_MS
 
   let pipe: EnginePipe | null = null
@@ -393,6 +395,7 @@ export function createEngine(config: EngineConfig): Engine {
     // pipe, abandoning it with no close() call.
     const run = async (): Promise<void> => {
       const token: string | null = requiresAuth ? ((await getToken?.()) ?? null) : null
+      const headers = requiresAuth ? ((await getHeaders?.()) ?? {}) : {}
 
       if (generation !== connectGeneration || authFailed) return
 
@@ -432,7 +435,14 @@ export function createEngine(config: EngineConfig): Engine {
         // `token: null` (not undefined) — the wire frame must always carry
         // the field. The server's anonymous-path (`resolveContext` against
         // upgrade headers) needs an explicit null sentinel.
-        sendOrClose({ type: 'auth', token: token ?? null }, generation)
+        sendOrClose(
+          {
+            type: 'auth',
+            token: token ?? null,
+            ...(Object.keys(headers).length === 0 ? {} : { headers }),
+          },
+          generation,
+        )
         authAckTimer = setTimeout(() => {
           authAckTimer = null
           failAuthAck(generation)

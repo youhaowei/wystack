@@ -380,6 +380,41 @@ describe('WsManager', () => {
     }
   })
 
+  test('carries getHeaders context into authenticated WebSocket subscriptions', async () => {
+    const app = await makeAuthApp()
+    const seenTenants: Array<string | null> = []
+    const authServer = serve({
+      app,
+      port: 0,
+      resolveContext: async (req) => {
+        const tenant = req.headers.get('x-tenant-id')
+        seenTenants.push(tenant)
+        if (tenant !== 'acme') throw new Error('Unauthorized')
+        return { tenant }
+      },
+    })
+
+    try {
+      const subscribed = deferred<void>()
+      const ws = createWsManager({
+        url: `ws://localhost:${authServer.port}/api/ws`,
+        getHeaders: () => ({ 'X-Tenant-Id': 'acme' }),
+        onSubscribed: (id) => {
+          if (id === 'sub1') subscribed.resolve()
+        },
+      })
+      ws.connect()
+      ws.subscribe('sub1', 'listTodos', {}, () => {})
+
+      await withTimeout(subscribed.promise, 'header-authenticated subscribe')
+      expect(seenTenants).toEqual(['acme', 'acme'])
+      expect(ws.isConnected()).toBe(true)
+      ws.disconnect()
+    } finally {
+      authServer.stop(true)
+    }
+  })
+
   test('requiresAuth:true without getToken sends auth frame with null token (cookie/session auth)', async () => {
     // Simulates a server that uses resolveContext for cookie/proxy-header auth —
     // no JWT, but the client still needs to trigger the handshake so the server

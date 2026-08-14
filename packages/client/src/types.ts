@@ -9,11 +9,17 @@ export interface WyStackClientConfig {
    */
   getToken?: () => Promise<string | null> | string | null
   /**
+   * App-provided request headers. Called for every HTTP request and each
+   * authenticated WebSocket connection attempt.
+   */
+  getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
+  /**
    * Whether the WebSocket transport must perform the auth handshake.
    *
-   * Defaults to true when `getToken` is provided and false otherwise. Set false
-   * for trusted transports such as in-process IPC or same-process local runtime
-   * usage where HTTP may still use `getToken` but WS must not send auth frames.
+   * Defaults to true when `getToken` or `getHeaders` is provided and false
+   * otherwise. Set false for trusted transports such as in-process IPC or
+   * same-process local runtime usage where HTTP may still use either callback
+   * but WS must not send auth frames.
    */
   requiresAuth?: boolean
 }

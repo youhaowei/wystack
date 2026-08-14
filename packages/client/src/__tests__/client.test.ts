@@ -207,3 +207,31 @@ describe('createClient — Action cancellation', () => {
     await expect(pending).rejects.toThrow()
   })
 })
+
+describe('createClient — app-provided headers', () => {
+  let server: ReturnType<typeof Bun.serve>
+
+  afterEach(() => server?.stop(true))
+
+  test('sends fresh getHeaders values on query, mutation, and action requests', async () => {
+    const tenants: Array<string | null> = []
+    server = Bun.serve({
+      fetch(req) {
+        tenants.push(req.headers.get('x-tenant-id'))
+        return Response.json({ data: null })
+      },
+      port: 0,
+    })
+    let headerCalls = 0
+    const client = createClient({
+      url: `http://localhost:${server.port}`,
+      getHeaders: () => ({ 'X-Tenant-Id': `tenant-${++headerCalls}` }),
+    })
+
+    await client.query(queryRef('query'))
+    await client.mutate(mutationRef('mutation'))
+    await client.action(actionRef('action'))
+
+    expect(tenants).toEqual(['tenant-1', 'tenant-2', 'tenant-3'])
+  })
+})

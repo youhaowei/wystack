@@ -94,6 +94,22 @@ describe('parseClientMessage — auth', () => {
     const got = parseClientMessage(JSON.stringify({ type: 'auth', token: null }))
     expect(got).toEqual({ type: 'auth', token: null })
   })
+  test('accepts string-valued context headers', () => {
+    const got = parseClientMessage(
+      JSON.stringify({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 'acme' } }),
+    )
+    expect(got).toEqual({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 'acme' } })
+  })
+  test('rejects malformed context headers', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'auth', token: 'jwt', headers: [] })),
+    ).toBeNull()
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 42 } }),
+      ),
+    ).toBeNull()
+  })
   test('rejects a missing token field', () => {
     // The wire requires token to be present; the server coerces non-string to
     // null but the parser is strict (see AuthMessage doc).

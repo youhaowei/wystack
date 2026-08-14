@@ -38,6 +38,7 @@ import { ValidationError } from '../validation'
 import { AuthenticationRequiredError } from '../functions'
 import {
   attachEngine,
+  Session,
   type AttachEngineOptions,
   createInMemorySubscriptionStore,
   createInvalidationRouter,
@@ -370,6 +371,66 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     h.send({ type: 'auth', token: 'tok123' })
     await until(() => seen.length > 0, 'resolve')
     expect(seen).toEqual([{ auth: 'Bearer tok123' }])
+  })
+
+  test('auth frame layers safe context headers onto every resolved request', async () => {
+    const seen: Array<{ auth: string | null; tenant: string | null }> = []
+    const session = new Session({
+      resolveContext: async (req) => {
+        seen.push({
+          auth: req.headers.get('authorization'),
+          tenant: req.headers.get('x-tenant-id'),
+        })
+        return {}
+      },
+    })
+
+    expect(await session.handleAuth('tok123', { 'X-Tenant-Id': 'acme' })).toEqual({
+      kind: 'authenticated',
+      committed: true,
+    })
+    await session.resolveSubContext()
+
+    expect(seen).toEqual([
+      { auth: 'Bearer tok123', tenant: 'acme' },
+      { auth: 'Bearer tok123', tenant: 'acme' },
+    ])
+  })
+
+  test('auth frame cannot override identity or transport headers', async () => {
+    const seen: Array<Record<string, string | null>> = []
+    const session = new Session({
+      baseRequest: new Request('wystack://pipe', {
+        headers: { cookie: 'trusted=session', origin: 'https://trusted.example' },
+      }),
+      resolveContext: async (req) => {
+        seen.push({
+          authorization: req.headers.get('authorization'),
+          cookie: req.headers.get('cookie'),
+          origin: req.headers.get('origin'),
+          forwarded: req.headers.get('x-forwarded-host'),
+        })
+        return {}
+      },
+    })
+
+    expect(
+      await session.handleAuth('real-token', {
+        Authorization: 'Bearer attacker',
+        Cookie: 'attacker=session',
+        Origin: 'https://attacker.example',
+        'X-Forwarded-Host': 'attacker.example',
+      }),
+    ).toEqual({ kind: 'authenticated', committed: true })
+
+    expect(seen).toEqual([
+      {
+        authorization: 'Bearer real-token',
+        cookie: 'trusted=session',
+        origin: 'https://trusted.example',
+        forwarded: null,
+      },
+    ])
   })
 
   // Parity regression: routes.ts uses a LENIENT envelope parse then coerces a

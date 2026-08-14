@@ -192,6 +192,22 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
+  test('auth handshake carries app-provided context headers', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => 'tkn',
+      getHeaders: () => ({ 'X-Tenant-Id': 'acme' }),
+    })
+    engine.connect()
+
+    await settle()
+    expect(harness.server().received).toEqual([
+      { type: 'auth', token: 'tkn', headers: { 'X-Tenant-Id': 'acme' } },
+    ])
+    engine.disconnect()
+  })
+
   test('close 4001 latches authFailed, fires invalidations, no reconnect', async () => {
     const harness = makeServerSide()
     const engine = createEngine({

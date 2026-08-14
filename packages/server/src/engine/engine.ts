@@ -254,8 +254,8 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     ? setTimeout(() => closeWith('transient'), authTimeoutMs)
     : null
 
-  async function handleAuth(rawToken: unknown): Promise<void> {
-    const outcome = await session.handleAuth(rawToken)
+  async function handleAuth(rawToken: unknown, rawHeaders: unknown): Promise<void> {
+    const outcome = await session.handleAuth(rawToken, rawHeaders)
     if (closed) return
     if (outcome.kind === 'close') {
       // TODO: replace with @wystack/log once server logging lands. Log the reason
@@ -492,7 +492,7 @@ export function attachEngine(pipe: Pipe, opts: AttachEngineOptions): EngineHandl
     // Hand the raw token to the Session, which coerces missing/empty/non-string
     // to null (anonymous) exactly as routes.ts does.
     if (envelope.type === 'auth') {
-      void handleAuth(envelope.token)
+      void handleAuth(envelope.token, envelope.headers)
       return
     }
 

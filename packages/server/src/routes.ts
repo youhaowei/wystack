@@ -99,6 +99,10 @@ export interface RouteOptions {
   /** URL prefix for all routes. Default: '/api' */
   prefix?: string
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
+  /** Opt-in browser CORS policy. Origins are denied unless explicitly trusted. */
+  cors?: {
+    origins: readonly string[] | ((origin: string) => boolean | Promise<boolean>)
+  }
   /**
    * Max ms to wait for the WS auth handshake message after connect.
    * Only applies when `resolveContext` is configured. Default: 10_000.
@@ -112,6 +116,43 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   const authTimeoutMs = opts.authTimeoutMs ?? 10_000
 
   const hono = new Hono()
+
+  const cors = opts.cors
+  if (cors) {
+    hono.use(`${prefix}/*`, async (c, next) => {
+      const origin = c.req.header('Origin')
+      if (!origin) return next()
+
+      const { origins } = cors
+      const allowed =
+        typeof origins === 'function' ? await origins(origin) : origins.includes(origin)
+
+      const applyCorsHeaders = (headers: Headers) => {
+        const vary = headers.get('Vary')
+        const varyValues = vary?.split(',').map((value) => value.trim().toLowerCase()) ?? []
+        if (!varyValues.includes('origin')) {
+          headers.set('Vary', vary ? `${vary}, Origin` : 'Origin')
+        }
+        if (!allowed) return
+
+        headers.set('Access-Control-Allow-Origin', origin)
+        headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        const requestedHeaders = c.req.header('Access-Control-Request-Headers')
+        if (requestedHeaders) {
+          headers.set('Access-Control-Allow-Headers', requestedHeaders)
+        }
+      }
+
+      if (c.req.method === 'OPTIONS') {
+        const response = new Response(null, { status: 204 })
+        applyCorsHeaders(response.headers)
+        return response
+      }
+
+      await next()
+      applyCorsHeaders(c.res.headers)
+    })
+  }
 
   // --- Shared reactive tier: one store per server instance, the app's source ---
   //

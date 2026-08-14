@@ -39,11 +39,14 @@
  * First frame on a connection when the server is configured with
  * `resolveContext`. `token` is `string | null` — null means anonymous
  * (any leaked Authorization header is stripped by the server before
- * `resolveContext` runs).
+ * `resolveContext` runs). Optional app headers carry context that browser
+ * WebSocket APIs cannot attach to the upgrade request.
  */
 export interface AuthMessage {
   type: 'auth'
   token: string | null
+  /** App-provided context headers for transports that cannot set upgrade headers. */
+  headers?: Record<string, string>
 }
 
 /**
@@ -277,7 +280,15 @@ export function parseClientMessage(data: string): ClientMessage | null {
       // counterpart: require the field, require the type. Callers that want
       // server-style leniency should pre-normalize.
       if (msg.token !== null && typeof msg.token !== 'string') return null
-      return { type: 'auth', token: msg.token }
+      if (msg.headers !== undefined) {
+        if (!isPlainObject(msg.headers)) return null
+        if (Object.values(msg.headers).some((value) => typeof value !== 'string')) return null
+      }
+      return {
+        type: 'auth',
+        token: msg.token,
+        ...(msg.headers === undefined ? {} : { headers: msg.headers as Record<string, string> }),
+      }
     }
     case 'subscribe': {
       if (typeof msg.id !== 'string') return null

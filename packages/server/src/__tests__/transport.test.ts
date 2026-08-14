@@ -163,6 +163,66 @@ describe('buildAuthRequest (unit)', () => {
 })
 
 describe('HTTP transport', () => {
+  test('approved CORS preflight reflects requested custom headers and varies by origin', async () => {
+    const db = await createTestDatabase()
+    const app = await wy.build({
+      db,
+      functions: { listTodos: wy.procedure.input({}).query(async () => []) },
+    })
+    const corsServer = serve({
+      app,
+      port: 0,
+      cors: { origins: ['https://app.example'] },
+    })
+
+    try {
+      const res = await fetch(`http://localhost:${corsServer.port}/api/listTodos`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://app.example',
+          'Access-Control-Request-Headers': 'authorization, x-tenant-id',
+        },
+      })
+
+      expect(res.status).toBe(204)
+      expect(res.headers.get('access-control-allow-origin')).toBe('https://app.example')
+      expect(res.headers.get('access-control-allow-headers')).toBe('authorization, x-tenant-id')
+      expect(res.headers.get('vary')).toContain('Origin')
+    } finally {
+      corsServer.stop(true)
+    }
+  })
+
+  test('CORS denies untrusted origins without reflecting them', async () => {
+    const db = await createTestDatabase()
+    const app = await wy.build({
+      db,
+      functions: { listTodos: wy.procedure.input({}).query(async () => []) },
+    })
+    const corsServer = serve({
+      app,
+      port: 0,
+      cors: { origins: ['https://app.example'] },
+    })
+
+    try {
+      const res = await fetch(`http://localhost:${corsServer.port}/api/listTodos`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://attacker.example',
+          'Access-Control-Request-Headers': 'x-tenant-id',
+        },
+      })
+
+      expect(res.status).toBe(204)
+      expect(res.headers.get('access-control-allow-origin')).toBeNull()
+      expect(res.headers.get('access-control-allow-headers')).toBeNull()
+      expect(res.headers.get('vary')).toContain('Origin')
+    } finally {
+      corsServer.stop(true)
+    }
+  })
+
   test('GET /api/listTodos returns empty array', async () => {
     const res = await fetch(`${baseUrl}/api/listTodos`)
     const json = await res.json()
