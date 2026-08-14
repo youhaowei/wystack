@@ -406,6 +406,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
           origin: 'https://trusted.example',
           'x-real-ip': '203.0.113.10',
           'cf-connecting-ip': '203.0.113.10',
+          'fly-client-ip': '203.0.113.10',
+          'x-tenant-id': 'trusted-tenant',
         },
       }),
       resolveContext: async (req) => {
@@ -416,6 +418,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
           forwarded: req.headers.get('x-forwarded-host'),
           realIp: req.headers.get('x-real-ip'),
           cloudflareIp: req.headers.get('cf-connecting-ip'),
+          flyIp: req.headers.get('fly-client-ip'),
+          tenant: req.headers.get('x-tenant-id'),
         })
         return {}
       },
@@ -429,6 +433,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
         'X-Forwarded-Host': 'attacker.example',
         'X-Real-IP': '127.0.0.1',
         'CF-Connecting-IP': '127.0.0.1',
+        'Fly-Client-IP': '127.0.0.1',
+        'X-Tenant-Id': 'attacker-tenant',
       }),
     ).toEqual({ kind: 'authenticated', committed: true })
 
@@ -440,6 +446,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
         forwarded: null,
         realIp: '203.0.113.10',
         cloudflareIp: '203.0.113.10',
+        flyIp: '203.0.113.10',
+        tenant: 'trusted-tenant',
       },
     ])
   })

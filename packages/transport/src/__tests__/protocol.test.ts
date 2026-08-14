@@ -131,6 +131,8 @@ describe('sanitizeContextHeaders', () => {
         Authorization: 'Bearer attacker',
         'X-Real-IP': '127.0.0.1',
         'CF-Connecting-IP': '127.0.0.1',
+        'Fly-Client-IP': '127.0.0.1',
+        'X-Envoy-External-Address': '127.0.0.1',
         'X-Forwarded-Host': 'attacker.example',
         'bad\nname': 'value',
       }),

@@ -64,7 +64,7 @@ export function buildAuthRequest(
 ): Request {
   const headers = new Headers(base.headers)
   for (const [name, value] of Object.entries(clientHeaders)) {
-    headers.set(name, value)
+    if (!headers.has(name)) headers.set(name, value)
   }
   if (token !== null && token.length > 0) {
     headers.set('authorization', `Bearer ${token}`)

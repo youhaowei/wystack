@@ -74,6 +74,16 @@ const FORBIDDEN_CONTEXT_HEADERS = new Set([
   'x-real-ip',
 ])
 
+const FORBIDDEN_CONTEXT_HEADER_PREFIXES = [
+  'cf-',
+  'fastly-',
+  'fly-',
+  'proxy-',
+  'sec-',
+  'x-envoy-',
+  'x-forwarded-',
+]
+
 /**
  * Keep app context headers consistent across HTTP and message transports.
  * Identity, proxy, and hop-by-hop headers remain owned by the real carrier.
@@ -87,9 +97,9 @@ export function sanitizeContextHeaders(value: unknown): Record<string, string> {
     if (
       typeof headerValue !== 'string' ||
       FORBIDDEN_CONTEXT_HEADERS.has(lowerName) ||
-      lowerName.startsWith('proxy-') ||
-      lowerName.startsWith('sec-') ||
-      lowerName.startsWith('x-forwarded-')
+      FORBIDDEN_CONTEXT_HEADER_PREFIXES.some((prefix) => lowerName.startsWith(prefix)) ||
+      lowerName.endsWith('-client-ip') ||
+      lowerName.endsWith('-real-ip')
     ) {
       continue
     }
