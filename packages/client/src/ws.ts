@@ -33,7 +33,7 @@ export interface WsManagerConfig {
    * with in-process trust, such as IPC-backed local runtimes.
    */
   getToken?: () => Promise<string | null> | string | null
-  /** Extra context headers sent in the auth frame on every connection attempt. */
+  /** Safe app context headers sent in the auth frame on every connection attempt. */
   getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
   /**
    * Send an auth frame on connect even when `getToken` is not provided.

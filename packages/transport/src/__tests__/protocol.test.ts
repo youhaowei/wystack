@@ -3,6 +3,7 @@ import {
   parseClientMessage,
   parseServerMessage,
   parseEnvelope,
+  sanitizeContextHeaders,
   REACTIVITY_NOT_ENABLED,
   type AuthMessage,
   type SubscribeMessage,
@@ -119,6 +120,21 @@ describe('parseClientMessage — auth', () => {
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: 42 }))).toBeNull()
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: {} }))).toBeNull()
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: [] }))).toBeNull()
+  })
+})
+
+describe('sanitizeContextHeaders', () => {
+  test('keeps app context and rejects identity, proxy, and invalid headers', () => {
+    expect(
+      sanitizeContextHeaders({
+        'X-Tenant-Id': 'acme',
+        Authorization: 'Bearer attacker',
+        'X-Real-IP': '127.0.0.1',
+        'CF-Connecting-IP': '127.0.0.1',
+        'X-Forwarded-Host': 'attacker.example',
+        'bad\nname': 'value',
+      }),
+    ).toEqual({ 'X-Tenant-Id': 'acme' })
   })
 })
 

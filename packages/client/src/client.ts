@@ -7,6 +7,7 @@
  * `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
+import { sanitizeContextHeaders } from '@wystack/transport'
 import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
@@ -73,7 +74,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
   async function getAuthHeaders(): Promise<Record<string, string>> {
     const token = await getToken?.()
-    const headers = (await getHeaders?.()) ?? {}
+    const headers = sanitizeContextHeaders(await getHeaders?.())
     return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
   }
 

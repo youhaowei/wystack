@@ -401,7 +401,12 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     const seen: Array<Record<string, string | null>> = []
     const session = new Session({
       baseRequest: new Request('wystack://pipe', {
-        headers: { cookie: 'trusted=session', origin: 'https://trusted.example' },
+        headers: {
+          cookie: 'trusted=session',
+          origin: 'https://trusted.example',
+          'x-real-ip': '203.0.113.10',
+          'cf-connecting-ip': '203.0.113.10',
+        },
       }),
       resolveContext: async (req) => {
         seen.push({
@@ -409,6 +414,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
           cookie: req.headers.get('cookie'),
           origin: req.headers.get('origin'),
           forwarded: req.headers.get('x-forwarded-host'),
+          realIp: req.headers.get('x-real-ip'),
+          cloudflareIp: req.headers.get('cf-connecting-ip'),
         })
         return {}
       },
@@ -420,6 +427,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
         Cookie: 'attacker=session',
         Origin: 'https://attacker.example',
         'X-Forwarded-Host': 'attacker.example',
+        'X-Real-IP': '127.0.0.1',
+        'CF-Connecting-IP': '127.0.0.1',
       }),
     ).toEqual({ kind: 'authenticated', committed: true })
 
@@ -429,6 +438,8 @@ describe('Engine — auth handshake parity (AC #2)', () => {
         cookie: 'trusted=session',
         origin: 'https://trusted.example',
         forwarded: null,
+        realIp: '203.0.113.10',
+        cloudflareIp: '203.0.113.10',
       },
     ])
   })

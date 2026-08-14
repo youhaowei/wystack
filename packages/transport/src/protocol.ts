@@ -49,6 +49,60 @@ export interface AuthMessage {
   headers?: Record<string, string>
 }
 
+const FORBIDDEN_CONTEXT_HEADERS = new Set([
+  'authorization',
+  'cf-connecting-ip',
+  'connection',
+  'content-length',
+  'cookie',
+  'date',
+  'expect',
+  'fastly-client-ip',
+  'forwarded',
+  'host',
+  'keep-alive',
+  'origin',
+  'referer',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'true-client-ip',
+  'upgrade',
+  'via',
+  'x-client-ip',
+  'x-cluster-client-ip',
+  'x-real-ip',
+])
+
+/**
+ * Keep app context headers consistent across HTTP and message transports.
+ * Identity, proxy, and hop-by-hop headers remain owned by the real carrier.
+ */
+export function sanitizeContextHeaders(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
+
+  const sanitized: Record<string, string> = {}
+  for (const [name, headerValue] of Object.entries(value)) {
+    const lowerName = name.toLowerCase()
+    if (
+      typeof headerValue !== 'string' ||
+      FORBIDDEN_CONTEXT_HEADERS.has(lowerName) ||
+      lowerName.startsWith('proxy-') ||
+      lowerName.startsWith('sec-') ||
+      lowerName.startsWith('x-forwarded-')
+    ) {
+      continue
+    }
+    try {
+      new Headers({ [name]: headerValue })
+      sanitized[name] = headerValue
+    } catch {
+      // Invalid header names and values are not transportable.
+    }
+  }
+  return sanitized
+}
+
 /**
  * Start a reactive subscription. `path` is the function registry key (e.g.
  * `"users.list"`); `args` is the function input. The connection's token is

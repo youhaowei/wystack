@@ -23,6 +23,7 @@
 // and removes the duplication. Editing `routes.ts` here is out of scope.
 
 import { isIdentityProviderUnavailable } from '@wystack/identity'
+import { sanitizeContextHeaders } from '@wystack/transport'
 
 /**
  * Transport-neutral reason a Session asks the connection to close. The adapter
@@ -56,45 +57,6 @@ export type ResolveContext = (req: Request) => Promise<Record<string, unknown>>
  * Pipe-based transports with no HTTP origin pass a minimal `Request` (e.g.
  * `new Request('wystack://pipe')`); the URL is opaque to `resolveContext`.
  */
-const FORBIDDEN_CLIENT_HEADERS = new Set([
-  'authorization',
-  'connection',
-  'content-length',
-  'cookie',
-  'date',
-  'expect',
-  'forwarded',
-  'host',
-  'keep-alive',
-  'origin',
-  'referer',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-  'via',
-])
-
-function normalizeClientHeaders(value: unknown): Record<string, string> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
-
-  const normalized: Record<string, string> = {}
-  for (const [name, headerValue] of Object.entries(value)) {
-    const lowerName = name.toLowerCase()
-    if (
-      typeof headerValue !== 'string' ||
-      FORBIDDEN_CLIENT_HEADERS.has(lowerName) ||
-      lowerName.startsWith('proxy-') ||
-      lowerName.startsWith('sec-') ||
-      lowerName.startsWith('x-forwarded-')
-    ) {
-      continue
-    }
-    normalized[name] = headerValue
-  }
-  return normalized
-}
-
 export function buildAuthRequest(
   base: Request,
   token: string | null,
@@ -209,7 +171,7 @@ export class Session {
     // committing here would let the slower frame overwrite the winner's token
     // before it is read. Commit only after winning the post-await re-check.
     const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-    const clientHeaders = normalizeClientHeaders(rawHeaders)
+    const clientHeaders = sanitizeContextHeaders(rawHeaders)
 
     try {
       const req = buildAuthRequest(this.baseRequest, token, clientHeaders)

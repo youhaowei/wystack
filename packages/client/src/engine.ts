@@ -2,7 +2,12 @@
 //
 // Owns the carrier-agnostic half of the v0.2 client.
 
-import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
+import {
+  sanitizeContextHeaders,
+  type Pipe,
+  type ServerMessage,
+  type ClientMessage,
+} from '@wystack/transport'
 
 type InvalidateHandler = () => void
 
@@ -395,7 +400,7 @@ export function createEngine(config: EngineConfig): Engine {
     // pipe, abandoning it with no close() call.
     const run = async (): Promise<void> => {
       const token: string | null = requiresAuth ? ((await getToken?.()) ?? null) : null
-      const headers = requiresAuth ? ((await getHeaders?.()) ?? {}) : {}
+      const headers = requiresAuth ? sanitizeContextHeaders(await getHeaders?.()) : {}
 
       if (generation !== connectGeneration || authFailed) return
 

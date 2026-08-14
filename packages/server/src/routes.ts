@@ -99,7 +99,10 @@ export interface RouteOptions {
   /** URL prefix for all routes. Default: '/api' */
   prefix?: string
   resolveContext?: (req: Request) => Promise<Record<string, unknown>>
-  /** Opt-in browser CORS policy. Origins are denied unless explicitly trusted. */
+  /**
+   * Opt-in browser CORS response policy. Untrusted origins receive no CORS
+   * headers. This does not provide CSRF protection or reject WebSocket origins.
+   */
   cors?: {
     origins: readonly string[] | ((origin: string) => boolean | Promise<boolean>)
   }
@@ -121,11 +124,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   if (cors) {
     hono.use(`${prefix}/*`, async (c, next) => {
       const origin = c.req.header('Origin')
-      if (!origin) return next()
-
       const { origins } = cors
       const allowed =
-        typeof origins === 'function' ? await origins(origin) : origins.includes(origin)
+        origin !== undefined &&
+        (typeof origins === 'function' ? await origins(origin) : origins.includes(origin))
 
       const applyCorsHeaders = (headers: Headers) => {
         const vary = headers.get('Vary')
@@ -133,7 +135,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         if (!varyValues.includes('origin')) {
           headers.set('Vary', vary ? `${vary}, Origin` : 'Origin')
         }
-        if (!allowed) return
+        if (!allowed || !origin) return
 
         headers.set('Access-Control-Allow-Origin', origin)
         headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')

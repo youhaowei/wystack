@@ -9,8 +9,9 @@ export interface WyStackClientConfig {
    */
   getToken?: () => Promise<string | null> | string | null
   /**
-   * App-provided request headers. Called for every HTTP request and each
-   * authenticated WebSocket connection attempt.
+   * App-provided context headers. Called for every HTTP request and each
+   * authenticated WebSocket connection attempt. Identity, proxy, and
+   * hop-by-hop headers are filtered; use `getToken` for Authorization.
    */
   getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
   /**

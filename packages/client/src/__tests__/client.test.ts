@@ -209,29 +209,42 @@ describe('createClient — Action cancellation', () => {
 })
 
 describe('createClient — app-provided headers', () => {
-  let server: ReturnType<typeof Bun.serve>
-
-  afterEach(() => server?.stop(true))
-
   test('sends fresh getHeaders values on query, mutation, and action requests', async () => {
     const tenants: Array<string | null> = []
-    server = Bun.serve({
-      fetch(req) {
-        tenants.push(req.headers.get('x-tenant-id'))
+    const auth: Array<string | null> = []
+    const clientIps: Array<string | null> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = Object.assign(
+      async (_input: URL | RequestInfo, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        tenants.push(headers.get('x-tenant-id'))
+        auth.push(headers.get('authorization'))
+        clientIps.push(headers.get('x-real-ip'))
         return Response.json({ data: null })
       },
-      port: 0,
-    })
+      { preconnect: realFetch.preconnect },
+    )
     let headerCalls = 0
     const client = createClient({
-      url: `http://localhost:${server.port}`,
-      getHeaders: () => ({ 'X-Tenant-Id': `tenant-${++headerCalls}` }),
+      url: 'https://api.example',
+      getToken: () => 'real-token',
+      getHeaders: () => ({
+        'X-Tenant-Id': `tenant-${++headerCalls}`,
+        Authorization: 'Bearer attacker',
+        'X-Real-IP': '127.0.0.1',
+      }),
     })
 
-    await client.query(queryRef('query'))
-    await client.mutate(mutationRef('mutation'))
-    await client.action(actionRef('action'))
+    try {
+      await client.query(queryRef('query'))
+      await client.mutate(mutationRef('mutation'))
+      await client.action(actionRef('action'))
+    } finally {
+      globalThis.fetch = realFetch
+    }
 
     expect(tenants).toEqual(['tenant-1', 'tenant-2', 'tenant-3'])
+    expect(auth).toEqual(['Bearer real-token', 'Bearer real-token', 'Bearer real-token'])
+    expect(clientIps).toEqual([null, null, null])
   })
 })

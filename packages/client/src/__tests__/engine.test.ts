@@ -197,7 +197,11 @@ describe('createEngine', () => {
     const engine = createEngine({
       createPipe: harness.createPipe,
       getToken: () => 'tkn',
-      getHeaders: () => ({ 'X-Tenant-Id': 'acme' }),
+      getHeaders: () => ({
+        'X-Tenant-Id': 'acme',
+        Authorization: 'Bearer attacker',
+        'X-Real-IP': '127.0.0.1',
+      }),
     })
     engine.connect()
 

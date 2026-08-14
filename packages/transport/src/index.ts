@@ -47,5 +47,6 @@ export {
   parseClientMessage,
   parseServerMessage,
   parseEnvelope,
+  sanitizeContextHeaders,
   REACTIVITY_NOT_ENABLED,
 } from './protocol'
