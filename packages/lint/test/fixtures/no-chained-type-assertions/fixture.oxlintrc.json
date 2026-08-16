@@ -1,0 +1,15 @@
+{
+  "plugins": ["typescript"],
+  "jsPlugins": [{ "name": "wystack", "specifier": "../../../src/index.mjs" }],
+  "rules": {
+    "wystack/no-chained-type-assertions": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.ts"],
+      "rules": {
+        "wystack/no-chained-type-assertions": "off"
+      }
+    }
+  ]
+}

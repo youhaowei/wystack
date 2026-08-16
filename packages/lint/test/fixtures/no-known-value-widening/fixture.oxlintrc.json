@@ -1,0 +1,7 @@
+{
+  "plugins": ["typescript"],
+  "jsPlugins": [{ "name": "wystack", "specifier": "../../../src/index.mjs" }],
+  "rules": {
+    "wystack/no-known-value-widening": ["error", { "targets": ["primitive", "record"] }]
+  }
+}

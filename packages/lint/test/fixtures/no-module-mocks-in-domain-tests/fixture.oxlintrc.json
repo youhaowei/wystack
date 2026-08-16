@@ -1,0 +1,12 @@
+{
+  "plugins": ["typescript"],
+  "jsPlugins": [{ "name": "wystack", "specifier": "../../../src/index.mjs" }],
+  "overrides": [
+    {
+      "files": ["**/*.domain.test.ts"],
+      "rules": {
+        "wystack/no-module-mocks-in-domain-tests": ["error", { "testModules": ["vite-plus/test"] }]
+      }
+    }
+  ]
+}

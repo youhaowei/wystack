@@ -87,6 +87,10 @@
         "typescript": "^5.8.3",
       },
     },
+    "packages/lint": {
+      "name": "@wystack/lint",
+      "version": "0.0.1",
+    },
     "packages/log": {
       "name": "@wystack/log",
       "version": "0.1.0",
@@ -228,6 +232,8 @@
     "@wystack/identity-clerk": ["@wystack/identity-clerk@workspace:packages/identity-clerk"],
 
     "@wystack/identity-workos": ["@wystack/identity-workos@workspace:packages/identity-workos"],
+
+    "@wystack/lint": ["@wystack/lint@workspace:packages/lint"],
 
     "@wystack/log": ["@wystack/log@workspace:packages/log"],
 
