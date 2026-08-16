@@ -21,9 +21,10 @@
  * `WsManager` / `WsManagerConfig` public surface in `ws.ts` re-exports this
  * factory so existing consumers are unaffected.
  */
-import type { ServerMessage, ClientMessage, Pipe } from '@wystack/transport'
-import { parseServerMessage } from '@wystack/transport'
-import type { EnginePipe, CloseInfo } from '../engine'
+import type { ServerMessage, ClientMessage } from '@wystack/transport/protocol'
+import { parseServerMessage } from '@wystack/transport/protocol'
+import type { Pipe } from '@wystack/transport'
+import type { EnginePipe, CloseInfo } from '../engine.js'
 
 /**
  * Build an {@link EnginePipe} from a fresh `WebSocket` connection.

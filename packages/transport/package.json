@@ -10,6 +10,11 @@
       "types": "./dist/index.d.ts",
       "bun": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "bun": "./src/protocol.ts",
+      "import": "./dist/protocol.js"
     }
   },
   "scripts": {

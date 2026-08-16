@@ -18,7 +18,7 @@ import './setup.dom'
 import { describe, test, expect, mock, afterAll } from 'bun:test'
 import { GlobalRegistrator } from '@happy-dom/global-registrator'
 import { createElement, type ReactNode } from 'react'
-import { renderHook, act, waitFor } from '@testing-library/react'
+import { render, renderHook, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { WyStackProvider } from '../provider'
 import { WyStackProvider as ReactWyStackProvider } from '../react-provider'
@@ -140,6 +140,38 @@ function makeActionRef<TArgs, TReturn>(path: string): ActionRef<TArgs, TReturn> 
 // ---------------------------------------------------------------------------
 
 describe('useQuery', () => {
+  test('keeps a shared client connected until its final provider unmounts', async () => {
+    const connect = mock(() => {})
+    const disconnect = mock(() => {})
+    const client: Client = {
+      connect,
+      disconnect,
+      subscribe: mock(() => () => {}),
+      query: mock(() => Promise.resolve(null)) as Client['query'],
+      mutate: mock(() => Promise.resolve(null)) as Client['mutate'],
+      action: mock(() => Promise.resolve(null)) as Client['action'],
+    }
+
+    const providers = (includeFirst: boolean) =>
+      createElement(
+        'div',
+        null,
+        includeFirst
+          ? createElement(ReactWyStackProvider, { key: 'first', client, children: 'first' })
+          : null,
+        createElement(ReactWyStackProvider, { key: 'second', client, children: 'second' }),
+      )
+
+    const view = render(providers(true))
+    await waitFor(() => expect(connect).toHaveBeenCalledTimes(1))
+
+    view.rerender(providers(false))
+    expect(disconnect).not.toHaveBeenCalled()
+
+    view.unmount()
+    expect(disconnect).toHaveBeenCalledTimes(1)
+  })
+
   test('works with a transport-neutral client', async () => {
     const subscribers: Array<() => void> = []
     const connect = mock(() => {})

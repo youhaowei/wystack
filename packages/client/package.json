@@ -33,7 +33,7 @@
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/check-dist-exports.mjs",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test": "bun test src"

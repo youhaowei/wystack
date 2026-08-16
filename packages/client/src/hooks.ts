@@ -10,8 +10,8 @@ import type {
   UseMutationResult,
   UseMutationOptions,
 } from '@tanstack/react-query'
-import type { QueryRef, MutationRef, ActionRef } from './refs'
-import { useWyStackClient } from './react-provider'
+import type { QueryRef, MutationRef, ActionRef } from './refs.js'
+import { useWyStackClient } from './react-provider.js'
 
 type WyQueryOptions<TReturn> = Omit<UseQueryOptions<TReturn>, 'queryKey' | 'queryFn'>
 

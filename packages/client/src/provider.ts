@@ -1,10 +1,10 @@
 import { createElement, useMemo } from 'react'
-import type { WyStackClient } from './client'
-import { isWebClient, toWebClient } from './client'
+import type { WyStackClient } from './client.js'
+import { isWebClient, toWebClient } from './client.js'
 import {
   WyStackProvider as ReactWyStackProvider,
   useWyStackClient as useReactWyStackClient,
-} from './react-provider'
+} from './react-provider.js'
 
 /** Backward-compatible web provider exported from `@wystack/client`. */
 export function WyStackProvider(props: { client: WyStackClient; children: React.ReactNode }) {

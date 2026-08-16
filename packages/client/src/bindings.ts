@@ -1,9 +1,9 @@
 import { createElement } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createApi } from './api'
-import type { Client } from './core-client'
-import type { ApiFromFunctions, FunctionDefinition } from './refs'
-import { WyStackProvider } from './react-provider'
+import { createApi } from './api.js'
+import type { Client } from './core-client.js'
+import type { ApiFromFunctions, FunctionDefinition } from './refs.js'
+import { WyStackProvider } from './react-provider.js'
 
 export interface WyStackReactBindings<
   TFunctions extends Record<string, FunctionDefinition>,

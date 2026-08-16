@@ -5,10 +5,11 @@
  * The app provides getToken for HTTP auth. WebSocket auth is optional and can
  * be disabled for trusted transports via `requiresAuth: false`.
  */
-import type { WyStackClientConfig } from './types'
-import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
-import { createWsManager, type WsManager } from './ws'
-import type { Client } from './core-client'
+import type { WyStackClientConfig } from './types.js'
+import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs.js'
+import { createWsManager, type WsManager } from './ws.js'
+import type { Client } from './core-client.js'
+import { createSubscriptionIdAllocator } from './subscription-ids.js'
 
 export interface WyStackClient {
   url: string
@@ -53,6 +54,8 @@ export function toWebClient(
 ): WebClient {
   if (isWebClient(client)) return client
 
+  const subscriptionIds = createSubscriptionIdAllocator(createSubscriptionId)
+
   return {
     url: client.url,
     prefix: client.prefix,
@@ -63,12 +66,18 @@ export function toWebClient(
     connect: () => client.ws.connect(),
     disconnect: () => client.ws.disconnect(),
     subscribe(path, args, onInvalidate, onError) {
-      const id = createSubscriptionId()
-      client.ws.subscribe(id, path, args, onInvalidate, onError)
+      const id = subscriptionIds.allocate()
+      try {
+        client.ws.subscribe(id, path, args, onInvalidate, onError)
+      } catch (error) {
+        subscriptionIds.release(id)
+        throw error
+      }
       let active = true
       return () => {
         if (!active) return
         active = false
+        subscriptionIds.release(id)
         client.ws.unsubscribe(id)
       }
     },

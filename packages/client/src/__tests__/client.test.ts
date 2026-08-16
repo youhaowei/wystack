@@ -228,6 +228,26 @@ describe('createClient — shared client contract', () => {
     expect(unsubscribed).toEqual(['wy_test'])
   })
 
+  test('keeps simultaneous custom subscription IDs distinct', () => {
+    const client = createClient({
+      url: 'http://localhost:9999',
+      createSubscriptionId: () => 'wy_test',
+    })
+    const subscribed: string[] = []
+    const unsubscribed: string[] = []
+
+    client.ws.subscribe = (id) => subscribed.push(id)
+    client.ws.unsubscribe = (id) => unsubscribed.push(id)
+
+    const unsubscribeFirst = client.subscribe('first', {}, () => {})
+    const unsubscribeSecond = client.subscribe('second', {}, () => {})
+    unsubscribeFirst()
+    unsubscribeSecond()
+
+    expect(subscribed).toEqual(['wy_test', 'wy_test_1'])
+    expect(unsubscribed).toEqual(['wy_test', 'wy_test_1'])
+  })
+
   test('adapts legacy clients whose RPC methods live on the prototype', async () => {
     const ws = createClient({ url: 'http://localhost:9999' }).ws
 

@@ -13,8 +13,8 @@
  *   4001 — auth failed / protocol violation → latch authFailed, no reconnect
  *   4002 — transient (timeout, flake) → reconnect per exponential backoff
  */
-import { createEngine, type Engine, type SubscriptionErrorHandler } from './engine'
-import { createWebSocketPipe } from './transport/websocket'
+import { createEngine, type Engine, type SubscriptionErrorHandler } from './engine.js'
+import { createWebSocketPipe } from './transport/websocket.js'
 
 type InvalidateHandler = () => void
 

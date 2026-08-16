@@ -1,4 +1,4 @@
-import type { ActionRef, MutationRef, QueryRef, RefArgs, RefReturn } from './refs'
+import type { ActionRef, MutationRef, QueryRef, RefArgs, RefReturn } from './refs.js'
 
 export type LiveUpdatesErrorHandler = (error: Error) => void
 

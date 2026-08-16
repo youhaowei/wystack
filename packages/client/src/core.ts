@@ -1,5 +1,5 @@
-export { createApi } from './api'
-export type { Client, ActionOptions, LiveUpdatesErrorHandler } from './core-client'
+export { createApi } from './api.js'
+export type { Client, ActionOptions, LiveUpdatesErrorHandler } from './core-client.js'
 export type {
   QueryRef,
   MutationRef,
@@ -9,4 +9,4 @@ export type {
   FunctionDefinition,
   RefArgs,
   RefReturn,
-} from './refs'
+} from './refs.js'

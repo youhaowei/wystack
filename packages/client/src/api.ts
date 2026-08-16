@@ -3,7 +3,7 @@
  *
  * React-agnostic. The api object is portable across platforms.
  */
-import type { ApiFromFunctions, FunctionDefinition } from './refs'
+import type { ApiFromFunctions, FunctionDefinition } from './refs.js'
 
 /**
  * createApi — builds a runtime Proxy where each property access returns
