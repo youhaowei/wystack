@@ -208,31 +208,28 @@ describe('createClient — Action cancellation', () => {
   })
 })
 
-describe('createClient — app-provided headers', () => {
-  test('sends fresh getHeaders values on query, mutation, and action requests', async () => {
-    const tenants: Array<string | null> = []
+describe('createClient — app-provided context', () => {
+  test('sends a fresh reserved context envelope without spoofable identity headers', async () => {
+    const contexts: unknown[] = []
     const auth: Array<string | null> = []
-    const clientIps: Array<string | null> = []
+    const proxyUsers: Array<string | null> = []
     const realFetch = globalThis.fetch
     globalThis.fetch = Object.assign(
       async (_input: URL | RequestInfo, init?: RequestInit) => {
         const headers = new Headers(init?.headers)
-        tenants.push(headers.get('x-tenant-id'))
+        const context = headers.get('x-wystack-context')
+        contexts.push(context === null ? null : JSON.parse(context))
         auth.push(headers.get('authorization'))
-        clientIps.push(headers.get('x-real-ip'))
+        proxyUsers.push(headers.get('x-auth-request-user'))
         return Response.json({ data: null })
       },
       { preconnect: realFetch.preconnect },
     )
-    let headerCalls = 0
+    let contextCalls = 0
     const client = createClient({
       url: 'https://api.example',
       getToken: () => 'real-token',
-      getHeaders: () => ({
-        'X-Tenant-Id': `tenant-${++headerCalls}`,
-        Authorization: 'Bearer attacker',
-        'X-Real-IP': '127.0.0.1',
-      }),
+      getContext: () => ({ tenantId: `tenant-${++contextCalls}` }),
     })
 
     try {
@@ -243,8 +240,12 @@ describe('createClient — app-provided headers', () => {
       globalThis.fetch = realFetch
     }
 
-    expect(tenants).toEqual(['tenant-1', 'tenant-2', 'tenant-3'])
+    expect(contexts).toEqual([
+      { tenantId: 'tenant-1' },
+      { tenantId: 'tenant-2' },
+      { tenantId: 'tenant-3' },
+    ])
     expect(auth).toEqual(['Bearer real-token', 'Bearer real-token', 'Bearer real-token'])
-    expect(clientIps).toEqual([null, null, null])
+    expect(proxyUsers).toEqual([null, null, null])
   })
 })

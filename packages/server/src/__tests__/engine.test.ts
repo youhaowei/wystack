@@ -373,31 +373,48 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(seen).toEqual([{ auth: 'Bearer tok123' }])
   })
 
-  test('auth frame layers safe context headers onto every resolved request', async () => {
-    const seen: Array<{ auth: string | null; tenant: string | null }> = []
+  test('auth frame validates structured context separately from request identity', async () => {
+    const seen: Array<{ auth: string | null; tenant: unknown; proxyUser: string | null }> = []
     const session = new Session({
-      resolveContext: async (req) => {
+      validateClientContext: (value) => {
+        if (
+          value === null ||
+          typeof value !== 'object' ||
+          Array.isArray(value) ||
+          typeof (value as { tenantId?: unknown }).tenantId !== 'string'
+        ) {
+          throw new Error('Invalid client context')
+        }
+        return { tenantId: (value as { tenantId: string }).tenantId }
+      },
+      resolveContext: async (req, clientContext) => {
         seen.push({
           auth: req.headers.get('authorization'),
-          tenant: req.headers.get('x-tenant-id'),
+          tenant: clientContext.tenantId,
+          proxyUser: req.headers.get('x-auth-request-user'),
         })
         return {}
       },
     })
 
-    expect(await session.handleAuth('tok123', { 'X-Tenant-Id': 'acme' })).toEqual({
+    expect(
+      await session.handleAuth('tok123', {
+        tenantId: 'acme',
+        'X-Auth-Request-User': 'admin@example.com',
+      }),
+    ).toEqual({
       kind: 'authenticated',
       committed: true,
     })
     await session.resolveSubContext()
 
     expect(seen).toEqual([
-      { auth: 'Bearer tok123', tenant: 'acme' },
-      { auth: 'Bearer tok123', tenant: 'acme' },
+      { auth: 'Bearer tok123', tenant: 'acme', proxyUser: null },
+      { auth: 'Bearer tok123', tenant: 'acme', proxyUser: null },
     ])
   })
 
-  test('auth frame cannot override identity or transport headers', async () => {
+  test('auth frame cannot supply unvalidated context', async () => {
     const seen: Array<Record<string, string | null>> = []
     const session = new Session({
       baseRequest: new Request('wystack://pipe', {
@@ -407,7 +424,6 @@ describe('Engine — auth handshake parity (AC #2)', () => {
           'x-real-ip': '203.0.113.10',
           'cf-connecting-ip': '203.0.113.10',
           'fly-client-ip': '203.0.113.10',
-          'x-tenant-id': 'trusted-tenant',
         },
       }),
       resolveContext: async (req) => {
@@ -419,7 +435,6 @@ describe('Engine — auth handshake parity (AC #2)', () => {
           realIp: req.headers.get('x-real-ip'),
           cloudflareIp: req.headers.get('cf-connecting-ip'),
           flyIp: req.headers.get('fly-client-ip'),
-          tenant: req.headers.get('x-tenant-id'),
         })
         return {}
       },
@@ -427,29 +442,38 @@ describe('Engine — auth handshake parity (AC #2)', () => {
 
     expect(
       await session.handleAuth('real-token', {
-        Authorization: 'Bearer attacker',
-        Cookie: 'attacker=session',
-        Origin: 'https://attacker.example',
-        'X-Forwarded-Host': 'attacker.example',
-        'X-Real-IP': '127.0.0.1',
-        'CF-Connecting-IP': '127.0.0.1',
-        'Fly-Client-IP': '127.0.0.1',
-        'X-Tenant-Id': 'attacker-tenant',
+        tenantId: 'attacker-tenant',
+        'X-Auth-Request-User': 'admin@example.com',
       }),
-    ).toEqual({ kind: 'authenticated', committed: true })
+    ).toEqual({ kind: 'close', reason: 'auth-failed' })
 
-    expect(seen).toEqual([
-      {
-        authorization: 'Bearer real-token',
-        cookie: 'trusted=session',
-        origin: 'https://trusted.example',
-        forwarded: null,
-        realIp: '203.0.113.10',
-        cloudflareIp: '203.0.113.10',
-        flyIp: '203.0.113.10',
-        tenant: 'trusted-tenant',
+    expect(seen).toEqual([])
+  })
+
+  test('legacy auth-frame headers cannot enter resolveContext', async () => {
+    const seen: Array<{ proxyUser: string | null; rawContext: string | null }> = []
+    const h = await harness({
+      baseRequest: new Request('wystack://pipe', {
+        headers: { 'X-WyStack-Context': '{"X-Auth-Request-User":"admin@example.com"}' },
+      }),
+      resolveContext: async (request) => {
+        seen.push({
+          proxyUser: request.headers.get('remote-user'),
+          rawContext: request.headers.get('x-wystack-context'),
+        })
+        return {}
       },
-    ])
+    })
+
+    h.send({
+      type: 'auth',
+      token: null,
+      headers: { 'Remote-User': 'admin@example.com' },
+    } as unknown as ClientMessage)
+    await until(() => h.received.length > 0, 'authenticated')
+
+    expect(h.received).toEqual([{ type: 'authenticated' }])
+    expect(seen).toEqual([{ proxyUser: null, rawContext: null }])
   })
 
   // Parity regression: routes.ts uses a LENIENT envelope parse then coerces a

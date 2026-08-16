@@ -16,6 +16,7 @@
  */
 import { createEngine, type Engine, type SubscriptionErrorHandler } from './engine'
 import { createWebSocketPipe } from './transport/websocket'
+import type { ClientContext } from '@wystack/transport'
 
 type InvalidateHandler = () => void
 
@@ -33,15 +34,15 @@ export interface WsManagerConfig {
    * with in-process trust, such as IPC-backed local runtimes.
    */
   getToken?: () => Promise<string | null> | string | null
-  /** Safe app context headers sent in the auth frame on every connection attempt. */
-  getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
+  /** Structured app context sent in the auth frame on every connection attempt. */
+  getContext?: () => Promise<ClientContext> | ClientContext
   /**
    * Send an auth frame on connect even when `getToken` is not provided.
    * Use this for servers that have `resolveContext` configured but authenticate
    * via cookies or proxy headers rather than a client-supplied token — the auth
    * frame carries no token but still triggers `resolveContext` on the server.
    *
-   * Defaults to `true` when `getToken` or `getHeaders` is set, `false` otherwise.
+   * Defaults to `true` when `getToken` or `getContext` is set, `false` otherwise.
    */
   requiresAuth?: boolean
   /**
@@ -89,7 +90,7 @@ export function createWsManager(config: WsManagerConfig): WsManager {
   const engine: Engine = createEngine({
     createPipe: () => createWebSocketPipe(config.url),
     getToken: config.getToken,
-    getHeaders: config.getHeaders,
+    getContext: config.getContext,
     requiresAuth: config.requiresAuth,
     authAckTimeoutMs: config.authAckTimeoutMs,
     onSubscribed: config.onSubscribed,

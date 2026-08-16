@@ -39,78 +39,52 @@
  * First frame on a connection when the server is configured with
  * `resolveContext`. `token` is `string | null` — null means anonymous
  * (any leaked Authorization header is stripped by the server before
- * `resolveContext` runs). Optional app headers carry context that browser
- * WebSocket APIs cannot attach to the upgrade request.
+ * `resolveContext` runs). Optional structured app context is carried separately
+ * because browser WebSocket APIs cannot attach it to the upgrade request.
  */
 export interface AuthMessage {
   type: 'auth'
   token: string | null
-  /** App-provided context headers for transports that cannot set upgrade headers. */
-  headers?: Record<string, string>
+  /** Untrusted app context. The server validates it before resolving auth context. */
+  context?: ClientContext
 }
 
-const FORBIDDEN_CONTEXT_HEADERS = new Set([
-  'authorization',
-  'cf-connecting-ip',
-  'connection',
-  'content-length',
-  'cookie',
-  'date',
-  'expect',
-  'fastly-client-ip',
-  'forwarded',
-  'host',
-  'keep-alive',
-  'origin',
-  'referer',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'true-client-ip',
-  'upgrade',
-  'via',
-  'x-client-ip',
-  'x-cluster-client-ip',
-  'x-real-ip',
-])
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+export type ClientContext = { [key: string]: JsonValue }
 
-const FORBIDDEN_CONTEXT_HEADER_PREFIXES = [
-  'cf-',
-  'fastly-',
-  'fly-',
-  'proxy-',
-  'sec-',
-  'x-envoy-',
-  'x-forwarded-',
-]
+/** Reserved HTTP carrier for the same context sent in WebSocket auth frames. */
+export const CLIENT_CONTEXT_HEADER = 'X-WyStack-Context'
 
 /**
- * Keep app context headers consistent across HTTP and message transports.
- * Identity, proxy, and hop-by-hop headers remain owned by the real carrier.
+ * Normalize app context to the exact JSON object both HTTP and message
+ * transports can carry. Reject unsupported values instead of silently dropping
+ * or reinterpreting them.
  */
-export function sanitizeContextHeaders(value: unknown): Record<string, string> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
-
-  const sanitized: Record<string, string> = {}
-  for (const [name, headerValue] of Object.entries(value)) {
-    const lowerName = name.toLowerCase()
-    if (
-      typeof headerValue !== 'string' ||
-      FORBIDDEN_CONTEXT_HEADERS.has(lowerName) ||
-      FORBIDDEN_CONTEXT_HEADER_PREFIXES.some((prefix) => lowerName.startsWith(prefix)) ||
-      lowerName.endsWith('-client-ip') ||
-      lowerName.endsWith('-real-ip')
-    ) {
-      continue
-    }
-    try {
-      new Headers({ [name]: headerValue })
-      sanitized[name] = headerValue
-    } catch {
-      // Invalid header names and values are not transportable.
-    }
+export function normalizeClientContext(value: unknown): ClientContext {
+  if (!isPlainObject(value) || !isJsonValue(value, new Set())) {
+    throw new TypeError('Client context must be a JSON object')
   }
-  return sanitized
+  return JSON.parse(JSON.stringify(value)) as ClientContext
+}
+
+function isJsonValue(value: unknown, ancestors: Set<object>): value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (typeof value !== 'object') return false
+  if (ancestors.has(value)) return false
+
+  const nextAncestors = new Set(ancestors).add(value)
+  if (Array.isArray(value)) {
+    return value.every((entry) => isJsonValue(entry, nextAncestors))
+  }
+  if (!isPlainObject(value)) return false
+  return Object.values(value).every((entry) => isJsonValue(entry, nextAncestors))
 }
 
 /**
@@ -320,7 +294,9 @@ export function parseEnvelope(data: string): Envelope | null {
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v)
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false
+  const prototype = Object.getPrototypeOf(v)
+  return prototype === Object.prototype || prototype === null
 }
 
 /**
@@ -344,14 +320,11 @@ export function parseClientMessage(data: string): ClientMessage | null {
       // counterpart: require the field, require the type. Callers that want
       // server-style leniency should pre-normalize.
       if (msg.token !== null && typeof msg.token !== 'string') return null
-      if (msg.headers !== undefined) {
-        if (!isPlainObject(msg.headers)) return null
-        if (Object.values(msg.headers).some((value) => typeof value !== 'string')) return null
-      }
+      if (msg.context !== undefined && !isPlainObject(msg.context)) return null
       return {
         type: 'auth',
         token: msg.token,
-        ...(msg.headers === undefined ? {} : { headers: msg.headers as Record<string, string> }),
+        ...(msg.context === undefined ? {} : { context: msg.context as ClientContext }),
       }
     }
     case 'subscribe': {

@@ -33,7 +33,7 @@
  * See: packages/client/src/transport/websocket.ts (the WS structural analog)
  * See: .wystack/docs/ipc-transport-contract.md (the pinned wire contract)
  */
-import type { ServerMessage, ClientMessage } from '@wystack/transport'
+import type { ServerMessage, ClientMessage, ClientContext } from '@wystack/transport'
 import { parseServerMessage } from '@wystack/transport'
 import type { EnginePipe, CloseInfo } from '../engine'
 import { createEngine, type Engine, type SubscriptionErrorHandler } from '../engine'
@@ -207,6 +207,8 @@ export interface IpcManagerConfig {
    * force the handshake without a token.
    */
   getToken?: () => Promise<string | null> | string | null
+  /** Structured app context validated by an auth-enabled server adapter. */
+  getContext?: () => Promise<ClientContext> | ClientContext
   /**
    * Force auth on or off. Defaults to `false` for IPC (trusted, in-process).
    */
@@ -246,6 +248,7 @@ export function createIpcManager(config: IpcManagerConfig): IpcManager {
   const engine: Engine = createEngine({
     createPipe: () => createElectronPipe({ ipcRenderer: config.ipcRenderer }),
     getToken: config.getToken,
+    getContext: config.getContext,
     requiresAuth: config.requiresAuth,
     authAckTimeoutMs: config.authAckTimeoutMs,
     onSubscribed: config.onSubscribed,

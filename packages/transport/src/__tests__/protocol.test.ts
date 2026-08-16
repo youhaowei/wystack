@@ -3,7 +3,7 @@ import {
   parseClientMessage,
   parseServerMessage,
   parseEnvelope,
-  sanitizeContextHeaders,
+  normalizeClientContext,
   REACTIVITY_NOT_ENABLED,
   type AuthMessage,
   type SubscribeMessage,
@@ -95,20 +95,15 @@ describe('parseClientMessage — auth', () => {
     const got = parseClientMessage(JSON.stringify({ type: 'auth', token: null }))
     expect(got).toEqual({ type: 'auth', token: null })
   })
-  test('accepts string-valued context headers', () => {
+  test('accepts a structured client context', () => {
     const got = parseClientMessage(
-      JSON.stringify({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 'acme' } }),
+      JSON.stringify({ type: 'auth', token: 'jwt', context: { tenantId: 'acme' } }),
     )
-    expect(got).toEqual({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 'acme' } })
+    expect(got).toEqual({ type: 'auth', token: 'jwt', context: { tenantId: 'acme' } })
   })
-  test('rejects malformed context headers', () => {
+  test('rejects malformed client context', () => {
     expect(
-      parseClientMessage(JSON.stringify({ type: 'auth', token: 'jwt', headers: [] })),
-    ).toBeNull()
-    expect(
-      parseClientMessage(
-        JSON.stringify({ type: 'auth', token: 'jwt', headers: { 'X-Tenant-Id': 42 } }),
-      ),
+      parseClientMessage(JSON.stringify({ type: 'auth', token: 'jwt', context: [] })),
     ).toBeNull()
   })
   test('rejects a missing token field', () => {
@@ -123,20 +118,23 @@ describe('parseClientMessage — auth', () => {
   })
 })
 
-describe('sanitizeContextHeaders', () => {
-  test('keeps app context and rejects identity, proxy, and invalid headers', () => {
+describe('normalizeClientContext', () => {
+  test('preserves nested JSON context', () => {
     expect(
-      sanitizeContextHeaders({
-        'X-Tenant-Id': 'acme',
-        Authorization: 'Bearer attacker',
-        'X-Real-IP': '127.0.0.1',
-        'CF-Connecting-IP': '127.0.0.1',
-        'Fly-Client-IP': '127.0.0.1',
-        'X-Envoy-External-Address': '127.0.0.1',
-        'X-Forwarded-Host': 'attacker.example',
-        'bad\nname': 'value',
-      }),
-    ).toEqual({ 'X-Tenant-Id': 'acme' })
+      normalizeClientContext({ tenantId: 'acme', flags: ['a', 'b'], limits: { seats: 3 } }),
+    ).toEqual({ tenantId: 'acme', flags: ['a', 'b'], limits: { seats: 3 } })
+  })
+
+  test('rejects values that cannot cross both HTTP and WebSocket JSON carriers', () => {
+    expect(() => normalizeClientContext({ value: undefined })).toThrow(
+      'Client context must be a JSON object',
+    )
+    expect(() => normalizeClientContext({ value: Number.POSITIVE_INFINITY })).toThrow(
+      'Client context must be a JSON object',
+    )
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    expect(() => normalizeClientContext(cyclic)).toThrow('Client context must be a JSON object')
   })
 })
 

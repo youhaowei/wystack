@@ -10,9 +10,10 @@
  * `upgradeWebSocket` adapter. The shared protocol is identical.
  *
  * WS auth: when `resolveContext` is configured, the client must send
- * `{ type: "auth", token }` as the first frame. Server calls `resolveContext`
- * with a synthetic Request carrying `Authorization: Bearer ${token}`; on
- * success responds `{ type: "authenticated" }`, on failure closes 4001.
+ * `{ type: "auth", token, context? }` as the first frame. The server validates
+ * untrusted structured context separately, then calls `resolveContext` with it
+ * and a synthetic Request carrying `Authorization: Bearer ${token}`. On success
+ * it responds `{ type: "authenticated" }`; on failure it closes 4001.
  *
  * No-auth servers (`resolveContext` omitted) start the connection authenticated:
  * subscribe/unsubscribe frames can be the first message. If a legacy or
@@ -61,6 +62,14 @@ import type { CloseReason } from './engine'
 import type { WyStackApp } from './create'
 import { ValidationError } from './validation'
 import { AuthenticationRequiredError } from './functions'
+import { CLIENT_CONTEXT_HEADER } from '@wystack/transport'
+import {
+  InvalidClientContextError,
+  readHttpClientContext,
+  validateIncomingClientContext,
+  withoutClientContextHeader,
+  type ValidateClientContext,
+} from './client-context'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
@@ -98,7 +107,17 @@ export interface RouteOptions {
   app: WyStackApp
   /** URL prefix for all routes. Default: '/api' */
   prefix?: string
-  resolveContext?: (req: Request) => Promise<Record<string, unknown>>
+  /** Resolve trusted request identity plus the separately validated app context. */
+  resolveContext?: (
+    req: Request,
+    clientContext: Readonly<Record<string, unknown>>,
+  ) => Promise<Record<string, unknown>>
+  /**
+   * Validate the reserved HTTP/WS client-context envelope before use. Required
+   * whenever a client sends `getContext`; omitted servers reject non-empty
+   * envelopes instead of passing them through.
+   */
+  validateClientContext?: ValidateClientContext
   /**
    * Opt-in browser CORS response policy. Untrusted origins receive no CORS
    * headers. This does not provide CSRF protection or reject WebSocket origins.
@@ -116,9 +135,20 @@ export interface RouteOptions {
 export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSocket) {
   const { app, prefix = '/api' } = opts
   const resolveContext = opts.resolveContext
+  const validateClientContext = opts.validateClientContext
   const authTimeoutMs = opts.authTimeoutMs ?? 10_000
 
   const hono = new Hono()
+
+  const resolveHttpContext = async (request: Request): Promise<Record<string, unknown>> => {
+    const clientContext = await validateIncomingClientContext(
+      readHttpClientContext(request),
+      validateClientContext,
+    )
+    return resolveContext
+      ? ((await resolveContext(withoutClientContextHeader(request), clientContext)) ?? {})
+      : {}
+  }
 
   const cors = opts.cors
   if (cors) {
@@ -139,10 +169,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
 
         headers.set('Access-Control-Allow-Origin', origin)
         headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        const requestedHeaders = c.req.header('Access-Control-Request-Headers')
-        if (requestedHeaders) {
-          headers.set('Access-Control-Allow-Headers', requestedHeaders)
-        }
+        headers.set(
+          'Access-Control-Allow-Headers',
+          `Content-Type, Authorization, X-WyStack-Function-Kind, ${CLIENT_CONTEXT_HEADER}`,
+        )
       }
 
       if (c.req.method === 'OPTIONS') {
@@ -258,6 +288,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
           const engineOpts: AttachEngineOptions = {
             app,
             resolveContext,
+            validateClientContext,
             authTimeoutMs,
             baseRequest: upgradeRequest,
             onClose: mapCloseCode,
@@ -328,11 +359,13 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return c.json({ error: `${functionPath} is a mutation — use POST` }, 405)
     }
 
-    const httpResolveContext = resolveContext ?? (async () => ({}))
     let context: Record<string, unknown>
     try {
-      context = await httpResolveContext(c.req.raw)
+      context = await resolveHttpContext(c.req.raw)
     } catch (err: unknown) {
+      if (err instanceof InvalidClientContextError) {
+        return c.json({ error: err.message }, 400)
+      }
       // An unreachable identity provider is a dependency failure, not a rejected
       // credential. Answering 401 would blame the user's token for an upstream outage
       // and, on the WebSocket path, tell clients not to retry.
@@ -395,11 +428,13 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       return c.json({ error: `${functionPath} is a mutation — omit the action header` }, 405)
     }
 
-    const httpResolveContext = resolveContext ?? (async () => ({}))
     let context: Record<string, unknown>
     try {
-      context = await httpResolveContext(c.req.raw)
+      context = await resolveHttpContext(c.req.raw)
     } catch (err: unknown) {
+      if (err instanceof InvalidClientContextError) {
+        return c.json({ error: err.message }, 400)
+      }
       // An unreachable identity provider is a dependency failure, not a rejected
       // credential. Answering 401 would blame the user's token for an upstream outage
       // and, on the WebSocket path, tell clients not to retry.

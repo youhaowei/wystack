@@ -2,12 +2,12 @@
  * WyStack Client — manages HTTP calls (GET queries, POST mutations)
  * and WS connection for live invalidation.
  *
- * The app provides getToken and optional context headers for HTTP auth.
+ * The app provides getToken and optional structured context for HTTP auth.
  * WebSocket auth is optional and can be disabled for trusted transports via
  * `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
-import { sanitizeContextHeaders } from '@wystack/transport'
+import { CLIENT_CONTEXT_HEADER, normalizeClientContext } from '@wystack/transport'
 import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
@@ -62,20 +62,24 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
   const httpUrl = config.url.replace(/\/$/, '')
   const prefix = config.prefix ?? '/api'
   const getToken = config.getToken
-  const getHeaders = config.getHeaders
+  const getContext = config.getContext
 
   const wsUrl = httpUrl.replace(/^http/, 'ws') + `${prefix}/ws`
   const ws = createWsManager({
     url: wsUrl,
     getToken,
-    getHeaders,
+    getContext,
     requiresAuth: config.requiresAuth,
   })
 
-  async function getAuthHeaders(): Promise<Record<string, string>> {
+  async function getRequestHeaders(): Promise<Record<string, string>> {
     const token = await getToken?.()
-    const headers = sanitizeContextHeaders(await getHeaders?.())
-    return token ? { ...headers, Authorization: `Bearer ${token}` } : headers
+    const rawContext = await getContext?.()
+    const contextHeaders: Record<string, string> = {}
+    if (rawContext !== undefined) {
+      contextHeaders[CLIENT_CONTEXT_HEADER] = JSON.stringify(normalizeClientContext(rawContext))
+    }
+    return token ? { ...contextHeaders, Authorization: `Bearer ${token}` } : contextHeaders
   }
 
   return {
@@ -85,7 +89,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
     async query(ref: QueryRef, args?: unknown) {
       const path = ref._path
-      const auth = await getAuthHeaders()
+      const auth = await getRequestHeaders()
       // TODO: fall back to POST for large args that would exceed URL length limits
       const argsParam =
         args !== undefined ? `?args=${encodeURIComponent(JSON.stringify(args))}` : ''
@@ -102,7 +106,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
     async mutate(ref: MutationRef, args?: unknown) {
       const path = ref._path
-      const auth = await getAuthHeaders()
+      const auth = await getRequestHeaders()
       const res = await fetch(`${httpUrl}${prefix}/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...auth },
@@ -118,7 +122,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
 
     async action(ref: ActionRef, args?: unknown, options?: { signal?: AbortSignal }) {
       const path = ref._path
-      const auth = await getAuthHeaders()
+      const auth = await getRequestHeaders()
       const res = await fetch(`${httpUrl}${prefix}/${path}`, {
         method: 'POST',
         headers: {

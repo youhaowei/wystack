@@ -192,22 +192,18 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
-  test('auth handshake carries app-provided context headers', async () => {
+  test('auth handshake carries structured app context without identity headers', async () => {
     const harness = makeServerSide()
     const engine = createEngine({
       createPipe: harness.createPipe,
       getToken: () => 'tkn',
-      getHeaders: () => ({
-        'X-Tenant-Id': 'acme',
-        Authorization: 'Bearer attacker',
-        'X-Real-IP': '127.0.0.1',
-      }),
+      getContext: () => ({ tenantId: 'acme' }),
     })
     engine.connect()
 
     await settle()
     expect(harness.server().received).toEqual([
-      { type: 'auth', token: 'tkn', headers: { 'X-Tenant-Id': 'acme' } },
+      { type: 'auth', token: 'tkn', context: { tenantId: 'acme' } },
     ])
     engine.disconnect()
   })

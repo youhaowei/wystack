@@ -1,3 +1,5 @@
+import type { ClientContext } from '@wystack/transport'
+
 export interface WyStackClientConfig {
   /** WyStack server URL (e.g., 'http://localhost:3001') */
   url: string
@@ -9,15 +11,15 @@ export interface WyStackClientConfig {
    */
   getToken?: () => Promise<string | null> | string | null
   /**
-   * App-provided context headers. Called for every HTTP request and each
-   * authenticated WebSocket connection attempt. Identity, proxy, and
-   * hop-by-hop headers are filtered; use `getToken` for Authorization.
+   * App-provided JSON context. Called for every HTTP request and authenticated
+   * WebSocket connection attempt, then validated by the server. Identity stays
+   * on the trusted Request; use `getToken` for Authorization.
    */
-  getHeaders?: () => Promise<Record<string, string>> | Record<string, string>
+  getContext?: () => Promise<ClientContext> | ClientContext
   /**
    * Whether the WebSocket transport must perform the auth handshake.
    *
-   * Defaults to true when `getToken` or `getHeaders` is provided and false
+   * Defaults to true when `getToken` or `getContext` is provided and false
    * otherwise. Set false for trusted transports such as in-process IPC or
    * same-process local runtime usage where HTTP may still use either callback
    * but WS must not send auth frames.

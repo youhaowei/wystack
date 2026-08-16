@@ -23,7 +23,8 @@
 // and removes the duplication. Editing `routes.ts` here is out of scope.
 
 import { isIdentityProviderUnavailable } from '@wystack/identity'
-import { sanitizeContextHeaders } from '@wystack/transport'
+import { CLIENT_CONTEXT_HEADER } from '@wystack/transport'
+import { validateIncomingClientContext, type ValidateClientContext } from '../client-context'
 
 /**
  * Transport-neutral reason a Session asks the connection to close. The adapter
@@ -42,7 +43,10 @@ export type CloseReason = 'auth-failed' | 'transient'
  * not HTTP-server-specific, so it carries cleanly over any Pipe. The Session
  * synthesizes the Request from the auth-frame token via `buildAuthRequest`.
  */
-export type ResolveContext = (req: Request) => Promise<Record<string, unknown>>
+export type ResolveContext = (
+  req: Request,
+  clientContext: Readonly<Record<string, unknown>>,
+) => Promise<Record<string, unknown>>
 
 /**
  * Build the synthetic `Request` passed to `resolveContext`.
@@ -57,15 +61,9 @@ export type ResolveContext = (req: Request) => Promise<Record<string, unknown>>
  * Pipe-based transports with no HTTP origin pass a minimal `Request` (e.g.
  * `new Request('wystack://pipe')`); the URL is opaque to `resolveContext`.
  */
-export function buildAuthRequest(
-  base: Request,
-  token: string | null,
-  clientHeaders: Record<string, string> = {},
-): Request {
+export function buildAuthRequest(base: Request, token: string | null): Request {
   const headers = new Headers(base.headers)
-  for (const [name, value] of Object.entries(clientHeaders)) {
-    if (!headers.has(name)) headers.set(name, value)
-  }
+  headers.delete(CLIENT_CONTEXT_HEADER)
   if (token !== null && token.length > 0) {
     headers.set('authorization', `Bearer ${token}`)
   } else {
@@ -95,6 +93,8 @@ export interface SessionOptions {
    * frame gets a compatibility ACK without adopting any token.
    */
   resolveContext?: ResolveContext
+  /** Validate untrusted client context before it reaches resolveContext. */
+  validateClientContext?: ValidateClientContext
   /**
    * Origin request for `buildAuthRequest` to layer the Bearer header onto.
    * HTTP/WS adapters pass the upgrade request; trusted message transports pass
@@ -119,9 +119,10 @@ export class Session {
    * anonymous. Only written after winning the post-await race (see `handleAuth`).
    */
   token: string | null = null
-  private clientHeaders: Record<string, string> = {}
+  private clientContext: Readonly<Record<string, unknown>> = Object.freeze({})
 
   private readonly resolveContext: ResolveContext
+  private readonly validateClientContext: ValidateClientContext | undefined
   private readonly baseRequest: Request
 
   /** True when this server demands a handshake before accepting other frames. */
@@ -130,6 +131,7 @@ export class Session {
   constructor(opts: SessionOptions = {}) {
     this.requiresAuth = opts.resolveContext !== undefined
     this.resolveContext = opts.resolveContext ?? (async () => ({}))
+    this.validateClientContext = opts.validateClientContext
     this.baseRequest = opts.baseRequest ?? new Request(PIPE_ORIGIN)
     this.authenticated = !this.requiresAuth
   }
@@ -143,8 +145,8 @@ export class Session {
    * "subscribe" — it mirrors the shipped `routes.ts:resolveSubContext`.
    */
   async resolveSubContext(): Promise<Record<string, unknown>> {
-    const req = buildAuthRequest(this.baseRequest, this.token, this.clientHeaders)
-    return (await this.resolveContext(req)) ?? {}
+    const req = buildAuthRequest(this.baseRequest, this.token)
+    return (await this.resolveContext(req, this.clientContext)) ?? {}
   }
 
   /**
@@ -161,7 +163,7 @@ export class Session {
    * The Engine, not the Session, sends frames and closes the pipe — this method
    * is pure decision-making over the `AuthOutcome` it returns.
    */
-  async handleAuth(rawToken: unknown, rawHeaders?: unknown): Promise<AuthOutcome> {
+  async handleAuth(rawToken: unknown, rawContext?: unknown): Promise<AuthOutcome> {
     if (this.authenticated) {
       return { kind: 'authenticated', committed: false }
     }
@@ -171,11 +173,25 @@ export class Session {
     // committing here would let the slower frame overwrite the winner's token
     // before it is read. Commit only after winning the post-await re-check.
     const token = typeof rawToken === 'string' && rawToken.length > 0 ? rawToken : null
-    const clientHeaders = sanitizeContextHeaders(rawHeaders)
-
     try {
-      const req = buildAuthRequest(this.baseRequest, token, clientHeaders)
-      await this.resolveContext(req)
+      const clientContext = await validateIncomingClientContext(
+        rawContext,
+        this.validateClientContext,
+      )
+      const req = buildAuthRequest(this.baseRequest, token)
+      await this.resolveContext(req, clientContext)
+
+      // Re-check after the await: a concurrent frame may have authenticated the
+      // connection. The slower frame sends an idempotent ACK and must NOT
+      // overwrite the winning identity's token or client context.
+      if (this.authenticated) {
+        return { kind: 'authenticated', committed: false }
+      }
+
+      this.token = token
+      this.clientContext = clientContext
+      this.authenticated = true
+      return { kind: 'authenticated', committed: true }
     } catch (error) {
       // Auth failed. Re-check after the await BEFORE closing: a concurrent frame
       // (e.g. a valid token immediately followed by an invalid one) may have
@@ -194,20 +210,8 @@ export class Session {
         return { kind: 'close', reason: 'transient' }
       }
       // Genuinely failed — terminal. The Engine logs the message only (never the
-      // token/header values that may be embedded in the thrown error) and closes.
+      // token/context values that may be embedded in the thrown error) and closes.
       return { kind: 'close', reason: 'auth-failed' }
     }
-
-    // Re-check after the await: a concurrent frame may have authenticated the
-    // connection. The slower frame sends an idempotent ACK and must NOT
-    // overwrite the winning identity's token.
-    if (this.authenticated) {
-      return { kind: 'authenticated', committed: false }
-    }
-
-    this.token = token
-    this.clientHeaders = clientHeaders
-    this.authenticated = true
-    return { kind: 'authenticated', committed: true }
   }
 }

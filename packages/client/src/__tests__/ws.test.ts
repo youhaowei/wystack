@@ -380,14 +380,26 @@ describe('WsManager', () => {
     }
   })
 
-  test('carries getHeaders context into authenticated WebSocket subscriptions', async () => {
+  test('carries validated client context into authenticated WebSocket subscriptions', async () => {
     const app = await makeAuthApp()
     const seenTenants: Array<string | null> = []
     const authServer = serve({
       app,
       port: 0,
-      resolveContext: async (req) => {
-        const tenant = req.headers.get('x-tenant-id')
+      validateClientContext: (value) => {
+        if (
+          value === null ||
+          typeof value !== 'object' ||
+          Array.isArray(value) ||
+          typeof (value as { tenantId?: unknown }).tenantId !== 'string'
+        ) {
+          throw new Error('Invalid client context')
+        }
+        return { tenantId: (value as { tenantId: string }).tenantId }
+      },
+      resolveContext: async (_req, clientContext) => {
+        const tenant = clientContext.tenantId
+        if (typeof tenant !== 'string') throw new Error('Invalid client context')
         seenTenants.push(tenant)
         if (tenant !== 'acme') throw new Error('Unauthorized')
         return { tenant }
@@ -398,7 +410,7 @@ describe('WsManager', () => {
       const subscribed = deferred<void>()
       const ws = createWsManager({
         url: `ws://localhost:${authServer.port}/api/ws`,
-        getHeaders: () => ({ 'X-Tenant-Id': 'acme' }),
+        getContext: () => ({ tenantId: 'acme' }),
         onSubscribed: (id) => {
           if (id === 'sub1') subscribed.resolve()
         },

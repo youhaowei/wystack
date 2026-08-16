@@ -432,6 +432,28 @@ describe('createEngine with ElectronPipe', () => {
 // ─── IpcManager convenience shim ─────────────────────────────────────────────
 
 describe('createIpcManager', () => {
+  test('auth frame carries structured client context', async () => {
+    const ipc = makeFakeIpc()
+    const manager = createIpcManager({
+      ipcRenderer: ipc,
+      requiresAuth: true,
+      getContext: () => ({ tenantId: 'acme' }),
+    })
+
+    manager.connect()
+    await settle()
+
+    expect(findSent(ipc, 'auth')?.[1]).toEqual({
+      type: 'auth',
+      token: null,
+      context: { tenantId: 'acme' },
+    })
+    ipc.emit('wystack:s2c', { type: 'authenticated' })
+    await settle()
+    expect(manager.isConnected()).toBe(true)
+    manager.disconnect()
+  })
+
   test('action preserves its explicit frame kind and correlates the result', async () => {
     const ipc = makeFakeIpc()
     const manager = createIpcManager({ ipcRenderer: ipc })
