@@ -16,5 +16,15 @@ const wrongReceiver = new Proxy(target, {
   },
 })
 
+const targetGetMethod = new Proxy(
+  {
+    get(target, property, receiver) {
+      return Reflect.get(target, property, receiver)
+    },
+  },
+  {},
+)
+
 void forwarded
 void wrongReceiver
+void targetGetMethod

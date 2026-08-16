@@ -37,7 +37,7 @@ describe('@wystack/lint', () => {
     const root = fixture('no-chained-type-assertions')
     const report = lint(root, resolve(root, 'production.ts'), resolve(root, 'production.test.ts'))
 
-    expect(ruleMessages(report, 'no-chained-type-assertions')).toHaveLength(1)
+    expect(ruleMessages(report, 'no-chained-type-assertions')).toHaveLength(2)
   })
 
   test('checks only configured const widening targets', () => {
@@ -51,7 +51,7 @@ describe('@wystack/lint', () => {
     const root = fixture('no-reflect-get')
     const report = lint(root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-reflect-get')).toHaveLength(2)
+    expect(ruleMessages(report, 'no-reflect-get')).toHaveLength(3)
   })
 
   test('applies module-mock policy only to consumer-selected domain test paths', () => {
@@ -59,10 +59,13 @@ describe('@wystack/lint', () => {
     const report = lint(
       root,
       resolve(root, 'engine.domain.test.ts'),
+      resolve(root, 'namespace.domain.test.ts'),
+      resolve(root, 'late-import.domain.test.ts'),
+      resolve(root, 'shadowed.domain.test.ts'),
       resolve(root, 'component.test.ts'),
     )
 
-    expect(ruleMessages(report, 'no-module-mocks-in-domain-tests')).toHaveLength(1)
+    expect(ruleMessages(report, 'no-module-mocks-in-domain-tests')).toHaveLength(3)
   })
 
   test('rejects only exact configured placeholder declaration names', () => {

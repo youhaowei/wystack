@@ -59,8 +59,24 @@ const isProxyGetTrap = (node) => {
   return (
     proxy?.type === 'NewExpression' &&
     proxy.callee?.type === 'Identifier' &&
-    proxy.callee.name === 'Proxy'
+    proxy.callee.name === 'Proxy' &&
+    proxy.arguments?.[1] === handler
   )
+}
+
+const isImportedBinding = (context, identifier, imports) => {
+  let scope = context.sourceCode.getScope(identifier)
+
+  while (scope) {
+    const variable = scope.variables?.find((candidate) => candidate.name === identifier.name)
+    if (variable) {
+      return variable.identifiers?.some((definition) => imports.has(definition))
+    }
+
+    scope = scope.upper
+  }
+
+  return false
 }
 
 const isCanonicalProxyForward = (node) => {
@@ -134,12 +150,18 @@ const noChainedTypeAssertions = {
   create(context) {
     return {
       TSAsExpression(node) {
-        if (node.expression?.type === 'TSAsExpression') {
+        if (
+          node.expression?.type === 'TSAsExpression' ||
+          node.expression?.type === 'TSTypeAssertion'
+        ) {
           context.report({ node, messageId: 'noChain' })
         }
       },
       TSTypeAssertion(node) {
-        if (node.expression?.type === 'TSTypeAssertion') {
+        if (
+          node.expression?.type === 'TSAsExpression' ||
+          node.expression?.type === 'TSTypeAssertion'
+        ) {
           context.report({ node, messageId: 'noChain' })
         }
       },
@@ -271,6 +293,8 @@ const noModuleMocksInDomainTests = {
   create(context) {
     const testModules = new Set(context.options[0]?.testModules ?? ['vitest', 'vite-plus/test'])
     const mockBindings = new Set()
+    const testNamespaces = new Set()
+    const candidates = []
 
     return {
       ImportDeclaration(node) {
@@ -284,27 +308,40 @@ const noModuleMocksInDomainTests = {
             specifier.imported?.name === 'vi' &&
             isIdentifier(specifier.local)
           ) {
-            mockBindings.add(specifier.local.name)
+            mockBindings.add(specifier.local)
           }
 
           if (specifier.type === 'ImportNamespaceSpecifier' && isIdentifier(specifier.local)) {
-            mockBindings.add(specifier.local.name)
+            testNamespaces.add(specifier.local)
           }
         }
       },
       CallExpression(node) {
         const callee = node.callee
-        if (
-          callee?.type !== 'MemberExpression' ||
-          !isIdentifier(callee.object) ||
-          !mockBindings.has(callee.object.name)
-        ) {
+        if (callee?.type !== 'MemberExpression') {
           return
         }
 
         const method = callee.computed ? callee.property?.value : callee.property?.name
         if (method === 'mock' || method === 'doMock') {
-          context.report({ node, messageId: 'noModuleMock' })
+          candidates.push(node)
+        }
+      },
+      'Program:exit'() {
+        for (const node of candidates) {
+          const callee = node.callee
+          const isDirectMock =
+            isIdentifier(callee.object) && isImportedBinding(context, callee.object, mockBindings)
+          const isNamespaceMock =
+            callee.object?.type === 'MemberExpression' &&
+            isIdentifier(callee.object.object) &&
+            isImportedBinding(context, callee.object.object, testNamespaces) &&
+            ((callee.object.computed === false && callee.object.property?.name === 'vi') ||
+              (callee.object.computed === true && callee.object.property?.value === 'vi'))
+
+          if (isDirectMock || isNamespaceMock) {
+            context.report({ node, messageId: 'noModuleMock' })
+          }
         }
       },
     }
