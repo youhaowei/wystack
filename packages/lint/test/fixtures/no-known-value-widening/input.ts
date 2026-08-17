@@ -1,6 +1,8 @@
 declare const source: string
 declare const palette: Record<string, string>
 declare const runtimeKey: string
+type OpenKey = string | 'primary'
+type FiniteKey = 'primary'
 
 const widenedPrimitive: string = 'known'
 const widenedTemplate: string = `known`
@@ -11,7 +13,9 @@ const widenedLiteralUnionRecord: Record<string | 'primary', string> = { primary:
 const widenedPropertyKeyUnionRecord: Record<PropertyKey | 'primary', string> = {
   primary: 'blue',
 }
+const widenedAliasUnionRecord: Record<OpenKey, string> = { primary: 'blue' }
 const finiteRecord: Record<'primary', string> = { primary: 'blue' }
+const finiteAliasRecord: Record<FiniteKey, string> = { primary: 'blue' }
 
 namespace finitePropertyKey {
   type PropertyKey = 'primary'
@@ -39,7 +43,9 @@ void widenedUnionRecord
 void widenedPropertyKeyRecord
 void widenedLiteralUnionRecord
 void widenedPropertyKeyUnionRecord
+void widenedAliasUnionRecord
 void finiteRecord
+void finiteAliasRecord
 void dynamicTemplate
 void copiedRecord
 void computedRecord

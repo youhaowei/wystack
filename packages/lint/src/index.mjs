@@ -38,14 +38,39 @@ const isRecordAnnotation = (node, context) => {
   }
 
   const keyType = (node.typeArguments?.params ?? node.typeParameters?.params ?? [])[0]
-  const isOpenKeyType = (type) =>
-    type?.type === 'TSStringKeyword' ||
-    type?.type === 'TSNumberKeyword' ||
-    type?.type === 'TSSymbolKeyword' ||
-    (type?.type === 'TSUnionType' && type.types.some(isOpenKeyType)) ||
-    (type?.type === 'TSTypeReference' &&
-      type.typeName?.name === 'PropertyKey' &&
-      isUnshadowedGlobal(context, type.typeName))
+  const isOpenKeyType = (type, aliases = new Set()) => {
+    if (
+      type?.type === 'TSStringKeyword' ||
+      type?.type === 'TSNumberKeyword' ||
+      type?.type === 'TSSymbolKeyword'
+    ) {
+      return true
+    }
+
+    if (type?.type === 'TSUnionType') {
+      return type.types.some((member) => isOpenKeyType(member, aliases))
+    }
+
+    if (type?.type !== 'TSTypeReference' || type.typeName?.type !== 'Identifier') {
+      return false
+    }
+
+    if (type.typeName.name === 'PropertyKey' && isUnshadowedGlobal(context, type.typeName)) {
+      return true
+    }
+
+    const variable = findVariable(context, type.typeName)
+    const declaration = variable?.defs?.find(
+      (definition) => definition.node?.type === 'TSTypeAliasDeclaration',
+    )?.node
+
+    if (!declaration || declaration.typeParameters || aliases.has(variable)) {
+      return false
+    }
+
+    aliases.add(variable)
+    return isOpenKeyType(declaration.typeAnnotation, aliases)
+  }
 
   return isOpenKeyType(keyType)
 }
