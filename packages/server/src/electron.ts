@@ -81,6 +81,8 @@ export interface AttachElectronTransportOptions {
    * handshake over IPC (uncommon).
    */
   resolveContext?: AttachEngineOptions['resolveContext']
+  validateClientContext?: AttachEngineOptions['validateClientContext']
+  trustedRequestHeaders?: AttachEngineOptions['trustedRequestHeaders']
   /** Forwarded to `attachEngine`. Default 10_000 ms. */
   authTimeoutMs?: number
   /**
@@ -200,7 +202,15 @@ class PipeImpl implements Pipe<unknown, unknown> {
  * down all active connections (echoing `__close` to each still-live renderer).
  */
 export function attachElectronTransport(opts: AttachElectronTransportOptions): { detach(): void } {
-  const { app, ipcMain, resolveContext, authTimeoutMs, onClose } = opts
+  const {
+    app,
+    ipcMain,
+    resolveContext,
+    validateClientContext,
+    trustedRequestHeaders,
+    authTimeoutMs,
+    onClose,
+  } = opts
   const getWebContents = opts.getWebContents ?? ((e: IpcMainEventLike) => e.sender)
 
   const connections = new Map<number, Connection>()
@@ -245,6 +255,8 @@ export function attachElectronTransport(opts: AttachElectronTransportOptions): {
     const handle = attachEngine(pipe, {
       app,
       resolveContext,
+      validateClientContext,
+      trustedRequestHeaders,
       authTimeoutMs,
       // Engine-initiated close (auth timeout / failed auth on an auth-required
       // transport) lands here. Tear down FIRST (clearing the map so a later

@@ -127,11 +127,23 @@ describe('buildAuthRequest (unit)', () => {
   test('with Bearer token: sets Authorization: Bearer ${token}', () => {
     const upgrade = new Request('http://x/api/ws', {
       method: 'GET',
-      headers: new Headers({ cookie: 'session=abc' }),
+      headers: new Headers({
+        cookie: 'session=abc',
+        'x-auth-request-user': 'forged@example.com',
+      }),
     })
     const req = buildAuthRequest(upgrade, 'user_123')
     expect(req.headers.get('authorization')).toBe('Bearer user_123')
     expect(req.headers.get('cookie')).toBe('session=abc')
+    expect(req.headers.get('x-auth-request-user')).toBeNull()
+  })
+
+  test('exposes an ingress-owned header only when explicitly configured', () => {
+    const upgrade = new Request('http://x/api/ws', {
+      headers: { 'x-auth-request-user': 'verified@example.com' },
+    })
+    const req = buildAuthRequest(upgrade, null, ['X-Auth-Request-User'])
+    expect(req.headers.get('x-auth-request-user')).toBe('verified@example.com')
   })
 
   test('with null token: strips any Authorization inherited from upgrade', () => {

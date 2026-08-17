@@ -192,6 +192,22 @@ describe('createEngine', () => {
     engine.disconnect()
   })
 
+  test('auth handshake carries structured app context without identity headers', async () => {
+    const harness = makeServerSide()
+    const engine = createEngine({
+      createPipe: harness.createPipe,
+      getToken: () => 'tkn',
+      getContext: () => ({ tenantId: 'acme' }),
+    })
+    engine.connect()
+
+    await settle()
+    expect(harness.server().received).toEqual([
+      { type: 'auth', token: 'tkn', context: { tenantId: 'acme' } },
+    ])
+    engine.disconnect()
+  })
+
   test('close 4001 latches authFailed, fires invalidations, no reconnect', async () => {
     const harness = makeServerSide()
     const engine = createEngine({

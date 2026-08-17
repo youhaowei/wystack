@@ -42,10 +42,16 @@ export type {
   ResyncMessage,
   // Envelope (lenient shape gate)
   Envelope,
+  ClientContext,
+  JsonValue,
 } from './protocol'
 export {
   parseClientMessage,
   parseServerMessage,
   parseEnvelope,
+  normalizeClientContext,
+  encodeClientContextHeader,
+  decodeClientContextHeader,
+  CLIENT_CONTEXT_HEADER,
   REACTIVITY_NOT_ENABLED,
 } from './protocol'

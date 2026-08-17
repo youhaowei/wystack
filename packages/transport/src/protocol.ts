@@ -39,11 +39,66 @@
  * First frame on a connection when the server is configured with
  * `resolveContext`. `token` is `string | null` — null means anonymous
  * (any leaked Authorization header is stripped by the server before
- * `resolveContext` runs).
+ * `resolveContext` runs). Optional structured app context is carried separately
+ * because browser WebSocket APIs cannot attach it to the upgrade request.
  */
 export interface AuthMessage {
   type: 'auth'
   token: string | null
+  /** Untrusted app context. The server validates it before resolving auth context. */
+  context?: ClientContext
+}
+
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+export type ClientContext = { [key: string]: JsonValue }
+
+/** Reserved HTTP carrier for the same context sent in WebSocket auth frames. */
+export const CLIENT_CONTEXT_HEADER = 'X-WyStack-Context'
+
+/** Encode client context as an ASCII-only HTTP header value. */
+export function encodeClientContextHeader(value: ClientContext): string {
+  return encodeURIComponent(JSON.stringify(value))
+}
+
+/** Decode the current ASCII carrier while accepting the original raw-JSON form. */
+export function decodeClientContextHeader(value: string): unknown {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return JSON.parse(decodeURIComponent(value))
+  }
+}
+
+/**
+ * Normalize app context to the exact JSON object both HTTP and message
+ * transports can carry. Reject unsupported values instead of silently dropping
+ * or reinterpreting them.
+ */
+export function normalizeClientContext(value: unknown): ClientContext {
+  if (!isPlainObject(value) || !isJsonValue(value, new Set())) {
+    throw new TypeError('Client context must be a JSON object')
+  }
+  return JSON.parse(JSON.stringify(value)) as ClientContext
+}
+
+function isJsonValue(value: unknown, ancestors: Set<object>): value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (typeof value !== 'object') return false
+  if (ancestors.has(value)) return false
+
+  const nextAncestors = new Set(ancestors).add(value)
+  if (Array.isArray(value)) {
+    return value.every((entry) => isJsonValue(entry, nextAncestors))
+  }
+  if (!isPlainObject(value)) return false
+  return Object.values(value).every((entry) => isJsonValue(entry, nextAncestors))
 }
 
 /**
@@ -253,7 +308,9 @@ export function parseEnvelope(data: string): Envelope | null {
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v)
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false
+  const prototype = Object.getPrototypeOf(v)
+  return prototype === Object.prototype || prototype === null
 }
 
 /**
@@ -277,7 +334,12 @@ export function parseClientMessage(data: string): ClientMessage | null {
       // counterpart: require the field, require the type. Callers that want
       // server-style leniency should pre-normalize.
       if (msg.token !== null && typeof msg.token !== 'string') return null
-      return { type: 'auth', token: msg.token }
+      if (msg.context !== undefined && !isPlainObject(msg.context)) return null
+      return {
+        type: 'auth',
+        token: msg.token,
+        ...(msg.context === undefined ? {} : { context: msg.context as ClientContext }),
+      }
     }
     case 'subscribe': {
       if (typeof msg.id !== 'string') return null

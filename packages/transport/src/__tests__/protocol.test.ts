@@ -3,6 +3,9 @@ import {
   parseClientMessage,
   parseServerMessage,
   parseEnvelope,
+  normalizeClientContext,
+  encodeClientContextHeader,
+  decodeClientContextHeader,
   REACTIVITY_NOT_ENABLED,
   type AuthMessage,
   type SubscribeMessage,
@@ -94,6 +97,17 @@ describe('parseClientMessage — auth', () => {
     const got = parseClientMessage(JSON.stringify({ type: 'auth', token: null }))
     expect(got).toEqual({ type: 'auth', token: null })
   })
+  test('accepts a structured client context', () => {
+    const got = parseClientMessage(
+      JSON.stringify({ type: 'auth', token: 'jwt', context: { tenantId: 'acme' } }),
+    )
+    expect(got).toEqual({ type: 'auth', token: 'jwt', context: { tenantId: 'acme' } })
+  })
+  test('rejects malformed client context', () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: 'auth', token: 'jwt', context: [] })),
+    ).toBeNull()
+  })
   test('rejects a missing token field', () => {
     // The wire requires token to be present; the server coerces non-string to
     // null but the parser is strict (see AuthMessage doc).
@@ -103,6 +117,38 @@ describe('parseClientMessage — auth', () => {
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: 42 }))).toBeNull()
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: {} }))).toBeNull()
     expect(parseClientMessage(JSON.stringify({ type: 'auth', token: [] }))).toBeNull()
+  })
+})
+
+describe('client context carriers', () => {
+  test('preserves nested JSON context', () => {
+    expect(
+      normalizeClientContext({ tenantId: 'acme', flags: ['a', 'b'], limits: { seats: 3 } }),
+    ).toEqual({ tenantId: 'acme', flags: ['a', 'b'], limits: { seats: 3 } })
+  })
+
+  test('rejects values that cannot cross both HTTP and WebSocket JSON carriers', () => {
+    expect(() => normalizeClientContext({ value: undefined })).toThrow(
+      'Client context must be a JSON object',
+    )
+    expect(() => normalizeClientContext({ value: Number.POSITIVE_INFINITY })).toThrow(
+      'Client context must be a JSON object',
+    )
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    expect(() => normalizeClientContext(cyclic)).toThrow('Client context must be a JSON object')
+  })
+
+  test('round-trips Unicode through an ASCII-only HTTP header value', () => {
+    const context = { tenantName: '你好 👋' }
+    const encoded = encodeClientContextHeader(context)
+
+    expect([...encoded].every((character) => character.charCodeAt(0) <= 0x7f)).toBe(true)
+    expect(decodeClientContextHeader(encoded)).toEqual(context)
+  })
+
+  test('accepts the original raw-JSON HTTP carrier during migration', () => {
+    expect(decodeClientContextHeader('{"tenantId":"acme"}')).toEqual({ tenantId: 'acme' })
   })
 })
 

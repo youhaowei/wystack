@@ -2,7 +2,13 @@
 //
 // Owns the carrier-agnostic half of the v0.2 client.
 
-import type { Pipe, ServerMessage, ClientMessage } from '@wystack/transport'
+import {
+  normalizeClientContext,
+  type ClientContext,
+  type Pipe,
+  type ServerMessage,
+  type ClientMessage,
+} from '@wystack/transport'
 
 type InvalidateHandler = () => void
 
@@ -44,19 +50,20 @@ export interface EngineConfig {
   /**
    * Provide a token for the auth handshake. When set, the engine sends an
    * `auth` frame on each (re)connect and waits for `{type:"authenticated"}`
-   * before flushing subscriptions. Return `null` for anonymous auth (cookie /
-   * proxy headers) — the auth frame is still sent with `token: null`, which
-   * triggers `resolveContext` on the server against the upgrade-request
-   * headers.
+   * before flushing subscriptions. Return `null` for anonymous auth (cookie or
+   * server-configured ingress headers) — the frame is still sent with
+   * `token: null`, which triggers `resolveContext` on the server.
    */
   getToken?: () => Promise<string | null> | string | null
+  /** Structured app context to carry in the auth frame on each connection. */
+  getContext?: () => Promise<ClientContext> | ClientContext
   /**
    * Force the auth handshake on or off, overriding the `getToken`-based
-   * default. Use `true` for cookie/proxy auth without a bearer token; use
+   * default. Use `true` for cookie or configured-ingress auth without a bearer token; use
    * `false` for trusted transports (IPC, local-loopback) where the server is
    * configured without `resolveContext`.
    *
-   * Defaults to `true` when `getToken` is set, `false` otherwise.
+   * Defaults to `true` when `getToken` or `getContext` is set, `false` otherwise.
    */
   requiresAuth?: boolean
   /**
@@ -122,8 +129,8 @@ interface PendingCall {
 }
 
 export function createEngine(config: EngineConfig): Engine {
-  const { createPipe, getToken, onSubscribed } = config
-  const requiresAuth = config.requiresAuth ?? getToken !== undefined
+  const { createPipe, getToken, getContext, onSubscribed } = config
+  const requiresAuth = config.requiresAuth ?? (getToken !== undefined || getContext !== undefined)
   const authAckTimeoutMs = config.authAckTimeoutMs ?? DEFAULT_AUTH_ACK_TIMEOUT_MS
 
   let pipe: EnginePipe | null = null
@@ -393,6 +400,8 @@ export function createEngine(config: EngineConfig): Engine {
     // pipe, abandoning it with no close() call.
     const run = async (): Promise<void> => {
       const token: string | null = requiresAuth ? ((await getToken?.()) ?? null) : null
+      const rawContext = requiresAuth ? await getContext?.() : undefined
+      const context = rawContext === undefined ? undefined : normalizeClientContext(rawContext)
 
       if (generation !== connectGeneration || authFailed) return
 
@@ -432,7 +441,14 @@ export function createEngine(config: EngineConfig): Engine {
         // `token: null` (not undefined) — the wire frame must always carry
         // the field. The server's anonymous-path (`resolveContext` against
         // upgrade headers) needs an explicit null sentinel.
-        sendOrClose({ type: 'auth', token: token ?? null }, generation)
+        sendOrClose(
+          {
+            type: 'auth',
+            token: token ?? null,
+            ...(context === undefined ? {} : { context }),
+          },
+          generation,
+        )
         authAckTimer = setTimeout(() => {
           authAckTimer = null
           failAuthAck(generation)

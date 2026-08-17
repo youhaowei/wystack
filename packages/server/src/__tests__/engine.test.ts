@@ -38,6 +38,7 @@ import { ValidationError } from '../validation'
 import { AuthenticationRequiredError } from '../functions'
 import {
   attachEngine,
+  Session,
   type AttachEngineOptions,
   createInMemorySubscriptionStore,
   createInvalidationRouter,
@@ -372,6 +373,109 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(seen).toEqual([{ auth: 'Bearer tok123' }])
   })
 
+  test('auth frame validates structured context separately from request identity', async () => {
+    const seen: Array<{ auth: string | null; tenant: unknown; proxyUser: string | null }> = []
+    const session = new Session({
+      validateClientContext: (value) => {
+        if (
+          value === null ||
+          typeof value !== 'object' ||
+          Array.isArray(value) ||
+          typeof (value as { tenantId?: unknown }).tenantId !== 'string'
+        ) {
+          throw new Error('Invalid client context')
+        }
+        return { tenantId: (value as { tenantId: string }).tenantId }
+      },
+      resolveContext: async (req, clientContext) => {
+        seen.push({
+          auth: req.headers.get('authorization'),
+          tenant: clientContext.tenantId,
+          proxyUser: req.headers.get('x-auth-request-user'),
+        })
+        return {}
+      },
+    })
+
+    expect(
+      await session.handleAuth('tok123', {
+        tenantId: 'acme',
+        'X-Auth-Request-User': 'admin@example.com',
+      }),
+    ).toEqual({
+      kind: 'authenticated',
+      committed: true,
+    })
+    await session.resolveSubContext()
+
+    expect(seen).toEqual([
+      { auth: 'Bearer tok123', tenant: 'acme', proxyUser: null },
+      { auth: 'Bearer tok123', tenant: 'acme', proxyUser: null },
+    ])
+  })
+
+  test('auth frame cannot supply unvalidated context', async () => {
+    const seen: Array<Record<string, string | null>> = []
+    const session = new Session({
+      baseRequest: new Request('wystack://pipe', {
+        headers: {
+          cookie: 'trusted=session',
+          origin: 'https://trusted.example',
+          'x-real-ip': '203.0.113.10',
+          'cf-connecting-ip': '203.0.113.10',
+          'fly-client-ip': '203.0.113.10',
+        },
+      }),
+      resolveContext: async (req) => {
+        seen.push({
+          authorization: req.headers.get('authorization'),
+          cookie: req.headers.get('cookie'),
+          origin: req.headers.get('origin'),
+          forwarded: req.headers.get('x-forwarded-host'),
+          realIp: req.headers.get('x-real-ip'),
+          cloudflareIp: req.headers.get('cf-connecting-ip'),
+          flyIp: req.headers.get('fly-client-ip'),
+        })
+        return {}
+      },
+    })
+
+    expect(
+      await session.handleAuth('real-token', {
+        tenantId: 'attacker-tenant',
+        'X-Auth-Request-User': 'admin@example.com',
+      }),
+    ).toEqual({ kind: 'close', reason: 'auth-failed' })
+
+    expect(seen).toEqual([])
+  })
+
+  test('legacy auth-frame headers cannot enter resolveContext', async () => {
+    const seen: Array<{ proxyUser: string | null; rawContext: string | null }> = []
+    const h = await harness({
+      baseRequest: new Request('wystack://pipe', {
+        headers: { 'X-WyStack-Context': '{"X-Auth-Request-User":"admin@example.com"}' },
+      }),
+      resolveContext: async (request) => {
+        seen.push({
+          proxyUser: request.headers.get('remote-user'),
+          rawContext: request.headers.get('x-wystack-context'),
+        })
+        return {}
+      },
+    })
+
+    h.send({
+      type: 'auth',
+      token: null,
+      headers: { 'Remote-User': 'admin@example.com' },
+    } as unknown as ClientMessage)
+    await until(() => h.received.length > 0, 'authenticated')
+
+    expect(h.received).toEqual([{ type: 'authenticated' }])
+    expect(seen).toEqual([{ proxyUser: null, rawContext: null }])
+  })
+
   // Parity regression: routes.ts uses a LENIENT envelope parse then coerces a
   // missing / non-string / empty token to null (anonymous). The engine must do
   // the same — NOT route the auth frame through the strict transport parser,
@@ -438,6 +542,15 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(h.received).toEqual([{ type: 'authenticated' }])
     // Token never adopted on a trusted transport.
     expect(h.handle.session.token).toBeNull()
+  })
+
+  test('no-auth server rejects an auth frame with unvalidated client context', async () => {
+    const h = await harness()
+    h.send({ type: 'auth', token: null, context: { tenantId: 'acme' } })
+    await until(() => h.closeReasons.length > 0, 'close')
+
+    expect(h.received).toEqual([])
+    expect(h.closeReasons).toEqual(['auth-failed'])
   })
 
   test('repeat auth frame → idempotent ACK, token unchanged', async () => {

@@ -64,6 +64,8 @@ export type {
 } from './draft-lifecycle'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'
+export type { ValidateClientContext } from './client-context'
+export type { TrustedRequestHeaders } from './resolver-request'
 export type { MountedRoutes } from './serve-node'
 // Public engine types expose attach options plus reactive port contracts.
 // `ResolveContext`, `AuthOutcome`, `Dispatch`, and `DispatchResult` stay in

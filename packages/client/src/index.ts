@@ -37,6 +37,7 @@ export type { WyStackClient } from './client'
 export type { WsManager, WsManagerConfig } from './ws'
 export type { IpcManager, IpcManagerConfig, IpcRendererLike } from './transport/electron'
 export type { WyStackClientConfig } from './types'
+export type { ClientContext, JsonValue } from '@wystack/transport'
 export type {
   Engine,
   EngineConfig,

@@ -1,3 +1,5 @@
+import type { ClientContext } from '@wystack/transport'
+
 export interface WyStackClientConfig {
   /** WyStack server URL (e.g., 'http://localhost:3001') */
   url: string
@@ -9,11 +11,20 @@ export interface WyStackClientConfig {
    */
   getToken?: () => Promise<string | null> | string | null
   /**
+   * App-provided JSON context. Called for every HTTP request and authenticated
+   * WebSocket connection attempt, then validated by the server. HTTP carries it
+   * in the reserved X-WyStack-Context header; WebSocket carries it in the auth
+   * frame. The raw carrier is removed before resolveContext receives the
+   * validated value separately. Use `getToken` for Authorization.
+   */
+  getContext?: () => Promise<ClientContext> | ClientContext
+  /**
    * Whether the WebSocket transport must perform the auth handshake.
    *
-   * Defaults to true when `getToken` is provided and false otherwise. Set false
-   * for trusted transports such as in-process IPC or same-process local runtime
-   * usage where HTTP may still use `getToken` but WS must not send auth frames.
+   * Defaults to true when `getToken` or `getContext` is provided and false
+   * otherwise. Set false for trusted transports such as in-process IPC or
+   * same-process local runtime usage where HTTP may still use either callback
+   * but WS must not send auth frames.
    */
   requiresAuth?: boolean
 }

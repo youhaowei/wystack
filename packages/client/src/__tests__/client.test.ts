@@ -207,3 +207,45 @@ describe('createClient — Action cancellation', () => {
     await expect(pending).rejects.toThrow()
   })
 })
+
+describe('createClient — app-provided context', () => {
+  test('sends a fresh reserved context envelope without spoofable identity headers', async () => {
+    const contexts: unknown[] = []
+    const auth: Array<string | null> = []
+    const proxyUsers: Array<string | null> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = Object.assign(
+      async (_input: URL | RequestInfo, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        const context = headers.get('x-wystack-context')
+        contexts.push(context === null ? null : JSON.parse(decodeURIComponent(context)))
+        auth.push(headers.get('authorization'))
+        proxyUsers.push(headers.get('x-auth-request-user'))
+        return Response.json({ data: null })
+      },
+      { preconnect: realFetch.preconnect },
+    )
+    let contextCalls = 0
+    const client = createClient({
+      url: 'https://api.example',
+      getToken: () => 'real-token',
+      getContext: () => ({ tenantId: `tenant-${++contextCalls}`, label: '你好 👋' }),
+    })
+
+    try {
+      await client.query(queryRef('query'))
+      await client.mutate(mutationRef('mutation'))
+      await client.action(actionRef('action'))
+    } finally {
+      globalThis.fetch = realFetch
+    }
+
+    expect(contexts).toEqual([
+      { tenantId: 'tenant-1', label: '你好 👋' },
+      { tenantId: 'tenant-2', label: '你好 👋' },
+      { tenantId: 'tenant-3', label: '你好 👋' },
+    ])
+    expect(auth).toEqual(['Bearer real-token', 'Bearer real-token', 'Bearer real-token'])
+    expect(proxyUsers).toEqual([null, null, null])
+  })
+})
