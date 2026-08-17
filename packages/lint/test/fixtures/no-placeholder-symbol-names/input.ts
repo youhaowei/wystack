@@ -29,6 +29,9 @@ enum PlaceholderEnum {
 }
 
 declare function ambientPlaceholder(shape: string): void
+declare namespace AmbientDeclarations {
+  function shape(value: string): void
+}
 type PlaceholderCallback = (shape: string) => void
 declare class AmbientPlaceholder {
   method(shape: string): void

@@ -95,7 +95,7 @@ describe('@wystack/lint', () => {
     const report = lint('fixture.oxlintrc.json', root, resolve(root, 'input.ts'))
 
     expect(ruleLines(report, 'no-placeholder-symbol-names')).toEqual([
-      1, 4, 5, 11, 16, 21, 23, 24, 28, 31, 32, 34, 39,
+      1, 4, 5, 11, 16, 21, 23, 24, 28, 31, 33, 35, 37, 42,
     ])
   })
 })

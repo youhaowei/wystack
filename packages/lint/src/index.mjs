@@ -28,8 +28,18 @@ const isPrimitiveAnnotation = (node) =>
   node?.type === 'TSNumberKeyword' ||
   node?.type === 'TSBooleanKeyword'
 
-const isRecordAnnotation = (node) =>
-  node?.type === 'TSTypeReference' && node.typeName?.name === 'Record'
+const isRecordAnnotation = (node) => {
+  if (node?.type !== 'TSTypeReference' || node.typeName?.name !== 'Record') {
+    return false
+  }
+
+  const keyType = (node.typeArguments?.params ?? node.typeParameters?.params ?? [])[0]
+  return (
+    keyType?.type === 'TSStringKeyword' ||
+    keyType?.type === 'TSNumberKeyword' ||
+    keyType?.type === 'TSSymbolKeyword'
+  )
+}
 
 const functionParent = (node) => {
   let current = node.parent
@@ -476,6 +486,14 @@ const noPlaceholderSymbolNames = {
       }
     }
 
+    const checkNamedFunction = (node) => {
+      if (isIdentifier(node.id)) {
+        check(node.id)
+      }
+
+      checkParameters(node)
+    }
+
     const checkNamedKey = (node) => {
       if (node.parent?.type !== 'ObjectPattern' && !node.computed && isIdentifier(node.key)) {
         check(node.key)
@@ -498,22 +516,10 @@ const noPlaceholderSymbolNames = {
       VariableDeclarator(node) {
         checkBinding(node.id)
       },
-      FunctionDeclaration(node) {
-        if (isIdentifier(node.id)) {
-          check(node.id)
-        }
-
-        checkParameters(node)
-      },
-      FunctionExpression(node) {
-        if (isIdentifier(node.id)) {
-          check(node.id)
-        }
-
-        checkParameters(node)
-      },
+      FunctionDeclaration: checkNamedFunction,
+      FunctionExpression: checkNamedFunction,
       ArrowFunctionExpression: checkParameters,
-      TSDeclareFunction: checkParameters,
+      TSDeclareFunction: checkNamedFunction,
       TSFunctionType: checkParameters,
       TSEmptyBodyFunctionExpression: checkParameters,
       CatchClause(node) {
