@@ -7,7 +7,11 @@
  * `requiresAuth: false`.
  */
 import type { WyStackClientConfig } from './types'
-import { CLIENT_CONTEXT_HEADER, normalizeClientContext } from '@wystack/transport'
+import {
+  CLIENT_CONTEXT_HEADER,
+  encodeClientContextHeader,
+  normalizeClientContext,
+} from '@wystack/transport'
 import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
 import { createWsManager, type WsManager } from './ws'
 
@@ -77,7 +81,9 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     const rawContext = await getContext?.()
     const contextHeaders: Record<string, string> = {}
     if (rawContext !== undefined) {
-      contextHeaders[CLIENT_CONTEXT_HEADER] = JSON.stringify(normalizeClientContext(rawContext))
+      contextHeaders[CLIENT_CONTEXT_HEADER] = encodeClientContextHeader(
+        normalizeClientContext(rawContext),
+      )
     }
     return token ? { ...contextHeaders, Authorization: `Bearer ${token}` } : contextHeaders
   }

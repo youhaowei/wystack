@@ -4,6 +4,8 @@ import {
   parseServerMessage,
   parseEnvelope,
   normalizeClientContext,
+  encodeClientContextHeader,
+  decodeClientContextHeader,
   REACTIVITY_NOT_ENABLED,
   type AuthMessage,
   type SubscribeMessage,
@@ -118,7 +120,7 @@ describe('parseClientMessage — auth', () => {
   })
 })
 
-describe('normalizeClientContext', () => {
+describe('client context carriers', () => {
   test('preserves nested JSON context', () => {
     expect(
       normalizeClientContext({ tenantId: 'acme', flags: ['a', 'b'], limits: { seats: 3 } }),
@@ -135,6 +137,18 @@ describe('normalizeClientContext', () => {
     const cyclic: Record<string, unknown> = {}
     cyclic.self = cyclic
     expect(() => normalizeClientContext(cyclic)).toThrow('Client context must be a JSON object')
+  })
+
+  test('round-trips Unicode through an ASCII-only HTTP header value', () => {
+    const context = { tenantName: '你好 👋' }
+    const encoded = encodeClientContextHeader(context)
+
+    expect([...encoded].every((character) => character.charCodeAt(0) <= 0x7f)).toBe(true)
+    expect(decodeClientContextHeader(encoded)).toEqual(context)
+  })
+
+  test('accepts the original raw-JSON HTTP carrier during migration', () => {
+    expect(decodeClientContextHeader('{"tenantId":"acme"}')).toEqual({ tenantId: 'acme' })
   })
 })
 

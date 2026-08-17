@@ -61,6 +61,20 @@ export type ClientContext = { [key: string]: JsonValue }
 /** Reserved HTTP carrier for the same context sent in WebSocket auth frames. */
 export const CLIENT_CONTEXT_HEADER = 'X-WyStack-Context'
 
+/** Encode client context as an ASCII-only HTTP header value. */
+export function encodeClientContextHeader(value: ClientContext): string {
+  return encodeURIComponent(JSON.stringify(value))
+}
+
+/** Decode the current ASCII carrier while accepting the original raw-JSON form. */
+export function decodeClientContextHeader(value: string): unknown {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return JSON.parse(decodeURIComponent(value))
+  }
+}
+
 /**
  * Normalize app context to the exact JSON object both HTTP and message
  * transports can carry. Reject unsupported values instead of silently dropping

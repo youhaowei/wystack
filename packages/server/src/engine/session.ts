@@ -173,6 +173,13 @@ export class Session {
    */
   async handleAuth(rawToken: unknown, rawContext?: unknown): Promise<AuthOutcome> {
     if (this.authenticated) {
+      if (!this.requiresAuth) {
+        try {
+          await validateIncomingClientContext(rawContext, this.validateClientContext)
+        } catch {
+          return { kind: 'close', reason: 'auth-failed' }
+        }
+      }
       return { kind: 'authenticated', committed: false }
     }
 

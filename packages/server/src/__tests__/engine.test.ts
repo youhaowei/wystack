@@ -544,6 +544,15 @@ describe('Engine — auth handshake parity (AC #2)', () => {
     expect(h.handle.session.token).toBeNull()
   })
 
+  test('no-auth server rejects an auth frame with unvalidated client context', async () => {
+    const h = await harness()
+    h.send({ type: 'auth', token: null, context: { tenantId: 'acme' } })
+    await until(() => h.closeReasons.length > 0, 'close')
+
+    expect(h.received).toEqual([])
+    expect(h.closeReasons).toEqual(['auth-failed'])
+  })
+
   test('repeat auth frame → idempotent ACK, token unchanged', async () => {
     const h = await harness({ resolveContext: async () => ({ userId: 'u1' }) })
     h.send({ type: 'auth', token: 'first' })

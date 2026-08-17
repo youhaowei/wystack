@@ -50,6 +50,8 @@ export {
   parseServerMessage,
   parseEnvelope,
   normalizeClientContext,
+  encodeClientContextHeader,
+  decodeClientContextHeader,
   CLIENT_CONTEXT_HEADER,
   REACTIVITY_NOT_ENABLED,
 } from './protocol'

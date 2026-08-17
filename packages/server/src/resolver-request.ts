@@ -29,11 +29,13 @@ export function createResolverRequest(
   })
 
   const clone = request.clone()
-  return new Request(clone.url, {
+  const init: RequestInit & { duplex?: 'half' } = {
     method: clone.method,
     headers,
     body: clone.method === 'GET' || clone.method === 'HEAD' ? undefined : clone.body,
     redirect: clone.redirect,
     signal: clone.signal,
-  })
+  }
+  if (init.body !== undefined && init.body !== null) init.duplex = 'half'
+  return new Request(clone.url, init)
 }

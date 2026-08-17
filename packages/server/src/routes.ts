@@ -178,6 +178,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
         if (!allowed || !origin) return
 
         headers.set('Access-Control-Allow-Origin', origin)
+        headers.set('Access-Control-Allow-Credentials', 'true')
         headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         headers.set(
           'Access-Control-Allow-Headers',

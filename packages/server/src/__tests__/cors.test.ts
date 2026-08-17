@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { upgradeWebSocket } from 'hono/bun'
+import { encodeClientContextHeader } from '@wystack/transport'
 import { createDispatchInvalidationSource } from '../engine'
 import { createRoutes } from '../routes'
 import { createSubscriptionManager } from '../subscriptions'
@@ -9,7 +10,10 @@ import type { WyStackApp } from '../create'
 function createTestApp(): WyStackApp {
   const invalidation = createDispatchInvalidationSource()
   return {
-    functions: new Map<string, FunctionDef>([['listTodos', { type: 'query' } as FunctionDef]]),
+    functions: new Map<string, FunctionDef>([
+      ['listTodos', { type: 'query' } as FunctionDef],
+      ['saveTodo', { type: 'mutation' } as FunctionDef],
+    ]),
     subscriptions: createSubscriptionManager(),
     invalidationSource: invalidation.source,
     emit: invalidation.emit,
@@ -46,6 +50,7 @@ describe('CORS response policy', () => {
 
     expect(response.status).toBe(204)
     expect(response.headers.get('access-control-allow-origin')).toBe('https://app.example')
+    expect(response.headers.get('access-control-allow-credentials')).toBe('true')
     const allowedHeaders = response.headers.get('access-control-allow-headers')
     expect(allowedHeaders).toContain('Authorization')
     expect(allowedHeaders).toContain('X-WyStack-Context')
@@ -146,6 +151,57 @@ describe('CORS response policy', () => {
     })
   })
 
+  test('decodes Unicode context from the HTTP-safe carrier', async () => {
+    const seen: unknown[] = []
+    const routes = createRoutes(
+      {
+        app: createTestApp(),
+        validateClientContext: (value) => value,
+        resolveContext: async (_request, clientContext) => {
+          seen.push(clientContext)
+          return {}
+        },
+      },
+      upgradeWebSocket,
+    )
+
+    const response = await routes.fetch(
+      new Request('http://localhost/api/listTodos', {
+        headers: {
+          'X-WyStack-Context': encodeClientContextHeader({ tenantName: '你好 👋' }),
+        },
+      }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(seen).toEqual([{ tenantName: '你好 👋' }])
+  })
+
+  test('preserves a POST body when projecting the resolver request', async () => {
+    const bodies: string[] = []
+    const routes = createRoutes(
+      {
+        app: createTestApp(),
+        resolveContext: async (request) => {
+          bodies.push(await request.text())
+          return {}
+        },
+      },
+      upgradeWebSocket,
+    )
+
+    const response = await routes.fetch(
+      new Request('http://localhost/api/saveTodo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'ship it' }),
+      }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(bodies).toEqual(['{"title":"ship it"}'])
+  })
+
   test('actual responses always vary by origin and reflect only trusted origins', async () => {
     const routes = createCorsRoutes()
 
@@ -159,6 +215,7 @@ describe('CORS response policy', () => {
       }),
     )
     expect(trusted.headers.get('access-control-allow-origin')).toBe('https://app.example')
+    expect(trusted.headers.get('access-control-allow-credentials')).toBe('true')
 
     const untrusted = await routes.fetch(
       new Request('http://localhost/api/listTodos', {
@@ -166,6 +223,7 @@ describe('CORS response policy', () => {
       }),
     )
     expect(untrusted.headers.get('access-control-allow-origin')).toBeNull()
+    expect(untrusted.headers.get('access-control-allow-credentials')).toBeNull()
     expect(untrusted.headers.get('vary')).toContain('Origin')
   })
 })

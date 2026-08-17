@@ -218,7 +218,7 @@ describe('createClient — app-provided context', () => {
       async (_input: URL | RequestInfo, init?: RequestInit) => {
         const headers = new Headers(init?.headers)
         const context = headers.get('x-wystack-context')
-        contexts.push(context === null ? null : JSON.parse(context))
+        contexts.push(context === null ? null : JSON.parse(decodeURIComponent(context)))
         auth.push(headers.get('authorization'))
         proxyUsers.push(headers.get('x-auth-request-user'))
         return Response.json({ data: null })
@@ -229,7 +229,7 @@ describe('createClient — app-provided context', () => {
     const client = createClient({
       url: 'https://api.example',
       getToken: () => 'real-token',
-      getContext: () => ({ tenantId: `tenant-${++contextCalls}` }),
+      getContext: () => ({ tenantId: `tenant-${++contextCalls}`, label: '你好 👋' }),
     })
 
     try {
@@ -241,9 +241,9 @@ describe('createClient — app-provided context', () => {
     }
 
     expect(contexts).toEqual([
-      { tenantId: 'tenant-1' },
-      { tenantId: 'tenant-2' },
-      { tenantId: 'tenant-3' },
+      { tenantId: 'tenant-1', label: '你好 👋' },
+      { tenantId: 'tenant-2', label: '你好 👋' },
+      { tenantId: 'tenant-3', label: '你好 👋' },
     ])
     expect(auth).toEqual(['Bearer real-token', 'Bearer real-token', 'Bearer real-token'])
     expect(proxyUsers).toEqual([null, null, null])

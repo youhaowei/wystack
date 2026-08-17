@@ -1,5 +1,6 @@
 import {
   CLIENT_CONTEXT_HEADER,
+  decodeClientContextHeader,
   normalizeClientContext,
   type ClientContext,
 } from '@wystack/transport'
@@ -16,7 +17,7 @@ export function readHttpClientContext(request: Request): unknown {
   const encoded = request.headers.get(CLIENT_CONTEXT_HEADER)
   if (encoded === null) return undefined
   try {
-    return JSON.parse(encoded)
+    return decodeClientContextHeader(encoded)
   } catch {
     throw new InvalidClientContextError('Invalid client context JSON')
   }
