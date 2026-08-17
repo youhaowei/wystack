@@ -12,8 +12,10 @@ export interface WyStackClientConfig {
   getToken?: () => Promise<string | null> | string | null
   /**
    * App-provided JSON context. Called for every HTTP request and authenticated
-   * WebSocket connection attempt, then validated by the server. Use `getToken`
-   * for Authorization; client context never becomes request headers.
+   * WebSocket connection attempt, then validated by the server. HTTP carries it
+   * in the reserved X-WyStack-Context header; WebSocket carries it in the auth
+   * frame. The raw carrier is removed before resolveContext receives the
+   * validated value separately. Use `getToken` for Authorization.
    */
   getContext?: () => Promise<ClientContext> | ClientContext
   /**
