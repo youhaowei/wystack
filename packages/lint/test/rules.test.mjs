@@ -1,15 +1,15 @@
 import { describe, expect, test } from 'bun:test'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 
 const packageRoot = resolve(import.meta.dir, '..')
 const fixture = (name) => resolve(packageRoot, 'test/fixtures', name)
 
-const lint = (...paths) => {
+const lint = (configName, ...paths) => {
   const result = Bun.spawnSync({
     cmd: [
       'oxlint',
       '--config',
-      resolve(paths[0], 'fixture.oxlintrc.json'),
+      resolve(paths[0], configName),
       '--format',
       'json',
       ...paths.slice(1),
@@ -28,31 +28,43 @@ const ruleMessages = (report, ruleName) =>
 const ruleLines = (report, ruleName) =>
   ruleMessages(report, ruleName).map((diagnostic) => diagnostic.labels[0].span.line)
 
+const ruleLocations = (report, ruleName) =>
+  ruleMessages(report, ruleName)
+    .map((diagnostic) => `${basename(diagnostic.filename)}:${diagnostic.labels[0].span.line}`)
+    .sort()
+
 describe('@wystack/lint', () => {
   test('rejects broad object parameters while allowing generic constraints', () => {
     const root = fixture('no-object-parameters')
-    const report = lint(root, resolve(root, 'input.ts'))
+    const report = lint('fixture.oxlintrc.json', root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-object-parameters')).toHaveLength(3)
+    expect(ruleLines(report, 'no-object-parameters')).toEqual([1, 2, 5])
   })
 
   test('lets consumers exempt test files from chained assertion enforcement', () => {
     const root = fixture('no-chained-type-assertions')
-    const report = lint(root, resolve(root, 'production.ts'), resolve(root, 'production.test.ts'))
+    const report = lint(
+      'fixture.oxlintrc.json',
+      root,
+      resolve(root, 'production.ts'),
+      resolve(root, 'production.test.ts'),
+    )
 
-    expect(ruleMessages(report, 'no-chained-type-assertions')).toHaveLength(3)
+    expect(ruleLines(report, 'no-chained-type-assertions')).toEqual([2, 3, 4])
   })
 
   test('checks only configured const widening targets', () => {
     const root = fixture('no-known-value-widening')
-    const report = lint(root, resolve(root, 'input.ts'))
+    const primitive = lint('primitive.oxlintrc.json', root, resolve(root, 'input.ts'))
+    const record = lint('record.oxlintrc.json', root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-known-value-widening')).toHaveLength(3)
+    expect(ruleLines(primitive, 'no-known-value-widening')).toEqual([5, 6])
+    expect(ruleLines(record, 'no-known-value-widening')).toEqual([7])
   })
 
   test('allows only canonical Proxy get forwarding', () => {
     const root = fixture('no-reflect-get')
-    const report = lint(root, resolve(root, 'input.ts'))
+    const report = lint('fixture.oxlintrc.json', root, resolve(root, 'input.ts'))
 
     expect(ruleLines(report, 'no-reflect-get')).toEqual([5, 15, 22, 31, 42, 49, 66])
   })
@@ -60,6 +72,7 @@ describe('@wystack/lint', () => {
   test('applies module-mock policy only to consumer-selected domain test paths', () => {
     const root = fixture('no-module-mocks-in-domain-tests')
     const report = lint(
+      'fixture.oxlintrc.json',
       root,
       resolve(root, 'engine.domain.test.ts'),
       resolve(root, 'namespace.domain.test.ts'),
@@ -69,13 +82,20 @@ describe('@wystack/lint', () => {
       resolve(root, 'component.test.ts'),
     )
 
-    expect(ruleMessages(report, 'no-module-mocks-in-domain-tests')).toHaveLength(4)
+    expect(ruleLocations(report, 'no-module-mocks-in-domain-tests')).toEqual([
+      'engine.domain.test.ts:3',
+      'global.domain.test.ts:1',
+      'late-import.domain.test.ts:1',
+      'namespace.domain.test.ts:3',
+    ])
   })
 
-  test('rejects only exact configured placeholder declaration names', () => {
+  test('rejects only exact configured placeholder declaration and member names', () => {
     const root = fixture('no-placeholder-symbol-names')
-    const report = lint(root, resolve(root, 'input.ts'))
+    const report = lint('fixture.oxlintrc.json', root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-placeholder-symbol-names')).toHaveLength(13)
+    expect(ruleLines(report, 'no-placeholder-symbol-names')).toEqual([
+      1, 4, 5, 11, 16, 21, 23, 24, 28, 31, 32, 34, 39,
+    ])
   })
 })

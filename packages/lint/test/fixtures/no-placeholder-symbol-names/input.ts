@@ -28,6 +28,12 @@ enum PlaceholderEnum {
   shape,
 }
 
+declare function ambientPlaceholder(shape: string): void
+type PlaceholderCallback = (shape: string) => void
+declare class AmbientPlaceholder {
+  method(shape: string): void
+}
+
 {
   const { shape: destructuredShape } = { shape: 'domain-vocabulary-is-allowed' }
   const { shape } = { shape: 'unhelpful' }

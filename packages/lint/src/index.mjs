@@ -14,11 +14,14 @@ const unwrapParameter = (parameter) => {
 
 const annotationType = (node) => node?.typeAnnotation?.typeAnnotation
 
+const hasStaticObjectKeys = (node) =>
+  node?.type === 'ObjectExpression' &&
+  node.properties.every((property) => property.type === 'Property' && !property.computed)
+
 const isStaticValue = (node) =>
   node?.type === 'Literal' ||
   (node?.type === 'TemplateLiteral' && node.expressions.length === 0) ||
-  node?.type === 'ObjectExpression' ||
-  node?.type === 'ArrayExpression'
+  hasStaticObjectKeys(node)
 
 const isPrimitiveAnnotation = (node) =>
   node?.type === 'TSStringKeyword' ||
@@ -408,7 +411,7 @@ const noPlaceholderSymbolNames = {
     type: 'suggestion',
     docs: {
       description:
-        'Disallow configured placeholder names in declarations and named members; match exact names so domain vocabulary remains available.',
+        'Disallow configured placeholder names in declarations and named type or class members; match exact names so domain vocabulary remains available.',
     },
     schema: [
       {
@@ -510,6 +513,9 @@ const noPlaceholderSymbolNames = {
         checkParameters(node)
       },
       ArrowFunctionExpression: checkParameters,
+      TSDeclareFunction: checkParameters,
+      TSFunctionType: checkParameters,
+      TSEmptyBodyFunctionExpression: checkParameters,
       CatchClause(node) {
         checkBinding(node.param)
       },
@@ -554,7 +560,6 @@ const noPlaceholderSymbolNames = {
       },
       TSEnumMember: checkEnumMember,
       TSTypeParameter: checkTypeParameter,
-      Property: checkNamedKey,
       MethodDefinition: checkNamedKey,
       PropertyDefinition: checkNamedKey,
       TSPropertySignature: checkNamedKey,

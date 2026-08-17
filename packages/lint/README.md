@@ -47,8 +47,9 @@ Vitest and Vite+ Test (`vite-plus/test`). Apply it only to a consumer's domain
 test globs through standard overrides. For a test runner that exposes globals,
 pass its permitted names through `globalBindings` (for example `['vi']`), so
 ordinary local bindings remain excluded. `no-placeholder-symbol-names` requires
-an exact `names` denylist for declarations and non-computed named members; it
-never rejects a domain name merely because it contains a discouraged word.
+an exact `names` denylist for declarations and non-computed class or type
+members; it never rejects a domain name merely because it contains a
+discouraged word.
 
 See [the rule roadmap](./ROADMAP.md) for the deliberately deferred rules that
 need richer analysis than an AST-only plugin can provide safely.
