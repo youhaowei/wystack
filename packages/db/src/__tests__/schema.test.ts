@@ -47,6 +47,17 @@ describe('defineSchema', () => {
     expect(cols.description.notNull).toBe(false)
   })
 
+  test('explicitly nullable columns are nullable without becoming optional', () => {
+    const schema = defineSchema({
+      items: {
+        id: int.primaryKey(),
+        assigneeId: uuid.nullable(),
+      },
+    })
+
+    expect(getTableColumns(schema.items).assigneeId.notNull).toBe(false)
+  })
+
   test('non-optional columns are notNull', () => {
     const schema = defineSchema({
       items: {

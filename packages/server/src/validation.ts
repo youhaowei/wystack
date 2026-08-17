@@ -6,7 +6,7 @@ import { z } from 'zod'
 import type { AnyColumnDef } from '@wystack/db'
 
 function columnToZod(col: AnyColumnDef): z.ZodType {
-  const { type, isOptional, isArray, hasDefault } = col.opts
+  const { type, isOptional, isNullable, isArray, hasDefault } = col.opts
 
   let schema: z.ZodType
   switch (type) {
@@ -33,6 +33,7 @@ function columnToZod(col: AnyColumnDef): z.ZodType {
   }
 
   if (isArray) schema = z.array(schema)
+  if (isNullable) schema = schema.nullable()
   if (isOptional) schema = schema.optional()
   if (hasDefault) {
     schema = schema.optional()

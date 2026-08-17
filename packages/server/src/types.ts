@@ -36,7 +36,7 @@ export type FunctionContext<TAppContext extends object = Record<string, unknown>
 export type InferArg<C> = InferColumn<C>
 
 /** True when a ColumnDef carries the optional flag (`.optional()`). */
-type IsOptionalColumn<C> = C extends ColumnDef<unknown, infer Opt> ? Opt : false
+type IsOptionalColumn<C> = C extends ColumnDef<unknown, infer Opt, boolean> ? Opt : false
 
 /**
  * Maps a table of DSL columns to a procedure's arg object, honoring optionality

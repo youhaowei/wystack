@@ -37,6 +37,14 @@ type _RequiredKeyEnforced = Expect<{ note: 'x' } extends Args ? false : true>
 type AllOptional = InferArgs<{ a: ColumnDef<string, true>; b: ColumnDef<number, true> }>
 type _AllOptionalEmpty = Expect<{} extends AllOptional ? true : false>
 
+// Nullable and optional are independent: callers may omit a patch field,
+// explicitly clear it with null, or provide a concrete value.
+type NullablePatch = InferArgs<{ assigneeId: ColumnDef<string, true, true> }>
+type _NullablePatchOmittable = Expect<{} extends NullablePatch ? true : false>
+type _NullablePatchClearable = Expect<{ assigneeId: null } extends NullablePatch ? true : false>
+type _NullablePatchSettable = Expect<{ assigneeId: string } extends NullablePatch ? true : false>
+type _NullablePatchTyped = Expect<{ assigneeId: number } extends NullablePatch ? false : true>
+
 // Reference the assertions so they are not flagged as unused if that lint is enabled.
 export type __InferArgsOptionalityContract = [
   _OptionalKeyOmittable,
@@ -44,4 +52,8 @@ export type __InferArgsOptionalityContract = [
   _OptionalValueTyped,
   _RequiredKeyEnforced,
   _AllOptionalEmpty,
+  _NullablePatchOmittable,
+  _NullablePatchClearable,
+  _NullablePatchSettable,
+  _NullablePatchTyped,
 ]
