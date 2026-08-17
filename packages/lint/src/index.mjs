@@ -16,7 +16,7 @@ const annotationType = (node) => node?.typeAnnotation?.typeAnnotation
 
 const isStaticValue = (node) =>
   node?.type === 'Literal' ||
-  node?.type === 'TemplateLiteral' ||
+  (node?.type === 'TemplateLiteral' && node.expressions.length === 0) ||
   node?.type === 'ObjectExpression' ||
   node?.type === 'ArrayExpression'
 
@@ -44,7 +44,22 @@ const functionParent = (node) => {
   return current
 }
 
-const isProxyGetTrap = (node) => {
+const isUnshadowedGlobal = (context, identifier) => {
+  let scope = context.sourceCode.getScope(identifier)
+
+  while (scope) {
+    const variable = scope.variables?.find((candidate) => candidate.name === identifier.name)
+    if (variable) {
+      return (variable.defs?.length ?? 0) === 0
+    }
+
+    scope = scope.upper
+  }
+
+  return true
+}
+
+const isProxyGetTrap = (node, context) => {
   const property = node.parent
   if (property?.type !== 'Property' || property.key?.name !== 'get') {
     return false
@@ -60,6 +75,7 @@ const isProxyGetTrap = (node) => {
     proxy?.type === 'NewExpression' &&
     proxy.callee?.type === 'Identifier' &&
     proxy.callee.name === 'Proxy' &&
+    isUnshadowedGlobal(context, proxy.callee) &&
     proxy.arguments?.[1] === handler
   )
 }
@@ -79,9 +95,9 @@ const isImportedBinding = (context, identifier, imports) => {
   return false
 }
 
-const isCanonicalProxyForward = (node) => {
+const isCanonicalProxyForward = (node, context) => {
   const trap = functionParent(node)
-  if (!trap || !isProxyGetTrap(trap) || trap.params.length < 3) {
+  if (!trap || !isProxyGetTrap(trap, context) || trap.params.length < 3) {
     return false
   }
 
@@ -257,7 +273,11 @@ const noReflectGet = {
           ((callee.computed === false && callee.property?.name === 'get') ||
             (callee.computed === true && callee.property?.value === 'get'))
 
-        if (isReflectGet && !isCanonicalProxyForward(node)) {
+        if (
+          isReflectGet &&
+          isUnshadowedGlobal(context, callee.object) &&
+          !isCanonicalProxyForward(node, context)
+        ) {
           context.report({ node, messageId: 'useTypedAccess' })
         }
       },
@@ -382,18 +402,76 @@ const noPlaceholderSymbolNames = {
       }
     }
 
+    const checkBinding = (node) => {
+      if (isIdentifier(node)) {
+        check(node)
+        return
+      }
+
+      if (node?.type === 'AssignmentPattern') {
+        checkBinding(node.left)
+        return
+      }
+
+      if (node?.type === 'RestElement' || node?.type === 'TSParameterProperty') {
+        checkBinding(node.argument ?? node.parameter)
+        return
+      }
+
+      if (node?.type === 'ArrayPattern') {
+        for (const element of node.elements ?? []) {
+          checkBinding(element)
+        }
+        return
+      }
+
+      if (node?.type === 'ObjectPattern') {
+        for (const property of node.properties ?? []) {
+          checkBinding(property.value ?? property.argument)
+        }
+      }
+    }
+
+    const checkParameters = (node) => {
+      for (const parameter of node.params ?? []) {
+        checkBinding(parameter)
+      }
+    }
+
+    const checkNamedKey = (node) => {
+      if (!node.computed && isIdentifier(node.key)) {
+        check(node.key)
+      }
+    }
+
     return {
       VariableDeclarator(node) {
-        if (isIdentifier(node.id)) {
-          check(node.id)
-        }
+        checkBinding(node.id)
       },
       FunctionDeclaration(node) {
         if (isIdentifier(node.id)) {
           check(node.id)
         }
+
+        checkParameters(node)
+      },
+      FunctionExpression(node) {
+        if (isIdentifier(node.id)) {
+          check(node.id)
+        }
+
+        checkParameters(node)
+      },
+      ArrowFunctionExpression: checkParameters,
+      CatchClause(node) {
+        checkBinding(node.param)
       },
       ClassDeclaration(node) {
+        if (isIdentifier(node.id)) {
+          check(node.id)
+        }
+      },
+      ClassExpression(node) {
         if (isIdentifier(node.id)) {
           check(node.id)
         }
@@ -408,6 +486,30 @@ const noPlaceholderSymbolNames = {
           check(node.id)
         }
       },
+      TSEnumDeclaration(node) {
+        if (isIdentifier(node.id)) {
+          check(node.id)
+        }
+      },
+      TSModuleDeclaration(node) {
+        if (isIdentifier(node.id)) {
+          check(node.id)
+        }
+      },
+      ImportSpecifier(node) {
+        checkBinding(node.local)
+      },
+      ImportDefaultSpecifier(node) {
+        checkBinding(node.local)
+      },
+      ImportNamespaceSpecifier(node) {
+        checkBinding(node.local)
+      },
+      Property: checkNamedKey,
+      MethodDefinition: checkNamedKey,
+      PropertyDefinition: checkNamedKey,
+      TSPropertySignature: checkNamedKey,
+      TSMethodSignature: checkNamedKey,
     }
   },
 }

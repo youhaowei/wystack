@@ -51,7 +51,7 @@ describe('@wystack/lint', () => {
     const root = fixture('no-reflect-get')
     const report = lint(root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-reflect-get')).toHaveLength(3)
+    expect(ruleMessages(report, 'no-reflect-get')).toHaveLength(4)
   })
 
   test('applies module-mock policy only to consumer-selected domain test paths', () => {
@@ -72,6 +72,6 @@ describe('@wystack/lint', () => {
     const root = fixture('no-placeholder-symbol-names')
     const report = lint(root, resolve(root, 'input.ts'))
 
-    expect(ruleMessages(report, 'no-placeholder-symbol-names')).toHaveLength(1)
+    expect(ruleMessages(report, 'no-placeholder-symbol-names')).toHaveLength(6)
   })
 })

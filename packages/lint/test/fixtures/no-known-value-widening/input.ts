@@ -3,12 +3,14 @@ declare const source: string
 const widenedPrimitive: string = 'known'
 const widenedTemplate: string = `known`
 const widenedRecord: Record<string, string> = { primary: 'blue' }
+const dynamicTemplate: string = `${source}`
 const inferredPrimitive = 'known'
 const checkedRecord = { primary: 'blue' } satisfies Record<string, string>
 const publicBoundary: string = source
 
 void widenedPrimitive
 void widenedRecord
+void dynamicTemplate
 void inferredPrimitive
 void checkedRecord
 void publicBoundary

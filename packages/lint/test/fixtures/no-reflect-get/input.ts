@@ -25,6 +25,25 @@ const targetGetMethod = new Proxy(
   {},
 )
 
+{
+  const Reflect = { get: () => undefined }
+  Reflect.get(target, property, receiver)
+}
+
+{
+  const Proxy = class {
+    constructor(..._arguments: unknown[]) {}
+  }
+
+  const shadowedProxy = new Proxy(target, {
+    get(target, property, receiver) {
+      return Reflect.get(target, property, receiver)
+    },
+  })
+
+  void shadowedProxy
+}
+
 void forwarded
 void wrongReceiver
 void targetGetMethod
