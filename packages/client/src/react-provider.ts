@@ -2,24 +2,33 @@ import { createContext, createElement, useContext, useEffect } from 'react'
 import type { Client } from './core-client.js'
 
 const WyStackContext = createContext<Client | null>(null)
-const mountedProviders = new WeakMap<Client, number>()
+type ClientLifecycle = { mounts: number; disconnectVersion: number }
+const clientLifecycles = new WeakMap<Client, ClientLifecycle>()
 
 /** Transport-neutral provider shared by every React renderer. */
 export function WyStackProvider(props: { client: Client; children: React.ReactNode }) {
   useEffect(() => {
-    const mounts = mountedProviders.get(props.client) ?? 0
-    if (mounts === 0) props.client.connect()
-    mountedProviders.set(props.client, mounts + 1)
+    let lifecycle = clientLifecycles.get(props.client)
+    if (!lifecycle) {
+      props.client.connect()
+      lifecycle = { mounts: 0, disconnectVersion: 0 }
+      clientLifecycles.set(props.client, lifecycle)
+    }
+
+    lifecycle.mounts += 1
+    lifecycle.disconnectVersion += 1
 
     return () => {
-      const remaining = (mountedProviders.get(props.client) ?? 1) - 1
-      if (remaining > 0) {
-        mountedProviders.set(props.client, remaining)
-        return
-      }
+      lifecycle.mounts -= 1
+      if (lifecycle.mounts > 0) return
 
-      mountedProviders.delete(props.client)
-      props.client.disconnect()
+      const disconnectVersion = ++lifecycle.disconnectVersion
+      void Promise.resolve().then(() => {
+        if (lifecycle.mounts > 0 || lifecycle.disconnectVersion !== disconnectVersion) return
+
+        clientLifecycles.delete(props.client)
+        props.client.disconnect()
+      })
     }
   }, [props.client])
 

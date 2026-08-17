@@ -17,7 +17,7 @@ import './setup.dom'
 
 import { describe, test, expect, mock, afterAll } from 'bun:test'
 import { GlobalRegistrator } from '@happy-dom/global-registrator'
-import { createElement, type ReactNode } from 'react'
+import { createElement, StrictMode, type ReactNode } from 'react'
 import { render, renderHook, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { WyStackProvider } from '../provider'
@@ -169,7 +169,34 @@ describe('useQuery', () => {
     expect(disconnect).not.toHaveBeenCalled()
 
     view.unmount()
-    expect(disconnect).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(disconnect).toHaveBeenCalledTimes(1))
+  })
+
+  test('keeps the client connected through StrictMode effect rehearsal', async () => {
+    const connect = mock(() => {})
+    const disconnect = mock(() => {})
+    const client: Client = {
+      connect,
+      disconnect,
+      subscribe: mock(() => () => {}),
+      query: mock(() => Promise.resolve(null)) as Client['query'],
+      mutate: mock(() => Promise.resolve(null)) as Client['mutate'],
+      action: mock(() => Promise.resolve(null)) as Client['action'],
+    }
+
+    const view = render(
+      createElement(
+        StrictMode,
+        null,
+        createElement(ReactWyStackProvider, { client, children: 'content' }),
+      ),
+    )
+
+    await waitFor(() => expect(connect).toHaveBeenCalledTimes(1))
+    expect(disconnect).not.toHaveBeenCalled()
+
+    view.unmount()
+    await waitFor(() => expect(disconnect).toHaveBeenCalledTimes(1))
   })
 
   test('works with a transport-neutral client', async () => {
@@ -201,7 +228,7 @@ describe('useQuery', () => {
     unmount()
 
     expect(unsubscribe).toHaveBeenCalledTimes(1)
-    expect(disconnect).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(disconnect).toHaveBeenCalledTimes(1))
   })
 
   test('fetches via client.query and returns data on success', async () => {
