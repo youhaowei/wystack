@@ -5,6 +5,8 @@ declare const runtimeKey: string
 const widenedPrimitive: string = 'known'
 const widenedTemplate: string = `known`
 const widenedRecord: Record<string, string> = { primary: 'blue' }
+const widenedUnionRecord: Record<string | number, string> = { primary: 'blue' }
+const widenedPropertyKeyRecord: Record<PropertyKey, string> = { primary: 'blue' }
 const finiteRecord: Record<'primary', string> = { primary: 'blue' }
 const dynamicTemplate: string = `${source}`
 const copiedRecord: Record<string, string> = { ...palette }
@@ -15,6 +17,8 @@ const publicBoundary: string = source
 
 void widenedPrimitive
 void widenedRecord
+void widenedUnionRecord
+void widenedPropertyKeyRecord
 void finiteRecord
 void dynamicTemplate
 void copiedRecord

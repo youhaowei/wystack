@@ -34,11 +34,14 @@ const isRecordAnnotation = (node) => {
   }
 
   const keyType = (node.typeArguments?.params ?? node.typeParameters?.params ?? [])[0]
-  return (
-    keyType?.type === 'TSStringKeyword' ||
-    keyType?.type === 'TSNumberKeyword' ||
-    keyType?.type === 'TSSymbolKeyword'
-  )
+  const isOpenKeyType = (type) =>
+    type?.type === 'TSStringKeyword' ||
+    type?.type === 'TSNumberKeyword' ||
+    type?.type === 'TSSymbolKeyword' ||
+    (type?.type === 'TSUnionType' && type.types.every(isOpenKeyType)) ||
+    (type?.type === 'TSTypeReference' && type.typeName?.name === 'PropertyKey')
+
+  return isOpenKeyType(keyType)
 }
 
 const functionParent = (node) => {
