@@ -25,8 +25,6 @@ const isPrimitiveAnnotation = (node) =>
   node?.type === 'TSNumberKeyword' ||
   node?.type === 'TSBooleanKeyword'
 
-const isArrayAnnotation = (node) => node?.type === 'TSArrayType'
-
 const isRecordAnnotation = (node) =>
   node?.type === 'TSTypeReference' && node.typeName?.name === 'Record'
 
@@ -35,8 +33,8 @@ const functionParent = (node) => {
 
   while (
     current &&
-    current.type !== 'FunctionExpression' &&
-    current.type !== 'ArrowFunctionExpression'
+    !current.type.endsWith('FunctionExpression') &&
+    current.type !== 'FunctionDeclaration'
   ) {
     current = current.parent
   }
@@ -44,19 +42,24 @@ const functionParent = (node) => {
   return current
 }
 
-const isUnshadowedGlobal = (context, identifier) => {
+const findVariable = (context, identifier) => {
   let scope = context.sourceCode.getScope(identifier)
 
   while (scope) {
     const variable = scope.variables?.find((candidate) => candidate.name === identifier.name)
     if (variable) {
-      return (variable.defs?.length ?? 0) === 0
+      return variable
     }
 
     scope = scope.upper
   }
 
-  return true
+  return undefined
+}
+
+const isUnshadowedGlobal = (context, identifier) => {
+  const variable = findVariable(context, identifier)
+  return !variable || (variable.defs?.length ?? 0) === 0
 }
 
 const isProxyGetTrap = (node, context) => {
@@ -101,18 +104,43 @@ const isCanonicalProxyForward = (node, context) => {
     return false
   }
 
-  const parameterNames = trap.params
-    .slice(0, 3)
-    .map(unwrapParameter)
-    .map((parameter) => (isIdentifier(parameter) ? parameter.name : undefined))
+  const parameters = trap.params.slice(0, 3).map(unwrapParameter).filter(isIdentifier)
 
-  if (parameterNames.some((name) => name === undefined) || node.arguments.length !== 3) {
+  if (
+    parameters.length !== 3 ||
+    node.arguments.length !== 3 ||
+    node.parent?.type !== 'ReturnStatement'
+  ) {
     return false
   }
 
   return node.arguments.every(
-    (argument, index) => isIdentifier(argument) && argument.name === parameterNames[index],
+    (argument, index) =>
+      isIdentifier(argument) &&
+      findVariable(context, argument) === findVariable(context, parameters[index]),
   )
+}
+
+const hasBroadObjectType = (node) => {
+  if (node?.type === 'TSObjectKeyword') {
+    return true
+  }
+
+  if (node?.type === 'TSUnionType' || node?.type === 'TSIntersectionType') {
+    return node.types.some(hasBroadObjectType)
+  }
+
+  return false
+}
+
+const unwrapAssertionExpression = (node) => {
+  let expression = node
+
+  while (expression?.type === 'TSNonNullExpression') {
+    expression = expression.expression
+  }
+
+  return expression
 }
 
 const noObjectParameters = {
@@ -132,7 +160,7 @@ const noObjectParameters = {
       for (const parameter of node.params ?? []) {
         const value = unwrapParameter(parameter)
         const annotation = annotationType(value)
-        if (annotation?.type === 'TSObjectKeyword') {
+        if (hasBroadObjectType(annotation)) {
           context.report({ node: annotation, messageId: 'useConstraint' })
         }
       }
@@ -147,6 +175,7 @@ const noObjectParameters = {
       TSDeclareFunction: checkParameters,
       TSFunctionType: checkParameters,
       TSMethodSignature: checkParameters,
+      TSEmptyBodyFunctionExpression: checkParameters,
     }
   },
 }
@@ -167,16 +196,16 @@ const noChainedTypeAssertions = {
     return {
       TSAsExpression(node) {
         if (
-          node.expression?.type === 'TSAsExpression' ||
-          node.expression?.type === 'TSTypeAssertion'
+          unwrapAssertionExpression(node.expression)?.type === 'TSAsExpression' ||
+          unwrapAssertionExpression(node.expression)?.type === 'TSTypeAssertion'
         ) {
           context.report({ node, messageId: 'noChain' })
         }
       },
       TSTypeAssertion(node) {
         if (
-          node.expression?.type === 'TSAsExpression' ||
-          node.expression?.type === 'TSTypeAssertion'
+          unwrapAssertionExpression(node.expression)?.type === 'TSAsExpression' ||
+          unwrapAssertionExpression(node.expression)?.type === 'TSTypeAssertion'
         ) {
           context.report({ node, messageId: 'noChain' })
         }
@@ -190,7 +219,7 @@ const noKnownValueWidening = {
     type: 'suggestion',
     docs: {
       description:
-        'Keep known constant values precise when a primitive, array, or Record annotation would discard useful literal or key information.',
+        'Keep known constant values precise when a primitive or Record annotation would discard useful literal or key information.',
     },
     schema: [
       {
@@ -199,7 +228,7 @@ const noKnownValueWidening = {
           targets: {
             type: 'array',
             items: {
-              enum: ['primitive', 'array', 'record'],
+              enum: ['primitive', 'record'],
             },
             uniqueItems: true,
           },
@@ -213,7 +242,7 @@ const noKnownValueWidening = {
     },
   },
   create(context) {
-    const targets = new Set(context.options[0]?.targets ?? ['primitive', 'array', 'record'])
+    const targets = new Set(context.options[0]?.targets ?? ['primitive', 'record'])
 
     return {
       VariableDeclarator(node) {
@@ -235,9 +264,6 @@ const noKnownValueWidening = {
           (targets.has('primitive') &&
             (node.init.type === 'Literal' || node.init.type === 'TemplateLiteral') &&
             isPrimitiveAnnotation(annotation)) ||
-          (targets.has('array') &&
-            node.init.type === 'ArrayExpression' &&
-            isArrayAnnotation(annotation)) ||
           (targets.has('record') &&
             node.init.type === 'ObjectExpression' &&
             isRecordAnnotation(annotation))
@@ -301,6 +327,11 @@ const noModuleMocksInDomainTests = {
             items: { type: 'string' },
             uniqueItems: true,
           },
+          globalBindings: {
+            type: 'array',
+            items: { type: 'string', minLength: 1 },
+            uniqueItems: true,
+          },
         },
         additionalProperties: false,
       },
@@ -312,6 +343,7 @@ const noModuleMocksInDomainTests = {
   },
   create(context) {
     const testModules = new Set(context.options[0]?.testModules ?? ['vitest', 'vite-plus/test'])
+    const globalBindings = new Set(context.options[0]?.globalBindings ?? [])
     const mockBindings = new Set()
     const testNamespaces = new Set()
     const candidates = []
@@ -351,7 +383,10 @@ const noModuleMocksInDomainTests = {
         for (const node of candidates) {
           const callee = node.callee
           const isDirectMock =
-            isIdentifier(callee.object) && isImportedBinding(context, callee.object, mockBindings)
+            isIdentifier(callee.object) &&
+            (isImportedBinding(context, callee.object, mockBindings) ||
+              (globalBindings.has(callee.object.name) &&
+                isUnshadowedGlobal(context, callee.object)))
           const isNamespaceMock =
             callee.object?.type === 'MemberExpression' &&
             isIdentifier(callee.object.object) &&
@@ -373,7 +408,7 @@ const noPlaceholderSymbolNames = {
     type: 'suggestion',
     docs: {
       description:
-        'Disallow configured placeholder names in declarations; match exact names so domain vocabulary remains available.',
+        'Disallow configured placeholder names in declarations and named members; match exact names so domain vocabulary remains available.',
     },
     schema: [
       {
@@ -439,8 +474,20 @@ const noPlaceholderSymbolNames = {
     }
 
     const checkNamedKey = (node) => {
-      if (!node.computed && isIdentifier(node.key)) {
+      if (node.parent?.type !== 'ObjectPattern' && !node.computed && isIdentifier(node.key)) {
         check(node.key)
+      }
+    }
+
+    const checkEnumMember = (node) => {
+      if (isIdentifier(node.id)) {
+        check(node.id)
+      }
+    }
+
+    const checkTypeParameter = (node) => {
+      if (isIdentifier(node.name)) {
+        check(node.name)
       }
     }
 
@@ -505,11 +552,19 @@ const noPlaceholderSymbolNames = {
       ImportNamespaceSpecifier(node) {
         checkBinding(node.local)
       },
+      TSEnumMember: checkEnumMember,
+      TSTypeParameter: checkTypeParameter,
       Property: checkNamedKey,
       MethodDefinition: checkNamedKey,
       PropertyDefinition: checkNamedKey,
       TSPropertySignature: checkNamedKey,
-      TSMethodSignature: checkNamedKey,
+      TSMethodSignature(node) {
+        checkNamedKey(node)
+        checkParameters(node)
+      },
+      TSIndexSignature: checkParameters,
+      TSCallSignatureDeclaration: checkParameters,
+      TSConstructSignatureDeclaration: checkParameters,
     }
   },
 }

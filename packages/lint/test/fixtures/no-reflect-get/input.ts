@@ -25,6 +25,32 @@ const targetGetMethod = new Proxy(
   {},
 )
 
+const nestedFunction = new Proxy(target, {
+  get(target, property, receiver) {
+    function reflectFromDifferentScope(target: object, property: string, receiver: object) {
+      return Reflect.get(target, property, receiver)
+    }
+
+    return reflectFromDifferentScope(target, property, receiver)
+  },
+})
+
+const shadowedParameter = new Proxy(target, {
+  get(target, property, receiver) {
+    {
+      const target = {}
+      return Reflect.get(target, property, receiver)
+    }
+  },
+})
+
+const ignoredForward = new Proxy(target, {
+  get(target, property, receiver) {
+    Reflect.get(target, property, receiver)
+    return target[property]
+  },
+})
+
 {
   const Reflect = { get: () => undefined }
   Reflect.get(target, property, receiver)
@@ -47,3 +73,6 @@ const targetGetMethod = new Proxy(
 void forwarded
 void wrongReceiver
 void targetGetMethod
+void nestedFunction
+void shadowedParameter
+void ignoredForward

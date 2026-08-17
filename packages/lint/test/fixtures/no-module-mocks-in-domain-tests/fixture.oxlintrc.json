@@ -5,7 +5,7 @@
     {
       "files": ["**/*.domain.test.ts"],
       "rules": {
-        "wystack/no-module-mocks-in-domain-tests": ["error", { "testModules": ["vite-plus/test"] }]
+        "wystack/no-module-mocks-in-domain-tests": ["error", { "testModules": ["vite-plus/test"], "globalBindings": ["vi"] }]
       }
     }
   ]
