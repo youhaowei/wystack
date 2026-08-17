@@ -1,0 +1,23 @@
+{
+  "name": "@wystack/lint",
+  "version": "0.0.1",
+  "description": "Reusable, configurable Oxlint rules for WyStack applications",
+  "files": [
+    "src",
+    "README.md",
+    "ROADMAP.md"
+  ],
+  "type": "module",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "build": "bun --check src/index.mjs",
+    "typecheck": "bun --check src/index.mjs",
+    "test": "bun test test/rules.test.mjs"
+  },
+  "devDependencies": {
+    "oxlint": "1.62.0"
+  }
+}
