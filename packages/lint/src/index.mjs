@@ -28,8 +28,12 @@ const isPrimitiveAnnotation = (node) =>
   node?.type === 'TSNumberKeyword' ||
   node?.type === 'TSBooleanKeyword'
 
-const isRecordAnnotation = (node) => {
-  if (node?.type !== 'TSTypeReference' || node.typeName?.name !== 'Record') {
+const isRecordAnnotation = (node, context) => {
+  if (
+    node?.type !== 'TSTypeReference' ||
+    node.typeName?.name !== 'Record' ||
+    !isUnshadowedGlobal(context, node.typeName)
+  ) {
     return false
   }
 
@@ -38,8 +42,10 @@ const isRecordAnnotation = (node) => {
     type?.type === 'TSStringKeyword' ||
     type?.type === 'TSNumberKeyword' ||
     type?.type === 'TSSymbolKeyword' ||
-    (type?.type === 'TSUnionType' && type.types.every(isOpenKeyType)) ||
-    (type?.type === 'TSTypeReference' && type.typeName?.name === 'PropertyKey')
+    (type?.type === 'TSUnionType' && type.types.some(isOpenKeyType)) ||
+    (type?.type === 'TSTypeReference' &&
+      type.typeName?.name === 'PropertyKey' &&
+      isUnshadowedGlobal(context, type.typeName))
 
   return isOpenKeyType(keyType)
 }
@@ -282,7 +288,7 @@ const noKnownValueWidening = {
             isPrimitiveAnnotation(annotation)) ||
           (targets.has('record') &&
             node.init.type === 'ObjectExpression' &&
-            isRecordAnnotation(annotation))
+            isRecordAnnotation(annotation, context))
 
         if (hasTarget) {
           context.report({ node: annotation, messageId: 'preserveKnownValue' })

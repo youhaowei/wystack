@@ -59,7 +59,7 @@ describe('@wystack/lint', () => {
     const record = lint('record.oxlintrc.json', root, resolve(root, 'input.ts'))
 
     expect(ruleLines(primitive, 'no-known-value-widening')).toEqual([5, 6])
-    expect(ruleLines(record, 'no-known-value-widening')).toEqual([7, 8, 9])
+    expect(ruleLines(record, 'no-known-value-widening')).toEqual([7, 8, 9, 10, 11])
   })
 
   test('allows only canonical Proxy get forwarding', () => {
