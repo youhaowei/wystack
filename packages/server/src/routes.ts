@@ -67,9 +67,9 @@ import {
   InvalidClientContextError,
   readHttpClientContext,
   validateIncomingClientContext,
-  withoutClientContextHeader,
   type ValidateClientContext,
 } from './client-context'
+import { createResolverRequest, type TrustedRequestHeaders } from './resolver-request'
 
 // Re-export buildAuthRequest from Session so external consumers that import it
 // from routes.ts (e.g. transport.test.ts) still resolve cleanly.
@@ -107,7 +107,7 @@ export interface RouteOptions {
   app: WyStackApp
   /** URL prefix for all routes. Default: '/api' */
   prefix?: string
-  /** Resolve trusted request identity plus the separately validated app context. */
+  /** Verify projected request credentials and combine them with validated app context. */
   resolveContext?: (
     req: Request,
     clientContext: Readonly<Record<string, unknown>>,
@@ -118,6 +118,12 @@ export interface RouteOptions {
    * envelopes instead of passing them through.
    */
   validateClientContext?: ValidateClientContext
+  /**
+   * Additional ingress-owned headers exposed to resolveContext. Authorization
+   * and Cookie are exposed by default. Configure proxy identity headers only
+   * when a trusted ingress overwrites or removes client-supplied values.
+   */
+  trustedRequestHeaders?: TrustedRequestHeaders
   /**
    * Opt-in browser CORS response policy. Untrusted origins receive no CORS
    * headers. This does not provide CSRF protection or reject WebSocket origins.
@@ -136,6 +142,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
   const { app, prefix = '/api' } = opts
   const resolveContext = opts.resolveContext
   const validateClientContext = opts.validateClientContext
+  const trustedRequestHeaders = opts.trustedRequestHeaders
   const authTimeoutMs = opts.authTimeoutMs ?? 10_000
 
   const hono = new Hono()
@@ -146,7 +153,10 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
       validateClientContext,
     )
     return resolveContext
-      ? ((await resolveContext(withoutClientContextHeader(request), clientContext)) ?? {})
+      ? ((await resolveContext(
+          createResolverRequest(request, trustedRequestHeaders),
+          clientContext,
+        )) ?? {})
       : {}
   }
 
@@ -289,6 +299,7 @@ export function createRoutes(opts: RouteOptions, upgradeWebSocket: UpgradeWebSoc
             app,
             resolveContext,
             validateClientContext,
+            trustedRequestHeaders,
             authTimeoutMs,
             baseRequest: upgradeRequest,
             onClose: mapCloseCode,

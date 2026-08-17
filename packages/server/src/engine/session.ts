@@ -23,8 +23,8 @@
 // and removes the duplication. Editing `routes.ts` here is out of scope.
 
 import { isIdentityProviderUnavailable } from '@wystack/identity'
-import { CLIENT_CONTEXT_HEADER } from '@wystack/transport'
 import { validateIncomingClientContext, type ValidateClientContext } from '../client-context'
+import { createResolverRequest, type TrustedRequestHeaders } from '../resolver-request'
 
 /**
  * Transport-neutral reason a Session asks the connection to close. The adapter
@@ -38,10 +38,10 @@ import { validateIncomingClientContext, type ValidateClientContext } from '../cl
 export type CloseReason = 'auth-failed' | 'transient'
 
 /**
- * Resolves a connection's auth context from a synthetic `Request`. Same shape
- * as the shipped `RouteOptions.resolveContext` — `Request` is a Fetch standard,
- * not HTTP-server-specific, so it carries cleanly over any Pipe. The Session
- * synthesizes the Request from the auth-frame token via `buildAuthRequest`.
+ * Resolves a connection's auth context from a projected credential `Request`.
+ * Same shape as the shipped `RouteOptions.resolveContext` — `Request` is a
+ * Fetch standard, not HTTP-server-specific, so it carries cleanly over any
+ * Pipe. The Session synthesizes it from the auth-frame token.
  */
 export type ResolveContext = (
   req: Request,
@@ -52,24 +52,28 @@ export type ResolveContext = (
  * Build the synthetic `Request` passed to `resolveContext`.
  *
  * Non-empty string `token` → layer `Authorization: Bearer ${token}` over the
- * connection's base headers. `null` (anonymous) → strip any inherited
+ * projected credential headers. `null` (anonymous) → strip any inherited
  * Authorization so the auth frame is the sole identity source — a null-token
  * client cannot silently inherit an identity leaked via cookie proxy, reverse
  * proxy, or stale query handoff. Mirrors `routes.ts:buildAuthRequest`.
  *
- * `base` is the connection's origin request (cookies, forwarded headers, URL).
- * Pipe-based transports with no HTTP origin pass a minimal `Request` (e.g.
- * `new Request('wystack://pipe')`); the URL is opaque to `resolveContext`.
+ * `base` is the connection's origin request. Only Authorization, Cookie, and
+ * explicitly configured ingress-owned headers cross into `resolveContext`.
+ * Pipe-based transports with no HTTP origin pass a minimal `Request`; the URL
+ * is opaque to `resolveContext`.
  */
-export function buildAuthRequest(base: Request, token: string | null): Request {
-  const headers = new Headers(base.headers)
-  headers.delete(CLIENT_CONTEXT_HEADER)
+export function buildAuthRequest(
+  base: Request,
+  token: string | null,
+  trustedRequestHeaders: TrustedRequestHeaders = [],
+): Request {
+  const request = createResolverRequest(base, trustedRequestHeaders)
   if (token !== null && token.length > 0) {
-    headers.set('authorization', `Bearer ${token}`)
+    request.headers.set('authorization', `Bearer ${token}`)
   } else {
-    headers.delete('authorization')
+    request.headers.delete('authorization')
   }
-  return new Request(base.url, { method: base.method, headers })
+  return request
 }
 
 /**
@@ -95,6 +99,8 @@ export interface SessionOptions {
   resolveContext?: ResolveContext
   /** Validate untrusted client context before it reaches resolveContext. */
   validateClientContext?: ValidateClientContext
+  /** Additional ingress-owned headers exposed to resolveContext. */
+  trustedRequestHeaders?: TrustedRequestHeaders
   /**
    * Origin request for `buildAuthRequest` to layer the Bearer header onto.
    * HTTP/WS adapters pass the upgrade request; trusted message transports pass
@@ -123,6 +129,7 @@ export class Session {
 
   private readonly resolveContext: ResolveContext
   private readonly validateClientContext: ValidateClientContext | undefined
+  private readonly trustedRequestHeaders: TrustedRequestHeaders
   private readonly baseRequest: Request
 
   /** True when this server demands a handshake before accepting other frames. */
@@ -132,6 +139,7 @@ export class Session {
     this.requiresAuth = opts.resolveContext !== undefined
     this.resolveContext = opts.resolveContext ?? (async () => ({}))
     this.validateClientContext = opts.validateClientContext
+    this.trustedRequestHeaders = opts.trustedRequestHeaders ?? []
     this.baseRequest = opts.baseRequest ?? new Request(PIPE_ORIGIN)
     this.authenticated = !this.requiresAuth
   }
@@ -145,7 +153,7 @@ export class Session {
    * "subscribe" — it mirrors the shipped `routes.ts:resolveSubContext`.
    */
   async resolveSubContext(): Promise<Record<string, unknown>> {
-    const req = buildAuthRequest(this.baseRequest, this.token)
+    const req = buildAuthRequest(this.baseRequest, this.token, this.trustedRequestHeaders)
     return (await this.resolveContext(req, this.clientContext)) ?? {}
   }
 
@@ -178,7 +186,7 @@ export class Session {
         rawContext,
         this.validateClientContext,
       )
-      const req = buildAuthRequest(this.baseRequest, token)
+      const req = buildAuthRequest(this.baseRequest, token, this.trustedRequestHeaders)
       await this.resolveContext(req, clientContext)
 
       // Re-check after the await: a concurrent frame may have authenticated the

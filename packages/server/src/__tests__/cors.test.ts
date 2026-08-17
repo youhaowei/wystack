@@ -56,6 +56,8 @@ describe('CORS response policy', () => {
   test('validates client context separately from request identity', async () => {
     const seen: Array<{
       tenantId: unknown
+      authorization: string | null
+      cookie: string | null
       proxyUser: string | null
       rawContext: string | null
     }> = []
@@ -66,9 +68,12 @@ describe('CORS response policy', () => {
           if (typeof value.tenantId !== 'string') throw new Error('tenantId is required')
           return { tenantId: value.tenantId }
         },
+        trustedRequestHeaders: ['X-WyStack-Context'],
         resolveContext: async (request, clientContext) => {
           seen.push({
             tenantId: clientContext.tenantId,
+            authorization: request.headers.get('authorization'),
+            cookie: request.headers.get('cookie'),
             proxyUser: request.headers.get('x-auth-request-user'),
             rawContext: request.headers.get('x-wystack-context'),
           })
@@ -81,6 +86,9 @@ describe('CORS response policy', () => {
     const response = await routes.fetch(
       new Request('http://localhost/api/listTodos', {
         headers: {
+          Authorization: 'Bearer signed-token',
+          Cookie: 'session=signed-cookie',
+          'X-Auth-Request-User': 'direct-admin@example.com',
           'X-WyStack-Context': JSON.stringify({
             tenantId: 'acme',
             'X-Auth-Request-User': 'admin@example.com',
@@ -90,7 +98,39 @@ describe('CORS response policy', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(seen).toEqual([{ tenantId: 'acme', proxyUser: null, rawContext: null }])
+    expect(seen).toEqual([
+      {
+        tenantId: 'acme',
+        authorization: 'Bearer signed-token',
+        cookie: 'session=signed-cookie',
+        proxyUser: null,
+        rawContext: null,
+      },
+    ])
+  })
+
+  test('exposes an ingress-owned identity header only through explicit server policy', async () => {
+    const seen: Array<string | null> = []
+    const routes = createRoutes(
+      {
+        app: createTestApp(),
+        trustedRequestHeaders: ['X-Auth-Request-User'],
+        resolveContext: async (request) => {
+          seen.push(request.headers.get('x-auth-request-user'))
+          return {}
+        },
+      },
+      upgradeWebSocket,
+    )
+
+    const response = await routes.fetch(
+      new Request('http://localhost/api/listTodos', {
+        headers: { 'X-Auth-Request-User': 'verified@example.com' },
+      }),
+    )
+
+    expect(response.status).toBe(200)
+    expect(seen).toEqual(['verified@example.com'])
   })
 
   test('rejects a client context envelope when no validator is configured', async () => {

@@ -12,8 +12,8 @@ export interface WyStackClientConfig {
   getToken?: () => Promise<string | null> | string | null
   /**
    * App-provided JSON context. Called for every HTTP request and authenticated
-   * WebSocket connection attempt, then validated by the server. Identity stays
-   * on the trusted Request; use `getToken` for Authorization.
+   * WebSocket connection attempt, then validated by the server. Use `getToken`
+   * for Authorization; client context never becomes request headers.
    */
   getContext?: () => Promise<ClientContext> | ClientContext
   /**

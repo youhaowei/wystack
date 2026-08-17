@@ -176,8 +176,10 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
       {
         app,
         prefix: '/api',
-        resolveContext: async (req) => {
-          const tenant = req.headers.get('x-tenant-id')
+        validateClientContext: (value) =>
+          typeof value.tenantId === 'string' ? { tenantId: value.tenantId } : {},
+        resolveContext: async (_req, clientContext) => {
+          const tenant = clientContext.tenantId
           if (!tenant) throw new Error('Missing tenant')
           return { tenantId: tenant }
         },
@@ -193,13 +195,13 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
     })
 
     try {
-      // Without tenant header → 401
+      // Without tenant context → 401
       const noTenant = await fetch(`http://localhost:${embServer.port}/data/api/whoami`)
       expect(noTenant.status).toBe(401)
 
-      // With tenant header → context flows through
+      // With validated client context → context flows through
       const withTenant = await fetch(`http://localhost:${embServer.port}/data/api/whoami`, {
-        headers: { 'x-tenant-id': 'acme_corp' },
+        headers: { 'X-WyStack-Context': JSON.stringify({ tenantId: 'acme_corp' }) },
       })
       const json = await withTenant.json()
       expect(json.data.tenant).toBe('acme_corp')

@@ -50,17 +50,16 @@ export interface EngineConfig {
   /**
    * Provide a token for the auth handshake. When set, the engine sends an
    * `auth` frame on each (re)connect and waits for `{type:"authenticated"}`
-   * before flushing subscriptions. Return `null` for anonymous auth (cookie /
-   * proxy headers) — the auth frame is still sent with `token: null`, which
-   * triggers `resolveContext` on the server against the upgrade-request
-   * headers.
+   * before flushing subscriptions. Return `null` for anonymous auth (cookie or
+   * server-configured ingress headers) — the frame is still sent with
+   * `token: null`, which triggers `resolveContext` on the server.
    */
   getToken?: () => Promise<string | null> | string | null
   /** Structured app context to carry in the auth frame on each connection. */
   getContext?: () => Promise<ClientContext> | ClientContext
   /**
    * Force the auth handshake on or off, overriding the `getToken`-based
-   * default. Use `true` for cookie/proxy auth without a bearer token; use
+   * default. Use `true` for cookie or configured-ingress auth without a bearer token; use
    * `false` for trusted transports (IPC, local-loopback) where the server is
    * configured without `resolveContext`.
    *

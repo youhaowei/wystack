@@ -27,7 +27,7 @@ export interface WsManagerConfig {
    * on connect and waits for the server's `{type:"authenticated"}` ack before
    * replaying subscriptions. Return `null` for anonymous auth (e.g., cookie /
    * session-based) — the auth frame is still sent with no token, triggering
-   * `resolveContext` on the server with the original upgrade request headers.
+   * `resolveContext` with projected credential headers from the upgrade request.
    *
    * Set `requiresAuth: false` to force a trusted/no-auth WS connection even
    * when `getToken` exists for HTTP. This is the intended mode for transports
@@ -39,8 +39,9 @@ export interface WsManagerConfig {
   /**
    * Send an auth frame on connect even when `getToken` is not provided.
    * Use this for servers that have `resolveContext` configured but authenticate
-   * via cookies or proxy headers rather than a client-supplied token — the auth
-   * frame carries no token but still triggers `resolveContext` on the server.
+   * via cookies or explicitly configured ingress-owned headers rather than a
+   * client-supplied token — the auth frame carries no token but still triggers
+   * `resolveContext` on the server.
    *
    * Defaults to `true` when `getToken` or `getContext` is set, `false` otherwise.
    */

@@ -22,12 +22,6 @@ export function readHttpClientContext(request: Request): unknown {
   }
 }
 
-/** Keep the unvalidated wire envelope out of resolveContext's trusted Request. */
-export function withoutClientContextHeader(request: Request): Request {
-  request.headers.delete(CLIENT_CONTEXT_HEADER)
-  return request
-}
-
 export async function validateIncomingClientContext(
   rawValue: unknown,
   validate?: ValidateClientContext,
