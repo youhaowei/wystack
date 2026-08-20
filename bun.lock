@@ -129,6 +129,17 @@
         "typescript": "^5.8.3",
       },
     },
+    "packages/secret-vault-1password": {
+      "name": "@wystack/secret-vault-1password",
+      "version": "0.0.1",
+      "dependencies": {
+        "@1password/sdk": "0.5.0",
+        "@wystack/secret-vault": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5.8.3",
+      },
+    },
     "packages/server": {
       "name": "@wystack/server",
       "version": "0.0.1",
@@ -174,6 +185,10 @@
     },
   },
   "packages": {
+    "@1password/sdk": ["@1password/sdk@0.5.0", "", { "dependencies": { "@1password/sdk-core": "0.5.0" } }, "sha512-k6kov3pcA7PRg2tev9CgTfEf/3JSyAp11BPQNCEsqAD32QbqM032OXC1rfjyC8Ba0sfH+NHYZxcifUZToyGyYA=="],
+
+    "@1password/sdk-core": ["@1password/sdk-core@0.5.0", "", {}, "sha512-9g7LWOKRKdePZ85evVgE9xEom3DAg3hRIyQdOwLPvpL/F7KpDXmUHMi72rsqJxKaDbWApXmrYjDExMSPqUg7xw=="],
+
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
 
     "@babel/helper-validator-identifier": ["@babel/helper-validator-identifier@7.29.7", "", {}, "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg=="],
@@ -281,6 +296,8 @@
     "@wystack/permissions": ["@wystack/permissions@workspace:packages/permissions"],
 
     "@wystack/secret-vault": ["@wystack/secret-vault@workspace:packages/secret-vault"],
+
+    "@wystack/secret-vault-1password": ["@wystack/secret-vault-1password@workspace:packages/secret-vault-1password"],
 
     "@wystack/server": ["@wystack/server@workspace:packages/server"],
 

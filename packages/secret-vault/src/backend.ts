@@ -4,15 +4,13 @@
 // interface. Only the test backend ships in this package.
 //
 // Key design constraints:
-//   - `has()` MUST NOT decrypt. Presence checks flow from this — they must
-//     not trigger any HSM/keychain/network operation that materialises
-//     plaintext. Implementations must enforce this structurally.
+//   - `has()` MUST NOT materialise the credential value. Provider metadata
+//     operations are allowed when they cannot return secret fields. Implementations
+//     must keep presence and credential-resolution paths structurally separate.
 //   - `withSecret()` is a SCOPED LEASE. Plaintext exists only inside the `use`
-//     callback. The type signature prevents returning plaintext out of the
-//     callback — `use` receives `string` but `withSecret` returns
-//     `Promise<T>`, and T is inferred from the callback's return type.
-//     JS cannot zero strings, so "the lease is structural, not memory-wipe"
-//     must be documented here rather than enforced at runtime.
+//     callback unless trusted caller code deliberately captures or returns it.
+//     The callback interface narrows accidental exposure; it is not a security
+//     barrier against the caller. JS cannot zero strings after use.
 
 /**
  * Contract for a concrete secret storage backend.
@@ -35,11 +33,9 @@ export interface SecretBackend {
   /**
    * Resolve a locator and call `use` with the plaintext.
    *
-   * Plaintext exists ONLY inside the `use` callback — this is a scoped lease.
-   * The type signature enforces this: `use` is the only place plaintext is
-   * visible; the return type `Promise<T>` carries only whatever `use` returns.
-   * JS cannot zero strings after the callback returns, so "scoped" means
-   * "structurally un-returnable" not "memory-wiped".
+   * Plaintext is handed only to the `use` callback. Trusted caller code can still
+   * capture or return it, so this narrows accidental exposure rather than forming
+   * a security barrier. JS cannot zero strings after the callback returns.
    *
    * @param locator - Opaque backend-internal locator (from `store()`).
    * @param use     - Callback that receives the plaintext for its duration.
@@ -49,9 +45,9 @@ export interface SecretBackend {
   /**
    * Returns `true` if the locator is present in the backend.
    *
-   * MUST NOT decrypt. MUST NOT call any path that materialises plaintext.
-   * Implementations should maintain a separate presence index rather than
-   * resolving through the decryption path.
+   * MUST NOT call a path that returns the credential value. A provider may return
+   * decrypted item metadata (such as an ID, title, or tags) when that operation
+   * cannot include secret fields. Keep this path separate from `withSecret()`.
    */
   has(locator: string): Promise<boolean>
 
