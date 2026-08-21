@@ -33,10 +33,10 @@
  * See: packages/client/src/transport/websocket.ts (the WS structural analog)
  * See: .wystack/docs/ipc-transport-contract.md (the pinned wire contract)
  */
-import type { ServerMessage, ClientMessage } from '@wystack/transport'
-import { parseServerMessage } from '@wystack/transport'
-import type { EnginePipe, CloseInfo } from '../engine'
-import { createEngine, type Engine, type SubscriptionErrorHandler } from '../engine'
+import type { ServerMessage, ClientMessage } from '@wystack/transport/protocol'
+import { parseServerMessage } from '@wystack/transport/protocol'
+import type { EnginePipe, CloseInfo } from '../engine.js'
+import { createEngine, type Engine, type SubscriptionErrorHandler } from '../engine.js'
 
 // ─── IPC channel names (contract-pinned) ─────────────────────────────────────
 

@@ -3,8 +3,7 @@
  *
  * React-agnostic. The api object is portable across platforms.
  */
-import type { FunctionDef } from '@wystack/server'
-import type { ApiFromFunctions } from './refs'
+import type { ApiFromFunctions, FunctionDefinition } from './refs.js'
 
 /**
  * createApi — builds a runtime Proxy where each property access returns
@@ -28,7 +27,7 @@ const PROBE_KEYS = new Set([
   '$$typeof',
 ])
 
-export function createApi<T extends Record<string, FunctionDef>>(): ApiFromFunctions<T> {
+export function createApi<T extends Record<string, FunctionDefinition>>(): ApiFromFunctions<T> {
   const cache = new Map<string, { _path: string }>()
   return new Proxy({} as ApiFromFunctions<T>, {
     get(_target, prop) {

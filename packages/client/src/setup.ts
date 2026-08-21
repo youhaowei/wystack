@@ -4,17 +4,13 @@
  * Returns { Provider, api, client } — everything needed to use WyStack in React.
  * The Provider is pre-bound to the client it creates internally.
  */
-import { createElement } from 'react'
-import { QueryClientProvider, QueryClient } from '@tanstack/react-query'
-import type { FunctionDef } from '@wystack/server'
-import type { WyStackClientConfig } from './types'
-import type { ApiFromFunctions } from './refs'
-import type { WyStackClient } from './client'
-import { createClient } from './client'
-import { createApi } from './api'
-import { WyStackProvider as InternalProvider } from './provider'
+import type { WyStackClientConfig } from './types.js'
+import type { ApiFromFunctions, FunctionDefinition } from './refs.js'
+import type { WebClient, WyStackClient } from './client.js'
+import { createClient } from './client.js'
+import { createReactBindings, type CreateReactBindingsOptions } from './bindings.js'
 
-export interface WyStackInstance<T extends Record<string, FunctionDef>> {
+export interface WyStackInstance<T extends Record<string, FunctionDefinition>> {
   /** Pre-bound Provider — wraps children in both QueryClientProvider and WyStackProvider. */
   Provider: React.FC<{ children: React.ReactNode }>
   /** Typed api object — each key is a phantom-branded QueryRef or MutationRef. */
@@ -23,13 +19,7 @@ export interface WyStackInstance<T extends Record<string, FunctionDef>> {
   client: WyStackClient
 }
 
-export interface CreateWyStackOptions {
-  /**
-   * Optional TanStack QueryClient to share with the rest of the app. If
-   * omitted, a fresh QueryClient with default config is created.
-   */
-  queryClient?: QueryClient
-}
+export type CreateWyStackOptions = CreateReactBindingsOptions
 
 /**
  * One-line setup. Call at module scope — never inside a component, or every
@@ -39,22 +29,10 @@ export interface CreateWyStackOptions {
  * const { Provider, api, client } = createWyStack<typeof functions>({ url })
  * ```
  */
-export function createWyStack<T extends Record<string, FunctionDef>>(
+export function createWyStack<T extends Record<string, FunctionDefinition>>(
   config: WyStackClientConfig,
   options: CreateWyStackOptions = {},
 ): WyStackInstance<T> {
   const client = createClient(config)
-  const api = createApi<T>()
-  const queryClient = options.queryClient ?? new QueryClient()
-
-  function Provider({ children }: { children: React.ReactNode }) {
-    // WS lifecycle is owned by InternalProvider's useEffect; do not duplicate it here.
-    return createElement(
-      QueryClientProvider,
-      { client: queryClient },
-      createElement(InternalProvider, { client, children }),
-    )
-  }
-
-  return { Provider, api, client }
+  return createReactBindings<T, WebClient>(client, options)
 }

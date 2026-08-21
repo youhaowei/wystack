@@ -5,9 +5,11 @@
  * The app provides getToken for HTTP auth. WebSocket auth is optional and can
  * be disabled for trusted transports via `requiresAuth: false`.
  */
-import type { WyStackClientConfig } from './types'
-import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs'
-import { createWsManager, type WsManager } from './ws'
+import type { WyStackClientConfig } from './types.js'
+import type { QueryRef, MutationRef, ActionRef, RefArgs, RefReturn } from './refs.js'
+import { createWsManager, type WsManager } from './ws.js'
+import type { Client } from './core-client.js'
+import { createSubscriptionIdAllocator } from './subscription-ids.js'
 
 export interface WyStackClient {
   url: string
@@ -23,6 +25,63 @@ export interface WyStackClient {
     args?: RefArgs<TRef>,
     options?: { signal?: AbortSignal },
   ): Promise<RefReturn<TRef>>
+}
+
+/** Web client with the transport-neutral lifecycle used by React bindings. */
+export interface WebClient extends WyStackClient, Client {}
+
+function defaultCreateSubscriptionId(): string {
+  return `wy_${globalThis.crypto.randomUUID()}`
+}
+
+export function isWebClient(client: Client | WyStackClient): client is WebClient {
+  const candidate = client as Partial<Client & WyStackClient>
+  return (
+    typeof candidate.url === 'string' &&
+    typeof candidate.prefix === 'string' &&
+    typeof candidate.ws === 'object' &&
+    candidate.ws !== null &&
+    typeof candidate.connect === 'function' &&
+    typeof candidate.disconnect === 'function' &&
+    typeof candidate.subscribe === 'function'
+  )
+}
+
+/** Adapt the legacy web client shape to the shared client contract. */
+export function toWebClient(
+  client: WyStackClient,
+  createSubscriptionId: () => string = defaultCreateSubscriptionId,
+): WebClient {
+  if (isWebClient(client)) return client
+
+  const subscriptionIds = createSubscriptionIdAllocator(createSubscriptionId)
+
+  return {
+    url: client.url,
+    prefix: client.prefix,
+    ws: client.ws,
+    query: (ref, args) => client.query(ref, args),
+    mutate: (ref, args) => client.mutate(ref, args),
+    action: (ref, args, options) => client.action(ref, args, options),
+    connect: () => client.ws.connect(),
+    disconnect: () => client.ws.disconnect(),
+    subscribe(path, args, onInvalidate, onError) {
+      const id = subscriptionIds.allocate()
+      try {
+        client.ws.subscribe(id, path, args, onInvalidate, onError)
+      } catch (error) {
+        subscriptionIds.release(id)
+        throw error
+      }
+      let active = true
+      return () => {
+        if (!active) return
+        active = false
+        subscriptionIds.release(id)
+        client.ws.unsubscribe(id)
+      }
+    },
+  }
 }
 
 /**
@@ -56,7 +115,7 @@ async function readHttpError(res: Response): Promise<Error> {
   return Object.assign(new Error(message), { status: res.status })
 }
 
-export function createClient(config: WyStackClientConfig): WyStackClient {
+export function createClient(config: WyStackClientConfig): WebClient {
   const httpUrl = config.url.replace(/\/$/, '')
   const prefix = config.prefix ?? '/api'
   const getToken = config.getToken
@@ -69,7 +128,7 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
     return token ? { Authorization: `Bearer ${token}` } : {}
   }
 
-  return {
+  const client: WyStackClient = {
     url: httpUrl,
     prefix,
     ws,
@@ -126,4 +185,6 @@ export function createClient(config: WyStackClientConfig): WyStackClient {
       return json.data
     },
   }
+
+  return toWebClient(client, config.createSubscriptionId)
 }

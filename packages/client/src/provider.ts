@@ -1,20 +1,22 @@
-import { createContext, useContext, createElement, useEffect } from 'react'
-import type { WyStackClient } from './client'
+import { createElement, useMemo } from 'react'
+import type { WyStackClient } from './client.js'
+import { isWebClient, toWebClient } from './client.js'
+import {
+  WyStackProvider as ReactWyStackProvider,
+  useWyStackClient as useReactWyStackClient,
+} from './react-provider.js'
 
-const WyStackContext = createContext<WyStackClient | null>(null)
-
+/** Backward-compatible web provider exported from `@wystack/client`. */
 export function WyStackProvider(props: { client: WyStackClient; children: React.ReactNode }) {
-  // Connect WS on mount, disconnect on unmount
-  useEffect(() => {
-    props.client.ws.connect()
-    return () => props.client.ws.disconnect()
-  }, [props.client])
+  const client = useMemo(() => toWebClient(props.client), [props.client])
 
-  return createElement(WyStackContext.Provider, { value: props.client }, props.children)
+  return createElement(ReactWyStackProvider, { client, children: props.children })
 }
 
 export function useWyStackClient(): WyStackClient {
-  const client = useContext(WyStackContext)
-  if (!client) throw new Error('useWyStackClient must be used within <WyStackProvider>')
+  const client = useReactWyStackClient()
+  if (!isWebClient(client)) {
+    throw new Error('The @wystack/client root hook requires a web client')
+  }
   return client
 }

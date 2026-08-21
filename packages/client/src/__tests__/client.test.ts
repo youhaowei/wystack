@@ -19,8 +19,8 @@ import { upgradeWebSocket, websocket } from 'hono/bun'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { createRoutes, defineApp } from '@wystack/server'
-import { createClient } from '../client'
-import type { QueryRef, MutationRef, ActionRef } from '../refs'
+import { createClient, toWebClient, type WyStackClient } from '../client'
+import type { QueryRef, MutationRef, ActionRef, RefReturn } from '../refs'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -205,5 +205,77 @@ describe('createClient — Action cancellation', () => {
     controller.abort()
 
     await expect(pending).rejects.toThrow()
+  })
+})
+
+describe('createClient — shared client contract', () => {
+  test('owns subscription IDs and returns idempotent cleanup', () => {
+    const client = createClient({
+      url: 'http://localhost:9999',
+      createSubscriptionId: () => 'wy_test',
+    })
+    const subscribed: string[] = []
+    const unsubscribed: string[] = []
+
+    client.ws.subscribe = (id) => subscribed.push(id)
+    client.ws.unsubscribe = (id) => unsubscribed.push(id)
+
+    const unsubscribe = client.subscribe('listTodos', {}, () => {})
+    unsubscribe()
+    unsubscribe()
+
+    expect(subscribed).toEqual(['wy_test'])
+    expect(unsubscribed).toEqual(['wy_test'])
+  })
+
+  test('keeps simultaneous custom subscription IDs distinct', () => {
+    const client = createClient({
+      url: 'http://localhost:9999',
+      createSubscriptionId: () => 'wy_test',
+    })
+    const subscribed: string[] = []
+    const unsubscribed: string[] = []
+
+    client.ws.subscribe = (id) => subscribed.push(id)
+    client.ws.unsubscribe = (id) => unsubscribed.push(id)
+
+    const unsubscribeFirst = client.subscribe('first', {}, () => {})
+    const unsubscribeSecond = client.subscribe('second', {}, () => {})
+    unsubscribeFirst()
+    unsubscribeSecond()
+
+    expect(subscribed).toEqual(['wy_test', 'wy_test_1'])
+    expect(unsubscribed).toEqual(['wy_test', 'wy_test_1'])
+  })
+
+  test('adapts legacy clients whose RPC methods live on the prototype', async () => {
+    const ws = createClient({ url: 'http://localhost:9999' }).ws
+
+    class LegacyClient implements WyStackClient {
+      readonly url = 'http://localhost:9999'
+      readonly prefix = '/api'
+
+      constructor(readonly ws: WyStackClient['ws']) {}
+
+      query<TRef extends QueryRef>(_ref: TRef): Promise<RefReturn<TRef>> {
+        return Promise.reject(new Error('prototype query called'))
+      }
+
+      mutate<TRef extends MutationRef>(_ref: TRef): Promise<RefReturn<TRef>> {
+        return Promise.reject(new Error('prototype mutation called'))
+      }
+
+      action<TRef extends ActionRef>(_ref: TRef): Promise<RefReturn<TRef>> {
+        return Promise.reject(new Error('prototype action called'))
+      }
+    }
+
+    const client = toWebClient(new LegacyClient(ws))
+
+    await expect(client.query(queryRef('query'))).rejects.toThrow('prototype query called')
+    await expect(client.mutate(mutationRef('mutation'))).rejects.toThrow(
+      'prototype mutation called',
+    )
+    await expect(client.action(actionRef('action'))).rejects.toThrow('prototype action called')
   })
 })
