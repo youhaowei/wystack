@@ -95,8 +95,8 @@ export class SecretVault {
   }
 
   /**
-   * Permanently delete the secret.
-   * Removes from the backend AND the mapping store.
+   * Delete the secret according to the backend's retention semantics.
+   * Removes its mapping record after the backend operation succeeds.
    * After this call, `has(ref)` returns false and `withSecret(ref, …)` throws.
    */
   async delete(ref: SecretRef): Promise<void> {

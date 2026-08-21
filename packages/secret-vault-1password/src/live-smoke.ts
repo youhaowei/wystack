@@ -34,8 +34,8 @@ const ref = await vault.store(probe, {
 
 try {
   if (!(await vault.has(ref))) throw new Error('stored probe was not present')
-  const length = await vault.withSecret(ref, async (secret) => secret.length)
-  if (length !== probe.length) throw new Error('resolved probe did not match')
+  const resolved = await vault.withSecret(ref, async (secret) => secret)
+  if (resolved !== probe) throw new Error('resolved probe did not match')
   console.log('1Password SecretVault live smoke passed')
 } finally {
   await vault.delete(ref)

@@ -7,6 +7,7 @@ import {
   RateLimitExceededError,
   type Item,
   type ItemCreateParams,
+  type ItemListFilter,
   type ItemOverview,
 } from '@1password/sdk'
 import { InMemoryMappingStore, SecretRegistry, SecretVault } from '@wystack/secret-vault'
@@ -22,6 +23,7 @@ class FakeOnePasswordItems implements OnePasswordItemsClient {
   getCalls = 0
   listCalls = 0
   #nextId = 1
+  #states = new Map<string, ItemState>()
 
   async create(params: ItemCreateParams): Promise<Item> {
     const now = new Date('2026-08-16T00:00:00.000Z')
@@ -41,6 +43,7 @@ class FakeOnePasswordItems implements OnePasswordItemsClient {
       updatedAt: now,
     }
     this.items.set(item.id, item)
+    this.#states.set(item.id, ItemState.Active)
     return item
   }
 
@@ -51,10 +54,19 @@ class FakeOnePasswordItems implements OnePasswordItemsClient {
     return item
   }
 
-  async list(vaultId: string): Promise<ItemOverview[]> {
+  async list(vaultId: string, ...filters: ItemListFilter[]): Promise<ItemOverview[]> {
     this.listCalls++
+    const stateFilter = filters.find((filter) => filter.type === 'ByState')
+    const states = stateFilter?.content ?? { active: true, archived: false }
     return [...this.items.values()]
-      .filter((item) => item.vaultId === vaultId)
+      .filter((item) => {
+        const state = this.#states.get(item.id) ?? ItemState.Active
+        return (
+          item.vaultId === vaultId &&
+          ((state === ItemState.Active && states.active) ||
+            (state === ItemState.Archived && states.archived))
+        )
+      })
       .map((item) => ({
         id: item.id,
         title: item.title,
@@ -64,14 +76,21 @@ class FakeOnePasswordItems implements OnePasswordItemsClient {
         tags: item.tags,
         createdAt: item.createdAt,
         updatedAt: item.updatedAt,
-        state: ItemState.Active,
+        state: this.#states.get(item.id) ?? ItemState.Active,
       }))
+  }
+
+  async archive(vaultId: string, itemId: string): Promise<void> {
+    const item = this.items.get(itemId)
+    if (!item || item.vaultId !== vaultId) throw new Error('item not found')
+    this.#states.set(itemId, ItemState.Archived)
   }
 
   async delete(vaultId: string, itemId: string): Promise<void> {
     const item = this.items.get(itemId)
     if (!item || item.vaultId !== vaultId) throw new Error('item not found')
     this.items.delete(itemId)
+    this.#states.delete(itemId)
   }
 }
 
@@ -206,6 +225,20 @@ describe('OnePasswordBackend prototype', () => {
     await vault.delete(ref)
 
     expect(items.items.size).toBe(0)
+    expect(await vault.has(ref)).toBe(false)
+  })
+
+  test('finds and deletes an archived managed item through SecretVault', async () => {
+    const { items, vault } = makeVault()
+    const ref = await vault.store('secret', { class: 'connector-key' })
+    const [item] = [...items.items.values()]
+    if (!item) throw new Error('fixture did not create an item')
+
+    await items.archive(item.vaultId, item.id)
+
+    expect(await vault.has(ref)).toBe(true)
+    await vault.delete(ref)
+    expect(items.items.has(item.id)).toBe(false)
     expect(await vault.has(ref)).toBe(false)
   })
 })

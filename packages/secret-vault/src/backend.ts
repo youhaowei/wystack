@@ -52,7 +52,8 @@ export interface SecretBackend {
   has(locator: string): Promise<boolean>
 
   /**
-   * Permanently delete the secret at `locator`.
+   * Delete the secret at `locator` according to the provider's retention semantics.
+   * Some providers may retain a recoverable copy (for example, in a trash bin).
    * Callers are responsible for also deleting the mapping record.
    */
   delete(locator: string): Promise<void>

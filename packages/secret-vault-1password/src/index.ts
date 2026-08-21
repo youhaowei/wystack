@@ -6,6 +6,7 @@ import {
   RateLimitExceededError,
   type Client,
   type Item,
+  type ItemListFilter,
 } from '@1password/sdk'
 import type { SecretBackend } from '@wystack/secret-vault'
 
@@ -13,6 +14,10 @@ const CREDENTIAL_FIELD_ID = 'password'
 const OWNER_TAG_PREFIX = 'wystack-owner:'
 const OWNER_TAG_RE =
   /^wystack-owner:[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
+const INCLUDE_ARCHIVED_ITEMS = {
+  type: 'ByState',
+  content: { active: true, archived: true },
+} satisfies ItemListFilter
 
 interface LocatorV1 {
   readonly version: 1
@@ -185,14 +190,18 @@ export class OnePasswordBackend implements SecretBackend {
 
   async has(locatorValue: string): Promise<boolean> {
     const locator = decodeLocator(locatorValue)
-    const overviews = await callProvider('has', () => this.#items.list(locator.vaultId))
+    const overviews = await callProvider('has', () =>
+      this.#items.list(locator.vaultId, INCLUDE_ARCHIVED_ITEMS),
+    )
     const item = overviews.find((candidate) => candidate.id === locator.itemId)
     return item?.tags.includes(locator.ownerTag) ?? false
   }
 
   async delete(locatorValue: string): Promise<void> {
     const locator = decodeLocator(locatorValue)
-    const overviews = await callProvider('delete', () => this.#items.list(locator.vaultId))
+    const overviews = await callProvider('delete', () =>
+      this.#items.list(locator.vaultId, INCLUDE_ARCHIVED_ITEMS),
+    )
     const item = overviews.find((candidate) => candidate.id === locator.itemId)
     if (!item) return
     assertOwned(item, locator.ownerTag)

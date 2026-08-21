@@ -24,6 +24,8 @@ registry.setClassDefault('connector-key', '1password')
 The prototype creates one Password item per secret. Its opaque locator contains the
 vault ID, item ID, and a random ownership tag. Reads and deletes require that tag to
 still exist on the item, so an arbitrary existing item cannot be attached or deleted.
+`delete()` uses the 1Password SDK deletion operation; 1Password's retention policy,
+including any recoverable trash state, remains provider-managed.
 
 Provider failures are exposed as `OnePasswordBackendError` with a stable `operation`,
 `kind`, and `retryable` flag. The adapter never retries automatically: a timed-out
