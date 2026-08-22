@@ -12,6 +12,7 @@
     "typecheck": "turbo typecheck",
     "test": "turbo test",
     "check": "oxlint packages/ && bunx oxfmt --check packages/*/src && turbo typecheck test",
+    "smoke:1password": "bun build --root=. packages/secret-vault-1password/src/live-smoke.ts --target=node --outfile=packages/secret-vault-1password/dist/live-smoke.node.mjs --external=@1password/sdk && node packages/secret-vault-1password/dist/live-smoke.node.mjs",
     "clean": "turbo clean",
     "clawpatch": "scripts/clawpatch.sh",
     "clawpatch:map": "scripts/clawpatch.sh map --source heuristic --json",

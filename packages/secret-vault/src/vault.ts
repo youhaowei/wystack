@@ -63,10 +63,9 @@ export class SecretVault {
   /**
    * Resolve a secret and call `use` with the plaintext — SCOPED LEASE.
    *
-   * Plaintext exists only inside the `use` callback. The type signature
-   * prevents returning plaintext out: `use` receives `string` but
-   * `withSecret` returns `Promise<T>` (whatever `use` returns).
-   * JS cannot zero strings — "scoped" means "structurally un-returnable."
+   * Plaintext is handed only to the `use` callback. Trusted caller code can still
+   * capture or return it; the callback narrows accidental exposure but is not a
+   * security barrier. JS cannot zero strings after use.
    *
    * Read-time routing: reads the mapping record (backend name + locator),
    * then looks up THAT backend by name. The store-time class policy is NOT
@@ -82,11 +81,11 @@ export class SecretVault {
   }
 
   /**
-   * Check whether the secret is present — MUST NOT decrypt.
+   * Check whether the secret is present without materialising its credential value.
    *
    * Reads the mapping store first (presence check), then asks the backend
-   * `has(locator)` — which is also a non-decrypting presence check.
-   * Never calls `withSecret` or any path that materialises plaintext.
+   * `has(locator)` — which must use a metadata-only presence path.
+   * Never calls `withSecret` or any path that returns credential fields.
    */
   async has(ref: SecretRef): Promise<boolean> {
     const record = await this.#mapping.get(ref)
@@ -96,8 +95,8 @@ export class SecretVault {
   }
 
   /**
-   * Permanently delete the secret.
-   * Removes from the backend AND the mapping store.
+   * Delete the secret according to the backend's retention semantics.
+   * Removes its mapping record after the backend operation succeeds.
    * After this call, `has(ref)` returns false and `withSecret(ref, …)` throws.
    */
   async delete(ref: SecretRef): Promise<void> {

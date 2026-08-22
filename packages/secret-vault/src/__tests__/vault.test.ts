@@ -71,9 +71,9 @@ describe('round-trip: store → withSecret → has → delete', () => {
   })
 })
 
-// ─── AC 2: has() MUST NOT invoke the backend's decrypt path ──────────────────
+// ─── AC 2: has() MUST NOT invoke the backend's credential path ───────────────
 
-describe('has() — never decrypts', () => {
+describe('has() — never materialises the credential', () => {
   test('has() does not increment resolveCallCount on the backend', async () => {
     const primaryBackend = new TestBackend()
     const { vault } = makeVault({ primaryBackend })
@@ -107,9 +107,9 @@ describe('has() — never decrypts', () => {
   })
 })
 
-// ─── AC 3: withSecret plaintext cannot escape the callback ───────────────────
+// ─── AC 3: withSecret propagates the callback result ─────────────────────────
 
-describe('withSecret — scoped lease, plaintext stays in callback', () => {
+describe('withSecret — scoped callback', () => {
   test('return value from withSecret is the callback result, not the plaintext', async () => {
     const { vault } = makeVault()
     const ref = await vault.store('top-secret', { class: 'primary-class' })
@@ -120,7 +120,7 @@ describe('withSecret — scoped lease, plaintext stays in callback', () => {
       return plaintext.length // transform, not return raw
     })
 
-    // Outer code sees the number, not the string
+    // The caller controls the transformed result returned from the callback.
     expect(typeof transformed).toBe('number')
     expect(transformed).toBe('top-secret'.length)
   })
