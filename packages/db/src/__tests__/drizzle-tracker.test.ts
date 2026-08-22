@@ -6,17 +6,18 @@ import { text, int, boolean } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
 import { pgTable, text as pgText, integer, primaryKey } from 'drizzle-orm/pg-core'
+import { table } from '../table'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
-  tags: {
+  }).draftable(),
+  tags: table({
     id: int.primaryKey(),
     label: text,
-  },
+  }),
 })
 
 let pg: PGlite

@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { createDrizzleTracker, defineSchema, eq, multiTenant, syncSchema, table, text } from '../index'
+import {
+  createDrizzleTracker,
+  defineSchema,
+  eq,
+  multiTenant,
+  syncSchema,
+  table,
+  text,
+} from '../index'
 import { uuid } from '../dsl'
 
 const tenancy = multiTenant({
@@ -13,7 +21,7 @@ const tenancy = multiTenant({
 })
 
 const schema = defineSchema({
-  catalog: table({ id: uuid.primaryKey(), name: text }),
+  catalog: table({ id: uuid.primaryKey(), name: text }).draftable(),
   insights: tenancy.table({ id: uuid.primaryKey(), name: text }).draftable(),
 })
 
@@ -96,18 +104,18 @@ describe('tenant-scoped database access', () => {
     })
 
     expect(await beta.from(schema.insights).where(eq('name', 'alpha updated')).all()).toEqual([])
-    expect(await alpha.from(schema.insights).where(eq('name', 'alpha updated')).delete()).toHaveLength(
-      1,
-    )
+    expect(
+      await alpha.from(schema.insights).where(eq('name', 'alpha updated')).delete(),
+    ).toHaveLength(1)
     expect(await alpha.from(schema.insights).all()).toEqual([])
     expect(await beta.from(schema.insights).all()).toHaveLength(1)
   })
 
   test('tenant property cannot be updated', async () => {
     const alpha = tracked.withTenant('alpha')
-    await expect(
-      alpha.from(schema.insights).update({ workspaceId: 'beta' }),
-    ).rejects.toThrow('system-managed')
+    await expect(alpha.from(schema.insights).update({ workspaceId: 'beta' })).rejects.toThrow(
+      'system-managed',
+    )
   })
 
   test('tenant and draft scopes compose across reads and writes', async () => {
@@ -141,6 +149,40 @@ describe('tenant-scoped database access', () => {
     ])
   })
 
+  test('tenant drafts may read global tables but cannot write their shadows', async () => {
+    await tracked.into(schema.catalog).insert({
+      id: '00000000-0000-4000-8000-000000000061',
+      name: 'global catalog',
+    })
+    const tenantDraft = tracked.withTenant('alpha').withDraft('alpha-draft')
+    await tracked
+      .withDraft('alpha-draft')
+      .from(schema.catalog)
+      .where(eq('name', 'global catalog'))
+      .update({ name: 'privileged global draft' })
+
+    expect(await tenantDraft.from(schema.catalog).all()).toEqual([
+      {
+        id: '00000000-0000-4000-8000-000000000061',
+        name: 'global catalog',
+      },
+    ])
+    await expect(
+      tenantDraft.into(schema.catalog).insert({
+        id: '00000000-0000-4000-8000-000000000062',
+        name: 'forbidden',
+      }),
+    ).rejects.toThrow('cannot write global table')
+    await expect(
+      tenantDraft.from(schema.catalog).where(eq('name', 'global catalog')).update({
+        name: 'forbidden',
+      }),
+    ).rejects.toThrow('cannot write global table')
+    await expect(
+      tenantDraft.from(schema.catalog).where(eq('name', 'global catalog')).delete(),
+    ).rejects.toThrow('cannot write global table')
+  })
+
   test('tenant draft tags do not overlap across tenants', async () => {
     const alphaTracker = createDrizzleTracker(tracked.raw).withTenant('alpha')
     const betaTracker = createDrizzleTracker(tracked.raw).withTenant('beta')
@@ -150,8 +192,8 @@ describe('tenant-scoped database access', () => {
       name: 'beta',
     })
 
-    expect(
-      [...alphaTracker.tablesRead].some((tag) => betaTracker.tablesWritten.has(tag)),
-    ).toBe(false)
+    expect([...alphaTracker.tablesRead].some((tag) => betaTracker.tablesWritten.has(tag))).toBe(
+      false,
+    )
   })
 })

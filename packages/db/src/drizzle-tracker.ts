@@ -40,6 +40,17 @@ function requireTenantScope(table: AnyTable, tenantScope: TenantScope) {
   return { tenancy, tenantId: tenantScope }
 }
 
+function assertDraftWriteScope(table: AnyTable, tenantScope: TenantScope): void {
+  const tenancy = tryGetTableCapabilities(table)?.tenancy
+  if (tenancy) {
+    requireTenantScope(table, tenantScope)
+    return
+  }
+  if (tenantScope !== noTenantScope) {
+    throw new Error(`Tenant-scoped drafts cannot write global table "${getTableName(table)}"`)
+  }
+}
+
 function assertTenantInput(table: AnyTable, values: Record<string, unknown>): void {
   const tenancy = tryGetTableCapabilities(table)?.tenancy
   if (!tenancy) return
@@ -54,19 +65,21 @@ function withoutUndefined(values: Record<string, unknown>): Record<string, unkno
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined))
 }
 
-function tableTrackingTag(table: AnyTable, tenantScope: TenantScope): string {
+function qualifiedTableName(table: AnyTable): string {
   const tableName = getTableName(table)
+  const schemaName = getTableConfig(table).schema
+  return schemaName ? `${schemaName}.${tableName}` : tableName
+}
+
+function tableTrackingTag(table: AnyTable, tenantScope: TenantScope): string {
+  const tableName = qualifiedTableName(table)
   const tenant = requireTenantScope(table, tenantScope)
   if (!tenant) return tableName
   return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}`
 }
 
-function draftTableTrackingTag(
-  table: AnyTable,
-  tenantScope: TenantScope,
-  draftId: string,
-): string {
-  const tableName = `${getTableName(table)}__draft`
+function draftTableTrackingTag(table: AnyTable, tenantScope: TenantScope, draftId: string): string {
+  const tableName = `${qualifiedTableName(table)}__draft`
   const tenant = requireTenantScope(table, tenantScope)
   if (!tenant) return tableName
   return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}:draft:${encodeURIComponent(draftId)}`
@@ -252,11 +265,10 @@ export interface DrizzleTracker {
    * canonical `from().all()` code path. A no-draft read is structurally
    * zero-overhead: it never reaches the coalesce logic.
    *
-   * API CONSTRAINT (load-bearing): a NULL in a draft shadow column means "no
-   * override for this column", NOT "set this column to NULL". A draft therefore
-   * cannot clear a nullable field back to NULL — the canonical value is kept and
-   * no error is raised. Deleting a row is expressed via the `__tombstone` flag,
-   * not by nulling its columns.
+   * Shadow rows carry an explicit `__overrides` property set. A property present
+   * there overrides canonical even when its stored value is SQL NULL; an omitted
+   * or `undefined` input leaves the effective value unchanged. Deleting a row is
+   * expressed via `__tombstone`.
    */
   withDraft(draftId: string): DraftDrizzleTracker
 }
@@ -283,6 +295,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   private _tracker: DrizzleTracker
   private _tenantScope: TenantScope
   private _clauses: ReadClauses
+  private _writeError?: string
 
   constructor(
     table: T,
@@ -290,12 +303,14 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     tracker: DrizzleTracker,
     tenantScope: TenantScope = noTenantScope,
     clauses: ReadClauses = emptyClauses(),
+    writeError?: string,
   ) {
     this._table = table
     this._db = db
     this._tracker = tracker
     this._tenantScope = tenantScope
     this._clauses = clauses
+    this._writeError = writeError
   }
 
   /**
@@ -313,10 +328,17 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * clause keeps `TRow`.
    */
   private _with<TNext = TRow>(patch: Partial<ReadClauses>): SelectBuilder<T, TNext> {
-    return new SelectBuilder<T, TNext>(this._table, this._db, this._tracker, this._tenantScope, {
-      ...this._clauses,
-      ...patch,
-    })
+    return new SelectBuilder<T, TNext>(
+      this._table,
+      this._db,
+      this._tracker,
+      this._tenantScope,
+      {
+        ...this._clauses,
+        ...patch,
+      },
+      this._writeError,
+    )
   }
 
   /**
@@ -377,7 +399,9 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     )
     const tenant = requireTenantScope(this._table, this._tenantScope)
     if (tenant) {
-      conditions.unshift(drizzleEq(requireColumn(columns, tenant.tenancy.property), tenant.tenantId))
+      conditions.unshift(
+        drizzleEq(requireColumn(columns, tenant.tenancy.property), tenant.tenantId),
+      )
     }
     return conditions
   }
@@ -496,6 +520,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   }
 
   async update(values: Partial<T['$inferInsert']>) {
+    if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('update', this._clauses)
     assertTenantInput(this._table, values as Record<string, unknown>)
     const patch = withoutUndefined(values as Record<string, unknown>)
@@ -512,6 +537,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   }
 
   async delete() {
+    if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('delete', this._clauses)
     let q = this._db.delete(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -536,25 +562,19 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
  * The draft table name is derived automatically: `<base_table>__draft`.
  * No application-specific mapping is required.
  *
- * READ side (`.all()` / `.first()`): a SINGLE `where(eq(pk, value))` IS pushed
- * into the coalesce SQL as a bound `AND COALESCE(d."<pk>", b."<pk>") = $value`
- * predicate — this is the exact shape every command handler emits
- * (`from(t).where(eq('id', x)).first()`), so a handler reads its row unmodified
- * inside a draft. Any OTHER read filter shape (a non-`eq` op, a non-PK column,
- * or more than one filter) THROWS, so a caller can never believe a draft read
- * was row-filtered when it was not (an auth/authz hazard). An UNFILTERED `.all()`
- * returns the full coalesced set, as before.
+ * READ side (`.all()` / `.first()`): every public filter is lowered against the
+ * effective presence-aware value as a bound predicate. Multiple filters and
+ * non-primary-key operators therefore select the same row set as canonical
+ * reads over the equivalent materialized state.
  *
  * `orderBy`/`limit` are pushed into the coalesce SQL, ordering on the COALESCED
  * value so draft-inserted rows sort by what the draft holds, with the PK kept as
  * a tiebreaker (a FULL OUTER JOIN has no inherent row order).
  *
- * WRITE side (`.where(eqPk).update(vals)` / `.where(eqPk).delete()`): routes the
- * mutation into the `<table>__draft` shadow as a sparse upsert (update) or
- * tombstone (delete), keyed `(draft_id, <pk>)`. The `where` MUST pin the primary
- * key with an `eq` (the only shape a command handler emits); any other filter
- * shape throws. This is the write path that makes an unmodified command handler
- * land in the draft overlay.
+ * WRITE side (`.where(...).update(vals)` / `.where(...).delete()`): resolves the
+ * full effective target set atomically, then routes one sparse upsert or
+ * tombstone per primary key into `<table>__draft`. This is the write path that
+ * makes an unmodified command handler land in the draft overlay.
  */
 export class DraftSelectBuilder<T extends AnyTable> {
   private _table: T
@@ -562,13 +582,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _draftId: string
   private _tracker: DraftDrizzleTracker
   private _tenantScope: TenantScope
-  // `_clauses.filters` accumulates `where()` predicates; the consuming method
-  // decides intent:
-  //   - READ (`all`/`first`) interprets a single PK `eq` as a row predicate
-  //     pushed into the coalesce SQL (any other shape throws).
-  //   - WRITE (`update`/`delete`) interprets a single PK `eq` as the write
-  //     target via `_requirePkFilter` (any other shape throws).
-  // The same accumulated filter serves both; only the consumer differs.
+  // `_clauses.filters` accumulates `where()` predicates against effective rows;
+  // the consuming terminal decides whether to read, update, or tombstone them.
   private _clauses: ReadClauses
 
   constructor(
@@ -668,18 +683,14 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * `from(t).where(eq('id', x)).update(vals)` shape a command handler emits, but
    * the write lands in `<table>__draft`, not the canonical table.
    *
-   * The `where` must pin the primary key with a single `eq`. Returns the upserted
-   * shadow rows (Drizzle `.returning()` shape) for parity with the canonical
-   * builder.
-   *
-   * Note what those shadow rows are, because it is why `select` cannot narrow
-   * them: a shadow row is the sparse OVERRIDE, where NULL means "not edited"
-   * rather than "the value is NULL". Projecting it would answer `{title: null}`
-   * for a row whose coalesced title is real — a wrong answer, not a narrower
-   * one. Hence the guard rejects rather than honors.
+   * Filters have full effective-row parity with canonical updates: every row
+   * matched by the composed predicate receives the sparse patch. Returns the
+   * resulting effective rows. Read-only select/order/limit clauses are rejected
+   * because a write cannot honor their return-shaping semantics.
    */
   async update(values: Partial<T['$inferInsert']>): Promise<Record<string, unknown>[]> {
     assertNoReadClauses('update', this._clauses)
+    assertDraftWriteScope(this._table, this._tenantScope)
     const patch = withoutUndefined(values as Record<string, unknown>)
     assertTenantInput(this._table, patch)
     if (Object.keys(patch).length === 0) return []
@@ -687,7 +698,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const columns = getTableColumns(this._table) as Record<string, { name: string }>
     const pkSqlName = resolvePkColumnName(this._table, getTableConfig(this._table))
     const pkProperty = Object.keys(columns).find((property) => columns[property].name === pkSqlName)
-    if (!pkProperty) throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
+    if (!pkProperty)
+      throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
     if (Object.hasOwn(patch, pkProperty) || Object.hasOwn(patch, pkSqlName)) {
       throw new Error(`Primary key "${pkProperty}" is immutable in a draft update`)
     }
@@ -725,14 +737,17 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * so the coalesce read suppresses it. Mirrors the canonical
    * `from(t).where(eq('id', x)).delete()` a command handler emits.
    *
-   * The `where` must pin the primary key with a single `eq`.
+   * Filters have full effective-row parity with canonical deletes; every match
+   * receives a tombstone in the shadow.
    */
   async delete(): Promise<Record<string, unknown>[]> {
     assertNoReadClauses('delete', this._clauses)
+    assertDraftWriteScope(this._table, this._tenantScope)
     const columns = getTableColumns(this._table) as Record<string, { name: string }>
     const pkSqlName = resolvePkColumnName(this._table, getTableConfig(this._table))
     const pkProperty = Object.keys(columns).find((property) => columns[property].name === pkSqlName)
-    if (!pkProperty) throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
+    if (!pkProperty)
+      throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
 
     let committedTracker: DraftDrizzleTracker | undefined
     const rows = await this._db.transaction(async (txDb: DrizzleDb) => {
@@ -753,95 +768,6 @@ export class DraftSelectBuilder<T extends AnyTable> {
       for (const tag of committedTracker.tablesWritten) this._tracker.tablesWritten.add(tag)
     }
     return rows
-  }
-
-  /**
-   * Extract the single primary-key value the write targets from the accumulated
-   * `where` filters. A draft write must address exactly one row by PK — the only
-   * shape a command handler emits (`where(eq(pk, value))`). Anything else
-   * (no filter, a non-`eq` op, a filter on a non-PK column, multiple filters)
-   * throws, because the shadow upsert is PK-keyed and cannot honor a predicate.
-   */
-  private _requirePkFilter(op: 'update' | 'delete'): unknown {
-    const tableName = getTableName(this._table)
-    const config = getTableConfig(this._table)
-    const pkColName = resolvePkColumnName(this._table, config)
-    // Map the PK SQL column name back to its Drizzle property key, since filters
-    // are expressed against property keys (e.g. `eq('id', x)`).
-    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
-    const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
-
-    if (this._clauses.filters.length !== 1) {
-      throw new Error(
-        `DraftSelectBuilder.${op}() requires exactly one \`where(eq('${pkPropKey ?? pkColName}', value))\` ` +
-          `filter pinning the primary key — got ${this._clauses.filters.length}. A draft write addresses ` +
-          `a single row by PK (it cannot honor a general predicate against the shadow).`,
-      )
-    }
-    const f = this._clauses.filters[0]
-    if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
-      throw new Error(
-        `DraftSelectBuilder.${op}() requires \`where(eq('${pkPropKey ?? pkColName}', value))\` on table ` +
-          `"${tableName}" — got \`${f.op}('${f.column}', …)\`. Draft writes are PK-addressed only.`,
-      )
-    }
-    return f.value
-  }
-
-  /**
-   * Resolve the single PK `eq` value the READ coalesce should pin, from the
-   * accumulated `where` filters. Returns `{ present: false }` when no filter was
-   * set (an unfiltered full-set read). When exactly one filter is present it MUST
-   * be an `eq` on the PK column (prop-key or sql-col-name form) with a defined,
-   * non-null value — the only shape a command handler emits
-   * (`where(eq('id', x)).first()`). Anything else (a non-`eq` op, a non-PK
-   * column, 2+ filters, or a PK pinned to `undefined`/`null`) THROWS rather than
-   * silently returning every row — a filtered-but-unfiltered draft read is an
-   * auth/authz hazard.
-   *
-   * Presence is keyed on filter COUNT, not on the resolved value: a falsy-but-
-   * valid PK (`0`, `''`) must still pin. `undefined`/`null` are rejected loud —
-   * binding them would either widen to the full set (`undefined` → no predicate)
-   * or fail closed inconsistently (`= NULL` → 0 rows); a handler reading by an
-   * absent id is a bug, not a request for every row. Mirrors `_requirePkFilter`
-   * (the write path) so read and write reject the same shapes identically.
-   */
-  private _resolvePkReadFilter(
-    pkColName: string,
-  ): { present: false } | { present: true; value: unknown } {
-    if (this._clauses.filters.length === 0) return { present: false }
-
-    const tableName = getTableName(this._table)
-    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
-    const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
-
-    if (this._clauses.filters.length !== 1) {
-      throw new Error(
-        `DraftSelectBuilder.all()/first() after .where() supports exactly one ` +
-          `\`where(eq('${pkPropKey ?? pkColName}', value))\` pinning the primary key — got ` +
-          `${this._clauses.filters.length} filters. The draft read coalesce can only push a single PK ` +
-          `predicate down (a general predicate is not supported — it would silently return every row).`,
-      )
-    }
-    const f = this._clauses.filters[0]
-    if (f.op !== 'eq' || (f.column !== pkPropKey && f.column !== pkColName)) {
-      throw new Error(
-        `DraftSelectBuilder.all()/first() after .where() requires ` +
-          `\`where(eq('${pkPropKey ?? pkColName}', value))\` on table "${tableName}" — got ` +
-          `\`${f.op}('${f.column}', …)\`. A draft read can only be pinned by the primary key.`,
-      )
-    }
-    if (f.value === undefined || f.value === null) {
-      throw new Error(
-        `DraftSelectBuilder.all()/first() after .where() got ` +
-          `\`where(eq('${pkPropKey ?? pkColName}', ${String(f.value)}))\` — a primary-key read ` +
-          `pinned to ${String(f.value)} is rejected (it would otherwise silently return every ` +
-          `coalesced row). Pass a defined PK value.`,
-      )
-    }
-    return { present: true, value: f.value }
   }
 
   async all(): Promise<Record<string, unknown>[]> {
@@ -1064,11 +990,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * Coalesced first-row read. Mirrors `SelectBuilder.first()` so an UNMODIFIED
    * handler that calls `ctx.db.from(table).where(eq('id', x)).first()` works
    * inside a draft (the `runHandler` widening hides the structural gap from the
-   * typechecker). Shares the coalesce with `all()`, so it honors the SAME
-   * single-PK read predicate: `where(eq(pk, x)).first()` returns the one
-   * coalesced row (or null); an unfiltered `first()` returns the first row of the
-   * full coalesced set in PK order. Any non-PK read filter throws in the shared
-   * read, so neither read method can be silently unfiltered.
+   * typechecker). Shares the effective-row filter lowering with `all()`;
+   * any supported canonical filter can select the first matching draft row.
    *
    * Lowers `LIMIT 1` as an override rather than setting `_clauses.limitVal`, for the
    * same reason as `SelectBuilder.first()` — that field is what the write guard
@@ -1313,9 +1236,7 @@ async function writeShadowRow(
   const pkValue = pkCol ? mapColumnValue(pkCol, opts.pkValue) : opts.pkValue
   const tenant = requireTenantScope(table, tenantScope)
   const tenantColumn = tenant ? requireColumn(columns, tenant.tenancy.property) : undefined
-  const tenantValue = tenantColumn
-    ? mapColumnValue(tenantColumn, tenant?.tenantId)
-    : undefined
+  const tenantValue = tenantColumn ? mapColumnValue(tenantColumn, tenant?.tenantId) : undefined
 
   // Provided value columns (sparse), excluding the PK (carried separately) and
   // any accidental __tombstone / draft_id passthrough (owned by this writer).
@@ -1358,17 +1279,11 @@ async function writeShadowRow(
   }
   parts.push(sql.raw(', '), sql`${sql.param(valueCols.map((column) => column.sqlName))}`)
   parts.push(sql.raw(', '), sql`${sql.param(opts.tombstone)}`)
-  const conflictColumns = [
-    'draft_id',
-    ...(tenant ? [tenant.tenancy.column] : []),
-    pkColName,
-  ]
+  const conflictColumns = ['draft_id', ...(tenant ? [tenant.tenancy.column] : []), pkColName]
     .map((column) => `"${column}"`)
     .join(', ')
   parts.push(
-    sql.raw(
-      `) ON CONFLICT (${conflictColumns}) DO UPDATE SET ${updateAssignments} RETURNING *`,
-    ),
+    sql.raw(`) ON CONFLICT (${conflictColumns}) DO UPDATE SET ${updateAssignments} RETURNING *`),
   )
   const query = sql.join(parts, sql.raw(''))
 
@@ -1408,6 +1323,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
   async insert(
     values: T['$inferInsert'] | T['$inferInsert'][],
   ): Promise<Record<string, unknown>[]> {
+    assertDraftWriteScope(this._table, this._tenantScope)
     const rows = Array.isArray(values) ? values : [values]
     const config = getTableConfig(this._table)
     const pkColName = resolvePkColumnName(this._table, config)
@@ -1428,19 +1344,16 @@ export class DraftInsertBuilder<T extends AnyTable> {
       }
       // Pass the full row as sparse values; writeShadowRow drops the PK column
       // (carried separately) and any reserved shadow columns.
-      const written = await writeShadowRow(
-        this._db,
-        this._tracker,
-        this._table,
-        this._draftId,
-        this._tenantScope,
-        {
-          pkValue,
-          values: r,
-          tombstone: false,
-        },
-      )
-      out.push(...written)
+      await writeShadowRow(this._db, this._tracker, this._table, this._draftId, this._tenantScope, {
+        pkValue,
+        values: r,
+        tombstone: false,
+      })
+      const effective = await this._tracker
+        .from(this._table)
+        .where({ op: 'eq', column: pkPropKey ?? pkColName, value: pkValue })
+        .first()
+      if (effective) out.push(effective)
     }
     return out
   }
@@ -1509,22 +1422,30 @@ export function createDrizzleTracker(
         tablesWritten: tracker.tablesWritten,
         raw: drizzleDb,
         from<T extends AnyTable>(table: T) {
-          return new DraftSelectBuilder(
-            table,
-            drizzleDb,
-            draftId,
-            draftHandle,
-            tenantScope,
-          )
+          const capabilities = tryGetTableCapabilities(table)
+          const isTenantReadingGlobal = tenantScope !== noTenantScope && !capabilities?.tenancy
+          if (capabilities?.draftable === false || isTenantReadingGlobal) {
+            const writeError = isTenantReadingGlobal
+              ? `Tenant-scoped drafts cannot write global table "${getTableName(table)}"`
+              : `Table "${getTableName(table)}" is not draftable; declare it with .draftable() before writing through withDraft()`
+            return new SelectBuilder(
+              table,
+              drizzleDb,
+              tracker,
+              tenantScope,
+              emptyClauses(),
+              writeError,
+            ) as unknown as DraftSelectBuilder<T>
+          }
+          return new DraftSelectBuilder(table, drizzleDb, draftId, draftHandle, tenantScope)
         },
         into<T extends AnyTable>(table: T) {
-          return new DraftInsertBuilder(
-            table,
-            drizzleDb,
-            draftId,
-            draftHandle,
-            tenantScope,
-          )
+          if (tryGetTableCapabilities(table)?.draftable === false) {
+            throw new Error(
+              `Table "${getTableName(table)}" is not draftable; declare it with .draftable() before writing through withDraft()`,
+            )
+          }
+          return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle, tenantScope)
         },
         transaction<R>(
           _fn: (tx: DrizzleTracker) => Promise<R>,

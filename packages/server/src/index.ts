@@ -61,6 +61,9 @@ export type {
   Version,
   Cell,
   OpenOptions,
+  DraftOperationOptions,
+  DraftLifecycleOptions,
+  DraftAuthorizationRequest,
 } from './draft-lifecycle'
 export type { Subscription } from './subscriptions'
 export type { RouteOptions } from './routes'

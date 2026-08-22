@@ -1,16 +1,16 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
+  }),
 })
 
 interface AppContext {

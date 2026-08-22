@@ -1,6 +1,6 @@
 # Multitenancy and durable drafts
 
-- Status: Proposed
+- Status: Accepted
 - Related decision: [ADR 0001](../adr/0001-compose-table-capabilities.md)
 
 ## Goal
@@ -83,7 +83,7 @@ const app = wy.build({
       requestedTenantId,
     );
     if (!access) throw new PermissionDeniedError("tenant.access");
-    return { tenantId: access.tenantId };
+    return access.tenantId;
   },
 });
 ```
@@ -240,38 +240,48 @@ if (updated.length === 0) throw new RevisionConflictError();
 
 ## Durable lifecycle
 
-Draft metadata and commands are database records. Logical framework tables are:
+Draft metadata, commands, and touched-shadow identities are database records.
+The first framework migration creates:
 
 ```text
-drafts
+wystack_drafts
 - draft_id
-- scope_kind: global | tenant
-- tenant_key: configured type, absent for global drafts
-- opened_by JSONB: validated WyStack Principal captured when opened
-- base_version
+- tenant_scope JSONB: opaque configured tenant ID, absent for global drafts
+- owner_key JSONB: stable Principal coordinates by default, or a host-resolved key
+- base_version JSONB
 - log_revision
 - created_at
 - updated_at
 
-draft_commands
+wystack_draft_commands
 - draft_id
-- sequence
-- command_id
-- path
-- args JSONB
-- kind
-- compaction_key
-- PRIMARY KEY (draft_id, sequence)
+- position
+- command JSONB
+- PRIMARY KEY (draft_id, position)
+
+wystack_draft_tables
+- draft_id
+- schema_name
+- table_name
+- pk_column
+- shadow_tag
+- PRIMARY KEY (draft_id, schema_name, table_name)
+
+wystack_framework_migrations
+- migration_name
+- version
+- applied_at
 ```
 
 The durable command log is publish authority. Shadows are derived read overlays.
 
-A draft ID is a locator, not authority. Every draft read and lifecycle operation
-first constrains lookup by its persisted scope and current tenant context, then
-authorizes the current principal for the requested action. WyStack defaults to
-the captured `opened_by` principal; applications may provide an authorization
-hook for collaboration or product roles. Tenant access must still resolve
-successfully, and publish always revalidates authorization.
+A draft ID is a locator, not authority. Every lifecycle operation resolves the
+current tenant, compares it with persisted scope, then checks the current owner.
+WyStack defaults the owner key to `{ kind, userId }` or `{ kind, credentialId }`;
+it does not persist optional identity profile fields. Applications may provide
+`resolveOwner` for a stable application key or `authorizeDraft` for explicit
+collaboration and product roles. An authorization hook can widen owner access,
+but never bypass tenant scope. Publish revalidates both before replay.
 
 ### Open
 

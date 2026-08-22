@@ -30,7 +30,8 @@
 // of the primitive; an application's draft controller adopts separately
 // (the durable-log delete is the analogous bookkeeping step there).
 
-import { resolvePkColumnName, type DraftDrizzleTracker } from '@wystack/db'
+import { resolvePkColumnName, type DraftDrizzleTracker, type DrizzleTracker } from '@wystack/db'
+import { isPrincipal } from '@wystack/identity'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import { getTableName, sql } from 'drizzle-orm'
 import {
@@ -40,6 +41,19 @@ import {
   type CommitResult,
 } from './apply-commands'
 import type { WyStackApp } from './create'
+import {
+  advanceStoredDraftRevision,
+  deleteStoredDraft,
+  ensureDraftStorage,
+  insertStoredDraft,
+  readStoredCommands,
+  readStoredDraft,
+  readStoredTouchedTables,
+  replaceStoredCommands,
+  upsertStoredTouchedTables,
+  type StoredDraft,
+  type StoredTouchedTable,
+} from './draft-store'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- polymorphic Drizzle table, mirrors drizzle-tracker.ts
 type AnyTable = any
@@ -48,7 +62,7 @@ type AnyTable = any
  * A `(table, id)` pair — one CELL the draft touched or canonical wrote. The
  * lifecycle's conflict detection speaks only this and an opaque `Version`; it
  * carries ZERO artifact-type knowledge. `id` is the row's primary-key value,
- * `table` its SQL table name.
+ * `table` its schema-qualified SQL identity when a non-default schema exists.
  */
 export interface Cell {
   table: string
@@ -109,99 +123,65 @@ export interface ConflictReport {
   overlappingCells: Cell[]
 }
 
-/** Per-draft registry entry. In-memory; a draft is ephemeral until published. */
-interface DraftEntry {
-  baseVersion: Version
-  /**
-   * The ordered command log — the PUBLISH unit. Replayed (never read) at publish
-   * via `applyCommands`. Compacted on append (see `compactLog`) so a long
-   * add→tweak→delete chain collapses to its net effect.
-   */
-  log: DraftCommand[]
-  /**
-   * The Drizzle table OBJECTS this draft wrote into the shadow, keyed by SQL
-   * table name. Detection + teardown need the table object (schema + PK
-   * introspection), not just the name — so we capture the object as handlers
-   * write, via a table-recording wrapper around the draft handle.
-   */
-  touchedTables: Map<string, AnyTable>
-  /**
-   * Invalidation tags for the shadow tables this draft ACTUALLY wrote rows into,
-   * accumulated from what the tracker reported on each `append`.
-   *
-   * Publish and discard both sweep the overlay through `tx.raw` / a raw handle,
-   * which is UNTRACKED — the sweep never lands in any `tablesWritten` set. But a
-   * draft-scoped subscription watches exactly these tags (the draft read coalesce
-   * registers both the canonical and the shadow name in `tablesRead`, so the
-   * router's read∩write intersection can fire), and after a sweep its rows are
-   * gone. Naming them explicitly is what stops a draft-scoped client from sitting
-   * on a swept overlay forever.
-   *
-   * Taken from the tracker rather than rebuilt from `touchedTables`, for two
-   * reasons: `touchedTables` also records tables the draft only READ (a
-   * `from(t)…delete()` routes through `from`, so reads cannot be excluded there),
-   * which would emit tags for shadows that never had a row; and a reconstructed
-   * `${name}__draft` string has to match `@wystack/db`'s own tag format exactly
-   * or it silently matches nothing. Copying the tracker's own tags cannot drift.
-   */
-  shadowWrites: Set<string>
-  /** Per-batch context threaded to publish's replay (auth/tenant). */
-  context: Record<string, unknown>
-  /**
-   * Serialization chain for this draft — the tail of a promise queue every
-   * mutating entry point (`append`/`publish`/`discard`) chains onto, so two
-   * callers can never interleave their awaits against this entry. Without it,
-   * two concurrent `append`s interleave their overlay writes and splice their
-   * commands into each other's log order. Never rejects (see `withDraftLock`),
-   * so one failed operation cannot wedge the draft.
-   */
-  lock: Promise<void>
-  /**
-   * Non-`'open'` for as long as a TERMINAL operation (publish or discard) is in
-   * flight — both end by removing the entry from `drafts`, so work admitted
-   * while one is running would run against a detached entry and vanish. Set
-   * SYNCHRONOUSLY, before the first await, so a concurrent caller observes the
-   * claim rather than racing into the window. Reset to `'open'` if the terminal
-   * operation fails — a failed publish (or discard) leaves the draft live and
-   * retryable.
-   */
-  state: 'open' | 'publishing' | 'discarding'
+export interface OpenOptions {
+  /** Current request context used to bind tenant and owner custody. Never persisted. */
+  context?: Record<string, unknown>
 }
 
-export interface OpenOptions {
-  /** Per-draft context (auth/tenant) forwarded to publish's command replay. */
+export interface DraftOperationOptions {
+  /** Current request context. Authorization is re-evaluated on every operation. */
   context?: Record<string, unknown>
+}
+
+export interface DraftLifecycleOptions {
+  versionProbe?: VersionProbe
+  /** Resolve the stable owner/custodian key. Defaults to the Principal's kind and stable ID. */
+  resolveOwner?: (context: Record<string, unknown>) => unknown | Promise<unknown>
+  /** Override owner-only access for explicit collaboration/product policy. Tenant scope still applies. */
+  authorizeDraft?: (request: DraftAuthorizationRequest) => boolean | Promise<boolean>
+}
+
+export interface DraftAuthorizationRequest {
+  action: 'append' | 'publish' | 'discard' | 'detectConflict' | 'getLog'
+  draft: {
+    draftId: string
+    tenantId: unknown | undefined
+    ownerKey: unknown | undefined
+  }
+  context: Record<string, unknown>
 }
 
 export interface DraftLifecycle {
   /** Open a draft over a base snapshot. Returns the new draft id. */
-  open(baseVersion: Version, opts?: OpenOptions): string
+  open(baseVersion: Version, opts?: OpenOptions): Promise<string>
   /**
    * Apply a batch of commands INSIDE the draft: routes each command's writes
    * into the `<table>__draft` overlay (via `withDraft`'s write path) and appends
    * them to the command log. Reads inside the handler see `canonical ⊕ draft`.
    * Returns the per-command results (same shape as `applyCommands`).
    *
-   * NOT atomic across the batch the way `publish` is — append is incremental
-   * draft authoring; the atomic boundary is `publish`. On a mid-batch command
-   * failure the throw propagates with the already-applied commands left in the
-   * shadow + log — the conducting app owns recovery (re-append or `discard`).
+   * The overlay writes, compacted command log, touched-table metadata, and log
+   * revision update share one row-locked transaction. A failed batch leaves no
+   * partial overlay or log state.
    *
    * `batch` is `DraftCommand[]` so the optional `compactionKey`/`kind` fields
    * are discoverable at the call site — an app that wants net-effect log
    * compaction mints those; a plain `Command` (no key) is never compacted.
    *
-   * Concurrency: appends on ONE draft are serialized FIFO, so two in-flight
-   * batches cannot interleave their overlay writes or their log positions.
-   * An append that arrives while `publish` is in flight REJECTS (see `publish`).
+   * Concurrency: the persisted draft row serializes appends, so two processes
+   * cannot interleave overlay writes or log positions.
    */
-  append(draftId: string, batch: DraftCommand[]): Promise<CommandResult[]>
+  append(
+    draftId: string,
+    batch: DraftCommand[],
+    opts?: DraftOperationOptions,
+  ): Promise<CommandResult[]>
   /**
    * PUBLISH = replay the ordered command log onto canonical via
    * `applyCommands(app, log, {commit})`, calling `resolve(log)` IMMEDIATELY
    * before the commit (the ONLY app injection inside publish — it binds
    * late-bound operands). Atomic via `applyCommands`'s tracked tx. The
-   * draft's shadow + registry entry are cleared on success.
+   * draft's shadow, command log, and metadata are cleared on success.
    *
    * Invalidation is the LIFECYCLE's job, not the host's: publish emits the
    * canonical tags from the replay plus the `<table>__draft` tags for the sweep
@@ -211,32 +191,30 @@ export interface DraftLifecycle {
    * subscriptions silently stale. `tablesWritten` is still returned for hosts
    * that want the set for their own bookkeeping.
    *
-   * Publish CLAIMS the draft for its whole duration: once entered, any further
-   * `append`, `discard`, or `publish` on the same draft rejects rather than
-   * racing the snapshot-then-sweep window (work admitted in that window used to
-   * be applied to the overlay and then silently destroyed). Work already
-   * in flight or queued when the claim is taken still runs first, and publishes
-   * with this batch. On FAILURE the claim is released and the draft stays live
-   * and retryable.
+   * The resolve hook runs outside the transaction. Publish then row-locks the
+   * draft and compares its persisted log revision; an append during resolution
+   * advances that revision and makes this attempt fail for a safe retry. Replay,
+   * shadow sweep, and metadata/log deletion share the locked transaction.
    */
-  publish(draftId: string, resolve?: ResolveHook): Promise<CommitResult>
+  publish(
+    draftId: string,
+    resolve?: ResolveHook,
+    opts?: DraftOperationOptions,
+  ): Promise<CommitResult>
   /**
-   * Drop the draft: clear its shadow rows and forget its registry entry.
-   * Like `publish`, discard CLAIMS the draft synchronously for its duration —
-   * it too detaches the entry, so later `append`/`discard`/`publish` calls are
-   * rejected rather than racing the sweep. Rejects if the draft is already
-   * mid-publish or mid-discard.
+   * Drop the draft: row-lock its metadata, clear every persisted touched-table
+   * shadow, and delete its command log and metadata in one transaction.
    */
-  discard(draftId: string): Promise<void>
+  discard(draftId: string, opts?: DraftOperationOptions): Promise<void>
   /**
    * Detect whether canonical moved under the draft. Returns the two generic
    * signals; makes NO policy decision. Reads the draft's touched cells straight
    * from the `<table>__draft` shadow (the `(draftId, id)` keys), then asks the
    * app's `VersionProbe` which canonical also wrote.
    */
-  detectConflict(draftId: string): Promise<ConflictReport>
+  detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
   /** Read-only peek at a draft's current command log (post-compaction). */
-  getLog(draftId: string): DraftCommand[]
+  getLog(draftId: string, opts?: DraftOperationOptions): Promise<DraftCommand[]>
 }
 
 /**
@@ -383,6 +361,59 @@ function qualifiedTableKey(table: AnyTable): string {
   return schema ? `${schema}.${name}` : name
 }
 
+function describeTouchedTables(
+  touchedTables: Map<string, AnyTable>,
+  shadowWrites: Set<string>,
+): StoredTouchedTable[] {
+  return [...touchedTables.values()].flatMap((table) => {
+    const tableName = getTableName(table)
+    const config = getTableConfig(table)
+    const qualifiedName = qualifiedTableKey(table)
+    const globalTag = `${qualifiedName}__draft`
+    const tenantMarker = `:${qualifiedName}__draft:draft:`
+    const shadowTag = [...shadowWrites].find(
+      (tag) => tag === globalTag || tag.includes(tenantMarker),
+    )
+    if (!shadowTag) return []
+    return [
+      {
+        schema: config.schema,
+        table: tableName,
+        pkColumn: resolvePkColumnName(table, config),
+        shadowTag,
+      },
+    ]
+  })
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return stableJson(left) === stableJson(right)
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return 'undefined'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(',')}}`
+}
+
+function defaultOwnerKey(context: Record<string, unknown>): unknown {
+  const principal = context.principal
+  if (principal === undefined || principal === null) return undefined
+  if (!isPrincipal(principal)) {
+    throw new Error(
+      'draft lifecycle: context.principal must be a valid Principal or resolveOwner must be configured',
+    )
+  }
+  return principal.kind === 'user'
+    ? { kind: principal.kind, userId: principal.userId }
+    : { kind: principal.kind, credentialId: principal.credentialId }
+}
+
 /**
  * Build the generic draft lifecycle over a WyStack app.
  *
@@ -394,264 +425,172 @@ function qualifiedTableKey(table: AnyTable): string {
  */
 export function createDraftLifecycle(
   app: WyStackApp,
-  opts: { versionProbe?: VersionProbe } = {},
+  opts: DraftLifecycleOptions = {},
 ): DraftLifecycle {
-  const drafts = new Map<string, DraftEntry>()
-  const { versionProbe } = opts
+  const { versionProbe, resolveOwner, authorizeDraft } = opts
+  let storageInitialization: Promise<void> | undefined
 
-  function require(draftId: string): DraftEntry {
-    const entry = drafts.get(draftId)
-    if (!entry) throw new Error(`draft lifecycle: unknown draft "${draftId}"`)
-    return entry
+  function storageReady(): Promise<void> {
+    storageInitialization ??= ensureDraftStorage(app.createTracked().raw)
+    return storageInitialization
   }
 
-  /**
-   * Resolve a draft that is accepting work. Rejecting while a TERMINAL operation
-   * is in flight is what makes the lost-write window (#88) impossible: both
-   * `publish` and `discard` await (the `resolve` hook and commit transaction;
-   * the shadow sweep) and then delete the entry. Work that landed in that window
-   * used to be applied to the overlay, missed the snapshot, and was then
-   * destroyed along with the entry — silently, with a success returned to its
-   * caller. Now it fails loud instead.
-   */
-  function requireOpen(draftId: string): DraftEntry {
-    const entry = require(draftId)
-    if (entry.state !== 'open') {
-      throw new Error(
-        `draft lifecycle: draft "${draftId}" is ${entry.state} — retry once it settles`,
-      )
+  async function ownerKey(context: Record<string, unknown>): Promise<unknown> {
+    return resolveOwner ? resolveOwner(context) : defaultOwnerKey(context)
+  }
+
+  async function requireStored(
+    raw: DrizzleTracker['raw'],
+    draftId: string,
+    lock = false,
+  ): Promise<StoredDraft> {
+    const draft = await readStoredDraft(raw, draftId, lock)
+    if (!draft) throw new Error(`draft lifecycle: unknown draft "${draftId}"`)
+    return draft
+  }
+
+  async function authorizeTracker(
+    tracked: DrizzleTracker,
+    draft: StoredDraft,
+    context: Record<string, unknown>,
+    action: DraftAuthorizationRequest['action'],
+  ): Promise<DrizzleTracker> {
+    const scoped = await app.scopeTracked(tracked, context)
+    if (!sameJsonValue(scoped.tenantId, draft.tenantId)) {
+      throw new Error(`draft lifecycle: access denied for draft "${draft.draftId}"`)
     }
-    return entry
-  }
-
-  /**
-   * Run `fn` with exclusive access to one draft, queued FIFO behind whatever is
-   * already in flight on it. Combined with the `requireOpen` check — which every
-   * caller passes BEFORE queueing — this yields the invariant that makes the
-   * queue safe: anything running or queued when `publish` or `discard` claims
-   * the draft was admitted before the claim and therefore runs BEFORE it, and
-   * anything arriving after is rejected outright. Nothing can ever run against
-   * an entry a terminal operation has already detached from `drafts`.
-   *
-   * Note that a queued `fn` STILL RUNS when the operation ahead of it failed —
-   * the chain deliberately swallows rejections so one failure cannot wedge the
-   * draft. So a publish queued behind a mid-batch-failed append publishes that
-   * append's partially-applied commands. That is the existing append contract
-   * ("the conducting app owns recovery"), just reached without an intervening
-   * app decision; issue the publish after awaiting the append if that matters.
-   */
-  function withDraftLock<T>(entry: DraftEntry, fn: () => Promise<T>): Promise<T> {
-    const run = entry.lock.then(fn)
-    // Swallow on the CHAIN only (the caller still sees the rejection via `run`),
-    // so a failed operation does not poison every operation queued behind it.
-    entry.lock = run.then(
-      () => undefined,
-      () => undefined,
-    )
-    return run
+    const currentOwner = await ownerKey(context)
+    if (sameJsonValue(currentOwner, draft.ownerKey)) return scoped
+    if (authorizeDraft) {
+      const allowed = await authorizeDraft({
+        action,
+        draft: {
+          draftId: draft.draftId,
+          tenantId: draft.tenantId,
+          ownerKey: draft.ownerKey,
+        },
+        context,
+      })
+      if (allowed) return scoped
+    }
+    throw new Error(`draft lifecycle: access denied for draft "${draft.draftId}"`)
   }
 
   return {
-    open(baseVersion, openOpts = {}) {
+    async open(baseVersion, openOpts = {}) {
+      await storageReady()
+      const context = openOpts.context ?? {}
+      const scoped = await app.scopeTracked(app.createTracked(), context)
+      const resolvedOwnerKey = await ownerKey(context)
       const draftId = mintDraftId()
-      drafts.set(draftId, {
+      await insertStoredDraft(scoped.raw, {
+        draftId,
         baseVersion,
-        log: [],
-        touchedTables: new Map(),
-        shadowWrites: new Set(),
-        context: openOpts.context ?? {},
-        lock: Promise.resolve(),
-        state: 'open',
+        tenantId: scoped.tenantId,
+        ownerKey: resolvedOwnerKey,
       })
       return draftId
     },
 
-    async append(draftId, batch) {
-      const entry = requireOpen(draftId)
+    async append(draftId, batch, operationOpts = {}) {
       const commands = batch.map(snapshotCommand)
+      await storageReady()
+      const context = operationOpts.context ?? {}
       for (const command of commands) {
         const definition = app.functions.get(command.path)
         if (definition?.type === 'action') {
           throw new Error(`Draft command ${command.path} cannot reference an action`)
         }
       }
-      return withDraftLock(entry, async () => {
-        // Route writes through the draft handle so `ctx.db.into/update/delete`
-        // lands in the `<table>__draft` overlay. The recording wrapper captures
-        // the Drizzle table OBJECTS written, keyed by schema-qualified name, so
-        // detection + teardown can introspect schema/PK without a global schema registry.
-        const draftDb: DraftDrizzleTracker = recordTouchedTables(
-          app.createTracked().withDraft(draftId),
-          entry.touchedTables,
-        )
+      const outer = app.createTracked()
+      let shadowWrites = new Set<string>()
+      const results = await outer.transaction(async (tx) => {
+        const stored = await requireStored(tx.raw, draftId, true)
+        const scopedTx = await authorizeTracker(tx, stored, context, 'append')
+        const existingLog = await readStoredCommands(tx.raw, draftId)
+        const touchedTables = new Map<string, AnyTable>()
+        const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
         const results: CommandResult[] = []
-        try {
-          for (const snapshot of commands) {
-            // Run the handler on the snapshot captured before the lock/await.
-            // The log is the publish unit (replayed verbatim later);
-            // storing the caller's object by reference would let a post-append
-            // mutation of the batch or its `args` silently change what `publish`
-            // replays — diverging the canonical commit from the draft preview
-            // that was executed here.
-            //
-            // Snapshotting first is what makes the two halves agree even when the
-            // clone FAILS. `structuredClone` throws on a non-cloneable value (a
-            // function, a class instance with a getter that throws), and a jsonb
-            // argument validates as `unknown`, so such a value reaches here
-            // through ordinary validation. Cloning after the handler ran meant a
-            // durable overlay row whose command never reached the log — publish
-            // would then silently omit it. Same defect family as #88: a write
-            // with nothing to replay. Cloning first moves the failure ahead of
-            // any write, so the batch aborts with the draft untouched.
-            // The registry can also change while this append waits for the
-            // draft lock, so recheck the kind at the dispatch boundary.
-            const definition = app.functions.get(snapshot.path)
-            if (definition?.type === 'action') {
-              throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
-            }
-            const value = await app.runHandler(snapshot.path, snapshot.args, draftDb, entry.context)
-            results.push({ id: snapshot.id, value })
-            entry.log.push(snapshot)
+        for (const snapshot of commands) {
+          const definition = app.functions.get(snapshot.path)
+          if (definition?.type === 'action') {
+            throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
           }
-        } finally {
-          // Announce the overlay writes, and remember them: publish and discard
-          // sweep those same shadow tables through an untracked raw handle, so
-          // this is the only place the tags are ever reported.
-          //
-          // In a `finally` because append is NOT atomic across a batch — each
-          // command auto-commits on its own, so a mid-batch throw still leaves
-          // earlier writes durable, and a draft-scoped subscription must see
-          // them. Guarded on size so a no-write batch never triggers a recompute
-          // storm.
-          if (draftDb.tablesWritten.size > 0) {
-            for (const tag of draftDb.tablesWritten) entry.shadowWrites.add(tag)
-            app.emit(draftDb.tablesWritten)
-          }
+          const value = await app.runHandler(snapshot.path, snapshot.args, draftDb, context)
+          results.push({ id: snapshot.id, value })
         }
-        // Compact the accumulated log to net effect (no-op for keyless commands).
-        entry.log = compactLog(entry.log)
+
+        const compactedLog = compactLog([...existingLog, ...commands])
+        await replaceStoredCommands(tx.raw, draftId, compactedLog)
+        await upsertStoredTouchedTables(
+          tx.raw,
+          draftId,
+          describeTouchedTables(touchedTables, draftDb.tablesWritten),
+        )
+        await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
+        shadowWrites = new Set(draftDb.tablesWritten)
         return results
       })
+      if (shadowWrites.size > 0) app.emit(shadowWrites)
+      return results
     },
 
-    async publish(draftId, resolve) {
-      const entry = requireOpen(draftId)
-      // CLAIM the draft synchronously, before any await: from here on `append`,
-      // `discard`, and a second `publish` are rejected rather than racing the
-      // snapshot-then-delete window below. Ordering matters — a claim taken
-      // after the first await is not a claim.
-      entry.state = 'publishing'
-      try {
-        return await withDraftLock(entry, async () => {
-          // Snapshot INSIDE the lock, so an append admitted before the claim has
-          // already landed its commands and they publish with this batch.
-          //
-          // Bind late-bound operands immediately before commit — the ONLY app
-          // injection inside publish. Identity if no hook supplied.
-          const boundLog = resolve ? await resolve([...entry.log]) : [...entry.log]
-          const touched = [...entry.touchedTables.values()]
+    async publish(draftId, resolve, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const snapshot = await requireStored(app.createTracked().raw, draftId)
+      await authorizeTracker(app.createTracked(), snapshot, context, 'publish')
+      const snapshotLog = await readStoredCommands(app.createTracked().raw, draftId)
+      const boundLog = resolve ? await resolve([...snapshotLog]) : [...snapshotLog]
 
-          // ATOMIC PUBLISH: open ONE outer transaction so command-log
-          // replay and shadow-sweep share a single commit boundary. A crash between
-          // the two is no longer possible — if either step fails, both roll back,
-          // and the in-memory registry entry stays intact so publish is retryable.
-          //
-          // Previously `clearShadow` ran AFTER `applyCommands` returned (two separate
-          // transactions). A process death in that gap left the canonical commit durable
-          // but shadow rows orphaned. While those orphans are inert for the in-memory
-          // lifecycle (the map is gone on restart), the same latent window exists for
-          // any durable consumer that wraps this lifecycle — closing it here at the
-          // framework level is the Rule-of-Three extraction.
-          // `DrizzleTracker.transaction` is generic over its callback return type — we
-          // capture the CommitResult directly rather than via a non-local variable.
-          const result = await app.createTracked().transaction(async (tx) => {
-            // Replay the command log against the caller-supplied tx handle. The
-            // outer-tx seam (applyCommands opts.tx) routes all
-            // command writes through this same handle — no inner transaction is
-            // opened; the outer's commit boundary governs.
-            const committed = (await applyCommands(app, boundLog, {
-              mode: 'commit',
-              context: entry.context,
-              tx,
-            })) as CommitResult
-            // Shadow-sweep inside the SAME tx: shadow rows disappear atomically
-            // with the canonical commit. On failure the outer tx rolls back both.
-            // `tx.raw` is the native Drizzle handle bound to this transaction.
-            await clearShadow(tx.raw, draftId, touched)
-            return committed
-          })
+      let shadowWrites = new Set<string>()
+      const result = await app.createTracked().transaction(async (tx) => {
+        const current = await requireStored(tx.raw, draftId, true)
+        const scopedTx = await authorizeTracker(tx, current, context, 'publish')
+        if (current.logRevision !== snapshot.logRevision) {
+          throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
+        }
+        const touched = await readStoredTouchedTables(tx.raw, draftId)
+        const committed = (await applyCommands(app, boundLog, {
+          mode: 'commit',
+          context,
+          tx: scopedTx,
+        })) as CommitResult
+        await clearShadow(tx.raw, draftId, touched)
+        await deleteStoredDraft(tx.raw, draftId)
+        shadowWrites = new Set(
+          touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+        )
+        return committed
+      })
 
-          // Outer transaction committed. Remove the in-memory registry entry now
-          // that the canonical write is durable and the shadow is swept. This is
-          // post-commit — a crash here is harmless (the map is ephemeral and will
-          // be empty on restart regardless). Deleting AFTER commit (not before)
-          // preserves the entry for a retry if the outer tx rolls back.
-          drafts.delete(draftId)
-
-          // Fan out AFTER the commit — canonical tags from the replay, shadow
-          // tags for the sweep (untracked, so `applyCommands` cannot report it).
-          //
-          // The lifecycle emits rather than deferring to the host. `applyCommands`
-          // defers because it may run inside a caller-owned transaction and cannot
-          // know when the write became durable; publish OWNS its commit boundary,
-          // so that reason does not apply here — and `app.emit` names draft
-          // publish as an intended caller. Leaving it to the host made a forgotten
-          // flush indistinguishable from success: canonical committed, every live
-          // subscription silently stale.
-          const tags = new Set([...result.tablesWritten, ...entry.shadowWrites])
-          if (tags.size > 0) app.emit(tags)
-          return result
-        })
-      } catch (err) {
-        // A failed publish leaves the draft LIVE and retryable (the outer tx
-        // rolled back and the entry was never deleted) — so hand the claim back,
-        // or the draft would be permanently unappendable and undiscardable.
-        entry.state = 'open'
-        throw err
-      }
+      const tags = new Set([...result.tablesWritten, ...shadowWrites])
+      if (tags.size > 0) app.emit(tags)
+      return result
     },
 
-    async discard(draftId) {
-      const entry = requireOpen(draftId)
-      // CLAIM the draft synchronously, for the same reason `publish` does:
-      // discard also ends by detaching the entry, so an `append` admitted while
-      // the sweep is in flight would write shadow rows for a draft that no
-      // longer exists — and report success. Work admitted BEFORE the claim still
-      // runs first (and is then discarded, which is what the caller asked for).
-      entry.state = 'discarding'
-      try {
-        return await withDraftLock(entry, async () => {
-          // Discard has no replay to be atomic with, but the sweep itself still
-          // needs a commit boundary: `clearShadow` issues one DELETE per
-          // touched table, and each statement auto-commits on its own
-          // connection. A multi-table draft whose sweep fails partway (a later
-          // DELETE errors) would otherwise leave the EARLIER deletes durably
-          // committed — visible state changed — while the catch below resets
-          // the draft to 'open' and no invalidation is ever emitted for those
-          // tables. Subscribers keep serving rows that are already gone.
-          // Wrapping the sweep in one transaction makes it all-or-nothing:
-          // either every touched shadow table clears (and its tag reaches the
-          // emit below) or none does, and the draft stays live/retryable.
-          const touched = [...entry.touchedTables.values()]
-          await app.createTracked().transaction(async (tx) => {
-            await clearShadow(tx.raw, draftId, touched)
-          })
-          drafts.delete(draftId)
-          // Canonical is untouched, but the overlay rows are gone — draft-scoped
-          // subscriptions are stale and must be told. Empty for a read-only
-          // draft: the sweep found nothing, so nobody's result changed.
-          if (entry.shadowWrites.size > 0) app.emit(entry.shadowWrites)
-        })
-      } catch (err) {
-        // Symmetric with publish: a failed sweep leaves the draft live, so hand
-        // the claim back or it becomes permanently unusable.
-        entry.state = 'open'
-        throw err
-      }
+    async discard(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      let shadowWrites = new Set<string>()
+      await app.createTracked().transaction(async (tx) => {
+        const stored = await requireStored(tx.raw, draftId, true)
+        await authorizeTracker(tx, stored, context, 'discard')
+        const touched = await readStoredTouchedTables(tx.raw, draftId)
+        await clearShadow(tx.raw, draftId, touched)
+        await deleteStoredDraft(tx.raw, draftId)
+        shadowWrites = new Set(
+          touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+        )
+      })
+      if (shadowWrites.size > 0) app.emit(shadowWrites)
     },
 
-    async detectConflict(draftId) {
-      const entry = require(draftId)
+    async detectConflict(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const stored = await requireStored(app.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'detectConflict')
       if (!versionProbe) {
         // No probe ⇒ detection opted out. Report no conflict (the app chose not
         // to track canonical versions).
@@ -659,35 +598,37 @@ export function createDraftLifecycle(
       }
 
       const current = await versionProbe.current()
-      const staleBase = versionProbe.isNewerThan(current, entry.baseVersion)
+      const staleBase = versionProbe.isNewerThan(current, stored.baseVersion)
 
       // Fine signal: enumerate THIS draft's touched cells from the shadow tables
       // (the `(draft_id, id)` keys), then ask the probe which canonical also
       // wrote at/after base. Reading the shadow keeps detection artifact-blind.
-      const touchedCells = await enumerateTouchedCells(app, draftId, [
-        ...entry.touchedTables.values(),
-      ])
+      const touched = await readStoredTouchedTables(scoped.raw, draftId)
+      const touchedCells = await enumerateTouchedCells(scoped.raw, draftId, touched)
       const overlappingCells =
         touchedCells.length > 0
-          ? await versionProbe.cellsWrittenSince(entry.baseVersion, touchedCells)
+          ? await versionProbe.cellsWrittenSince(stored.baseVersion, touchedCells)
           : []
 
       return { staleBase, overlappingCells }
     },
 
-    getLog(draftId) {
-      return [...require(draftId).log]
+    async getLog(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const stored = await requireStored(app.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'getLog')
+      return readStoredCommands(scoped.raw, draftId)
     },
   }
 }
 
 /**
  * Wrap a draft handle so every `into(table)` / `from(table)` records the Drizzle
- * table OBJECT (keyed by SQL name) into `touchedTables`. We capture the object —
- * not just the name from `tablesWritten` — because detection + teardown need to
- * introspect each table's schema + PK, and there is no generic name→table
- * registry. Reads (`from`) are recorded too: a `from(t).where(eqPk).delete()`
- * routes through `from`, so a delete-only draft is still captured.
+ * table OBJECT (keyed by SQL name) as a candidate. We capture reads too because
+ * `from(t).where(...).delete()` routes through `from`; after execution,
+ * `describeTouchedTables` keeps only candidates whose draft write tag actually
+ * committed. Canonical-only reads therefore never become shadow sweep targets.
  */
 function recordTouchedTables(
   draftDb: DraftDrizzleTracker,
@@ -725,21 +666,19 @@ function recordTouchedTables(
  * as touched cells — a draft delete still conflicts with a canonical write.
  */
 async function enumerateTouchedCells(
-  app: WyStackApp,
+  raw: DrizzleTracker['raw'],
   draftId: string,
-  touchedTables: AnyTable[],
+  touchedTables: StoredTouchedTable[],
 ): Promise<Cell[]> {
-  const db = app.createTracked().raw
   const cells: Cell[] = []
-  for (const drizzleTable of touchedTables) {
-    const tableName = getTableName(drizzleTable)
-    const config = getTableConfig(drizzleTable)
-    const pkColName = resolvePkColumnName(drizzleTable, config)
-    const schema = config.schema
-    const draftRel = schema ? `"${schema}"."${tableName}__draft"` : `"${tableName}__draft"`
-    const prefix = sql.raw(`SELECT "${pkColName}" AS id FROM ${draftRel} WHERE "draft_id" = `)
-    const rows = normalizeRows(await db.execute(sql`${prefix}${draftId}`))
-    for (const r of rows) cells.push({ table: tableName, id: (r as { id: unknown }).id })
+  for (const table of touchedTables) {
+    const draftRel = qualifiedDraftRelation(table)
+    const prefix = sql.raw(
+      `SELECT ${quoteIdentifier(table.pkColumn)} AS id FROM ${draftRel} WHERE "draft_id" = `,
+    )
+    const rows = normalizeRows(await raw.execute(sql`${prefix}${draftId}`))
+    const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
+    for (const r of rows) cells.push({ table: tableIdentity, id: (r as { id: unknown }).id })
   }
   return cells
 }
@@ -761,16 +700,22 @@ async function clearShadow(
   // oxlint-disable-next-line typescript/no-explicit-any -- DrizzleDb is `any` in @wystack/db
   raw: any,
   draftId: string,
-  touchedTables: AnyTable[],
+  touchedTables: StoredTouchedTable[],
 ): Promise<void> {
-  for (const drizzleTable of touchedTables) {
-    const tableName = getTableName(drizzleTable)
-    const config = getTableConfig(drizzleTable)
-    const schema = config.schema
-    const draftRel = schema ? `"${schema}"."${tableName}__draft"` : `"${tableName}__draft"`
+  for (const table of touchedTables) {
+    const draftRel = qualifiedDraftRelation(table)
     const prefix = sql.raw(`DELETE FROM ${draftRel} WHERE "draft_id" = `)
     await raw.execute(sql`${prefix}${draftId}`)
   }
+}
+
+function qualifiedDraftRelation(table: StoredTouchedTable): string {
+  const relation = quoteIdentifier(`${table.table}__draft`)
+  return table.schema ? `${quoteIdentifier(table.schema)}.${relation}` : relation
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`
 }
 
 function normalizeRows(result: unknown): Record<string, unknown>[] {

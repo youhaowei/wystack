@@ -18,21 +18,20 @@ import type { PgTable, PgTableExtraConfigValue } from 'drizzle-orm/pg-core'
 import type { AnyColumnDef, ColumnDefOptions } from './dsl'
 import { TableDefinition, type TableCapabilities } from './table'
 
-type LegacyTableDefinition = Record<string, AnyColumnDef>
-type AnyTableDefinition = TableDefinition<LegacyTableDefinition, boolean> | LegacyTableDefinition
-type TableDefs = Record<string, AnyTableDefinition>
+type ColumnMap = Record<string, AnyColumnDef>
+type AnyTableDefinition = TableDefinition<ColumnMap, boolean>
 
 const tableCapabilities = new WeakMap<object, TableCapabilities>()
 const generatedTables = new WeakMap<object, PgTable[]>()
 
-function normalizeTableDefinition(definition: AnyTableDefinition): {
-  columns: LegacyTableDefinition
+function normalizeTableDefinition(definition: unknown): {
+  columns: ColumnMap
   capabilities: TableCapabilities
 } {
   if (definition instanceof TableDefinition) {
     return { columns: definition.columns, capabilities: definition.capabilities }
   }
-  return { columns: definition, capabilities: { draftable: false } }
+  throw new Error('defineSchema entries must use table(...) or multiTenant(...).table(...)')
 }
 
 export function getTableCapabilities(table: object): TableCapabilities {
@@ -49,10 +48,10 @@ export function getGeneratedTables(schema: object): PgTable[] {
   return [...(generatedTables.get(schema) ?? [])]
 }
 
-// oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
 function buildColumn(
   name: string,
   opts: ColumnDefOptions,
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
   allTables: Record<string, any>,
   sqlName: string = name,
 ) {
@@ -133,7 +132,7 @@ function buildColumn(
 
 function buildTable(
   tableName: string,
-  columns: LegacyTableDefinition,
+  columns: ColumnMap,
   capabilities: TableCapabilities,
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
   allTables: Record<string, any>,
@@ -141,7 +140,8 @@ function buildTable(
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle column builders
   const colDefs: Record<string, any> = {}
   for (const [property, definition] of Object.entries(columns)) {
-    const sqlName = capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
+    const sqlName =
+      capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
     colDefs[property] = buildColumn(property, definition.opts, allTables, sqlName)
   }
 
@@ -150,13 +150,13 @@ function buildTable(
     ([, definition]) => definition.opts.isUniqueWithinTenant || definition.opts.ref?.withinTenant,
   )
   if (!tenant && tenantLocalColumns.length > 0) {
-    throw new Error(
-      `Table "${tableName}" uses tenant-local constraints but is not tenant-isolated`,
-    )
+    throw new Error(`Table "${tableName}" uses tenant-local constraints but is not tenant-isolated`)
   }
   if (!tenant) return pgTable(tableName, colDefs)
 
-  const primaryEntries = Object.entries(columns).filter(([, definition]) => definition.opts.isPrimaryKey)
+  const primaryEntries = Object.entries(columns).filter(
+    ([, definition]) => definition.opts.isPrimaryKey,
+  )
   if (primaryEntries.length !== 1) {
     throw new Error(`Tenant-isolated table "${tableName}" requires exactly one primary key`)
   }
@@ -205,11 +205,7 @@ function buildTable(
   return compiled
 }
 
-function buildDraftTable(
-  tableName: string,
-  columns: LegacyTableDefinition,
-  capabilities: TableCapabilities,
-) {
+function buildDraftTable(tableName: string, columns: ColumnMap, capabilities: TableCapabilities) {
   const primaryEntries = Object.entries(columns).filter(([, column]) => column.opts.isPrimaryKey)
   if (primaryEntries.length !== 1) {
     throw new Error(
@@ -221,7 +217,8 @@ function buildDraftTable(
   const tenantProperty = capabilities.tenancy?.property
   const reservedSqlNames = new Set(['draft_id', '__overrides', '__tombstone'])
   for (const [property, definition] of Object.entries(columns)) {
-    const sqlName = capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
+    const sqlName =
+      capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
     if (reservedSqlNames.has(sqlName)) {
       throw new Error(
         `Draftable table "${tableName}" column "${property}" collides with reserved shadow column "${sqlName}"`,
@@ -303,7 +300,18 @@ function buildDraftTable(
   return shadow
 }
 
-export function defineSchema<T extends TableDefs>(tables: T) {
+export function defineSchema<const T extends Record<string, unknown>>(
+  tables: T & { [K in keyof T]: AnyTableDefinition },
+) {
+  const tenancyDescriptors = new Set(
+    Object.values(tables)
+      .map((definition) => normalizeTableDefinition(definition).capabilities.tenancy?.descriptorId)
+      .filter((descriptorId): descriptorId is symbol => descriptorId !== undefined),
+  )
+  if (tenancyDescriptors.size > 1) {
+    throw new Error('defineSchema supports exactly one multiTenant descriptor')
+  }
+
   // oxlint-disable-next-line typescript/no-explicit-any -- accumulates Drizzle pgTable objects passed to buildColumn for references
   const result: Record<string, any> = {}
 

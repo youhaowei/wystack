@@ -13,7 +13,7 @@
 //   AC #8 — multiple renderers get independent connections keyed by webContents.id
 
 import { describe, test, expect } from 'bun:test'
-import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { attachElectronTransport } from '../electron'
 import type { IpcMainEventLike, IpcMainLike, WebContentsLike } from '../electron'
 import { defineApp } from '../define-app'
@@ -25,7 +25,7 @@ const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 // ---------------------------------------------------------------------------
 
 const schema = defineSchema({
-  todos: { id: int.primaryKey(), title: text, done: boolean },
+  todos: table({ id: int.primaryKey(), title: text, done: boolean }),
 })
 
 async function makeApp() {

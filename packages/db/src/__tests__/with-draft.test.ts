@@ -211,7 +211,7 @@ describe('draft lowering', () => {
 
   test('orderBy(col) lowers the named column with the pk as trailing tiebreaker', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title').toSql()
-    expect(lowered).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(lowered).toContain('ORDER BY CASE WHEN \'title\' = ANY(d."__overrides")')
     expect(lowered).toContain(', COALESCE(d."id", b."id")')
   })
 
@@ -219,7 +219,7 @@ describe('draft lowering', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title', 'desc').toSql()
     // DESC binds to the named column; the tiebreaker stays ascending, so a
     // descending read still resolves ties the same way an ascending one does.
-    expect(lowered).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(lowered).toContain('ORDER BY CASE WHEN \'title\' = ANY(d."__overrides")')
     expect(lowered).toContain('END DESC, COALESCE(d."id", b."id")')
   })
 
@@ -233,7 +233,7 @@ describe('draft lowering', () => {
     const draft = tracked.withDraft('d1').from(todos).orderBy('title').toSql().sql
 
     expect(canonical).toContain('order by "todos"."title" asc, "todos"."id" asc')
-    expect(draft).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(draft).toContain('ORDER BY CASE WHEN \'title\' = ANY(d."__overrides")')
     expect(draft).toContain(', COALESCE(d."id", b."id")')
   })
 
@@ -262,8 +262,8 @@ describe('draft lowering', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).select('done', 'title').toSql()
     // Named order, not schema order — asserted on the SELECT list because the
     // returned row's key order is the same either way when the two coincide.
-    const doneIndex = lowered.indexOf("CASE WHEN 'done' = ANY(d.\"__overrides\")")
-    const titleIndex = lowered.indexOf("CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    const doneIndex = lowered.indexOf('CASE WHEN \'done\' = ANY(d."__overrides")')
+    const titleIndex = lowered.indexOf('CASE WHEN \'title\' = ANY(d."__overrides")')
     expect(doneIndex).toBeGreaterThanOrEqual(0)
     expect(titleIndex).toBeGreaterThan(doneIndex)
     // The pk is absent from the SELECT list but still drives join and ordering.
@@ -695,6 +695,7 @@ describe('withDraft schema-qualified tables', () => {
     expect(rows).toHaveLength(2)
     expect(byId[1]['owner']).toBe('root-edited')
     expect(byId[2]['owner']).toBe('guest')
+    expect(tracked.tablesRead).toEqual(new Set(['app.accounts', 'app.accounts__draft']))
   })
 })
 
@@ -900,8 +901,8 @@ describe('decodeRowFromDriver — column codec decode (read mirror of #48)', () 
   })
 
   test('a NULL column value passes through (no override sentinel preserved, codec not invoked)', () => {
-    // `config` is nullable; a coalesced NULL means SQL NULL / no override and
-    // must never be fed to the codec (jsonb would stringify null → "null").
+    // `config` is nullable; an effective SQL NULL (canonical or explicit draft
+    // assignment) must never be fed to the codec.
     const decoded = decodeRowFromDriver(
       { id: 3, title: 'r3', fields: '[]', config: null },
       reportEntries,

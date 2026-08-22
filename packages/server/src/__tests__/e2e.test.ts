@@ -5,18 +5,18 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean, eq } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { serve } from '../serve-bun'
 import { defineApp } from '../define-app'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
+  }),
 })
 
 let server: ReturnType<typeof serve>

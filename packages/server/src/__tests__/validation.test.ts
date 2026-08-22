@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
 import { buildArgsSchema, ValidationError } from '../validation'
 import { defineApp } from '../define-app'
 import { PermissionDeniedError } from '../index'
@@ -133,11 +133,11 @@ describe('buildArgsSchema', () => {
 
 describe('validation in call()', () => {
   const schema = defineSchema({
-    todos: {
+    todos: table({
       id: int.primaryKey(),
       title: text,
       done: boolean,
-    },
+    }),
   })
 
   let app: Awaited<ReturnType<typeof wy.build>>

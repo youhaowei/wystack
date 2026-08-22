@@ -19,7 +19,7 @@
 import { describe, test, expect } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '../index'
 import { createCaller } from '../caller'
 import { createInvalidationRouter } from '../engine/invalidation-router'
@@ -27,7 +27,7 @@ import { createInMemorySubscriptionStore } from '../engine/subscription-store'
 import type { SubscriptionEntry } from '../engine/subscription-store'
 
 const schema = defineSchema({
-  todos: { id: int.primaryKey(), title: text, done: boolean },
+  todos: table({ id: int.primaryKey(), title: text, done: boolean }),
 })
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })

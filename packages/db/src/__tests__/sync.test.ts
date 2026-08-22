@@ -13,7 +13,7 @@ import {
 } from 'drizzle-orm/pg-core'
 
 import { renderCreateTableIfNotExists, syncSchema } from '../sync'
-import { defineSchema, multiTenant, table, text as wyText, uuid as wyUuid } from '../index'
+import { defineSchema, multiTenant, text as wyText, uuid as wyUuid } from '../index'
 
 const bytea = customType<{ data: Uint8Array; default: false }>({
   dataType() {

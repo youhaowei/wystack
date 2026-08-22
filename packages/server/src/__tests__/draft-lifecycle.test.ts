@@ -18,7 +18,8 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean, jsonb, eq } from '@wystack/db'
+import { integer, pgSchema, text as pgText } from 'drizzle-orm/pg-core'
+import { table, defineSchema, text, int, boolean, jsonb, eq } from '@wystack/db'
 import {
   createDraftLifecycle,
   type VersionProbe,
@@ -30,10 +31,19 @@ import { defineApp } from '../define-app'
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
-  todos: { id: int.primaryKey(), title: text, done: boolean },
+  todos: table({ id: int.primaryKey(), title: text, done: boolean }).draftable(),
+  settings: table({ id: int.primaryKey(), prefix: text }),
   // A "dashboard" with a jsonb-ish text column holding a comma-joined id list —
   // stands in for the intent-grouping case (add_to_dashboard merges into a node).
-  dashboards: { id: int.primaryKey(), items: text },
+  dashboards: table({ id: int.primaryKey(), items: text }).draftable(),
+})
+const appAccounts = pgSchema('app').table('accounts', {
+  id: integer('id').primaryKey(),
+  name: pgText('name').notNull(),
+})
+const auditAccounts = pgSchema('audit').table('accounts', {
+  id: integer('id').primaryKey(),
+  name: pgText('name').notNull(),
 })
 
 let app: Awaited<ReturnType<typeof wy.build>>
@@ -52,6 +62,7 @@ beforeEach(async () => {
       __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id))
   `)
   await db.execute(`CREATE TABLE dashboards (id INTEGER PRIMARY KEY, items TEXT NOT NULL)`)
+  await db.execute(`CREATE TABLE settings (id INTEGER PRIMARY KEY, prefix TEXT NOT NULL)`)
   await db.execute(`
     CREATE TABLE dashboards__draft (
       draft_id TEXT NOT NULL, id INTEGER NOT NULL, items TEXT,
@@ -60,6 +71,7 @@ beforeEach(async () => {
   `)
   await db.execute(`INSERT INTO todos (id,title,done) VALUES (1,'apple',false),(2,'banana',false)`)
   await db.execute(`INSERT INTO dashboards (id,items) VALUES (1,'a')`)
+  await db.execute(`INSERT INTO settings (id,prefix) VALUES (1,'from-setting')`)
 
   app = await wy.build({
     db,
@@ -78,6 +90,14 @@ beforeEach(async () => {
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
+      addTodoUsingSetting: wy.procedure.input({ id: int }).mutation(async (ctx, args) => {
+        const setting = await ctx.db.from(schema.settings).first()
+        return ctx.db.into(schema.todos).insert({
+          id: args.id,
+          title: String(setting?.prefix),
+          done: false,
+        })
+      }),
       renameTodo: wy.procedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
@@ -86,6 +106,16 @@ beforeEach(async () => {
       removeTodo: wy.procedure
         .input({ id: int })
         .mutation(async (ctx, args) => ctx.db.from(schema.todos).where(eq('id', args.id)).delete()),
+      renameAppAccount: wy.procedure
+        .input({ id: int, name: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.from(appAccounts).where(eq('id', args.id)).update({ name: args.name }),
+        ),
+      renameAuditAccount: wy.procedure
+        .input({ id: int, name: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.from(auditAccounts).where(eq('id', args.id)).update({ name: args.name }),
+        ),
       // INTENT-GROUPING handler: appends an item id to a dashboard's `items`
       // list. The EFFECT (read-modify-write of a merged list) cannot be
       // reconstructed from a row-delta — only replaying THIS command reproduces
@@ -93,9 +123,8 @@ beforeEach(async () => {
       addToDashboard: wy.procedure
         .input({ dashboardId: int, item: text })
         .mutation(async (ctx, args) => {
-          // Read-modify-write. NOTE: the draft read coalesce does not yet push
-          // `where` down, so a draft-safe handler reads the full
-          // coalesced set and filters in JS rather than `.where().all()`.
+          // Read-modify-write over the effective draft relation. This intentionally
+          // reads the full dashboard set because the command merges one node's list.
           const rows = (await ctx.db.from(schema.dashboards).all()) as {
             id: number
             items: string
@@ -144,9 +173,71 @@ function makeProbe(): VersionProbe & {
 }
 
 describe('draft lifecycle — golden path (open→append→read→publish)', () => {
+  test('draft metadata and command log survive lifecycle recreation', async () => {
+    const firstProcess = createDraftLifecycle(app)
+    const draftId = await firstProcess.open(0)
+    await firstProcess.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+
+    const restartedProcess = createDraftLifecycle(app)
+    expect(await restartedProcess.getLog(draftId)).toEqual([
+      { path: 'addTodo', args: { id: 3, title: 'cherry' } },
+    ])
+    const migration = await db.execute(
+      `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((migration as any).rows[0].version).toBe(1)
+
+    await restartedProcess.publish(draftId)
+    const { result: canonical } = await app.call('listTodos', {})
+    expect((canonical as { id: number }[]).some((row) => row.id === 3)).toBe(true)
+    await expect(restartedProcess.getLog(draftId)).rejects.toThrow('unknown draft')
+  })
+
+  test('default custody follows stable principal identity, not mutable profile fields', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0, {
+      context: {
+        principal: {
+          kind: 'user',
+          userId: 'user-1',
+          identity: { subject: 'provider|1', email: 'old@example.test' },
+        },
+      },
+    })
+
+    expect(
+      await createDraftLifecycle(app).getLog(draftId, {
+        context: {
+          principal: {
+            kind: 'user',
+            userId: 'user-1',
+            identity: { subject: 'provider|1', email: 'new@example.test' },
+          },
+        },
+      }),
+    ).toEqual([])
+
+    const persisted = await db.execute(
+      `SELECT owner_key FROM wystack_drafts WHERE draft_id = '${draftId}'`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect(JSON.stringify((persisted as any).rows[0].owner_key)).not.toContain('old@example.test')
+  })
+
+  test('canonical-only reads are not treated as draft shadows during publish', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodoUsingSetting', args: { id: 3 } }])
+
+    await lifecycle.publish(draftId)
+    const { result } = await app.call('listTodos', {})
+    expect((result as { title: string }[]).some((row) => row.title === 'from-setting')).toBe(true)
+  })
+
   test('append routes writes into the overlay; canonical is untouched until publish', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     await lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
@@ -166,7 +257,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
 
   test('publish replays the log onto canonical atomically; overlay is torn down', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
       { path: 'renameTodo', args: { id: 1, title: 'APPLE' } },
@@ -195,7 +286,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     // canonical command replay AND the sweep — no "canonical committed but
     // shadow still present" state. The draft stays live and publish is retryable.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     // Drop the shadow table so clearShadow throws inside the outer tx.
@@ -210,8 +301,8 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     expect(canonical as unknown[]).toHaveLength(2)
     expect((canonical as { id: number }[]).find((r) => r.id === 3)).toBeUndefined()
 
-    // Draft registry entry is still live — the caller can retry or discard.
-    expect(lc.getLog(draftId)).toHaveLength(1)
+    // Durable metadata and log are still live — the caller can retry or discard.
+    expect(await lc.getLog(draftId)).toHaveLength(1)
   })
 
   test('atomic publish: replay + sweep commit together — no crash window between them', async () => {
@@ -231,9 +322,9 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     // Test approach: open, append, then verify that a SUCCESSFUL publish leaves
     // canonical written AND shadow swept in the same observable snapshot — we
     // cannot observe mid-transaction state, but we can verify the end-to-end
-    // invariant and check that the registry entry is removed only post-commit.
+    // invariant and check that durable metadata disappears with the commit.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const result = await lc.publish(draftId)
@@ -256,7 +347,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
 
   test('compaction accumulates ACROSS appends: create in batch 1, delete in batch 2 ⇒ net empty', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     // Batch 1 creates id=3; batch 2 deletes it. Net effect: the row never
     // existed canonically, so the published log is empty.
     await lc.append(draftId, [
@@ -270,7 +361,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     await lc.append(draftId, [
       { path: 'removeTodo', args: { id: 3 }, compactionKey: 'todo:3', kind: 'delete' },
     ])
-    expect(lc.getLog(draftId)).toHaveLength(0)
+    expect(await lc.getLog(draftId)).toHaveLength(0)
 
     await lc.publish(draftId)
     // Canonical unchanged — the create+delete cancelled before publish.
@@ -282,7 +373,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
 describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
   test('an intent-grouping command (add_to_dashboard) reconstructs ONLY via replay', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     // Two add_to_dashboard read-modify-write commands inside the draft. The
     // overlay's stored `items` reflects the merge against the canonical value
@@ -303,7 +394,10 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
     await db.execute(`UPDATE dashboards SET items = 'a,z' WHERE id = 1`)
 
     // The log is the publish unit — both commands present, in order.
-    expect(lc.getLog(draftId).map((c) => c.path)).toEqual(['addToDashboard', 'addToDashboard'])
+    expect((await lc.getLog(draftId)).map((c) => c.path)).toEqual([
+      'addToDashboard',
+      'addToDashboard',
+    ])
 
     await lc.publish(draftId)
 
@@ -315,7 +409,7 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
 
   test('a mid-log failure at publish rolls the whole batch back (atomic)', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
     // Publish-time resolve injects a command that violates the NOT NULL title —
     // proving the replay is one atomic applyCommands(commit).
@@ -333,13 +427,11 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
   })
 
   test('a failed publish leaves the draft live and recoverable (discard cleans up)', async () => {
-    // A failed replay leaves the draft ENTRY intact so the app can retry or
-    // discard — publish only deletes it after the outer tx commits, and its
-    // catch releases the `publishing` claim without touching the entry. Prove
-    // the draft survives and discard then clears the overlay (no orphaned
-    // shadow rows, no canonical effect).
+    // A failed replay leaves the durable draft row and log intact so the app can
+    // retry or discard. Prove discard then clears the overlay with no orphaned
+    // shadow rows and no canonical effect.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     await expect(
@@ -351,7 +443,7 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
     ).rejects.toThrow()
 
     // Draft is still live: its log is intact and a clean re-publish succeeds.
-    expect(lc.getLog(draftId)).toHaveLength(1)
+    expect(await lc.getLog(draftId)).toHaveLength(1)
 
     // Recover via discard: shadow cleared, canonical untouched, draft forgotten.
     await lc.discard(draftId)
@@ -366,7 +458,7 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
 describe('draft lifecycle — resolve(log) binds late-bound operands pre-commit', () => {
   test('the resolve hook rewrites the log immediately before commit', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     // The appended command carries a PLACEHOLDER title; resolve binds it.
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: '<<late>>' } }])
 
@@ -388,7 +480,7 @@ describe('draft lifecycle — resolve(log) binds late-bound operands pre-commit'
 describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () => {
   test('no probe ⇒ detection opts out (no conflict reported)', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'X' } }])
     expect(await lc.detectConflict(draftId)).toEqual({ staleBase: false, overlappingCells: [] })
   })
@@ -397,7 +489,7 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const probe = makeProbe()
     const lc = createDraftLifecycle(app, { versionProbe: probe })
     const base = await probe.current()
-    const draftId = lc.open(base)
+    const draftId = await lc.open(base)
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'DRAFT-1' } }])
     // No canonical bump between open and detect — nothing moved.
     expect(await lc.detectConflict(draftId)).toEqual({ staleBase: false, overlappingCells: [] })
@@ -407,7 +499,7 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const probe = makeProbe()
     const lc = createDraftLifecycle(app, { versionProbe: probe })
     const base = await probe.current()
-    const draftId = lc.open(base)
+    const draftId = await lc.open(base)
 
     // Draft touches todos id=1.
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'DRAFT-1' } }])
@@ -424,7 +516,7 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const probe = makeProbe()
     const lc = createDraftLifecycle(app, { versionProbe: probe })
     const base = await probe.current()
-    const draftId = lc.open(base)
+    const draftId = await lc.open(base)
 
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'DRAFT-1' } }])
 
@@ -440,7 +532,7 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const probe = makeProbe()
     const lc = createDraftLifecycle(app, { versionProbe: probe })
     const base = await probe.current()
-    const draftId = lc.open(base)
+    const draftId = await lc.open(base)
 
     await lc.append(draftId, [{ path: 'removeTodo', args: { id: 2 } }])
     probe.bump([{ table: 'todos', id: 2 }])
@@ -448,12 +540,46 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const report = await lc.detectConflict(draftId)
     expect(report.overlappingCells).toEqual([{ table: 'todos', id: 2 }])
   })
+
+  test('same-named tables in different schemas retain distinct conflict identities', async () => {
+    await db.execute(`CREATE SCHEMA app`)
+    await db.execute(`CREATE SCHEMA audit`)
+    for (const namespace of ['app', 'audit']) {
+      await db.execute(
+        `CREATE TABLE ${namespace}.accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
+      )
+      await db.execute(`
+        CREATE TABLE ${namespace}.accounts__draft (
+          draft_id TEXT NOT NULL,
+          id INTEGER NOT NULL,
+          name TEXT,
+          __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+          __tombstone BOOLEAN NOT NULL DEFAULT false,
+          PRIMARY KEY (draft_id, id)
+        )
+      `)
+      await db.execute(`INSERT INTO ${namespace}.accounts (id, name) VALUES (1, 'original')`)
+    }
+
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    await lifecycle.append(draftId, [
+      { path: 'renameAppAccount', args: { id: 1, name: 'app draft' } },
+      { path: 'renameAuditAccount', args: { id: 1, name: 'audit draft' } },
+    ])
+    probe.bump([{ table: 'app.accounts', id: 1 }])
+
+    expect((await lifecycle.detectConflict(draftId)).overlappingCells).toEqual([
+      { table: 'app.accounts', id: 1 },
+    ])
+  })
 })
 
 describe('draft lifecycle — discard', () => {
   test('discard drops the overlay with no canonical effect', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     await lc.discard(draftId)
@@ -476,7 +602,7 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
     // silently omitted it. The clone now runs first, so the failure lands ahead
     // of any write.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     await expect(
       lc.append(draftId, [
@@ -493,7 +619,7 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
     ).rejects.toThrow('can not be cloned')
 
     // Neither half of the draft moved: no command logged, no overlay row.
-    expect(lc.getLog(draftId)).toHaveLength(0)
+    expect(await lc.getLog(draftId)).toHaveLength(0)
     const shadow = await db.execute(`SELECT * FROM todos__draft WHERE draft_id = '${draftId}'`)
     // oxlint-disable-next-line typescript/no-explicit-any
     expect((shadow as any).rows).toHaveLength(0)
@@ -501,24 +627,24 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
     // And the draft is still usable — this was a rejected command, not a
     // poisoned draft.
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
-    expect(lc.getLog(draftId)).toHaveLength(1)
+    expect(await lc.getLog(draftId)).toHaveLength(1)
   })
 })
 
 describe('draft lifecycle — command envelope ownership', () => {
   test('rejects an Action before it can execute against the draft tracker', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     await expect(lc.append(draftId, [{ path: 'externalAction', args: {} }])).rejects.toThrow(
       'Draft command externalAction cannot reference an action',
     )
-    expect(lc.getLog(draftId)).toEqual([])
+    expect(await lc.getLog(draftId)).toEqual([])
   })
 
   test('snapshots a mutable batch before validation and queued execution', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     const batch: Command[] = [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }]
 
     const appending = lc.append(draftId, batch)
@@ -526,17 +652,19 @@ describe('draft lifecycle — command envelope ownership', () => {
     batch[0].args = {}
     await appending
 
-    expect(lc.getLog(draftId)).toEqual([{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    expect(await lc.getLog(draftId)).toEqual([
+      { path: 'addTodo', args: { id: 3, title: 'cherry' } },
+    ])
   })
 
   test('rejects a path replaced with an Action while append waits to execute', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     const appending = lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
     app.functions.set('addTodo', app.functions.get('externalAction')!)
 
     await expect(appending).rejects.toThrow('Draft command addTodo cannot reference an action')
-    expect(lc.getLog(draftId)).toEqual([])
+    expect(await lc.getLog(draftId)).toEqual([])
   })
 })
 
@@ -550,40 +678,36 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     return { gate, release }
   }
 
-  test('an append that arrives while publish is in flight is REJECTED, not silently lost', async () => {
-    // The lost-write window: publish snapshots the log, awaits (resolve hook,
-    // then the commit tx), then deletes the draft entry. An append landing in
-    // that window used to write to the overlay, miss the snapshot, and then be
-    // destroyed with the entry — returning success to its caller while nothing
-    // was ever published.
+  test('an append during publish resolution advances CAS and forces a safe retry', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const { gate, release } = deferred()
+    const enteredResolve = deferred()
     const publishing = lc.publish(draftId, async (logToBind) => {
+      enteredResolve.release()
       await gate // hold publish open, mid-flight, before it commits
       return logToBind
     })
 
-    // Publish has claimed the draft (synchronously, before its first await).
-    await expect(
-      lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }]),
-    ).rejects.toThrow('is publishing')
+    await enteredResolve.gate
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }])
 
     release()
-    await publishing
+    await expect(publishing).rejects.toThrow('changed during publish')
+    await lc.publish(draftId)
 
-    // Only the pre-publish command landed. The rejected append wrote nothing —
-    // to canonical OR to the (now swept) overlay.
+    // Neither command was lost: the stale publish committed nothing, and its
+    // retry replayed the newer durable log.
     const { result: canonical } = await app.call('listTodos', {})
     const ids = (canonical as { id: number }[]).map((r) => r.id).sort()
-    expect(ids).toEqual([1, 2, 3])
+    expect(ids).toEqual([1, 2, 3, 4])
   })
 
-  test('discard during publish is rejected (it would sweep the shadow mid-commit)', async () => {
+  test('discard during publish resolution wins atomically and invalidates the stale publish', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const { gate, release } = deferred()
@@ -592,18 +716,18 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
       return l
     })
 
-    await expect(lc.discard(draftId)).rejects.toThrow('is publishing')
+    await lc.discard(draftId)
 
     release()
-    await publishing
+    await expect(publishing).rejects.toThrow('unknown draft')
     const res = await db.execute(`SELECT id FROM todos WHERE id = 3`)
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((res as any).rows).toHaveLength(1)
+    expect((res as any).rows).toHaveLength(0)
   })
 
-  test('a second concurrent publish is rejected; the first commits exactly once', async () => {
+  test('two concurrent publishes commit exactly once through row locking', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addToDashboard', args: { dashboardId: 1, item: 'z' } }])
 
     const { gate, release } = deferred()
@@ -612,10 +736,10 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
       return l
     })
 
-    await expect(lc.publish(draftId)).rejects.toThrow('is publishing')
+    await lc.publish(draftId)
 
     release()
-    await first
+    await expect(first).rejects.toThrow('unknown draft')
 
     // `addToDashboard` is read-modify-write, so a double replay would show as
     // 'a,z,z'. Exactly-once is visible in the value itself.
@@ -624,11 +748,9 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect((res as any).rows[0].items).toBe('a,z')
   })
 
-  test('a FAILED publish releases the claim — append and discard work again', async () => {
-    // The claim must not outlive the publish attempt, or a draft that failed to
-    // publish would be permanently frozen: unappendable and undiscardable.
+  test('a failed publish rolls back its row lock — append and discard work again', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     await expect(
@@ -641,7 +763,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
 
     // Claim released: the draft accepts work again.
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 5, title: 'elderberry' } }])
-    expect(lc.getLog(draftId)).toHaveLength(2)
+    expect(await lc.getLog(draftId)).toHaveLength(2)
     await lc.discard(draftId)
   })
 
@@ -649,7 +771,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     // Without the per-draft lock the two batches interleave their awaits and
     // splice commands into each other's log positions.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     const a = lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'c1' } },
@@ -661,7 +783,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     ])
     await Promise.all([a, b])
 
-    expect(lc.getLog(draftId).map((c) => (c.args as { title: string }).title)).toEqual([
+    expect((await lc.getLog(draftId)).map((c) => (c.args as { title: string }).title)).toEqual([
       'c1',
       'c2',
       'c3',
@@ -669,24 +791,17 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     ])
   })
 
-  test('an append that arrives while DISCARD is in flight is rejected, not orphaned', async () => {
-    // Discard is terminal too — it sweeps the shadow and detaches the entry. An
-    // append admitted into that window would write shadow rows for a draft that
-    // no longer exists (the sweep has already passed that table) and return
-    // success. Same lost-write class as the publish window, one call earlier.
+  test('concurrent append and discard cannot leave an orphaned overlay', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
-    // No gate needed: discard claims the draft SYNCHRONOUSLY, so the un-awaited
-    // call above is enough to put us inside its window.
     const discarding = lc.discard(draftId)
-    await expect(
-      lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }]),
-    ).rejects.toThrow('is discarding')
-    await discarding
+    const appending = lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }])
+    const outcomes = await Promise.allSettled([discarding, appending])
+    expect(outcomes.some((outcome) => outcome.status === 'fulfilled')).toBe(true)
 
-    expect(() => lc.getLog(draftId)).toThrow('unknown draft')
+    await expect(lc.getLog(draftId)).rejects.toThrow('unknown draft')
     const shadow = await db.execute(`SELECT id FROM todos__draft`)
     // oxlint-disable-next-line typescript/no-explicit-any
     expect((shadow as any).rows).toHaveLength(0)
@@ -694,16 +809,9 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect((canonical as { id: number }[]).map((r) => r.id).sort()).toEqual([1, 2])
   })
 
-  test('a publish queued behind a FAILED append still publishes that batch partial work', async () => {
-    // Pinning intended behavior, not asserting it is ideal. The lock chain
-    // deliberately swallows rejections so one failure cannot wedge the draft —
-    // which means queued work runs even when the operation ahead of it threw.
-    // Combined with the existing append contract (a batch is NOT atomic; the
-    // already-applied commands stay in the log and "the conducting app owns
-    // recovery"), a concurrently-issued publish commits the partial batch.
-    // Await the append before publishing if the app wants a say.
+  test('a publish queued behind a failed append observes its atomic rollback', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     const appending = lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
@@ -716,7 +824,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     await publishing
 
     const { result: canonical } = await app.call('listTodos', {})
-    expect((canonical as { id: number }[]).map((r) => r.id).sort()).toEqual([1, 2, 3])
+    expect((canonical as { id: number }[]).map((r) => r.id).sort()).toEqual([1, 2])
   })
 })
 
@@ -732,7 +840,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
 
   test('append announces the OVERLAY write so draft-scoped subscriptions refetch', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     const cap = captureEmits()
 
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
@@ -742,12 +850,9 @@ describe('draft lifecycle — invalidation fan-out', () => {
     cap.unsubscribe()
   })
 
-  test('a mid-batch failure still announces the commands that DID land', async () => {
-    // append is not atomic across a batch: the first command auto-committed to
-    // the overlay and is durable. Staying silent would leave a draft-scoped
-    // client showing stale data for a write that really happened.
+  test('a mid-batch failure rolls back the overlay, log, and invalidation', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     const cap = captureEmits()
 
     await expect(
@@ -757,13 +862,17 @@ describe('draft lifecycle — invalidation fan-out', () => {
       ]),
     ).rejects.toThrow('Unknown function')
 
-    expect(cap.tags()).toEqual(['todos__draft'])
+    expect(cap.tags()).toEqual([])
+    expect(await lc.getLog(draftId)).toEqual([])
+    const shadow = await db.execute(`SELECT id FROM todos__draft WHERE draft_id = '${draftId}'`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((shadow as any).rows).toHaveLength(0)
     cap.unsubscribe()
   })
 
   test('publish announces BOTH the canonical replay and the shadow sweep', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const cap = captureEmits()
@@ -778,7 +887,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
 
   test('a FAILED publish announces nothing (the transaction rolled back)', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const cap = captureEmits()
@@ -796,7 +905,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
 
   test('discard announces the shadow sweep and nothing canonical', async () => {
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
 
     const cap = captureEmits()
@@ -814,7 +923,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     // full recompute for a sweep that deleted nothing. The tags come from what
     // the tracker actually reported written instead.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'listTodos', args: {} }])
 
     const cap = captureEmits()
@@ -839,7 +948,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     // Dropping `dashboards__draft` makes the SECOND delete in that loop fail;
     // an unwrapped sweep would have already committed the first.
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
     await lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
       { path: 'addToDashboard', args: { dashboardId: 1, item: 'x' } },
@@ -861,7 +970,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     cap.unsubscribe()
 
     // The draft stays live and retryable, symmetric with a failed publish.
-    expect(lc.getLog(draftId)).toHaveLength(2)
+    expect(await lc.getLog(draftId)).toHaveLength(2)
 
     // Recreate the dropped table and retry: the sweep now succeeds fully and
     // announces both shadow tags.
@@ -888,7 +997,7 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
     // the same key, so publish replayed the insert alone onto a live primary
     // key — a duplicate-key failure (or, with a forgiving handler, a stale row).
     const lc = createDraftLifecycle(app)
-    const draftId = lc.open(0)
+    const draftId = await lc.open(0)
 
     await lc.append(draftId, [
       { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
@@ -901,7 +1010,7 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
     ])
 
     // Both halves survive compaction, in order.
-    expect(lc.getLog(draftId).map((c) => c.kind)).toEqual(['delete', 'create'])
+    expect((await lc.getLog(draftId)).map((c) => c.kind)).toEqual(['delete', 'create'])
 
     // And the overlay already shows the replacement (the shadow write is a
     // sparse upsert, so the create clears the tombstone the delete set).

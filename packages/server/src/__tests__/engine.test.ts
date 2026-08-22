@@ -27,7 +27,7 @@
 
 import { afterEach, describe, test, expect } from 'bun:test'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
-import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import {
   createLoopbackPair,
   REACTIVITY_NOT_ENABLED,
@@ -47,7 +47,7 @@ import { defineApp } from '../define-app'
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
-  todos: { id: int.primaryKey(), title: text, done: boolean },
+  todos: table({ id: int.primaryKey(), title: text, done: boolean }),
 })
 
 const deniedPermission = {

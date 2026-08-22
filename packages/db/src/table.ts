@@ -12,9 +12,13 @@ export interface TenantKeyDefinition<
   type: TType
 }
 
+export interface TenantCapability extends TenantKeyDefinition {
+  readonly descriptorId: symbol
+}
+
 export interface TableCapabilities {
   draftable: boolean
-  tenancy?: TenantKeyDefinition
+  tenancy?: TenantCapability
 }
 
 export class TableDefinition<
@@ -61,6 +65,10 @@ export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
   if (key.type.opts.isOptional || key.type.opts.isNullable) {
     throw new Error('multiTenant key.type must be required and non-nullable')
   }
+  if (key.type.opts.isArray || !['text', 'uuid', 'int'].includes(key.type.opts.type)) {
+    throw new Error('multiTenant key.type must be a scalar text, uuid, or int column')
+  }
+  const descriptorId = Symbol('multiTenant descriptor')
 
   return {
     key,
@@ -74,7 +82,10 @@ export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
         ...columns,
         [key.property]: key.type,
       } as WithTenantKey<TColumns, TKey>
-      return new TableDefinition(withTenant, { draftable: false, tenancy: key })
+      return new TableDefinition(withTenant, {
+        draftable: false,
+        tenancy: { ...key, descriptorId },
+      })
     },
   }
 }

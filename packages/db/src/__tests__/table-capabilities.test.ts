@@ -5,6 +5,7 @@ import {
   getGeneratedTables,
   getTableCapabilities,
   int,
+  jsonb,
   multiTenant,
   renderCreateTableIfNotExists,
   table,
@@ -14,6 +15,15 @@ import {
 import { getTableConfig } from 'drizzle-orm/pg-core'
 
 describe('composable table capabilities', () => {
+  test('schema entries must declare table capabilities explicitly', () => {
+    expect(() =>
+      defineSchema({
+        // @ts-expect-error — bare column maps are no longer table definitions
+        legacy: { id: uuid.primaryKey() },
+      }),
+    ).toThrow('table(...)')
+  })
+
   test('plain, draftable, tenant, and tenant-draftable tables compile from one model', () => {
     const tenancy = multiTenant({
       key: {
@@ -64,6 +74,35 @@ describe('composable table capabilities', () => {
     ).toThrow('workspaceId')
   })
 
+  test('one schema cannot mix tenancy descriptors', () => {
+    const first = multiTenant({
+      key: { property: 'tenantId', column: 'tenant_id', type: text },
+    })
+    const second = multiTenant({
+      key: { property: 'tenantId', column: 'tenant_id', type: text },
+    })
+
+    expect(() =>
+      defineSchema({
+        first: first.table({ id: uuid.primaryKey() }),
+        second: second.table({ id: uuid.primaryKey() }),
+      }),
+    ).toThrow('exactly one multiTenant descriptor')
+  })
+
+  test('tenant keys are required scalar text, uuid, or int values', () => {
+    expect(() =>
+      multiTenant({
+        key: { property: 'tenantId', column: 'tenant_id', type: jsonb },
+      }),
+    ).toThrow('scalar text, uuid, or int')
+    expect(() =>
+      multiTenant({
+        key: { property: 'tenantId', column: 'tenant_id', type: text.array() },
+      }),
+    ).toThrow('scalar text, uuid, or int')
+  })
+
   test('draftable tables generate presence-aware shadow schemas', () => {
     const tenancy = multiTenant({
       key: {
@@ -74,9 +113,7 @@ describe('composable table capabilities', () => {
     })
     const schema = defineSchema({
       templates: table({ id: uuid.primaryKey(), description: text.nullable() }).draftable(),
-      insights: tenancy
-        .table({ id: uuid.primaryKey(), description: text.nullable() })
-        .draftable(),
+      insights: tenancy.table({ id: uuid.primaryKey(), description: text.nullable() }).draftable(),
     })
 
     const generated = getGeneratedTables(schema)

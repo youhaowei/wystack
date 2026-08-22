@@ -101,6 +101,17 @@ describe('withDraft write — into().insert()', () => {
     expect(byId[4]['title']).toBe('date')
   })
 
+  test('draft insert returns effective rows rather than shadow bookkeeping', async () => {
+    const inserted = await tracked
+      .withDraft('d1')
+      .into(todos)
+      .insert({ id: 4, title: 'date', done: false, note: null })
+
+    expect(inserted).toEqual([{ id: 4, title: 'date', done: false, note: null }])
+    expect(inserted[0]).not.toHaveProperty('draft_id')
+    expect(inserted[0]).not.toHaveProperty('__overrides')
+  })
+
   test('insert requires a client-minted PK', async () => {
     await expect(
       // @ts-expect-error — intentionally omit the PK to prove the runtime guard
@@ -180,11 +191,7 @@ describe('withDraft write — from().where(eqPk).update()', () => {
 
 describe('withDraft write — from().where(eqPk).delete()', () => {
   test('deletes every row selected by non-primary-key filters', async () => {
-    const deleted = await tracked
-      .withDraft('d1')
-      .from(todos)
-      .where(eq('done', false))
-      .delete()
+    const deleted = await tracked.withDraft('d1').from(todos).where(eq('done', false)).delete()
 
     expect(deleted).toHaveLength(3)
     expect(await tracked.withDraft('d1').from(todos).all()).toEqual([])
