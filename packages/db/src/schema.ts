@@ -12,33 +12,59 @@ import {
   uuid as pgUuid,
 } from 'drizzle-orm/pg-core'
 import type { AnyColumnDef, ColumnDefOptions } from './dsl'
+import { TableDefinition, type TableCapabilities } from './table'
 
-type TableDefs = Record<string, Record<string, AnyColumnDef>>
+type LegacyTableDefinition = Record<string, AnyColumnDef>
+type AnyTableDefinition = TableDefinition<LegacyTableDefinition, boolean> | LegacyTableDefinition
+type TableDefs = Record<string, AnyTableDefinition>
+
+const tableCapabilities = new WeakMap<object, TableCapabilities>()
+
+function normalizeTableDefinition(definition: AnyTableDefinition): {
+  columns: LegacyTableDefinition
+  capabilities: TableCapabilities
+} {
+  if (definition instanceof TableDefinition) {
+    return { columns: definition.columns, capabilities: definition.capabilities }
+  }
+  return { columns: definition, capabilities: { draftable: false } }
+}
+
+export function getTableCapabilities(table: object): TableCapabilities {
+  const capabilities = tableCapabilities.get(table)
+  if (!capabilities) throw new Error('Table was not compiled by defineSchema')
+  return capabilities
+}
 
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
-function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<string, any>) {
+function buildColumn(
+  name: string,
+  opts: ColumnDefOptions,
+  allTables: Record<string, any>,
+  sqlName: string = name,
+) {
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builder types vary per column type; no common base type
   let col: any
   const isSerial = opts.type === 'int' && opts.isPrimaryKey
 
   switch (opts.type) {
     case 'text':
-      col = pgText(name)
+      col = pgText(sqlName)
       break
     case 'int':
-      col = isSerial ? serial(name) : integer(name)
+      col = isSerial ? serial(sqlName) : integer(sqlName)
       break
     case 'boolean':
-      col = pgBoolean(name)
+      col = pgBoolean(sqlName)
       break
     case 'timestamp':
-      col = pgTimestamp(name)
+      col = pgTimestamp(sqlName)
       break
     case 'jsonb':
-      col = pgJsonb(name)
+      col = pgJsonb(sqlName)
       break
     case 'uuid':
-      col = pgUuid(name)
+      col = pgUuid(sqlName)
       break
     default: {
       const _exhaustive: never = opts.type
@@ -50,7 +76,7 @@ function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<str
     col = col.array()
   }
 
-  if (!opts.isOptional && !opts.hasDefault && !isSerial) {
+  if (!opts.isOptional && !opts.isNullable && !opts.hasDefault && !isSerial) {
     col = col.notNull()
   }
 
@@ -97,26 +123,32 @@ export function defineSchema<T extends TableDefs>(tables: T) {
   const result: Record<string, any> = {}
 
   // Pass 1: create all tables without foreign key references
-  for (const [tableName, columns] of Object.entries(tables)) {
+  for (const [tableName, definition] of Object.entries(tables)) {
+    const { columns, capabilities } = normalizeTableDefinition(definition)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
     const colDefs: Record<string, any> = {}
     for (const [colName, colDef] of Object.entries(columns)) {
-      colDefs[colName] = buildColumn(colName, colDef.opts, {})
+      const sqlName = capabilities.tenancy?.property === colName ? capabilities.tenancy.column : colName
+      colDefs[colName] = buildColumn(colName, colDef.opts, {}, sqlName)
     }
     result[tableName] = pgTable(tableName, colDefs)
+    tableCapabilities.set(result[tableName], capabilities)
   }
 
   // Pass 2: rebuild tables that have foreign key references (now all tables exist)
-  for (const [tableName, columns] of Object.entries(tables)) {
+  for (const [tableName, definition] of Object.entries(tables)) {
+    const { columns, capabilities } = normalizeTableDefinition(definition)
     const hasRefs = Object.values(columns).some((c) => c.opts.ref)
     if (!hasRefs) continue
 
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builders have heterogeneous types
     const colDefs: Record<string, any> = {}
     for (const [colName, colDef] of Object.entries(columns)) {
-      colDefs[colName] = buildColumn(colName, colDef.opts, result)
+      const sqlName = capabilities.tenancy?.property === colName ? capabilities.tenancy.column : colName
+      colDefs[colName] = buildColumn(colName, colDef.opts, result, sqlName)
     }
     result[tableName] = pgTable(tableName, colDefs)
+    tableCapabilities.set(result[tableName], capabilities)
   }
 
   return result as { [K in keyof T]: ReturnType<typeof pgTable> }

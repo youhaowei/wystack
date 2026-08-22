@@ -66,6 +66,17 @@ describe('buildArgsSchema', () => {
     expect(schema.safeParse({ name: 42 }).success).toBe(false)
   })
 
+  test('distinguishes omitted, explicit null, and concrete nullable values', () => {
+    const schema = buildArgsSchema({ assigneeId: uuid.nullable().optional() })
+    const id = '550e8400-e29b-41d4-a716-446655440000'
+
+    expect(schema.safeParse({}).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: undefined }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: null }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: id }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: 'not-a-uuid' }).success).toBe(false)
+  })
+
   test('handles args with defaults as optional and applies default value', () => {
     const schema = buildArgsSchema({ limit: int.default(10) })
     expect(schema.safeParse({ limit: 5 }).success).toBe(true)
