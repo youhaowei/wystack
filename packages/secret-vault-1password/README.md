@@ -51,4 +51,11 @@ bun run --cwd packages/secret-vault-1password smoke:live
 
 It creates a random non-sensitive probe item, verifies the full `SecretVault` round
 trip, and deletes the item in `finally`. Do not use a personal vault; use a dedicated
-least-privilege development vault.
+least-privilege development vault. The command runs the official Node.js SDK under
+Node, not Bun; inject the service-account token through CI secret storage so it never
+requires an interactive `op signin` or Touch ID prompt.
+
+The repository includes a manual GitHub Actions workflow. It expects a
+`WYSTACK_1PASSWORD_SMOKE_TOKEN` Actions secret with only `read_items` and
+`write_items` access to this vault, plus a `WYSTACK_1PASSWORD_SMOKE_VAULT_ID` Actions
+variable. The workflow never invokes the 1Password CLI or personal-account login.

@@ -15,7 +15,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "smoke:live": "bun src/live-smoke.ts",
+    "smoke:live": "bun build src/live-smoke.ts --target=node --outfile=dist/live-smoke.node.mjs --external=@1password/sdk && node dist/live-smoke.node.mjs",
     "typecheck": "tsc --noEmit",
     "test": "bun test src"
   },

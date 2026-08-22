@@ -3,12 +3,12 @@ import { InMemoryMappingStore, SecretRegistry, SecretVault } from '@wystack/secr
 import { OnePasswordBackend } from './index'
 
 function requireLiveVariable(name: string): string {
-  const value = Bun.env[name]
+  const value = process.env[name]
   if (!value) throw new Error(`${name} is required`)
   return value
 }
 
-if (Bun.env.WYSTACK_1PASSWORD_LIVE_TEST !== '1') {
+if (process.env.WYSTACK_1PASSWORD_LIVE_TEST !== '1') {
   throw new Error('Live 1Password smoke test is disabled; set WYSTACK_1PASSWORD_LIVE_TEST=1')
 }
 
