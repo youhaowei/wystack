@@ -46,7 +46,7 @@ The live test is deliberately disabled unless all three variables are set:
 WYSTACK_1PASSWORD_LIVE_TEST=1 \
 OP_SERVICE_ACCOUNT_TOKEN=... \
 OP_VAULT_ID=... \
-bun run --cwd packages/secret-vault-1password smoke:live
+bun run smoke:1password
 ```
 
 It creates a random non-sensitive probe item, verifies the full `SecretVault` round
