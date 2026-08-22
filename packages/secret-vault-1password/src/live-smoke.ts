@@ -1,5 +1,5 @@
 import { createClient } from '@1password/sdk'
-import { InMemoryMappingStore, SecretRegistry, SecretVault } from '@wystack/secret-vault'
+import { InMemoryMappingStore, SecretRegistry, SecretVault } from '../../secret-vault/src/index'
 import { OnePasswordBackend } from './index'
 
 function requireLiveVariable(name: string): string {
