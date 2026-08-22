@@ -50,7 +50,7 @@ function buildColumn(name: string, opts: ColumnDefOptions, allTables: Record<str
     col = col.array()
   }
 
-  if (!opts.isOptional && !opts.hasDefault && !isSerial) {
+  if (!opts.isOptional && !opts.isNullable && !opts.hasDefault && !isSerial) {
     col = col.notNull()
   }
 
