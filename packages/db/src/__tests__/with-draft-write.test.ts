@@ -25,6 +25,7 @@ const todos = pgTable('todos', {
   id: integer('id').primaryKey(),
   title: pgText('title').notNull(),
   done: pgBoolean('done').notNull(),
+  note: pgText('note'),
 })
 
 let pg: PGlite
@@ -38,7 +39,8 @@ beforeEach(async () => {
     CREATE TABLE IF NOT EXISTS todos (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL,
-      done BOOLEAN NOT NULL
+      done BOOLEAN NOT NULL,
+      note TEXT
     )
   `)
   await db.execute(`
@@ -47,14 +49,16 @@ beforeEach(async () => {
       id INTEGER NOT NULL,
       title TEXT,
       done BOOLEAN,
+      note TEXT,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN NOT NULL DEFAULT false,
       PRIMARY KEY (draft_id, id)
     )
   `)
   // Canonical seed: {1,apple,false}, {2,banana,false}, {3,cherry,false}
   await db.execute(`
-    INSERT INTO todos (id, title, done) VALUES
-      (1,'apple',false),(2,'banana',false),(3,'cherry',false)
+    INSERT INTO todos (id, title, done, note) VALUES
+      (1,'apple',false,'keep me'),(2,'banana',false,NULL),(3,'cherry',false,'third')
   `)
   tracked = createDrizzleTracker(db)
 })
@@ -106,6 +110,33 @@ describe('withDraft write — into().insert()', () => {
 })
 
 describe('withDraft write — from().where(eqPk).update()', () => {
+  test('explicit null overrides a canonical value while undefined leaves it unchanged', async () => {
+    const handle = tracked.withDraft('d1')
+
+    expect(await handle.from(todos).where(eq('id', 1)).update({ note: undefined })).toEqual([])
+    expect((await handle.from(todos).where(eq('id', 1)).first())?.note).toBe('keep me')
+
+    await handle.from(todos).where(eq('id', 1)).update({ note: null })
+    expect((await handle.from(todos).where(eq('id', 1)).first())?.note).toBeNull()
+    expect((await tracked.from(todos).where(eq('id', 1)).first())?.note).toBe('keep me')
+
+    const shadow = await shadowRows('d1')
+    expect(shadow[0]?.['__overrides']).toEqual(['note'])
+  })
+
+  test('updates every row selected by full effective-row filters', async () => {
+    const handle = tracked.withDraft('d1')
+    const updated = await handle
+      .from(todos)
+      .where(eq('done', false))
+      .where(eq('title', 'banana'))
+      .update({ done: true })
+
+    expect(updated).toHaveLength(1)
+    expect(updated[0]?.['id']).toBe(2)
+    expect(await handle.from(todos).where(eq('done', true)).all()).toHaveLength(1)
+  })
+
   test('a draft update edits the shadow (canonical untouched) and the coalesce read wins', async () => {
     await tracked.withDraft('d1').from(todos).where(eq('id', 1)).update({ title: 'APPLE-edited' })
 
@@ -140,17 +171,26 @@ describe('withDraft write — from().where(eqPk).update()', () => {
     expect(byId[1]['done']).toBe(true)
   })
 
-  test('update without a PK-pinning where throws (PK-addressed only)', async () => {
-    await expect(tracked.withDraft('d1').from(todos).update({ title: 'x' })).rejects.toThrow(
-      /requires exactly one .*where/,
-    )
-    await expect(
-      tracked.withDraft('d1').from(todos).where(eq('title', 'apple')).update({ done: true }),
-    ).rejects.toThrow(/requires .*primary key|PK-addressed/)
+  test('an unfiltered update matches canonical all-row semantics', async () => {
+    const updated = await tracked.withDraft('d1').from(todos).update({ done: true })
+    expect(updated).toHaveLength(3)
+    expect(updated.every((row) => row['done'] === true)).toBe(true)
   })
 })
 
 describe('withDraft write — from().where(eqPk).delete()', () => {
+  test('deletes every row selected by non-primary-key filters', async () => {
+    const deleted = await tracked
+      .withDraft('d1')
+      .from(todos)
+      .where(eq('done', false))
+      .delete()
+
+    expect(deleted).toHaveLength(3)
+    expect(await tracked.withDraft('d1').from(todos).all()).toEqual([])
+    expect(await tracked.from(todos).all()).toHaveLength(3)
+  })
+
   test('a draft delete tombstones the row; the coalesce read suppresses it', async () => {
     await tracked.withDraft('d1').from(todos).where(eq('id', 2)).delete()
 
@@ -171,10 +211,9 @@ describe('withDraft write — from().where(eqPk).delete()', () => {
     expect(draftRows.map((r) => r['id']).sort()).toEqual([1, 3])
   })
 
-  test('delete without a PK-pinning where throws', async () => {
-    await expect(tracked.withDraft('d1').from(todos).delete()).rejects.toThrow(
-      /requires exactly one .*where/,
-    )
+  test('an unfiltered delete matches canonical all-row semantics', async () => {
+    expect(await tracked.withDraft('d1').from(todos).delete()).toHaveLength(3)
+    expect(await tracked.withDraft('d1').from(todos).all()).toEqual([])
   })
 })
 

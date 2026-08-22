@@ -83,6 +83,11 @@ export interface WyStackApp {
    * but not the intended public API; prefer `applyCommands`/`call`.
    */
   createTracked: () => DrizzleTracker
+  /** Bind host-resolved tenant scope to a tracker for one request or batch. */
+  scopeTracked: (
+    tracked: DrizzleTracker,
+    context?: Record<string, unknown>,
+  ) => Promise<DrizzleTracker>
 }
 
 function resolveDbConfig(db: DbInput): DbConfig | null {
@@ -100,6 +105,7 @@ export async function buildWyStack(opts: {
   functions: Record<string, FunctionDef>
   permissions: unknown
   expectedPermissionIds?: readonly string[]
+  resolveTenant?: (context: Record<string, unknown>) => unknown | Promise<unknown>
 }): Promise<WyStackApp> {
   if (opts.expectedPermissionIds) {
     assertPermissionIds(opts.permissions, opts.expectedPermissionIds)
@@ -137,9 +143,15 @@ export async function buildWyStack(opts: {
       return createDrizzleTracker(drizzleDb)
     },
 
+    async scopeTracked(tracked, context = {}) {
+      if (!opts.resolveTenant) return tracked
+      const tenantId = await opts.resolveTenant(context)
+      return tracked.withTenant(tenantId)
+    },
+
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
       // Fresh DrizzleTracker per call — no shared mutable state
-      const tracked = app.createTracked()
+      const tracked = await app.scopeTracked(app.createTracked(), context)
       let result: unknown
       try {
         result = await app.runHandler(path, args, tracked, context)

@@ -1,7 +1,7 @@
 // @wystack/db
 // SQL-agnostic database layer with schema DSL, tracked queries, and change detection
 
-export { defineSchema, getTableCapabilities } from './schema'
+export { defineSchema, getGeneratedTables, getTableCapabilities } from './schema'
 export { table, multiTenant, TableDefinition } from './table'
 export { createDb } from './driver'
 export { createDrizzleTracker, resetTracking, resolvePkColumnName } from './drizzle-tracker'

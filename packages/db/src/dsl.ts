@@ -9,6 +9,7 @@ export interface RefOptions {
   table: string
   column: string
   onDelete?: 'cascade' | 'set null' | 'no action'
+  withinTenant?: boolean
 }
 
 export interface ColumnDefOptions {
@@ -21,6 +22,7 @@ export interface ColumnDefOptions {
   isDefaultNow: boolean
   isPrimaryKey: boolean
   isUnique: boolean
+  isUniqueWithinTenant: boolean
   isArray: boolean
   ref?: RefOptions
 }
@@ -69,6 +71,10 @@ export class ColumnDef<
     return new ColumnDef({ ...this.opts, isUnique: true })
   }
 
+  uniqueWithinTenant(): ColumnDef<TType, TOptional, TNullable> {
+    return new ColumnDef({ ...this.opts, isUniqueWithinTenant: true })
+  }
+
   /** Foreign key reference: .references('tableName') or .references('tableName', 'columnName') */
   references(
     table: string,
@@ -76,6 +82,17 @@ export class ColumnDef<
     onDelete?: 'cascade' | 'set null' | 'no action',
   ): ColumnDef<TType, TOptional, TNullable> {
     return new ColumnDef({ ...this.opts, ref: { table, column, onDelete } })
+  }
+
+  referencesWithinTenant(
+    table: string,
+    column: string = 'id',
+    onDelete?: 'cascade' | 'set null' | 'no action',
+  ): ColumnDef<TType, TOptional, TNullable> {
+    return new ColumnDef({
+      ...this.opts,
+      ref: { table, column, onDelete, withinTenant: true },
+    })
   }
 
   /** Array column: text.array() → TEXT[] */
@@ -94,6 +111,7 @@ function col<T>(type: ColumnType): ColumnDef<T, false> {
     isDefaultNow: false,
     isPrimaryKey: false,
     isUnique: false,
+    isUniqueWithinTenant: false,
     isArray: false,
   })
 }

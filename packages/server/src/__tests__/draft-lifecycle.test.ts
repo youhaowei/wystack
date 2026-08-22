@@ -48,12 +48,14 @@ beforeEach(async () => {
   await db.execute(`
     CREATE TABLE todos__draft (
       draft_id TEXT NOT NULL, id INTEGER NOT NULL, title TEXT, done BOOLEAN,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id))
   `)
   await db.execute(`CREATE TABLE dashboards (id INTEGER PRIMARY KEY, items TEXT NOT NULL)`)
   await db.execute(`
     CREATE TABLE dashboards__draft (
       draft_id TEXT NOT NULL, id INTEGER NOT NULL, items TEXT,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id))
   `)
   await db.execute(`INSERT INTO todos (id,title,done) VALUES (1,'apple',false),(2,'banana',false)`)
@@ -866,6 +868,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     await db.execute(`
       CREATE TABLE dashboards__draft (
         draft_id TEXT NOT NULL, id INTEGER NOT NULL, items TEXT,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id))
     `)
     const cap2 = captureEmits()

@@ -11,6 +11,7 @@ export interface BuildOptions {
   dialect?: 'postgres'
   functions: Record<string, FunctionDef>
   expectedPermissionIds?: readonly string[]
+  resolveTenant?: (context: Record<string, unknown>) => unknown | Promise<unknown>
 }
 
 export function defineApp<TAppContext extends object = Record<string, unknown>>(

@@ -19,11 +19,58 @@ import type { PgTableWithColumns } from 'drizzle-orm/pg-core'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import { getTableName, getTableColumns } from 'drizzle-orm'
+import { tryGetTableCapabilities } from './schema'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle DB instance type varies by driver; no common typed interface
 type DrizzleDb = any
 // oxlint-disable-next-line typescript/no-explicit-any -- PgTableWithColumns requires a config generic; any is needed for polymorphic table usage
 type AnyTable = PgTableWithColumns<any>
+
+const noTenantScope = Symbol('no tenant scope')
+type TenantScope = unknown | typeof noTenantScope
+
+function requireTenantScope(table: AnyTable, tenantScope: TenantScope) {
+  const tenancy = tryGetTableCapabilities(table)?.tenancy
+  if (!tenancy) return undefined
+  if (tenantScope === noTenantScope) {
+    throw new Error(
+      `Table "${getTableName(table)}" requires tenant scope; call withTenant() with a trusted tenant ID`,
+    )
+  }
+  return { tenancy, tenantId: tenantScope }
+}
+
+function assertTenantInput(table: AnyTable, values: Record<string, unknown>): void {
+  const tenancy = tryGetTableCapabilities(table)?.tenancy
+  if (!tenancy) return
+  if (Object.hasOwn(values, tenancy.property) || Object.hasOwn(values, tenancy.column)) {
+    throw new Error(
+      `Tenant property "${tenancy.property}" is system-managed and cannot be supplied or updated`,
+    )
+  }
+}
+
+function withoutUndefined(values: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined))
+}
+
+function tableTrackingTag(table: AnyTable, tenantScope: TenantScope): string {
+  const tableName = getTableName(table)
+  const tenant = requireTenantScope(table, tenantScope)
+  if (!tenant) return tableName
+  return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}`
+}
+
+function draftTableTrackingTag(
+  table: AnyTable,
+  tenantScope: TenantScope,
+  draftId: string,
+): string {
+  const tableName = `${getTableName(table)}__draft`
+  const tenant = requireTenantScope(table, tenantScope)
+  if (!tenant) return tableName
+  return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}:draft:${encodeURIComponent(draftId)}`
+}
 
 /**
  * The entire surface `_buildSelectQuery`'s callers touch on a lowered Drizzle
@@ -163,8 +210,12 @@ export interface DrizzleTracker {
   /** Raw Drizzle instance for complex queries (joins, raw SQL). Caller must manually
    *  record table reads/writes for reactive tracking to work. */
   raw: DrizzleDb
+  /** Trusted opaque tenant ID carried by this handle, when scoped. */
+  readonly tenantId?: unknown
   from<T extends AnyTable>(table: T): SelectBuilder<T>
   into<T extends AnyTable>(table: T): InsertBuilder<T>
+  /** Bind trusted tenant scope. Tenant tables fail closed until a scope is bound. */
+  withTenant(tenantId: unknown): DrizzleTracker
   /**
    * Run `fn` inside an atomic transaction whose writes still emit reactive Tags.
    *
@@ -230,17 +281,20 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   private _table: T
   private _db: DrizzleDb
   private _tracker: DrizzleTracker
+  private _tenantScope: TenantScope
   private _clauses: ReadClauses
 
   constructor(
     table: T,
     db: DrizzleDb,
     tracker: DrizzleTracker,
+    tenantScope: TenantScope = noTenantScope,
     clauses: ReadClauses = emptyClauses(),
   ) {
     this._table = table
     this._db = db
     this._tracker = tracker
+    this._tenantScope = tenantScope
     this._clauses = clauses
   }
 
@@ -259,7 +313,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * clause keeps `TRow`.
    */
   private _with<TNext = TRow>(patch: Partial<ReadClauses>): SelectBuilder<T, TNext> {
-    return new SelectBuilder<T, TNext>(this._table, this._db, this._tracker, {
+    return new SelectBuilder<T, TNext>(this._table, this._db, this._tracker, this._tenantScope, {
       ...this._clauses,
       ...patch,
     })
@@ -318,9 +372,14 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
 
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
   private _buildConditions(columns: Record<string, any>) {
-    return this._clauses.filters.map((f) =>
+    const conditions = this._clauses.filters.map((f) =>
       drizzleOpMap[f.op](requireColumn(columns, f.column), f.value),
     )
+    const tenant = requireTenantScope(this._table, this._tenantScope)
+    if (tenant) {
+      conditions.unshift(drizzleEq(requireColumn(columns, tenant.tenancy.property), tenant.tenantId))
+    }
+    return conditions
   }
 
   /**
@@ -409,7 +468,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * `limit()`", because the write guard reads it as intent.
    */
   private async _read(limitOverride?: number): Promise<TRow[]> {
-    this._tracker.tablesRead.add(getTableName(this._table))
+    this._tracker.tablesRead.add(tableTrackingTag(this._table, this._tenantScope))
     // Await here (not a bare return) so errors surface in this async frame and
     // the resolved value is the row array, not the Drizzle builder.
     return await this._buildSelectQuery(limitOverride)
@@ -438,14 +497,17 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
 
   async update(values: Partial<T['$inferInsert']>) {
     assertNoReadClauses('update', this._clauses)
-    let q = this._db.update(this._table).set(values)
+    assertTenantInput(this._table, values as Record<string, unknown>)
+    const patch = withoutUndefined(values as Record<string, unknown>)
+    if (Object.keys(patch).length === 0) return []
+    let q = this._db.update(this._table).set(patch)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
     if (conditions.length > 0) {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
     const rows = await q.returning()
-    this._tracker.tablesWritten.add(getTableName(this._table))
+    this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return rows
   }
 
@@ -458,7 +520,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
       q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
     }
     const rows = await q.returning()
-    this._tracker.tablesWritten.add(getTableName(this._table))
+    this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return rows
   }
 }
@@ -499,6 +561,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
   private _db: DrizzleDb
   private _draftId: string
   private _tracker: DraftDrizzleTracker
+  private _tenantScope: TenantScope
   // `_clauses.filters` accumulates `where()` predicates; the consuming method
   // decides intent:
   //   - READ (`all`/`first`) interprets a single PK `eq` as a row predicate
@@ -513,22 +576,31 @@ export class DraftSelectBuilder<T extends AnyTable> {
     db: DrizzleDb,
     draftId: string,
     tracker: DraftDrizzleTracker,
+    tenantScope: TenantScope = noTenantScope,
     clauses: ReadClauses = emptyClauses(),
   ) {
     this._table = table
     this._db = db
     this._draftId = draftId
     this._tracker = tracker
+    this._tenantScope = tenantScope
     this._clauses = clauses
   }
 
   /** Copy carrying `patch`. See `SelectBuilder._with` for why no clause method
    *  assigns to `this`. */
   private _with(patch: Partial<ReadClauses>): DraftSelectBuilder<T> {
-    return new DraftSelectBuilder<T>(this._table, this._db, this._draftId, this._tracker, {
-      ...this._clauses,
-      ...patch,
-    })
+    return new DraftSelectBuilder<T>(
+      this._table,
+      this._db,
+      this._draftId,
+      this._tracker,
+      this._tenantScope,
+      {
+        ...this._clauses,
+        ...patch,
+      },
+    )
   }
 
   /**
@@ -607,15 +679,45 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * one. Hence the guard rejects rather than honors.
    */
   async update(values: Partial<T['$inferInsert']>): Promise<Record<string, unknown>[]> {
-    // Same guard as the canonical builder, which is the point: handlers cannot
-    // see which handle they hold.
     assertNoReadClauses('update', this._clauses)
-    const pkValue = this._requirePkFilter('update')
-    return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
-      pkValue,
-      values: values as Record<string, unknown>,
-      tombstone: false,
+    const patch = withoutUndefined(values as Record<string, unknown>)
+    assertTenantInput(this._table, patch)
+    if (Object.keys(patch).length === 0) return []
+
+    const columns = getTableColumns(this._table) as Record<string, { name: string }>
+    const pkSqlName = resolvePkColumnName(this._table, getTableConfig(this._table))
+    const pkProperty = Object.keys(columns).find((property) => columns[property].name === pkSqlName)
+    if (!pkProperty) throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
+    if (Object.hasOwn(patch, pkProperty) || Object.hasOwn(patch, pkSqlName)) {
+      throw new Error(`Primary key "${pkProperty}" is immutable in a draft update`)
+    }
+
+    let committedTracker: DraftDrizzleTracker | undefined
+    const rows = await this._db.transaction(async (txDb: DrizzleDb) => {
+      const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
+      committedTracker = txDraft
+      const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
+      const updated: Record<string, unknown>[] = []
+      for (const match of matches) {
+        const pkValue = match[pkProperty]
+        await writeShadowRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
+          pkValue,
+          values: patch,
+          tombstone: false,
+        })
+        const effective = await txDraft
+          .from(this._table)
+          .where({ op: 'eq', column: pkProperty, value: pkValue })
+          .first()
+        if (effective) updated.push(effective)
+      }
+      return updated
     })
+    if (committedTracker) {
+      for (const tag of committedTracker.tablesRead) this._tracker.tablesRead.add(tag)
+      for (const tag of committedTracker.tablesWritten) this._tracker.tablesWritten.add(tag)
+    }
+    return rows
   }
 
   /**
@@ -627,12 +729,30 @@ export class DraftSelectBuilder<T extends AnyTable> {
    */
   async delete(): Promise<Record<string, unknown>[]> {
     assertNoReadClauses('delete', this._clauses)
-    const pkValue = this._requirePkFilter('delete')
-    return writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
-      pkValue,
-      values: {},
-      tombstone: true,
+    const columns = getTableColumns(this._table) as Record<string, { name: string }>
+    const pkSqlName = resolvePkColumnName(this._table, getTableConfig(this._table))
+    const pkProperty = Object.keys(columns).find((property) => columns[property].name === pkSqlName)
+    if (!pkProperty) throw new Error(`Cannot resolve primary-key property for "${getTableName(this._table)}"`)
+
+    let committedTracker: DraftDrizzleTracker | undefined
+    const rows = await this._db.transaction(async (txDb: DrizzleDb) => {
+      const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
+      committedTracker = txDraft
+      const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
+      for (const match of matches) {
+        await writeShadowRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
+          pkValue: match[pkProperty],
+          values: {},
+          tombstone: true,
+        })
+      }
+      return matches
     })
+    if (committedTracker) {
+      for (const tag of committedTracker.tablesRead) this._tracker.tablesRead.add(tag)
+      for (const tag of committedTracker.tablesWritten) this._tracker.tablesWritten.add(tag)
+    }
+    return rows
   }
 
   /**
@@ -734,16 +854,15 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * mean only "the caller attached `limit()`".
    */
   private async _coalescedRead(limitOverride?: number): Promise<Record<string, unknown>[]> {
-    const tableName = getTableName(this._table)
-    const draftTableName = `${tableName}__draft`
-
     // Record the base table read AND the shadow-table read. The draft read's
     // result genuinely depends on `<table>__draft`: a write to it (e.g.
     // `into(todosDraft).insert(...)` publishing tablesWritten={'todos__draft'})
     // must invalidate this subscription, which only happens if the shadow table
     // is in tablesRead so the reactive router's read∩write intersection fires.
-    this._tracker.tablesRead.add(tableName)
-    this._tracker.tablesRead.add(draftTableName)
+    this._tracker.tablesRead.add(tableTrackingTag(this._table, this._tenantScope))
+    this._tracker.tablesRead.add(
+      draftTableTrackingTag(this._table, this._tenantScope, this._draftId),
+    )
 
     const { query, colEntries } = this._buildCoalesceQuery(limitOverride)
     const result = await this._db.execute(query)
@@ -810,21 +929,18 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const config = getTableConfig(this._table)
     const pkColName = resolvePkColumnName(this._table, config)
 
-    // Resolve an optional single-PK read predicate from `where()`. No filter
-    // → unfiltered full-set read (as before). A present filter → push
-    // `AND COALESCE(d."<pk>", b."<pk>") = $value` into the WHERE as a bound
-    // param. Any non-PK / non-`eq` / multi-filter / null-pinned shape throws
-    // inside the resolver (an auth/authz hazard if silently dropped). Presence
-    // is a discriminated flag keyed on the filter, NOT on the value — a falsy
-    // PK (`0`, `''`) must still pin. The value is routed through the PK column
-    // codec so it binds identically to the write path.
-    const pkFilter = this._resolvePkReadFilter(pkColName)
-    const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
-    const pkFilterValue = pkFilter.present
-      ? pkCol
-        ? mapColumnValue(pkCol, pkFilter.value)
-        : pkFilter.value
-      : undefined
+    const tenant = requireTenantScope(this._table, this._tenantScope)
+    const identityColumns = new Set([pkColName])
+    if (tenant) identityColumns.add(tenant.tenancy.column)
+    const effectiveExpression = (sqlName: string) => {
+      if (identityColumns.has(sqlName)) return `COALESCE(d."${sqlName}", b."${sqlName}")`
+      const literal = sqlName.replace(/'/g, "''")
+      return (
+        `CASE WHEN '${literal}' = ANY(d."__overrides") THEN d."${sqlName}" ` +
+        `WHEN cardinality(d."__overrides") = 0 AND d."${sqlName}" IS NOT NULL THEN d."${sqlName}" ` +
+        `ELSE b."${sqlName}" END`
+      )
+    }
 
     // Schema-qualify both relations when the table lives outside the default
     // schema (pgSchema('app').table(...)). Canonical Drizzle selects emit the
@@ -834,21 +950,13 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const baseRel = schema ? `"${schema}"."${tableName}"` : `"${tableName}"`
     const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
 
-    // Build: COALESCE(d."sql_col", b."sql_col") AS "propertyKey" for every column.
+    // Build a presence-aware effective value for every selected column.
     //
     // The JOIN/COALESCE operate on the SQL column name (col.name), but the
     // result is aliased to the Drizzle PROPERTY KEY so the returned row shape is
     // byte-identical to canonical `from().all()`. Without this, a column like
     // `createdAt: timestamp('created_at')` would come back as `created_at` and
     // consumers reading `row.createdAt` would see undefined.
-    //
-    // Storage convention (load-bearing): NULL in a draft shadow column means
-    // "no override for this column" — NOT "set this column to NULL". Setting a
-    // nullable column to NULL via a draft is therefore not supported by this
-    // primitive. The `__tombstone` flag is the only way to delete a row.
-    // This convention must be enforced by the schema (shadow columns default to NULL,
-    // tombstone = true captures deletes). Column-drift (base schema evolves under an
-    // old draft) is out of scope — see PR body.
     //
     // A projection narrows THIS list and nothing else: the join predicate, the
     // tombstone WHERE, the pk predicate and the ORDER BY all name their columns
@@ -865,7 +973,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const colSelects = selectedEntries
       .map(([propKey, col]) => {
         const sqlName = col.name as string
-        return `COALESCE(d."${sqlName}", b."${sqlName}") AS "${propKey}"`
+        return `${effectiveExpression(sqlName)} AS "${propKey}"`
       })
       .join(', ')
 
@@ -892,8 +1000,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // NULL) or a canonical row (draft side NULL) identically. It sits BEFORE the
     // ORDER BY and AFTER the tombstone clause, so a tombstoned PK-pinned read
     // still returns no row.
+    const tenantJoin = tenant
+      ? ` AND b."${tenant.tenancy.column}" = d."${tenant.tenancy.column}"`
+      : ''
     const joinAndTombstone = sql.raw(
-      `) d ON b."${pkColName}" = d."${pkColName}" ` +
+      `) d ON b."${pkColName}" = d."${pkColName}"${tenantJoin} ` +
         `WHERE COALESCE(d."__tombstone", false) = false`,
     )
     // The pk order plays two different roles, and only one of them is a promise.
@@ -911,7 +1022,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // safe in the other direction — this is a FULL OUTER JOIN, whose output
     // order is join-algorithm-dependent rather than heap-stable, so dropping the
     // default would make an unfiltered `first()` genuinely arbitrary.
-    const pkOrder = `COALESCE(d."${pkColName}", b."${pkColName}")`
+    const pkOrder = effectiveExpression(pkColName)
     let orderByClause = ` ORDER BY ${pkOrder}`
     if (this._clauses.orderByCol !== undefined) {
       // `!== undefined`, not truthiness, and the same test the write guard uses:
@@ -921,20 +1032,30 @@ export class DraftSelectBuilder<T extends AnyTable> {
       const col = requireColumn(columns, this._clauses.orderByCol)
       const sqlName = col.name as string
       const dir = this._clauses.orderDir === 'desc' ? ' DESC' : ''
-      orderByClause = ` ORDER BY COALESCE(d."${sqlName}", b."${sqlName}")${dir}, ${pkOrder}`
+      orderByClause = ` ORDER BY ${effectiveExpression(sqlName)}${dir}, ${pkOrder}`
     }
     const orderBy = sql.raw(orderByClause)
     // Bound param, not interpolated — the value is caller-supplied.
     const limitVal = limitOverride ?? this._clauses.limitVal
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
-    // `present` → bound `AND COALESCE(...) = $pkFilterValue`; absent → no fragment.
-    const pkPredicate = pkFilter.present
-      ? sql`${sql.raw(` AND COALESCE(d."${pkColName}", b."${pkColName}") = `)}${pkFilterValue}`
+    const sqlOperators = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' } as const
+    const filterFragments = this._clauses.filters.map((filter) => {
+      const column = requireColumn(columns, filter.column)
+      return sql`${sql.raw(
+        ` AND ${effectiveExpression(column.name as string)} ${sqlOperators[filter.op]} `,
+      )}${sql.param(mapColumnValue(column, filter.value))}`
+    })
+    const filterPredicate = sql.join(filterFragments, sql.raw(''))
+    const tenantShadowPredicate = tenant
+      ? sql`${sql.raw(` AND "${tenant.tenancy.column}" = `)}${sql.param(tenant.tenantId)}`
+      : sql.raw('')
+    const tenantEffectivePredicate = tenant
+      ? sql`${sql.raw(
+          ` AND ${effectiveExpression(tenant.tenancy.column)} = `,
+        )}${sql.param(tenant.tenantId)}`
       : sql.raw('')
 
-    // `this._draftId` and `pkFilterValue` are interpolated as bound parameters by
-    // the sql tag; relation/column names are introspected identifiers via sql.raw.
-    const query = sql`${prefix}${this._draftId}${joinAndTombstone}${pkPredicate}${orderBy}${limit}`
+    const query = sql`${prefix}${sql.param(this._draftId)}${tenantShadowPredicate}${joinAndTombstone}${tenantEffectivePredicate}${filterPredicate}${orderBy}${limit}`
 
     return { query, colEntries }
   }
@@ -1106,6 +1227,7 @@ function toSqlColumnMap(
   const columns = getTableColumns(table) as Record<string, any>
   const out: { sqlName: string; value: unknown }[] = []
   for (const [propKey, value] of Object.entries(values)) {
+    if (value === undefined) continue
     const col = columns[propKey]
     if (!col) continue
     out.push({ sqlName: col.name as string, value: mapColumnValue(col, value) })
@@ -1171,6 +1293,7 @@ async function writeShadowRow(
   tracker: { tablesWritten: Set<string> },
   table: AnyTable,
   draftId: string,
+  tenantScope: TenantScope,
   opts: { pkValue: unknown; values: Record<string, unknown>; tombstone: boolean },
 ): Promise<Record<string, unknown>[]> {
   const tableName = getTableName(table)
@@ -1188,42 +1311,69 @@ async function writeShadowRow(
   const columns = getTableColumns(table) as Record<string, any>
   const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
   const pkValue = pkCol ? mapColumnValue(pkCol, opts.pkValue) : opts.pkValue
+  const tenant = requireTenantScope(table, tenantScope)
+  const tenantColumn = tenant ? requireColumn(columns, tenant.tenancy.property) : undefined
+  const tenantValue = tenantColumn
+    ? mapColumnValue(tenantColumn, tenant?.tenantId)
+    : undefined
 
   // Provided value columns (sparse), excluding the PK (carried separately) and
   // any accidental __tombstone / draft_id passthrough (owned by this writer).
   const valueCols = toSqlColumnMap(table, opts.values).filter(
-    (c) => c.sqlName !== pkColName && c.sqlName !== '__tombstone' && c.sqlName !== 'draft_id',
+    (c) =>
+      c.sqlName !== pkColName &&
+      c.sqlName !== tenant?.tenancy.column &&
+      c.sqlName !== '__tombstone' &&
+      c.sqlName !== 'draft_id',
   )
 
   // INSERT column list + bound-parameter VALUES list. Order:
   //   draft_id, <pk>, <provided value cols...>, __tombstone
-  const insertCols = ['draft_id', pkColName, ...valueCols.map((c) => c.sqlName), '__tombstone']
+  const insertCols = [
+    'draft_id',
+    ...(tenant ? [tenant.tenancy.column] : []),
+    pkColName,
+    ...valueCols.map((c) => c.sqlName),
+    '__overrides',
+    '__tombstone',
+  ]
   const insertColSql = insertCols.map((c) => `"${c}"`).join(', ')
 
   // ON CONFLICT (draft_id, <pk>) DO UPDATE: only the provided value cols +
   // __tombstone. (A tombstone with no value cols just flips __tombstone.)
   const updateAssignments = [
     ...valueCols.map((c) => `"${c.sqlName}" = EXCLUDED."${c.sqlName}"`),
+    `"__overrides" = COALESCE("${draftTableName}"."__overrides", ARRAY[]::text[]) || EXCLUDED."__overrides"`,
     `"__tombstone" = EXCLUDED."__tombstone"`,
   ].join(', ')
 
   // Assemble parameterized VALUES. Every dynamic value is a bound param; column
   // and relation names are introspected identifiers spliced via sql.raw.
   const head = sql.raw(`INSERT INTO ${draftRel} (${insertColSql}) VALUES (`)
-  const parts: ReturnType<typeof sql>[] = [head, sql`${draftId}`, sql.raw(', '), sql`${pkValue}`]
+  const parts: ReturnType<typeof sql>[] = [head, sql`${sql.param(draftId)}`]
+  if (tenant) parts.push(sql.raw(', '), sql`${sql.param(tenantValue)}`)
+  parts.push(sql.raw(', '), sql`${sql.param(pkValue)}`)
   for (const c of valueCols) {
-    parts.push(sql.raw(', '), sql`${c.value}`)
+    parts.push(sql.raw(', '), sql`${sql.param(c.value)}`)
   }
-  parts.push(sql.raw(', '), sql`${opts.tombstone}`)
+  parts.push(sql.raw(', '), sql`${sql.param(valueCols.map((column) => column.sqlName))}`)
+  parts.push(sql.raw(', '), sql`${sql.param(opts.tombstone)}`)
+  const conflictColumns = [
+    'draft_id',
+    ...(tenant ? [tenant.tenancy.column] : []),
+    pkColName,
+  ]
+    .map((column) => `"${column}"`)
+    .join(', ')
   parts.push(
     sql.raw(
-      `) ON CONFLICT ("draft_id", "${pkColName}") DO UPDATE SET ${updateAssignments} RETURNING *`,
+      `) ON CONFLICT (${conflictColumns}) DO UPDATE SET ${updateAssignments} RETURNING *`,
     ),
   )
   const query = sql.join(parts, sql.raw(''))
 
   const result = await db.execute(query)
-  tracker.tablesWritten.add(draftTableName)
+  tracker.tablesWritten.add(draftTableTrackingTag(table, tenantScope, draftId))
   return normalizeExecuteRows(result)
 }
 
@@ -1239,12 +1389,20 @@ export class DraftInsertBuilder<T extends AnyTable> {
   private _db: DrizzleDb
   private _draftId: string
   private _tracker: DraftDrizzleTracker
+  private _tenantScope: TenantScope
 
-  constructor(table: T, db: DrizzleDb, draftId: string, tracker: DraftDrizzleTracker) {
+  constructor(
+    table: T,
+    db: DrizzleDb,
+    draftId: string,
+    tracker: DraftDrizzleTracker,
+    tenantScope: TenantScope = noTenantScope,
+  ) {
     this._table = table
     this._db = db
     this._draftId = draftId
     this._tracker = tracker
+    this._tenantScope = tenantScope
   }
 
   async insert(
@@ -1260,6 +1418,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
     const out: Record<string, unknown>[] = []
     for (const row of rows) {
       const r = row as Record<string, unknown>
+      assertTenantInput(this._table, r)
       const pkValue = pkPropKey !== undefined ? r[pkPropKey] : r[pkColName]
       if (pkValue === undefined || pkValue === null) {
         throw new Error(
@@ -1269,11 +1428,18 @@ export class DraftInsertBuilder<T extends AnyTable> {
       }
       // Pass the full row as sparse values; writeShadowRow drops the PK column
       // (carried separately) and any reserved shadow columns.
-      const written = await writeShadowRow(this._db, this._tracker, this._table, this._draftId, {
-        pkValue,
-        values: r,
-        tombstone: false,
-      })
+      const written = await writeShadowRow(
+        this._db,
+        this._tracker,
+        this._table,
+        this._draftId,
+        this._tenantScope,
+        {
+          pkValue,
+          values: r,
+          tombstone: false,
+        },
+      )
       out.push(...written)
     }
     return out
@@ -1284,31 +1450,58 @@ export class InsertBuilder<T extends AnyTable> {
   private _table: T
   private _db: DrizzleDb
   private _tracker: DrizzleTracker
+  private _tenantScope: TenantScope
 
-  constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker) {
+  constructor(table: T, db: DrizzleDb, tracker: DrizzleTracker, tenantScope: TenantScope) {
     this._table = table
     this._db = db
     this._tracker = tracker
+    this._tenantScope = tenantScope
   }
 
   async insert(values: T['$inferInsert'] | T['$inferInsert'][]) {
     const rows = Array.isArray(values) ? values : [values]
-    const inserted = await this._db.insert(this._table).values(rows).returning()
-    this._tracker.tablesWritten.add(getTableName(this._table))
+    const tenant = requireTenantScope(this._table, this._tenantScope)
+    const scopedRows = rows.map((row) => {
+      const record = row as Record<string, unknown>
+      assertTenantInput(this._table, record)
+      const sanitized = withoutUndefined(record)
+      return tenant ? { ...sanitized, [tenant.tenancy.property]: tenant.tenantId } : sanitized
+    })
+    const inserted = await this._db.insert(this._table).values(scopedRows).returning()
+    this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return inserted
   }
 }
 
-export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
+export function createDrizzleTracker(
+  drizzleDb: DrizzleDb,
+  tenantScope: TenantScope = noTenantScope,
+  sharedTracking?: { tablesRead: Set<string>; tablesWritten: Set<string> },
+): DrizzleTracker {
   const tracker: DrizzleTracker = {
-    tablesRead: new Set(),
-    tablesWritten: new Set(),
+    tablesRead: sharedTracking?.tablesRead ?? new Set(),
+    tablesWritten: sharedTracking?.tablesWritten ?? new Set(),
     raw: drizzleDb,
+    tenantId: tenantScope === noTenantScope ? undefined : tenantScope,
     from<T extends AnyTable>(table: T) {
-      return new SelectBuilder(table, drizzleDb, tracker)
+      return new SelectBuilder(table, drizzleDb, tracker, tenantScope)
     },
     into<T extends AnyTable>(table: T) {
-      return new InsertBuilder(table, drizzleDb, tracker)
+      return new InsertBuilder(table, drizzleDb, tracker, tenantScope)
+    },
+    withTenant(tenantId: unknown) {
+      if (tenantId === null || tenantId === undefined) {
+        throw new Error('withTenant() requires a non-null trusted tenant ID')
+      }
+      if (tenantScope !== noTenantScope && tenantScope !== tenantId) {
+        throw new Error('A tenant-scoped database handle cannot change tenant scope')
+      }
+      if (tenantScope === tenantId) return tracker
+      return createDrizzleTracker(drizzleDb, tenantId, {
+        tablesRead: tracker.tablesRead,
+        tablesWritten: tracker.tablesWritten,
+      })
     },
     withDraft(draftId: string): DraftDrizzleTracker {
       const draftHandle: DraftDrizzleTracker = {
@@ -1316,10 +1509,22 @@ export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
         tablesWritten: tracker.tablesWritten,
         raw: drizzleDb,
         from<T extends AnyTable>(table: T) {
-          return new DraftSelectBuilder(table, drizzleDb, draftId, draftHandle)
+          return new DraftSelectBuilder(
+            table,
+            drizzleDb,
+            draftId,
+            draftHandle,
+            tenantScope,
+          )
         },
         into<T extends AnyTable>(table: T) {
-          return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle)
+          return new DraftInsertBuilder(
+            table,
+            drizzleDb,
+            draftId,
+            draftHandle,
+            tenantScope,
+          )
         },
         transaction<R>(
           _fn: (tx: DrizzleTracker) => Promise<R>,
@@ -1351,7 +1556,7 @@ export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
       // there is deliberately no `committed` flag to drift out of sync.
       let inner: DrizzleTracker | undefined
       const result = await drizzleDb.transaction(async (txHandle: DrizzleDb) => {
-        inner = createDrizzleTracker(txHandle)
+        inner = createDrizzleTracker(txHandle, tenantScope)
         return fn(inner)
       }, opts)
       // Reached only on commit. Flush the transaction's accumulated Tags up to
@@ -1371,5 +1576,7 @@ export function createDrizzleTracker(drizzleDb: DrizzleDb): DrizzleTracker {
 
 /** Create a fresh DrizzleTracker that shares the same Drizzle connection but with empty tracking sets */
 export function resetTracking(tracked: DrizzleTracker): DrizzleTracker {
-  return createDrizzleTracker(tracked.raw)
+  return tracked.tenantId === undefined
+    ? createDrizzleTracker(tracked.raw)
+    : createDrizzleTracker(tracked.raw, tracked.tenantId)
 }

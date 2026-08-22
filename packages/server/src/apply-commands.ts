@@ -226,10 +226,11 @@ export async function applyCommands(
       // "COMMAND-BATCH writes only" contract — callers flush only command-
       // relevant tables to invalidation, not pre-existing bookkeeping writes.
       // The caller must NOT flush this set until AFTER the outer tx resolves.
-      const tablesWrittenBefore = new Set(outerTx.tablesWritten)
-      const results = await applyAll(app, commands, outerTx, context)
+      const scopedTx = await app.scopeTracked(outerTx, context)
+      const tablesWrittenBefore = new Set(scopedTx.tablesWritten)
+      const results = await applyAll(app, commands, scopedTx, context)
       const tablesWritten = new Set(
-        [...outerTx.tablesWritten].filter((t) => !tablesWrittenBefore.has(t)),
+        [...scopedTx.tablesWritten].filter((t) => !tablesWrittenBefore.has(t)),
       )
       return {
         mode: 'commit',
@@ -245,7 +246,7 @@ export async function applyCommands(
     // `outer.tablesWritten` (the call-scope set that reaches invalidation).
     // `applyCommands` is a peer of `app.call`, which likewise mints its own fresh
     // tracker per dispatch.
-    const outer = app.createTracked()
+    const outer = await app.scopeTracked(app.createTracked(), context)
     // Apply every command in order inside one transaction. Any throw rolls the
     // whole batch back (including commands applied before the failure) and the
     // tracked-transaction merge is skipped, so nothing flushes to invalidation.
@@ -272,7 +273,7 @@ export async function applyCommands(
   // sentinel outside; a real command error is NOT a sentinel and propagates.
   // `opts.tx` is intentionally ignored in preview mode — preview manages its
   // own rollback sentinel and has no defined semantics for an outer tx handle.
-  const previewOuter = app.createTracked()
+  const previewOuter = await app.scopeTracked(app.createTracked(), context)
   try {
     await previewOuter.transaction(async (tx) => {
       const results = await applyAll(app, commands, tx, context)

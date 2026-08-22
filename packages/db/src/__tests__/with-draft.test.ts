@@ -101,6 +101,7 @@ beforeEach(async () => {
       id INTEGER NOT NULL,
       title TEXT,
       done BOOLEAN,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN NOT NULL,
       PRIMARY KEY (draft_id, id)
     )
@@ -110,6 +111,7 @@ beforeEach(async () => {
       draft_id TEXT NOT NULL,
       id INTEGER NOT NULL,
       name TEXT,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN NOT NULL,
       PRIMARY KEY (draft_id, id)
     )
@@ -209,16 +211,16 @@ describe('draft lowering', () => {
 
   test('orderBy(col) lowers the named column with the pk as trailing tiebreaker', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title').toSql()
-    expect(lowered).toContain('ORDER BY COALESCE(d."title", b."title"), COALESCE(d."id", b."id")')
+    expect(lowered).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(lowered).toContain(', COALESCE(d."id", b."id")')
   })
 
   test('orderBy(col, desc) applies the direction to the named column only', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).orderBy('title', 'desc').toSql()
     // DESC binds to the named column; the tiebreaker stays ascending, so a
     // descending read still resolves ties the same way an ascending one does.
-    expect(lowered).toContain(
-      'ORDER BY COALESCE(d."title", b."title") DESC, COALESCE(d."id", b."id")',
-    )
+    expect(lowered).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(lowered).toContain('END DESC, COALESCE(d."id", b."id")')
   })
 
   test('PARITY: both builders lower the same trailing pk tiebreaker under orderBy', () => {
@@ -231,7 +233,8 @@ describe('draft lowering', () => {
     const draft = tracked.withDraft('d1').from(todos).orderBy('title').toSql().sql
 
     expect(canonical).toContain('order by "todos"."title" asc, "todos"."id" asc')
-    expect(draft).toContain('ORDER BY COALESCE(d."title", b."title"), COALESCE(d."id", b."id")')
+    expect(draft).toContain("ORDER BY CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(draft).toContain(', COALESCE(d."id", b."id")')
   })
 
   test('NO PARITY without orderBy: canonical emits no ORDER BY, draft defaults to pk', () => {
@@ -259,9 +262,10 @@ describe('draft lowering', () => {
     const { sql: lowered } = tracked.withDraft('d1').from(todos).select('done', 'title').toSql()
     // Named order, not schema order — asserted on the SELECT list because the
     // returned row's key order is the same either way when the two coincide.
-    expect(lowered).toContain(
-      'SELECT COALESCE(d."done", b."done") AS "done", COALESCE(d."title", b."title") AS "title" ',
-    )
+    const doneIndex = lowered.indexOf("CASE WHEN 'done' = ANY(d.\"__overrides\")")
+    const titleIndex = lowered.indexOf("CASE WHEN 'title' = ANY(d.\"__overrides\")")
+    expect(doneIndex).toBeGreaterThanOrEqual(0)
+    expect(titleIndex).toBeGreaterThan(doneIndex)
     // The pk is absent from the SELECT list but still drives join and ordering.
     expect(lowered).toContain('b."id" = d."id"')
     expect(lowered).toContain('ORDER BY COALESCE(d."id", b."id")')
@@ -540,6 +544,7 @@ describe('withDraft row shape — property name differs from SQL column name', (
         id INTEGER NOT NULL,
         event_name TEXT,
         created_at TIMESTAMP,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL,
         PRIMARY KEY (draft_id, id)
       )
@@ -609,6 +614,7 @@ describe('withDraft primary-key detection', () => {
         draft_id TEXT NOT NULL,
         tenant_id INTEGER NOT NULL,
         label TEXT,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL,
         PRIMARY KEY (draft_id, tenant_id)
       )
@@ -673,6 +679,7 @@ describe('withDraft schema-qualified tables', () => {
         draft_id TEXT NOT NULL,
         id INTEGER NOT NULL,
         owner TEXT,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL,
         PRIMARY KEY (draft_id, id)
       )
@@ -788,6 +795,7 @@ describe('withDraft jsonb codec on writes (Gap 1)', () => {
         title TEXT,
         fields JSONB,
         config JSONB,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL DEFAULT false,
         PRIMARY KEY (draft_id, id)
       )
@@ -950,6 +958,7 @@ describe('withDraft coalesce read decode (integration, driver-independent)', () 
     await jdb.execute(`
       CREATE TABLE IF NOT EXISTS reports__draft (
         draft_id TEXT NOT NULL, id INTEGER NOT NULL, title TEXT, fields JSONB, config JSONB,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (draft_id, id)
       )
     `)
@@ -1048,22 +1057,28 @@ describe('withDraft PK-filtered read coalesce (Gap 2)', () => {
     expect((b as { title: string }).title).toBe('B-cherry')
   })
 
-  test('CONTRACT 7a: two filters on a read throws (fail-loud)', async () => {
-    await expect(
-      tracked.withDraft('d1').from(todos).where(eq('id', 1)).where(eq('title', 'apple')).all(),
-    ).rejects.toThrow(/exactly one .*where|single PK predicate/i)
+  test('CONTRACT 7a: multiple filters apply to effective values', async () => {
+    const rows = await tracked
+      .withDraft('d1')
+      .from(todos)
+      .where(eq('id', 1))
+      .where(eq('title', 'APPLE-edited'))
+      .all()
+    expect(rows.map((row) => row['id'])).toEqual([1])
   })
 
-  test('CONTRACT 7b: a non-eq op on a read throws (fail-loud)', async () => {
-    await expect(
-      tracked.withDraft('d1').from(todos).where({ column: 'id', op: 'gt', value: 1 }).all(),
-    ).rejects.toThrow(/pinned by the primary key|requires .*eq/i)
+  test('CONTRACT 7b: non-equality operators match canonical filter behavior', async () => {
+    const rows = await tracked
+      .withDraft('d1')
+      .from(todos)
+      .where({ column: 'id', op: 'gt', value: 1 })
+      .all()
+    expect(rows.map((row) => row['id'])).toEqual([3, 4])
   })
 
-  test('CONTRACT 7c: a non-PK column filter on a read throws (fail-loud)', async () => {
-    await expect(
-      tracked.withDraft('d1').from(todos).where(eq('title', 'apple')).all(),
-    ).rejects.toThrow(/pinned by the primary key|requires .*eq/i)
+  test('CONTRACT 7c: non-primary-key filters use effective draft values', async () => {
+    const rows = await tracked.withDraft('d1').from(todos).where(eq('title', 'APPLE-edited')).all()
+    expect(rows.map((row) => row['id'])).toEqual([1])
   })
 
   test('CONTRACT 7d: an unfiltered .all() still returns the FULL coalesced set', async () => {
@@ -1082,25 +1097,13 @@ describe('withDraft PK-filtered read coalesce (Gap 2)', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]['title']).toBe('APPLE-edited')
 
-    // And the WRITE path still rejects an unfiltered update (PK filter is the
-    // write target, unchanged by the read path addition).
-    await expect(tracked.withDraft('d1').from(todos).update({ title: 'x' })).rejects.toThrow(
-      /requires exactly one .*where/,
-    )
+    const updated = await tracked.withDraft('d1').from(todos).update({ done: true })
+    expect(updated).toHaveLength(3)
   })
 
-  test('CONTRACT 7e: a PK pinned to undefined/null throws (never silently widens to the full set)', async () => {
-    // The auth/authz hazard the MUST guards: `eq('id', undefined)` passes the
-    // op/column checks but, if its value were used to gate the predicate, would
-    // drop the WHERE and return EVERY coalesced row. The resolver must reject it
-    // loud. `null` is rejected too (it would bind `= NULL` → 0 rows, an
-    // inconsistent silent fail-closed).
-    await expect(
-      tracked.withDraft('d1').from(todos).where(eq('id', undefined)).all(),
-    ).rejects.toThrow(/pinned to undefined|defined PK value/i)
-    await expect(tracked.withDraft('d1').from(todos).where(eq('id', null)).all()).rejects.toThrow(
-      /pinned to null|defined PK value/i,
-    )
+  test('CONTRACT 7e: undefined and null filter values never widen a read', async () => {
+    expect(await tracked.withDraft('d1').from(todos).where(eq('id', undefined)).all()).toEqual([])
+    expect(await tracked.withDraft('d1').from(todos).where(eq('id', null)).all()).toEqual([])
   })
 
   test('a falsy-but-valid PK (0) still pins (presence is keyed on the filter, not the value)', async () => {
@@ -1137,8 +1140,8 @@ const reportRowsDraft = pgTable('report_rows__draft', {
 })
 void reportRowsDraft
 
-describe('withDraft PK pin by SQL column name (prop key ≠ col name)', () => {
-  test('a read filter using the SQL column name (report_id) pins, equivalently to the prop key (reportId)', async () => {
+describe('withDraft filters use Drizzle property names', () => {
+  test('a SQL column name is rejected while its public property key works', async () => {
     await db.execute(`
       CREATE TABLE IF NOT EXISTS report_rows (
         report_id INTEGER PRIMARY KEY,
@@ -1150,6 +1153,7 @@ describe('withDraft PK pin by SQL column name (prop key ≠ col name)', () => {
         draft_id TEXT NOT NULL,
         report_id INTEGER NOT NULL,
         label TEXT,
+        __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         __tombstone BOOLEAN NOT NULL DEFAULT false,
         PRIMARY KEY (draft_id, report_id)
       )
@@ -1160,13 +1164,13 @@ describe('withDraft PK pin by SQL column name (prop key ≠ col name)', () => {
         ('dr', 1, 'one-edited', false)
     `)
 
-    // Pin by the SQL column name — exercises the `f.column === pkColName` branch.
-    const bySqlName = await tracked
-      .withDraft('dr')
-      .from(reportRows)
-      .where({ column: 'report_id', op: 'eq', value: 1 })
-      .first()
-    expect((bySqlName as { label: string }).label).toBe('one-edited')
+    await expect(
+      tracked
+        .withDraft('dr')
+        .from(reportRows)
+        .where({ column: 'report_id', op: 'eq', value: 1 })
+        .first(),
+    ).rejects.toThrow('Unknown column: report_id')
 
     // Pin by the prop key — must be equivalent.
     const byPropKey = await tracked

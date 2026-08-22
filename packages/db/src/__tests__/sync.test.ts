@@ -13,6 +13,7 @@ import {
 } from 'drizzle-orm/pg-core'
 
 import { renderCreateTableIfNotExists, syncSchema } from '../sync'
+import { defineSchema, multiTenant, table, text as wyText, uuid as wyUuid } from '../index'
 
 const bytea = customType<{ data: Uint8Array; default: false }>({
   dataType() {
@@ -69,6 +70,37 @@ describe('renderCreateTableIfNotExists', () => {
 })
 
 describe('syncSchema', () => {
+  test('creates generated tenant-aware draft shadows', async () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: wyUuid },
+    })
+    const schema = defineSchema({
+      insights: tenancy
+        .table({ id: wyUuid.primaryKey(), description: wyText.nullable() })
+        .draftable(),
+    })
+    const client = new PGlite()
+    await client.waitReady
+    const db = drizzle(client)
+
+    await syncSchema(db, schema)
+
+    const result = await client.query<{ column_name: string }>(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'insights__draft'
+      ORDER BY ordinal_position
+    `)
+    expect(result.rows.map((row) => row.column_name)).toEqual([
+      'draft_id',
+      'workspace_id',
+      'id',
+      'description',
+      '__overrides',
+      '__tombstone',
+    ])
+  })
+
   test('creates all tables in dependency order', async () => {
     const insights = pgTable('insights', {
       id: uuid('id').primaryKey().defaultRandom(),

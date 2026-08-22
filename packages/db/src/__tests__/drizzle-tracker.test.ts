@@ -312,6 +312,7 @@ const createShadow = () =>
       draft_id TEXT NOT NULL,
       title TEXT,
       done BOOLEAN,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN DEFAULT false,
       PRIMARY KEY (id, draft_id)
     )
@@ -337,6 +338,7 @@ const createSnakeTodos = async ({ withShadow = false } = {}) => {
       draft_id TEXT NOT NULL,
       todo_title TEXT,
       owner_name TEXT,
+      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
       __tombstone BOOLEAN DEFAULT false,
       PRIMARY KEY (id, draft_id)
     )

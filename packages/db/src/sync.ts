@@ -28,6 +28,7 @@
 import { sql } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { PgTable } from 'drizzle-orm/pg-core'
+import { getGeneratedTables } from './schema'
 
 /** Anything that can execute a Drizzle SQL object. Covers both the PGLite-backed
  *  drizzle instance and the future drizzle-tracker wrapper. */
@@ -37,7 +38,7 @@ export interface SyncTarget {
 }
 
 export async function syncSchema(db: SyncTarget, schema: Record<string, PgTable>): Promise<void> {
-  const tables = Object.values(schema)
+  const tables = [...Object.values(schema), ...getGeneratedTables(schema)]
   const ordered = sortByFkDeps(tables)
   for (const table of ordered) {
     const ddl = renderCreateTableIfNotExists(table)
