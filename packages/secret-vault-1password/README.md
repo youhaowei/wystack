@@ -55,8 +55,6 @@ least-privilege development vault. The command runs the official Node.js SDK und
 Node, not Bun; inject the service-account token through CI secret storage so it never
 requires an interactive `op signin` or Touch ID prompt.
 
-The repository runs the workflow for adapter changes on same-repository pull requests
-and supports manual dispatch after it reaches the default branch. It expects a
-`WYSTACK_1PASSWORD_SMOKE_TOKEN` Actions secret with only `read_items` and
-`write_items` access to this vault, plus a `WYSTACK_1PASSWORD_SMOKE_VAULT_ID` Actions
-variable. The workflow never invokes the 1Password CLI or personal-account login.
+For future live verification, provide a short-lived service-account token scoped only
+to the dedicated smoke vault. The command never invokes the 1Password CLI or a
+personal-account login.
