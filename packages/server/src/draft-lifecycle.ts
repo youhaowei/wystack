@@ -2,7 +2,7 @@
 //
 // The draft system has three legs:
 //   1. Read overlay  — `withDraft(draftId)` coalesce (canonical ⊕ delta). READ.
-//   2. Write storage — `<table>__draft` shadow (sparse upsert + tombstone),
+//   2. Write storage — central sparse JSONB row changes,
 //                       written through the `withDraft` WRITE path (this PR's
 //                       @wystack/db half) + a bounded, compacted command log.
 //   3. Lifecycle (THIS) — open / append / publish / discard + conflict
@@ -18,8 +18,8 @@
 // ORDERED COMMAND LOG via `applyCommands(app, log, {commit})`, NOT "apply a
 // row-delta onto canonical." The command log is the publish unit because it
 // preserves INTENT GROUPING (e.g. an `add_to_dashboard` command merges into the
-// dashboard node — a row-delta cannot reconstruct that). The `<table>__draft`
-// delta tables are the READ overlay; the command log is the PUBLISH source. The
+// dashboard node — a row-delta cannot reconstruct that). Central row changes
+// are the READ overlay; the command log is the PUBLISH source. The
 // two are different artifacts with different jobs.
 //
 // ATOMIC PUBLISH: `publish` adopts the `applyCommands` outer-tx seam
@@ -43,6 +43,7 @@ import {
 import type { WyStackApp } from './create'
 import {
   advanceStoredDraftRevision,
+  deleteStoredTouchedTables,
   deleteStoredDraft,
   ensureDraftStorage,
   insertStoredDraft,
@@ -142,7 +143,7 @@ export interface DraftLifecycleOptions {
 }
 
 export interface DraftAuthorizationRequest {
-  action: 'append' | 'publish' | 'discard' | 'detectConflict' | 'getLog'
+  action: 'append' | 'publish' | 'discard' | 'rebuild' | 'detectConflict' | 'getLog'
   draft: {
     draftId: string
     tenantId: unknown | undefined
@@ -156,7 +157,7 @@ export interface DraftLifecycle {
   open(baseVersion: Version, opts?: OpenOptions): Promise<string>
   /**
    * Apply a batch of commands INSIDE the draft: routes each command's writes
-   * into the `<table>__draft` overlay (via `withDraft`'s write path) and appends
+   * into the central derived overlay (via `withDraft`'s write path) and appends
    * them to the command log. Reads inside the handler see `canonical ⊕ draft`.
    * Returns the per-command results (same shape as `applyCommands`).
    *
@@ -184,7 +185,7 @@ export interface DraftLifecycle {
    * draft's shadow, command log, and metadata are cleared on success.
    *
    * Invalidation is the LIFECYCLE's job, not the host's: publish emits the
-   * canonical tags from the replay plus the `<table>__draft` tags for the sweep
+   * canonical tags from the replay plus virtual per-table draft tags for the sweep
    * (untracked, so `applyCommands` cannot report them), once the transaction has
    * durably committed. `append` and `discard` emit too — every entry point that
    * writes announces its own writes, so no consumer can forget to and leave
@@ -206,10 +207,12 @@ export interface DraftLifecycle {
    * shadow, and delete its command log and metadata in one transaction.
    */
   discard(draftId: string, opts?: DraftOperationOptions): Promise<void>
+  /** Rebuild the derived central change set by replaying the authoritative command log. */
+  rebuild(draftId: string, opts?: DraftOperationOptions): Promise<void>
   /**
    * Detect whether canonical moved under the draft. Returns the two generic
    * signals; makes NO policy decision. Reads the draft's touched cells straight
-   * from the `<table>__draft` shadow (the `(draftId, id)` keys), then asks the
+   * from central changes (the `(draftId, tableKey, rowKey)` keys), then asks the
    * app's `VersionProbe` which canonical also wrote.
    */
   detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
@@ -556,7 +559,7 @@ export function createDraftLifecycle(
           context,
           tx: scopedTx,
         })) as CommitResult
-        await clearShadow(tx.raw, draftId, touched)
+        await clearDerivedChanges(tx.raw, draftId)
         await deleteStoredDraft(tx.raw, draftId)
         shadowWrites = new Set(
           touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
@@ -577,13 +580,41 @@ export function createDraftLifecycle(
         const stored = await requireStored(tx.raw, draftId, true)
         await authorizeTracker(tx, stored, context, 'discard')
         const touched = await readStoredTouchedTables(tx.raw, draftId)
-        await clearShadow(tx.raw, draftId, touched)
+        await clearDerivedChanges(tx.raw, draftId)
         await deleteStoredDraft(tx.raw, draftId)
         shadowWrites = new Set(
           touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
         )
       })
       if (shadowWrites.size > 0) app.emit(shadowWrites)
+    },
+
+    async rebuild(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      let emitted = new Set<string>()
+      await app.createTracked().transaction(async (tx) => {
+        const stored = await requireStored(tx.raw, draftId, true)
+        const scopedTx = await authorizeTracker(tx, stored, context, 'rebuild')
+        const log = await readStoredCommands(tx.raw, draftId)
+        const previousTouched = await readStoredTouchedTables(tx.raw, draftId)
+        await clearDerivedChanges(tx.raw, draftId)
+        await deleteStoredTouchedTables(tx.raw, draftId)
+
+        const touchedTables = new Map<string, AnyTable>()
+        const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
+        for (const command of log) {
+          await app.runHandler(command.path, command.args, draftDb, context)
+        }
+        const rebuiltTouched = describeTouchedTables(touchedTables, draftDb.tablesWritten)
+        await upsertStoredTouchedTables(tx.raw, draftId, rebuiltTouched)
+        await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
+        emitted = new Set([
+          ...previousTouched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+          ...draftDb.tablesWritten,
+        ])
+      })
+      if (emitted.size > 0) app.emit(emitted)
     },
 
     async detectConflict(draftId, operationOpts = {}) {
@@ -600,8 +631,8 @@ export function createDraftLifecycle(
       const current = await versionProbe.current()
       const staleBase = versionProbe.isNewerThan(current, stored.baseVersion)
 
-      // Fine signal: enumerate THIS draft's touched cells from the shadow tables
-      // (the `(draft_id, id)` keys), then ask the probe which canonical also
+      // Fine signal: enumerate THIS draft's touched cells from central changes,
+      // then ask the probe which canonical also
       // wrote at/after base. Reading the shadow keeps detection artifact-blind.
       const touched = await readStoredTouchedTables(scoped.raw, draftId)
       const touchedCells = await enumerateTouchedCells(scoped.raw, draftId, touched)
@@ -653,6 +684,7 @@ function recordTouchedTables(
       record(table)
       return draftDb.into(table)
     },
+    changes: draftDb.changes.bind(draftDb),
     // Delegate to the underlying draft handle's transaction, which throws the
     // named "drafts have no per-handler transaction" contract error.
     transaction: draftDb.transaction.bind(draftDb),
@@ -660,7 +692,7 @@ function recordTouchedTables(
 }
 
 /**
- * Read the `(id)` keys this draft wrote into each touched `<table>__draft`,
+ * Read the typed row keys this draft wrote into the central relation,
  * returning them as `(table, id)` cells. `draftId` is a BOUND parameter (guard
  * the sink); table/PK names are introspected identifiers. Tombstoned rows count
  * as touched cells — a draft delete still conflicts with a canonical write.
@@ -672,50 +704,43 @@ async function enumerateTouchedCells(
 ): Promise<Cell[]> {
   const cells: Cell[] = []
   for (const table of touchedTables) {
-    const draftRel = qualifiedDraftRelation(table)
-    const prefix = sql.raw(
-      `SELECT ${quoteIdentifier(table.pkColumn)} AS id FROM ${draftRel} WHERE "draft_id" = `,
-    )
-    const rows = normalizeRows(await raw.execute(sql`${prefix}${draftId}`))
     const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
-    for (const r of rows) cells.push({ table: tableIdentity, id: (r as { id: unknown }).id })
+    const rows = normalizeRows(
+      await raw.execute(sql`
+        SELECT row_key
+        FROM wystack_draft_row_changes
+        WHERE draft_id = ${draftId} AND table_key = ${tableIdentity}
+        ORDER BY tenant_key_text, row_key_text
+      `),
+    )
+    for (const row of rows) {
+      const encoded = decodeJsonColumn(row['row_key']) as { value?: unknown }
+      cells.push({ table: tableIdentity, id: encoded?.value })
+    }
   }
   return cells
 }
 
 /**
- * Delete a draft's shadow rows across every table it touched. `draftId` bound.
+ * Delete a draft's central derived rows in one indexed sweep. `draftId` bound.
  *
  * Accepts a `raw` Drizzle db handle directly (rather than a `WyStackApp`) so
  * the caller can pass a tx-bound handle and share a commit boundary. When
  * called from `publish`, `raw` is `tx.raw` inside the outer transaction —
  * sweep and replay commit atomically. When called from `discard`, `raw` is
- * `tx.raw` inside a transaction scoped to the sweep alone (no replay to share
- * it with) — still required because this function issues one DELETE per
- * touched table, and without a shared commit boundary a failure partway
- * through would leave earlier tables' deletes durably committed with no
- * invalidation ever emitted for them.
+ * `tx.raw` inside a transaction scoped to the sweep alone, keeping the derived
+ * delete and lifecycle metadata changes inside the same commit boundary.
  */
-async function clearShadow(
+async function clearDerivedChanges(
   // oxlint-disable-next-line typescript/no-explicit-any -- DrizzleDb is `any` in @wystack/db
   raw: any,
   draftId: string,
-  touchedTables: StoredTouchedTable[],
 ): Promise<void> {
-  for (const table of touchedTables) {
-    const draftRel = qualifiedDraftRelation(table)
-    const prefix = sql.raw(`DELETE FROM ${draftRel} WHERE "draft_id" = `)
-    await raw.execute(sql`${prefix}${draftId}`)
-  }
+  await raw.execute(sql`DELETE FROM wystack_draft_row_changes WHERE draft_id = ${draftId}`)
 }
 
-function qualifiedDraftRelation(table: StoredTouchedTable): string {
-  const relation = quoteIdentifier(`${table.table}__draft`)
-  return table.schema ? `${quoteIdentifier(table.schema)}.${relation}` : relation
-}
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`
+function decodeJsonColumn(value: unknown): unknown {
+  return typeof value === 'string' ? JSON.parse(value) : value
 }
 
 function normalizeRows(result: unknown): Record<string, unknown>[] {

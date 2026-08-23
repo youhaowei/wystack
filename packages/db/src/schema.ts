@@ -205,99 +205,35 @@ function buildTable(
   return compiled
 }
 
-function buildDraftTable(tableName: string, columns: ColumnMap, capabilities: TableCapabilities) {
-  const primaryEntries = Object.entries(columns).filter(([, column]) => column.opts.isPrimaryKey)
-  if (primaryEntries.length !== 1) {
-    throw new Error(
-      `Draftable table "${tableName}" requires exactly one explicitly declared primary key`,
-    )
-  }
-
-  const [primaryProperty, primaryDefinition] = primaryEntries[0]
-  const tenantProperty = capabilities.tenancy?.property
-  const reservedSqlNames = new Set(['draft_id', '__overrides', '__tombstone'])
-  for (const [property, definition] of Object.entries(columns)) {
-    const sqlName =
-      capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
-    if (reservedSqlNames.has(sqlName)) {
-      throw new Error(
-        `Draftable table "${tableName}" column "${property}" collides with reserved shadow column "${sqlName}"`,
-      )
-    }
-    if (definition.opts.isPrimaryKey && property !== primaryProperty) {
-      throw new Error(`Draftable table "${tableName}" has multiple primary keys`)
-    }
-  }
-
-  // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle column builders
-  const shadowColumns: Record<string, any> = {
-    draftId: pgText('draft_id').notNull(),
-  }
-
-  if (capabilities.tenancy) {
-    const tenantDefinition = columns[capabilities.tenancy.property]
-    shadowColumns[capabilities.tenancy.property] = buildColumn(
-      capabilities.tenancy.property,
-      {
-        ...tenantDefinition.opts,
-        isPrimaryKey: false,
-        isUnique: false,
-        isUniqueWithinTenant: false,
-        ref: undefined,
-      },
-      {},
-      capabilities.tenancy.column,
-    )
-  }
-
-  shadowColumns[primaryProperty] = buildColumn(
-    primaryProperty,
+/**
+ * Contender B stores every draft row delta in one relation. `row_key` and
+ * `tenant_key` retain a typed JSON envelope for inspection/rebuild while their
+ * canonical text forms make the btree identity lossless and indexable.
+ *
+ * This is intentionally a spike schema: production migration ownership and
+ * foreign keys to the lifecycle tables are decision-followups.
+ */
+function buildDraftChangesTable() {
+  return pgTable(
+    'wystack_draft_row_changes',
     {
-      ...primaryDefinition.opts,
-      isPrimaryKey: false,
-      isUnique: false,
-      isUniqueWithinTenant: false,
-      hasDefault: false,
-      defaultValue: undefined,
-      isDefaultNow: false,
-      isDefaultRandom: false,
-      ref: undefined,
+      draftId: pgText('draft_id').notNull(),
+      tableKey: pgText('table_key').notNull(),
+      tenantKeyText: pgText('tenant_key_text').notNull().default(''),
+      tenantKey: pgJsonb('tenant_key'),
+      rowKeyText: pgText('row_key_text').notNull(),
+      rowKey: pgJsonb('row_key').notNull(),
+      operation: pgText('operation').notNull(),
+      baseExists: pgBoolean('base_exists').notNull(),
+      baseRevision: pgJsonb('base_revision'),
+      fields: pgJsonb('fields').notNull().default({}),
     },
-    {},
+    (change) => [
+      primaryKey({
+        columns: [change.draftId, change.tableKey, change.tenantKeyText, change.rowKeyText],
+      }),
+    ],
   )
-
-  for (const [property, definition] of Object.entries(columns)) {
-    if (property === primaryProperty || property === tenantProperty) continue
-    shadowColumns[property] = buildColumn(
-      property,
-      {
-        ...definition.opts,
-        isOptional: true,
-        isNullable: true,
-        isPrimaryKey: false,
-        isUnique: false,
-        isUniqueWithinTenant: false,
-        hasDefault: false,
-        defaultValue: undefined,
-        isDefaultNow: false,
-        isDefaultRandom: false,
-        ref: undefined,
-      },
-      {},
-    )
-  }
-
-  shadowColumns.__overrides = pgText('__overrides').array().notNull().default([])
-  shadowColumns.__tombstone = pgBoolean('__tombstone').notNull().default(false)
-
-  const shadow = pgTable(`${tableName}__draft`, shadowColumns, (draft) => {
-    const keyColumns = [draft.draftId] as [typeof draft.draftId, ...(typeof draft.draftId)[]]
-    if (capabilities.tenancy) keyColumns.push(draft[capabilities.tenancy.property])
-    keyColumns.push(draft[primaryProperty])
-    return [primaryKey({ columns: keyColumns })]
-  })
-  tableCapabilities.set(shadow, { draftable: false, tenancy: capabilities.tenancy })
-  return shadow
 }
 
 export function defineSchema<const T extends Record<string, unknown>>(
@@ -333,11 +269,19 @@ export function defineSchema<const T extends Record<string, unknown>>(
   }
 
   const compiled = result as { [K in keyof T]: ReturnType<typeof pgTable> }
-  const generated: PgTable[] = []
-  for (const [tableName, definition] of Object.entries(tables)) {
-    const { columns, capabilities } = normalizeTableDefinition(definition)
-    if (capabilities.draftable) generated.push(buildDraftTable(tableName, columns, capabilities))
+  const draftableEntries = Object.entries(tables).filter(
+    ([, definition]) => normalizeTableDefinition(definition).capabilities.draftable,
+  )
+  for (const [tableName, definition] of draftableEntries) {
+    const { columns } = normalizeTableDefinition(definition)
+    const primaryKeys = Object.values(columns).filter((column) => column.opts.isPrimaryKey)
+    if (primaryKeys.length !== 1) {
+      throw new Error(
+        `Draftable table "${tableName}" requires exactly one explicitly declared primary key`,
+      )
+    }
   }
+  const generated: PgTable[] = draftableEntries.length > 0 ? [buildDraftChangesTable()] : []
   generatedTables.set(compiled, generated)
   return compiled
 }

@@ -25,7 +25,7 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-const draftStorageVersion = 1
+const draftStorageVersion = 2
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -52,6 +52,22 @@ const storageDdlV1 = [
   )`),
 ]
 
+const storageDdlV2 = [
+  sql.raw(`CREATE TABLE IF NOT EXISTS wystack_draft_row_changes (
+    draft_id TEXT NOT NULL,
+    table_key TEXT NOT NULL,
+    tenant_key_text TEXT NOT NULL DEFAULT '',
+    tenant_key JSONB,
+    row_key_text TEXT NOT NULL,
+    row_key JSONB NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('insert', 'update', 'delete')),
+    base_exists BOOLEAN NOT NULL,
+    base_revision JSONB,
+    fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
+  )`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await raw.execute(migrationTableDdl)
   const rows = normalizeRows(
@@ -69,7 +85,12 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   }
   if (installedVersion === draftStorageVersion) return
 
-  for (const statement of storageDdlV1) await raw.execute(statement)
+  if (installedVersion < 1) {
+    for (const statement of storageDdlV1) await raw.execute(statement)
+  }
+  if (installedVersion < 2) {
+    for (const statement of storageDdlV2) await raw.execute(statement)
+  }
   await raw.execute(sql`
     INSERT INTO wystack_framework_migrations (migration_name, version)
     VALUES ('draft-storage', ${draftStorageVersion})
@@ -199,6 +220,10 @@ export async function readStoredTouchedTables(
     pkColumn: String(row['pk_column']),
     shadowTag: row['shadow_tag'] == null ? undefined : String(row['shadow_tag']),
   }))
+}
+
+export async function deleteStoredTouchedTables(raw: RawDb, draftId: string): Promise<void> {
+  await raw.execute(sql`DELETE FROM wystack_draft_tables WHERE draft_id = ${draftId}`)
 }
 
 export async function deleteStoredDraft(raw: RawDb, draftId: string): Promise<void> {

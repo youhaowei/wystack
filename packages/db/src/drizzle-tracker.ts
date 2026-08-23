@@ -26,6 +26,65 @@ type DrizzleDb = any
 // oxlint-disable-next-line typescript/no-explicit-any -- PgTableWithColumns requires a config generic; any is needed for polymorphic table usage
 type AnyTable = PgTableWithColumns<any>
 
+const draftChangesRelation = '"wystack_draft_row_changes"'
+const draftJsonNullMarker = Symbol('wystack draft JSON null')
+
+/** Explicit JSON `null` for a json/jsonb draft field. Plain `null` remains SQL NULL. */
+export interface DraftJsonNull {
+  readonly [draftJsonNullMarker]: true
+}
+
+export function draftJsonNull(): DraftJsonNull {
+  return Object.freeze({ [draftJsonNullMarker]: true as const })
+}
+
+export interface DraftRowChange {
+  draftId: string
+  tableKey: string
+  tenantKey: unknown
+  rowKey: unknown
+  operation: 'insert' | 'update' | 'delete'
+  baseExists: boolean
+  baseRevision: unknown
+  fields: Record<
+    string,
+    {
+      original: DraftStoredValue
+      value: DraftStoredValue
+    }
+  >
+}
+
+export type DraftStoredValue =
+  | { kind: 'absent' }
+  | { kind: 'sql-null' }
+  | { kind: 'json'; value: unknown }
+  | { kind: 'value'; value: unknown }
+
+/** One indexed scan for review, conflict classification, rebuild, or diagnostics. */
+export async function enumerateDraftRowChanges(
+  raw: DrizzleDb,
+  draftId: string,
+): Promise<DraftRowChange[]> {
+  const result = await raw.execute(sql`
+    SELECT draft_id, table_key, tenant_key, row_key, operation,
+           base_exists, base_revision, fields
+    FROM wystack_draft_row_changes
+    WHERE draft_id = ${draftId}
+    ORDER BY table_key, tenant_key_text, row_key_text
+  `)
+  return normalizeExecuteRows(result).map((row) => ({
+    draftId: String(row['draft_id']),
+    tableKey: String(row['table_key']),
+    tenantKey: decodeJsonDriverValue(row['tenant_key']),
+    rowKey: decodeJsonDriverValue(row['row_key']),
+    operation: String(row['operation']) as DraftRowChange['operation'],
+    baseExists: Boolean(row['base_exists']),
+    baseRevision: decodeJsonDriverValue(row['base_revision']),
+    fields: decodeJsonDriverValue(row['fields']) as DraftRowChange['fields'],
+  }))
+}
+
 const noTenantScope = Symbol('no tenant scope')
 type TenantScope = unknown | typeof noTenantScope
 
@@ -140,6 +199,75 @@ function requireColumn(columns: Record<string, any>, name: string) {
   return columns[name]
 }
 
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+// `serial` is a DDL shorthand, not a cast target. The overlay needs the real
+// canonical type because JSON values cross back into SQL on the small side.
+function draftCastType(column: { getSQLType(): string }): string {
+  const type = column.getSQLType().toLowerCase()
+  if (type === 'serial') return 'integer'
+  if (type === 'bigserial') return 'bigint'
+  if (type === 'smallserial') return 'smallint'
+  return type
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+function encodeTypedKey(column: any, value: unknown): { envelope: unknown; text: string } {
+  const envelope = { type: draftCastType(column), value: mapColumnValue(column, value) }
+  return { envelope, text: JSON.stringify(envelope) }
+}
+
+function isDraftJsonNull(value: unknown): value is DraftJsonNull {
+  return Boolean(
+    value && typeof value === 'object' && (value as Partial<DraftJsonNull>)[draftJsonNullMarker],
+  )
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+function encodeProposedDraftValue(column: any, value: unknown): DraftStoredValue {
+  if (value === null) return { kind: 'sql-null' }
+  if (isDraftJsonNull(value)) return { kind: 'json', value: null }
+  const type = draftCastType(column)
+  if (type === 'json' || type === 'jsonb') return { kind: 'json', value }
+  const encoded = mapColumnValue(column, value)
+  return { kind: 'value', value: encoded instanceof Date ? encoded.toISOString() : encoded }
+}
+
+function decodeJsonDriverValue(value: unknown): unknown {
+  return typeof value === 'string' ? JSON.parse(value) : value
+}
+
+/** Cast a tagged proposal from the central JSONB row back to a canonical type. */
+// oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+function draftFieldValueSql(column: any, fieldsAlias: string): string {
+  const name = column.name as string
+  const key = sqlLiteral(name)
+  const cast = draftCastType(column)
+  const entry = `${fieldsAlias}."fields" -> ${key} -> 'value'`
+  if (cast === 'json' || cast === 'jsonb') {
+    return `CASE WHEN ${entry} ->> 'kind' = 'sql-null' THEN NULL::${cast} ELSE (${entry} -> 'value')::${cast} END`
+  }
+  if (cast.endsWith('[]')) {
+    const element = cast.slice(0, -2)
+    return (
+      `CASE WHEN ${entry} ->> 'kind' = 'sql-null' THEN NULL::${cast} ELSE ` +
+      `ARRAY(SELECT value::${element} FROM jsonb_array_elements_text(${entry} -> 'value') AS value)::${cast} END`
+    )
+  }
+  return `CASE WHEN ${entry} ->> 'kind' = 'sql-null' THEN NULL::${cast} ELSE (${entry} #>> '{value}')::${cast} END`
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+function typedKeyValueSql(alias: string, jsonColumn: string, column: any): string {
+  return `(${alias}.${quoteSqlIdentifier(jsonColumn)} #>> '{value}')::${draftCastType(column)}`
+}
+
 /**
  * Reject read-terminal clauses on a write terminal.
  *
@@ -185,12 +313,12 @@ const drizzleOpMap = {
 /**
  * A draft-scoped handle returned by `withDraft(draftId)`. Exposes the same
  * read+write surface shape as `DrizzleTracker`, but every operation is routed at the
- * `<table>__draft` shadow rather than the canonical table:
+ * central `wystack_draft_row_changes` relation rather than the canonical table:
  *
  *   - `from(table).all()`            → coalesced read (canonical ⊕ draft delta)
- *   - `into(table).insert(rows)`     → sparse upsert into `<table>__draft`
- *   - `from(table).where(eqPk).update(vals)` → sparse cell edit in the shadow
- *   - `from(table).where(eqPk).delete()`     → tombstone row in the shadow
+ *   - `into(table).insert(rows)`     → sparse central change upsert
+ *   - `from(table).where(eqPk).update(vals)` → sparse JSONB field edit
+ *   - `from(table).where(eqPk).delete()`     → central delete operation
  *
  * The write methods (`into` + the `DraftSelectBuilder.update/delete`) are what
  * make an EXISTING command handler — which writes via `ctx.db.into(table)` /
@@ -213,6 +341,8 @@ export interface DraftDrizzleTracker {
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
   into<T extends AnyTable>(table: T): DraftInsertBuilder<T>
+  /** Enumerate the entire derived change set through the central draft index. */
+  changes(): Promise<DraftRowChange[]>
   /** Always throws — drafts have no per-handler transaction (publish owns atomicity). */
   transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
@@ -260,15 +390,14 @@ export interface DrizzleTracker {
    * Return a draft-coalescing read handle for the given draft ID.
    *
    * `handle.from(table).all()` executes a FULL OUTER JOIN coalesce between the
-   * base table and its `<table>__draft` shadow, applying delta edits, surfacing
+   * base table and its central JSONB changes, applying delta edits, surfacing
    * draft inserts, and suppressing tombstoned rows — all without touching the
    * canonical `from().all()` code path. A no-draft read is structurally
    * zero-overhead: it never reaches the coalesce logic.
    *
-   * Shadow rows carry an explicit `__overrides` property set. A property present
-   * there overrides canonical even when its stored value is SQL NULL; an omitted
-   * or `undefined` input leaves the effective value unchanged. Deleting a row is
-   * expressed via `__tombstone`.
+   * Change rows carry sparse `fields` entries with tagged values. A present field
+   * overrides canonical even when its proposal is SQL NULL; omitted/undefined
+   * leaves it unchanged. Deletion is the row-level `operation = 'delete'`.
    */
   withDraft(draftId: string): DraftDrizzleTracker
 }
@@ -555,12 +684,11 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
  * Draft-coalescing select builder returned by `DraftDrizzleTracker.from()`.
  *
  * `all()` executes a FULL OUTER JOIN between the base table and its
- * `<table>__draft` shadow, coalescing every column so that draft edits win
+ * central change relation, coalescing every column so that draft edits win
  * over canonical values, draft inserts appear, and tombstoned rows are
  * excluded.
  *
- * The draft table name is derived automatically: `<base_table>__draft`.
- * No application-specific mapping is required.
+ * `table_key` is derived automatically from the schema-qualified base relation.
  *
  * READ side (`.all()` / `.first()`): every public filter is lowered against the
  * effective presence-aware value as a bound predicate. Multiple filters and
@@ -573,7 +701,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
  *
  * WRITE side (`.where(...).update(vals)` / `.where(...).delete()`): resolves the
  * full effective target set atomically, then routes one sparse upsert or
- * tombstone per primary key into `<table>__draft`. This is the write path that
+ * delete operation per primary key into the central relation. This is the write path that
  * makes an unmodified command handler land in the draft overlay.
  */
 export class DraftSelectBuilder<T extends AnyTable> {
@@ -677,11 +805,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   /**
-   * Sparse cell-edit into the shadow: upsert `(draft_id, <pk>)` setting ONLY the
-   * columns present in `values` (+ `__tombstone = false`), so a draft update of
-   * one field does not clobber other fields. Mirrors the canonical
+   * Sparse cell-edit: upsert one central change row and merge ONLY the fields
+   * present in `values`, so a draft update of one field does not clobber another.
+   * Mirrors the canonical
    * `from(t).where(eq('id', x)).update(vals)` shape a command handler emits, but
-   * the write lands in `<table>__draft`, not the canonical table.
+   * the write lands in `wystack_draft_row_changes`, not the canonical table.
    *
    * Filters have full effective-row parity with canonical updates: every row
    * matched by the composed predicate receives the sparse patch. Returns the
@@ -716,6 +844,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
           pkValue,
           values: patch,
           tombstone: false,
+          intent: 'update',
         })
         const effective = await txDraft
           .from(this._table)
@@ -759,6 +888,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
           pkValue: match[pkProperty],
           values: {},
           tombstone: true,
+          intent: 'delete',
         })
       }
       return matches
@@ -780,11 +910,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * mean only "the caller attached `limit()`".
    */
   private async _coalescedRead(limitOverride?: number): Promise<Record<string, unknown>[]> {
-    // Record the base table read AND the shadow-table read. The draft read's
-    // result genuinely depends on `<table>__draft`: a write to it (e.g.
-    // `into(todosDraft).insert(...)` publishing tablesWritten={'todos__draft'})
-    // must invalidate this subscription, which only happens if the shadow table
-    // is in tablesRead so the reactive router's read∩write intersection fires.
+    // Record the base table read AND its virtual per-table draft tag. The rows
+    // physically share one central relation, but invalidation remains scoped by
+    // logical table/tenant/draft so unrelated drafts do not refetch.
     this._tracker.tablesRead.add(tableTrackingTag(this._table, this._tenantScope))
     this._tracker.tablesRead.add(
       draftTableTrackingTag(this._table, this._tenantScope, this._draftId),
@@ -845,143 +973,106 @@ export class DraftSelectBuilder<T extends AnyTable> {
     colEntries: [string, any][]
   } {
     const tableName = getTableName(this._table)
-    const draftTableName = `${tableName}__draft`
-
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const colEntries = Object.entries(columns)
-
-    // Single getTableConfig() read shared by PK resolution + schema qualification.
     const config = getTableConfig(this._table)
     const pkColName = resolvePkColumnName(this._table, config)
-
+    const pkEntry = colEntries.find(([, column]) => column.name === pkColName)
+    if (!pkEntry) throw new Error(`Cannot resolve primary key property for "${tableName}"`)
+    const [pkProperty, pkColumn] = pkEntry
     const tenant = requireTenantScope(this._table, this._tenantScope)
-    const identityColumns = new Set([pkColName])
-    if (tenant) identityColumns.add(tenant.tenancy.column)
-    const effectiveExpression = (sqlName: string) => {
-      if (identityColumns.has(sqlName)) return `COALESCE(d."${sqlName}", b."${sqlName}")`
-      const literal = sqlName.replace(/'/g, "''")
+    const schema = config.schema
+    const tableKey = schema ? `${schema}.${tableName}` : tableName
+    const baseRel = schema
+      ? `${quoteSqlIdentifier(schema)}.${quoteSqlIdentifier(tableName)}`
+      : quoteSqlIdentifier(tableName)
+    const tenantColumn = tenant ? requireColumn(columns, tenant.tenancy.property) : undefined
+    const tenantKey = tenantColumn
+      ? encodeTypedKey(tenantColumn, tenant!.tenantId)
+      : { envelope: null, text: '' }
+
+    const keyFromChange = typedKeyValueSql('d', 'row_key', pkColumn)
+    // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+    const effectiveExpression = (column: any) => {
+      const sqlName = column.name as string
+      if (sqlName === pkColName)
+        return `COALESCE(${keyFromChange}, b.${quoteSqlIdentifier(sqlName)})`
+      if (tenantColumn && sqlName === tenantColumn.name) {
+        const tenantFromChange = typedKeyValueSql('d', 'tenant_key', tenantColumn)
+        return `COALESCE(${tenantFromChange}, b.${quoteSqlIdentifier(sqlName)})`
+      }
       return (
-        `CASE WHEN '${literal}' = ANY(d."__overrides") THEN d."${sqlName}" ` +
-        `WHEN cardinality(d."__overrides") = 0 AND d."${sqlName}" IS NOT NULL THEN d."${sqlName}" ` +
-        `ELSE b."${sqlName}" END`
+        `CASE WHEN d."fields" ? ${sqlLiteral(sqlName)} ` +
+        `THEN ${draftFieldValueSql(column, 'd')} ELSE b.${quoteSqlIdentifier(sqlName)} END`
       )
     }
 
-    // Schema-qualify both relations when the table lives outside the default
-    // schema (pgSchema('app').table(...)). Canonical Drizzle selects emit the
-    // schema prefix; the raw coalesce SQL must match or it reads the wrong
-    // relation / fails with relation-not-found.
-    const schema = config.schema
-    const baseRel = schema ? `"${schema}"."${tableName}"` : `"${tableName}"`
-    const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
-
-    // Build a presence-aware effective value for every selected column.
-    //
-    // The JOIN/COALESCE operate on the SQL column name (col.name), but the
-    // result is aliased to the Drizzle PROPERTY KEY so the returned row shape is
-    // byte-identical to canonical `from().all()`. Without this, a column like
-    // `createdAt: timestamp('created_at')` would come back as `created_at` and
-    // consumers reading `row.createdAt` would see undefined.
-    //
-    // A projection narrows THIS list and nothing else: the join predicate, the
-    // tombstone WHERE, the pk predicate and the ORDER BY all name their columns
-    // directly below, so omitting the PK from the output leaves them intact.
     const selectedEntries = this._clauses.projection
       ? this._clauses.projection.map(
-          // `requireColumn` throws on an unknown name rather than dropping the
-          // column from the result — and does an own-property check, so a name
-          // like `constructor` cannot resolve up `Object.prototype`.
           (propKey) => [propKey, requireColumn(columns, propKey)] as const,
         )
       : colEntries
-
     const colSelects = selectedEntries
       .map(([propKey, col]) => {
-        const sqlName = col.name as string
-        return `${effectiveExpression(sqlName)} AS "${propKey}"`
+        return `${effectiveExpression(col)} AS ${quoteSqlIdentifier(propKey)}`
       })
       .join(', ')
 
-    // Build the coalesce query using a Drizzle sql-tagged-template so draftId is
-    // sent as a bound parameter (not interpolated into the SQL string).
-    // Table/column names come from schema introspection (not user input) and are
-    // double-quoted; they are safe to include as raw SQL fragments.
-    //
-    // The draft table is pre-filtered by draftId in a subquery BEFORE the FULL
-    // OUTER JOIN. This is critical: a bare `FULL OUTER JOIN draft ON pk AND
-    // draft_id = $id` leaks unrelated draft rows (for other draftIds) as
-    // right-side-only rows when $id doesn't match — the subquery eliminates
-    // that hazard by restricting the right side to exactly this draft's rows.
-    const prefix = sql.raw(
-      `SELECT ${colSelects} ` +
-        `FROM ${baseRel} b ` +
-        `FULL OUTER JOIN (SELECT * FROM ${draftRel} WHERE "draft_id" = `,
+    // A PK equality is pushed into BOTH sides. The canonical side retains its
+    // native PK index; the small side hits the central composite key instead of
+    // scanning the entire draft and filtering a COALESCE after the join.
+    const pkFilter = this._clauses.filters.find(
+      (filter) => filter.op === 'eq' && filter.column === pkProperty,
     )
+    const pointKey = pkFilter ? encodeTypedKey(pkColumn, pkFilter.value) : undefined
 
-    // The join + tombstone-suppression WHERE is a single shared fragment so the
-    // filtered and unfiltered paths can never diverge on it. The optional pk
-    // predicate composes with the tombstone WHERE via COALESCE(d.pk, b.pk) — the
-    // SAME expression the ORDER BY uses, so it pins a draft-insert row (base side
-    // NULL) or a canonical row (draft side NULL) identically. It sits BEFORE the
-    // ORDER BY and AFTER the tombstone clause, so a tombstoned PK-pinned read
-    // still returns no row.
-    const tenantJoin = tenant
-      ? ` AND b."${tenant.tenancy.column}" = d."${tenant.tenancy.column}"`
-      : ''
-    const joinAndTombstone = sql.raw(
-      `) d ON b."${pkColName}" = d."${pkColName}"${tenantJoin} ` +
-        `WHERE COALESCE(d."__tombstone", false) = false`,
-    )
-    // The pk order plays two different roles, and only one of them is a promise.
-    //
-    // As the TRAILING TIEBREAKER (when a caller names a column) it is the
-    // cross-path guarantee: canonical lowers the same tiebreaker, so the two
-    // handles resolve ties identically and a preview agrees with its publish.
-    //
-    // As the DEFAULT (no `orderBy()` at all) it is draft-only, and deliberately
-    // NOT matched canonically — canonical emits no ORDER BY there, because
-    // `with-draft.test.ts` pins its lowering as byte-identical to plain Drizzle.
-    // The asymmetry is safe in the direction it runs: the contract is "no order
-    // unless you ask", so the draft is free to be stronger, and a caller relying
-    // on unordered row order is already broken on the canonical path. It is not
-    // safe in the other direction — this is a FULL OUTER JOIN, whose output
-    // order is join-algorithm-dependent rather than heap-stable, so dropping the
-    // default would make an unfiltered `first()` genuinely arbitrary.
-    const pkOrder = effectiveExpression(pkColName)
+    const basePredicates: SQL[] = []
+    if (tenant && tenantColumn) {
+      basePredicates.push(
+        sql`${sql.raw(`${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(mapColumnValue(tenantColumn, tenant.tenantId))}`,
+      )
+    }
+    if (pkFilter) {
+      basePredicates.push(
+        sql`${sql.raw(`${quoteSqlIdentifier(pkColName)} = `)}${sql.param(mapColumnValue(pkColumn, pkFilter.value))}`,
+      )
+    }
+    const baseWhere = basePredicates.length
+      ? sql`${sql.raw(' WHERE ')}${sql.join(basePredicates, sql.raw(' AND '))}`
+      : sql.raw('')
+
+    const changePoint = pointKey
+      ? sql`${sql.raw(' AND "row_key_text" = ')}${sql.param(pointKey.text)}`
+      : sql.raw('')
+    const prefix = sql.raw(`SELECT ${colSelects} FROM (SELECT * FROM ${baseRel}`)
+    const change = sql`${sql.raw(
+      `) b FULL OUTER JOIN (SELECT * FROM ${draftChangesRelation} WHERE "draft_id" = `,
+    )}${sql.param(this._draftId)}${sql.raw(' AND "table_key" = ')}${sql.param(tableKey)}${sql.raw(
+      ' AND "tenant_key_text" = ',
+    )}${sql.param(tenantKey.text)}${changePoint}${sql.raw(
+      `) d ON b.${quoteSqlIdentifier(pkColName)} = ${keyFromChange} WHERE COALESCE(d."operation", 'update') <> 'delete'`,
+    )}`
+
+    const pkOrder = effectiveExpression(pkColumn)
     let orderByClause = ` ORDER BY ${pkOrder}`
     if (this._clauses.orderByCol !== undefined) {
-      // `!== undefined`, not truthiness, and the same test the write guard uses:
-      // when the two disagreed, `orderBy('')` produced an unordered read the
-      // caller believed was sorted while still blocking a later write. The empty
-      // name is now rejected in the setter; this stays aligned regardless.
       const col = requireColumn(columns, this._clauses.orderByCol)
-      const sqlName = col.name as string
       const dir = this._clauses.orderDir === 'desc' ? ' DESC' : ''
-      orderByClause = ` ORDER BY ${effectiveExpression(sqlName)}${dir}, ${pkOrder}`
+      orderByClause = ` ORDER BY ${effectiveExpression(col)}${dir}, ${pkOrder}`
     }
     const orderBy = sql.raw(orderByClause)
-    // Bound param, not interpolated — the value is caller-supplied.
     const limitVal = limitOverride ?? this._clauses.limitVal
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
     const sqlOperators = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' } as const
     const filterFragments = this._clauses.filters.map((filter) => {
       const column = requireColumn(columns, filter.column)
       return sql`${sql.raw(
-        ` AND ${effectiveExpression(column.name as string)} ${sqlOperators[filter.op]} `,
+        ` AND ${effectiveExpression(column)} ${sqlOperators[filter.op]} `,
       )}${sql.param(mapColumnValue(column, filter.value))}`
     })
     const filterPredicate = sql.join(filterFragments, sql.raw(''))
-    const tenantShadowPredicate = tenant
-      ? sql`${sql.raw(` AND "${tenant.tenancy.column}" = `)}${sql.param(tenant.tenantId)}`
-      : sql.raw('')
-    const tenantEffectivePredicate = tenant
-      ? sql`${sql.raw(
-          ` AND ${effectiveExpression(tenant.tenancy.column)} = `,
-        )}${sql.param(tenant.tenantId)}`
-      : sql.raw('')
-
-    const query = sql`${prefix}${sql.param(this._draftId)}${tenantShadowPredicate}${joinAndTombstone}${tenantEffectivePredicate}${filterPredicate}${orderBy}${limit}`
+    const query = sql`${prefix}${baseWhere}${change}${filterPredicate}${orderBy}${limit}`
 
     return { query, colEntries }
   }
@@ -1127,38 +1218,6 @@ export function resolvePkColumnName(
 }
 
 /**
- * Map a record keyed by Drizzle PROPERTY keys (the shape a handler passes to
- * `.insert()` / `.update()`) to SQL column names, for the shadow upsert which
- * speaks raw SQL. A property whose key is not a real column is dropped (the
- * caller's schema is the source of truth for the shadow's column set).
- *
- * Each value is routed through the Drizzle column codec (`col.mapToDriverValue`)
- * so it is bound exactly as the canonical INSERT path would bind it. This is
- * load-bearing for non-identity codecs: a `jsonb('fields')` column serializes
- * its JS array/object to a JSON string here (the codec is `JSON.stringify`),
- * matching what Drizzle's own insert lowering emits. Without it the raw JS value
- * binds straight to the driver and a `jsonb` column receives a JS array/object,
- * producing a type error or stored garbage. Columns with an identity codec
- * (text/integer/boolean) are unaffected — `mapToDriverValue` returns the value
- * unchanged for them.
- */
-function toSqlColumnMap(
-  table: AnyTable,
-  values: Record<string, unknown>,
-): { sqlName: string; value: unknown }[] {
-  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-  const columns = getTableColumns(table) as Record<string, any>
-  const out: { sqlName: string; value: unknown }[] = []
-  for (const [propKey, value] of Object.entries(values)) {
-    if (value === undefined) continue
-    const col = columns[propKey]
-    if (!col) continue
-    out.push({ sqlName: col.name as string, value: mapColumnValue(col, value) })
-  }
-  return out
-}
-
-/**
  * Route a value through a Drizzle column's driver codec, mirroring the canonical
  * INSERT/UPDATE lowering. A `null`/`undefined` is passed through untouched: a
  * codec like `jsonb`'s `JSON.stringify` would otherwise turn `null` into the
@@ -1193,23 +1252,18 @@ function mapColumnValueFromDriver(col: any, value: unknown): unknown {
 }
 
 /**
- * Core draft WRITE primitive: upsert ONE sparse row into `<table>__draft`.
+ * Core draft WRITE primitive: upsert ONE sparse row into the central change relation.
  *
- * Sparse semantics — the upsert sets only `(draft_id, <pk>, <provided cols>,
- * __tombstone)`. ON CONFLICT (draft_id, <pk>) it updates ONLY the provided
- * columns + `__tombstone`, so two successive draft edits of different fields on
- * the same row ACCUMULATE rather than clobber. A tombstone is just an upsert
- * with `__tombstone = true` and no value columns.
+ * Sparse semantics — `fields` contains only proposals supplied by this write.
+ * ON CONFLICT it preserves every first-touch `original` and replaces only the
+ * current proposal, so successive edits accumulate without clobbering.
  *
  * `draftId` and every value are sent as BOUND parameters via the Drizzle `sql`
  * tag (guard-the-sink). Table/column names come from schema introspection (not
- * user input) and are double-quoted, safe as raw SQL fragments. The shadow read
- * (`DraftSelectBuilder.all`) and this writer agree on the `(draft_id, <pk>,
- * __tombstone)` shape by convention; the shadow table DDL is the app/host's to
- * provision (sparse columns default NULL, composite PK `(draft_id, <pk>)`).
+ * user input) and are double-quoted, safe as raw SQL fragments.
  *
- * Records `tablesWritten = '<table>__draft'` so the shadow write invalidates the
- * draft-coalesced reads (which read `<table>__draft`), NOT canonical readers.
+ * Records the existing virtual `<table>__draft` invalidation tag so this write
+ * invalidates only draft-coalesced readers, not canonical readers.
  */
 async function writeShadowRow(
   db: DrizzleDb,
@@ -1217,14 +1271,21 @@ async function writeShadowRow(
   table: AnyTable,
   draftId: string,
   tenantScope: TenantScope,
-  opts: { pkValue: unknown; values: Record<string, unknown>; tombstone: boolean },
+  opts: {
+    pkValue: unknown
+    values: Record<string, unknown>
+    tombstone: boolean
+    intent: 'insert' | 'update' | 'delete'
+  },
 ): Promise<Record<string, unknown>[]> {
   const tableName = getTableName(table)
-  const draftTableName = `${tableName}__draft`
   const config = getTableConfig(table)
   const pkColName = resolvePkColumnName(table, config)
   const schema = config.schema
-  const draftRel = schema ? `"${schema}"."${draftTableName}"` : `"${draftTableName}"`
+  const tableKey = schema ? `${schema}.${tableName}` : tableName
+  const baseRel = schema
+    ? `${quoteSqlIdentifier(schema)}.${quoteSqlIdentifier(tableName)}`
+    : quoteSqlIdentifier(tableName)
 
   // Route the PK value through its column codec too, so a PK whose type has a
   // non-identity codec binds identically to the canonical path. PKs are
@@ -1233,59 +1294,90 @@ async function writeShadowRow(
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
   const columns = getTableColumns(table) as Record<string, any>
   const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
-  const pkValue = pkCol ? mapColumnValue(pkCol, opts.pkValue) : opts.pkValue
+  if (!pkCol) throw new Error(`Cannot resolve primary key column for "${tableKey}"`)
+  const pkValue = mapColumnValue(pkCol, opts.pkValue)
+  const rowKey = encodeTypedKey(pkCol, opts.pkValue)
   const tenant = requireTenantScope(table, tenantScope)
   const tenantColumn = tenant ? requireColumn(columns, tenant.tenancy.property) : undefined
   const tenantValue = tenantColumn ? mapColumnValue(tenantColumn, tenant?.tenantId) : undefined
+  const tenantKey = tenantColumn
+    ? encodeTypedKey(tenantColumn, tenant?.tenantId)
+    : { envelope: null, text: '' }
 
-  // Provided value columns (sparse), excluding the PK (carried separately) and
-  // any accidental __tombstone / draft_id passthrough (owned by this writer).
-  const valueCols = toSqlColumnMap(table, opts.values).filter(
-    (c) =>
-      c.sqlName !== pkColName &&
-      c.sqlName !== tenant?.tenancy.column &&
-      c.sqlName !== '__tombstone' &&
-      c.sqlName !== 'draft_id',
-  )
+  const valueCols = Object.entries(opts.values).flatMap(([property, value]) => {
+    if (value === undefined || !Object.hasOwn(columns, property)) return []
+    const column = columns[property]
+    const sqlName = column.name as string
+    if (sqlName === pkColName || sqlName === tenant?.tenancy.column) return []
+    return [{ column, sqlName, proposed: encodeProposedDraftValue(column, value) }]
+  })
 
-  // INSERT column list + bound-parameter VALUES list. Order:
-  //   draft_id, <pk>, <provided value cols...>, __tombstone
-  const insertCols = [
-    'draft_id',
-    ...(tenant ? [tenant.tenancy.column] : []),
-    pkColName,
-    ...valueCols.map((c) => c.sqlName),
-    '__overrides',
-    '__tombstone',
+  const basePredicates: SQL[] = [
+    sql`${sql.raw(`${quoteSqlIdentifier(pkColName)} = `)}${sql.param(pkValue)}`,
   ]
-  const insertColSql = insertCols.map((c) => `"${c}"`).join(', ')
-
-  // ON CONFLICT (draft_id, <pk>) DO UPDATE: only the provided value cols +
-  // __tombstone. (A tombstone with no value cols just flips __tombstone.)
-  const updateAssignments = [
-    ...valueCols.map((c) => `"${c.sqlName}" = EXCLUDED."${c.sqlName}"`),
-    `"__overrides" = COALESCE("${draftTableName}"."__overrides", ARRAY[]::text[]) || EXCLUDED."__overrides"`,
-    `"__tombstone" = EXCLUDED."__tombstone"`,
-  ].join(', ')
-
-  // Assemble parameterized VALUES. Every dynamic value is a bound param; column
-  // and relation names are introspected identifiers spliced via sql.raw.
-  const head = sql.raw(`INSERT INTO ${draftRel} (${insertColSql}) VALUES (`)
-  const parts: ReturnType<typeof sql>[] = [head, sql`${sql.param(draftId)}`]
-  if (tenant) parts.push(sql.raw(', '), sql`${sql.param(tenantValue)}`)
-  parts.push(sql.raw(', '), sql`${sql.param(pkValue)}`)
-  for (const c of valueCols) {
-    parts.push(sql.raw(', '), sql`${sql.param(c.value)}`)
+  if (tenant && tenantColumn) {
+    basePredicates.push(
+      sql`${sql.raw(`${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(tenantValue)}`,
+    )
   }
-  parts.push(sql.raw(', '), sql`${sql.param(valueCols.map((column) => column.sqlName))}`)
-  parts.push(sql.raw(', '), sql`${sql.param(opts.tombstone)}`)
-  const conflictColumns = ['draft_id', ...(tenant ? [tenant.tenancy.column] : []), pkColName]
-    .map((column) => `"${column}"`)
-    .join(', ')
-  parts.push(
-    sql.raw(`) ON CONFLICT (${conflictColumns}) DO UPDATE SET ${updateAssignments} RETURNING *`),
+  const baseCte = sql`${sql.raw(`WITH base AS (SELECT * FROM ${baseRel} WHERE `)}${sql.join(
+    basePredicates,
+    sql.raw(' AND '),
+  )}${sql.raw(' FOR UPDATE) ')}`
+
+  const basePresent = `b.${quoteSqlIdentifier(pkColName)} IS NOT NULL`
+  const fieldPairs = valueCols.flatMap(({ column, sqlName, proposed }, index) => {
+    const kind = ['json', 'jsonb'].includes(draftCastType(column)) ? 'json' : 'value'
+    const original =
+      `CASE WHEN NOT (${basePresent}) THEN '{"kind":"absent"}'::jsonb ` +
+      `WHEN b.${quoteSqlIdentifier(sqlName)} IS NULL THEN '{"kind":"sql-null"}'::jsonb ` +
+      `ELSE jsonb_build_object('kind', ${sqlLiteral(kind)}, 'value', to_jsonb(b.${quoteSqlIdentifier(sqlName)})) END`
+    const separator = index === 0 ? '' : ', '
+    return [
+      sql`${sql.raw(
+        `${separator}${sqlLiteral(sqlName)}, jsonb_build_object('original', ${original}, 'value', `,
+      )}${sql.param(JSON.stringify(proposed))}${sql.raw('::jsonb)')}`,
+    ]
+  })
+  const fieldsExpression = fieldPairs.length
+    ? sql`${sql.raw('jsonb_build_object(')}${sql.join(fieldPairs, sql.raw(''))}${sql.raw(')')}`
+    : sql.raw("'{}'::jsonb")
+
+  const revisionColumn = Object.values(columns).find(
+    (column) => (column.name as string) === 'revision',
   )
-  const query = sql.join(parts, sql.raw(''))
+  const baseRevision = revisionColumn
+    ? sql.raw(`to_jsonb(b.${quoteSqlIdentifier(revisionColumn.name as string)})`)
+    : sql.raw('NULL::jsonb')
+  const tenantJson = tenantColumn
+    ? sql`${sql.param(JSON.stringify(tenantKey.envelope))}${sql.raw('::jsonb')}`
+    : sql.raw('NULL::jsonb')
+  const operation = opts.tombstone ? 'delete' : opts.intent
+
+  const query = sql`${baseCte}${sql.raw(
+    `INSERT INTO ${draftChangesRelation} ` +
+      `("draft_id", "table_key", "tenant_key_text", "tenant_key", "row_key_text", "row_key", ` +
+      `"operation", "base_exists", "base_revision", "fields") SELECT `,
+  )}${sql.param(draftId)}${sql.raw(', ')}${sql.param(tableKey)}${sql.raw(', ')}${sql.param(
+    tenantKey.text,
+  )}${sql.raw(', ')}${tenantJson}${sql.raw(', ')}${sql.param(rowKey.text)}${sql.raw(
+    ', ',
+  )}${sql.param(JSON.stringify(rowKey.envelope))}${sql.raw('::jsonb, ')}${sql.param(
+    operation,
+  )}${sql.raw(`, ${basePresent}, `)}${baseRevision}${sql.raw(', ')}${fieldsExpression}${sql.raw(
+    ` FROM (SELECT 1) seed LEFT JOIN base b ON TRUE ` +
+      `ON CONFLICT ("draft_id", "table_key", "tenant_key_text", "row_key_text") DO UPDATE SET ` +
+      `"operation" = CASE ` +
+      `WHEN EXCLUDED."operation" = 'delete' THEN 'delete' ` +
+      `WHEN ${draftChangesRelation}."operation" = 'insert' THEN 'insert' ` +
+      `ELSE EXCLUDED."operation" END, ` +
+      `"fields" = ${draftChangesRelation}."fields" || COALESCE((` +
+      `SELECT jsonb_object_agg(entry.key, CASE ` +
+      `WHEN ${draftChangesRelation}."fields" ? entry.key ` +
+      `THEN jsonb_set(${draftChangesRelation}."fields" -> entry.key, '{value}', entry.value -> 'value', true) ` +
+      `ELSE entry.value END) FROM jsonb_each(EXCLUDED."fields") entry` +
+      `), '{}'::jsonb) RETURNING *`,
+  )}`
 
   const result = await db.execute(query)
   tracker.tablesWritten.add(draftTableTrackingTag(table, tenantScope, draftId))
@@ -1294,8 +1386,8 @@ async function writeShadowRow(
 
 /**
  * Insert builder returned by `DraftDrizzleTracker.into(table)`. Routes
- * `.insert(rows)` into the `<table>__draft` shadow as a sparse upsert per row
- * (each row carrying the full PK + columns, `__tombstone = false`). Mirrors the
+ * `.insert(rows)` into the central change relation as a sparse upsert per row
+ * (each row carrying the full PK + columns and `operation = 'insert'`). Mirrors the
  * canonical `into(table).insert(...)` a command handler emits — the handler is
  * unaware it is inserting into a draft.
  */
@@ -1348,6 +1440,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
         pkValue,
         values: r,
         tombstone: false,
+        intent: 'insert',
       })
       const effective = await this._tracker
         .from(this._table)
@@ -1446,6 +1539,9 @@ export function createDrizzleTracker(
             )
           }
           return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle, tenantScope)
+        },
+        changes() {
+          return enumerateDraftRowChanges(drizzleDb, draftId)
         },
         transaction<R>(
           _fn: (tx: DrizzleTracker) => Promise<R>,

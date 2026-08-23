@@ -4,7 +4,13 @@
 export { defineSchema, getGeneratedTables, getTableCapabilities } from './schema'
 export { table, multiTenant, TableDefinition } from './table'
 export { createDb } from './driver'
-export { createDrizzleTracker, resetTracking, resolvePkColumnName } from './drizzle-tracker'
+export {
+  createDrizzleTracker,
+  resetTracking,
+  resolvePkColumnName,
+  draftJsonNull,
+  enumerateDraftRowChanges,
+} from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
@@ -33,5 +39,8 @@ export type {
   InsertBuilder,
   DraftInsertBuilder,
   TransactionOptions,
+  DraftJsonNull,
+  DraftRowChange,
+  DraftStoredValue,
 } from './drizzle-tracker'
 export type { WyStackSchema, TableDef, DbConfig, Db } from './types'
