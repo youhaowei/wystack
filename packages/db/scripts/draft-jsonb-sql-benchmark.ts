@@ -99,7 +99,7 @@ async function run(n: number, m: number) {
 }
 
 const results = []
-for (const n of [100, 10_000]) {
+for (const n of [100, 10_000, 100_000]) {
   for (const m of [1, 10]) results.push(await run(n, m))
 }
 console.log(JSON.stringify({ engine: 'PGlite 0.3.16', results }, null, 2))

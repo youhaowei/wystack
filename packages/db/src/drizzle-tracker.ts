@@ -1072,6 +1072,82 @@ export class DraftSelectBuilder<T extends AnyTable> {
       )}${sql.param(mapColumnValue(column, filter.value))}`
     })
     const filterPredicate = sql.join(filterFragments, sql.raw(''))
+
+    // A filtered effective query can start from canonical matches; a limited
+    // one can reduce those matches further. If this table has M draft changes,
+    // at most M rows can enter, leave, move, or disappear relative to the base
+    // ordering. Therefore an unchanged base row below the canonical top L + M
+    // cannot reach the effective top L.
+    //
+    // Keep every comparison in PostgreSQL: the bounded plan reduces the base
+    // candidate set, then applies the SAME effective expressions, filters,
+    // ordering, and limit as the generic full-join plan. JavaScript never has
+    // to emulate SQL NULL, collation, timestamp, or JSONB semantics.
+    //
+    // PK equality already has a tighter two-sided index pushdown above, so it
+    // stays on the simpler generic shape.
+    if ((limitVal !== undefined || this._clauses.filters.length > 0) && !pkFilter) {
+      const candidatePredicates: SQL[] = []
+      if (tenant && tenantColumn) {
+        candidatePredicates.push(
+          sql`${sql.raw(`c.${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(mapColumnValue(tenantColumn, tenant.tenantId))}`,
+        )
+      }
+      for (const filter of this._clauses.filters) {
+        const column = requireColumn(columns, filter.column)
+        candidatePredicates.push(
+          sql`${sql.raw(
+            `c.${quoteSqlIdentifier(column.name)} ${sqlOperators[filter.op]} `,
+          )}${sql.param(mapColumnValue(column, filter.value))}`,
+        )
+      }
+      const candidateWhere = candidatePredicates.length
+        ? sql`${sql.raw(' WHERE ')}${sql.join(candidatePredicates, sql.raw(' AND '))}`
+        : sql.raw('')
+
+      const cteKeyFromChange = typedKeyValueSql('dc', 'row_key', pkColumn)
+      const changedBaseTenantJoin =
+        tenant && tenantColumn
+          ? sql`${sql.raw(` AND c.${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(mapColumnValue(tenantColumn, tenant.tenantId))}`
+          : sql.raw('')
+
+      let candidateBound = sql.raw('')
+      if (limitVal !== undefined) {
+        const candidateOrderColumn = this._clauses.orderByCol
+          ? requireColumn(columns, this._clauses.orderByCol)
+          : pkColumn
+        const candidateDirection =
+          this._clauses.orderByCol && this._clauses.orderDir === 'desc' ? ' DESC' : ''
+        const candidateOrder =
+          candidateOrderColumn.name === pkColName
+            ? `c.${quoteSqlIdentifier(pkColName)}${candidateDirection}`
+            : `c.${quoteSqlIdentifier(candidateOrderColumn.name)}${candidateDirection}, c.${quoteSqlIdentifier(pkColName)}`
+        candidateBound = sql`${sql.raw(` ORDER BY ${candidateOrder} LIMIT (`)}${sql.param(
+          limitVal,
+        )}${sql.raw(' + (SELECT COUNT(*) FROM draft_delta))')}`
+      }
+
+      const boundedQuery = sql`${sql.raw('WITH draft_delta AS (SELECT * FROM ')}${sql.raw(
+        draftChangesRelation,
+      )}${sql.raw(' WHERE "draft_id" = ')}${sql.param(this._draftId)}${sql.raw(
+        ' AND "table_key" = ',
+      )}${sql.param(tableKey)}${sql.raw(' AND "tenant_key_text" = ')}${sql.param(
+        tenantKey.text,
+      )}${sql.raw('), base_top AS (SELECT c.* FROM ')}${sql.raw(baseRel)}${sql.raw(
+        ' c',
+      )}${candidateWhere}${candidateBound}${sql.raw(
+        '), candidate_base AS (SELECT bt.* FROM base_top bt WHERE NOT EXISTS (SELECT 1 FROM draft_delta dc WHERE bt.',
+      )}${sql.raw(
+        quoteSqlIdentifier(pkColName),
+      )}${sql.raw(` = ${cteKeyFromChange}) UNION ALL SELECT c.* FROM draft_delta dc JOIN `)}${sql.raw(
+        baseRel,
+      )}${sql.raw(` c ON c.${quoteSqlIdentifier(pkColName)} = ${cteKeyFromChange}`)}${changedBaseTenantJoin}${sql.raw(
+        `) SELECT ${colSelects} FROM candidate_base b FULL OUTER JOIN draft_delta d ON b.${quoteSqlIdentifier(pkColName)} = ${keyFromChange} WHERE COALESCE(d."operation", 'update') <> 'delete'`,
+      )}${filterPredicate}${orderBy}${limit}`
+
+      return { query: boundedQuery, colEntries }
+    }
+
     const query = sql`${prefix}${baseWhere}${change}${filterPredicate}${orderBy}${limit}`
 
     return { query, colEntries }
