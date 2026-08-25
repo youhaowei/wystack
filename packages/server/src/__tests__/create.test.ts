@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { table, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
@@ -115,6 +115,12 @@ beforeEach(async () => {
         .query(async (ctx) => ctx.can(throwingPermission)),
       inspectDbSurface: wy.procedure.input({}).query(async (ctx) => {
         const dbSurface = ctx.db as unknown as Record<string, unknown>
+        const selectSurface = ctx.db.from(schema.todos) as unknown as Record<string, unknown>
+        const chainedSurface = ctx.db.from(schema.todos).where(eq('id', 1)) as unknown as Record<
+          string,
+          unknown
+        >
+        const insertSurface = ctx.db.into(schema.todos) as unknown as Record<string, unknown>
         return {
           raw: 'raw' in dbSurface,
           withTenant: 'withTenant' in dbSurface,
@@ -122,6 +128,10 @@ beforeEach(async () => {
           tablesRead: 'tablesRead' in dbSurface,
           tablesWritten: 'tablesWritten' in dbSurface,
           transaction: typeof dbSurface['transaction'] === 'function',
+          builderDb: '_db' in selectSurface,
+          builderTracker: '_tracker' in selectSurface,
+          chainedDb: '_db' in chainedSurface,
+          insertDb: '_db' in insertSurface,
         }
       }),
     },
@@ -143,6 +153,10 @@ describe('defineApp().build()', () => {
       tablesRead: false,
       tablesWritten: false,
       transaction: true,
+      builderDb: false,
+      builderTracker: false,
+      chainedDb: false,
+      insertDb: false,
     })
   })
 

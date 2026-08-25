@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { integer, jsonb, pgSchema, pgTable, text } from 'drizzle-orm/pg-core'
+import { integer, jsonb, pgSchema, pgTable, text, timestamp } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { createDrizzleTracker, draftJsonNull, enumerateDraftRowChanges } from '../drizzle-tracker'
 import { eq, gt, lt } from '../operators'
@@ -21,6 +21,11 @@ const items = pgTable('draft_items', {
 const defaultedItems = pgTable('draft_defaulted_items', {
   id: integer('id').primaryKey(),
   label: text('label').notNull().default('new'),
+})
+
+const dynamicDefaultItems = pgTable('draft_dynamic_default_items', {
+  id: integer('id').primaryKey(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
 })
 
 const audit = pgSchema('draft_audit')
@@ -54,6 +59,10 @@ beforeEach(async () => {
     `CREATE TABLE draft_defaulted_items (
       id INTEGER PRIMARY KEY,
       label TEXT NOT NULL DEFAULT 'new'
+    )`,
+    `CREATE TABLE draft_dynamic_default_items (
+      id INTEGER PRIMARY KEY,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE SCHEMA draft_audit`,
     `CREATE TABLE draft_audit.draft_items (
@@ -151,6 +160,15 @@ describe('durable central draft overlay', () => {
     expect(await tracked.from(defaultedItems).all()).toEqual([])
 
     expect(await tracked.into(defaultedItems).insert({ id: 2 })).toEqual([{ id: 2, label: 'new' }])
+  })
+
+  test('rejects omitted dynamic defaults that would change when the command is replayed', async () => {
+    const draft = tracked.withDraft('d-dynamic-default')
+
+    await expect(draft.into(dynamicDefaultItems).insert({ id: 1 })).rejects.toThrow(
+      'resolve it into the command input',
+    )
+    expect(await enumerateDraftRowChanges(db, 'd-dynamic-default')).toEqual([])
   })
 
   test('updates a newly drafted row through the same effective filter path', async () => {

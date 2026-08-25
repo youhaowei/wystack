@@ -88,7 +88,7 @@ function buildColumn(
     col = col.array()
   }
 
-  if (!opts.isOptional && !opts.isNullable && !opts.hasDefault && !isSerial) {
+  if (!opts.isOptional && !opts.isNullable && !isSerial) {
     col = col.notNull()
   }
 

@@ -526,7 +526,13 @@ export function createDraftLifecycle(
   let storageInitialization: Promise<void> | undefined
 
   function storageReady(): Promise<void> {
-    storageInitialization ??= ensureDraftStorage(app.createTracked().raw)
+    if (!storageInitialization) {
+      const attempt = ensureDraftStorage(app.createTracked().raw)
+      storageInitialization = attempt
+      void attempt.catch(() => {
+        if (storageInitialization === attempt) storageInitialization = undefined
+      })
+    }
     return storageInitialization
   }
 
@@ -858,7 +864,7 @@ async function assertDraftRowsUnchanged(
     )
 
     const revisionConflict = table.revisionColumn
-      ? ` OR (d.base_exists AND d.base_revision IS DISTINCT FROM to_jsonb(c.${quoteIdentifier(table.revisionColumn)}))`
+      ? ` OR (d.base_exists AND (c.${quoteIdentifier(table.revisionColumn)} IS NULL OR d.base_revision IS DISTINCT FROM to_jsonb(c.${quoteIdentifier(table.revisionColumn)})))`
       : ''
     const rows = normalizeRows(
       await raw.execute(

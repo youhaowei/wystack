@@ -8,7 +8,7 @@ describe('draft storage migrations', () => {
     const pg = new PGlite()
     const db = drizzle(pg)
 
-    await ensureDraftStorage(db)
+    await Promise.all([ensureDraftStorage(db), ensureDraftStorage(db)])
     await ensureDraftStorage(db)
 
     const migration = await db.execute(

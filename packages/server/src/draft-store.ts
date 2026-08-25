@@ -150,39 +150,47 @@ const storageDdlV4 = [
 
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await raw.execute(migrationTableDdl)
-  const rows = normalizeRows(
-    await raw.execute(sql`
+  await raw.execute(sql`
+    INSERT INTO wystack_framework_migrations (migration_name, version)
+    VALUES ('draft-storage', 0)
+    ON CONFLICT (migration_name) DO NOTHING
+  `)
+
+  await raw.transaction(async (tx: RawDb) => {
+    const rows = normalizeRows(
+      await tx.execute(sql`
       SELECT version
       FROM wystack_framework_migrations
       WHERE migration_name = 'draft-storage'
+      FOR UPDATE
     `),
-  )
-  const installedVersion = rows[0] ? Number(rows[0]['version']) : 0
-  if (installedVersion > draftStorageVersion) {
-    throw new Error(
-      `draft lifecycle: database schema version ${installedVersion} is newer than supported version ${draftStorageVersion}`,
     )
-  }
-  if (installedVersion === draftStorageVersion) return
+    const installedVersion = Number(rows[0]?.['version'] ?? 0)
+    if (installedVersion > draftStorageVersion) {
+      throw new Error(
+        `draft lifecycle: database schema version ${installedVersion} is newer than supported version ${draftStorageVersion}`,
+      )
+    }
+    if (installedVersion === draftStorageVersion) return
 
-  if (installedVersion < 1) {
-    for (const statement of storageDdlV1) await raw.execute(statement)
-  }
-  if (installedVersion < 2) {
-    for (const statement of storageDdlV2) await raw.execute(statement)
-  }
-  if (installedVersion < 3) {
-    for (const statement of storageDdlV3) await raw.execute(statement)
-  }
-  if (installedVersion < 4) {
-    for (const statement of storageDdlV4) await raw.execute(statement)
-  }
-  await raw.execute(sql`
-    INSERT INTO wystack_framework_migrations (migration_name, version)
-    VALUES ('draft-storage', ${draftStorageVersion})
-    ON CONFLICT (migration_name)
-    DO UPDATE SET version = EXCLUDED.version, applied_at = CURRENT_TIMESTAMP
-  `)
+    if (installedVersion < 1) {
+      for (const statement of storageDdlV1) await tx.execute(statement)
+    }
+    if (installedVersion < 2) {
+      for (const statement of storageDdlV2) await tx.execute(statement)
+    }
+    if (installedVersion < 3) {
+      for (const statement of storageDdlV3) await tx.execute(statement)
+    }
+    if (installedVersion < 4) {
+      for (const statement of storageDdlV4) await tx.execute(statement)
+    }
+    await tx.execute(sql`
+      UPDATE wystack_framework_migrations
+      SET version = ${draftStorageVersion}, applied_at = CURRENT_TIMESTAMP
+      WHERE migration_name = 'draft-storage'
+    `)
+  })
 }
 
 export async function insertStoredDraft(

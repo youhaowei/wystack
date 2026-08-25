@@ -120,6 +120,15 @@ describe('composable table capabilities', () => {
     expect(() => table({ id: uuid.primaryKey(), revision: text }).revision('revision')).toThrow(
       'must be an integer',
     )
+
+    const schema = defineSchema({
+      records: table({ id: uuid.primaryKey(), revision: int }).revision('revision'),
+    })
+    expect(getTableColumns(schema.records).revision).toMatchObject({
+      hasDefault: true,
+      notNull: true,
+      default: 1,
+    })
   })
 
   test('one schema cannot mix tenancy descriptors', () => {

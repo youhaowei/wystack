@@ -99,15 +99,49 @@ function resolveDbConfig(db: DbInput): DbConfig | null {
   return null // Pre-built Drizzle instance
 }
 
+function invokeBuilder(source: object, method: string, args: unknown[]): unknown {
+  const candidate = Reflect.get(source, method)
+  if (typeof candidate !== 'function') {
+    throw new Error(`Procedure database builder does not support ${method}()`)
+  }
+  return Reflect.apply(candidate, source, args)
+}
+
+function toProcedureSelectBuilder(source: object): object {
+  const chained =
+    (method: string) =>
+    (...args: unknown[]) =>
+      toProcedureSelectBuilder(invokeBuilder(source, method, args) as object)
+  return Object.freeze({
+    select: chained('select'),
+    where: chained('where'),
+    orderBy: chained('orderBy'),
+    limit: chained('limit'),
+    all: (...args: unknown[]) => invokeBuilder(source, 'all', args),
+    first: (...args: unknown[]) => invokeBuilder(source, 'first', args),
+    update: (...args: unknown[]) => invokeBuilder(source, 'update', args),
+    delete: (...args: unknown[]) => invokeBuilder(source, 'delete', args),
+    toSql: (...args: unknown[]) => invokeBuilder(source, 'toSql', args),
+  })
+}
+
+function toProcedureInsertBuilder(source: object): object {
+  return Object.freeze({
+    insert: (...args: unknown[]) => invokeBuilder(source, 'insert', args),
+  })
+}
+
 function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
-  return {
-    from: tracked.from.bind(tracked) as ProcedureDb['from'],
-    into: tracked.into.bind(tracked) as ProcedureDb['into'],
+  return Object.freeze({
+    from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
+      toProcedureSelectBuilder(tracked.from(table))) as ProcedureDb['from'],
+    into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
+      toProcedureInsertBuilder(tracked.into(table))) as ProcedureDb['into'],
     transaction: async <R>(
       fn: (tx: ProcedureDb) => Promise<R>,
       opts?: Parameters<ProcedureDb['transaction']>[1],
     ) => tracked.transaction((tx) => fn(toProcedureDb(tx)), opts),
-  }
+  })
 }
 
 export async function buildWyStack(opts: {
