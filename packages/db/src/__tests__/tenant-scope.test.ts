@@ -149,7 +149,7 @@ describe('tenant-scoped database access', () => {
     ])
   })
 
-  test('tenant drafts may read global tables but cannot write their shadows', async () => {
+  test('tenant drafts may read global tables but cannot write their derived state', async () => {
     await tracked.into(schema.catalog).insert({
       id: '00000000-0000-4000-8000-000000000061',
       name: 'global catalog',

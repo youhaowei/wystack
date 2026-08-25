@@ -140,12 +140,23 @@ describe('server tenant resolution', () => {
 
     const restartedProcess = createDraftLifecycle(app, { resolveOwner })
     await expect(restartedProcess.getLog(draftId, { context: beta })).rejects.toThrow(
-      'access denied',
+      'unknown draft',
     )
     await expect(restartedProcess.getLog(draftId, { context: bob })).rejects.toThrow(
-      'access denied',
+      'unknown draft',
     )
     expect(await restartedProcess.getLog(draftId, { context: alice })).toHaveLength(1)
+    expect(await restartedProcess.inspect(draftId, { context: alice })).toMatchObject([
+      {
+        table: 'insights',
+        operation: 'insert',
+        tenantKey: { type: 'text', value: 'alpha' },
+        rowKey: { type: 'uuid', value: '00000000-0000-4000-8000-000000000007' },
+      },
+    ])
+    await expect(restartedProcess.inspect(draftId, { context: beta })).rejects.toThrow(
+      'unknown draft',
+    )
 
     await restartedProcess.publish(draftId, undefined, { context: alice })
     const alphaRows = (await app.call('listInsights', {}, alpha)).result as { name: string }[]
@@ -170,7 +181,7 @@ describe('server tenant resolution', () => {
       collaborative.getLog(draftId, {
         context: { ...beta, collaborator: true },
       }),
-    ).rejects.toThrow('access denied')
+    ).rejects.toThrow('unknown draft')
     expect(
       await collaborative.getLog(draftId, {
         context: { ...alpha, principalId: 'bob', collaborator: true },

@@ -10,7 +10,7 @@ import { int, text as dslText } from '../dsl'
 import { multiTenant } from '../table'
 import { syncSchema } from '../sync'
 
-const items = pgTable('spike_items', {
+const items = pgTable('draft_items', {
   id: integer('id').primaryKey(),
   title: text('title').notNull(),
   score: integer('score').notNull(),
@@ -18,8 +18,8 @@ const items = pgTable('spike_items', {
   payload: jsonb('payload'),
 })
 
-const audit = pgSchema('audit_spike')
-const auditItems = audit.table('spike_items', {
+const audit = pgSchema('draft_audit')
+const auditItems = audit.table('draft_items', {
   id: integer('id').primaryKey(),
   title: text('title').notNull(),
 })
@@ -39,15 +39,15 @@ beforeEach(async () => {
   pg = new PGlite()
   db = drizzle(pg)
   const setup = [
-    `CREATE TABLE spike_items (
+    `CREATE TABLE draft_items (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL,
       score INTEGER NOT NULL,
       note TEXT,
       payload JSONB
     )`,
-    `CREATE SCHEMA audit_spike`,
-    `CREATE TABLE audit_spike.spike_items (
+    `CREATE SCHEMA draft_audit`,
+    `CREATE TABLE draft_audit.draft_items (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL
     )`,
@@ -64,19 +64,19 @@ beforeEach(async () => {
       fields JSONB NOT NULL DEFAULT '{}'::jsonb,
       PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
     )`,
-    `INSERT INTO spike_items (id, title, score, note, payload) VALUES
+    `INSERT INTO draft_items (id, title, score, note, payload) VALUES
       (1, 'apple', 10, 'original note', '{"nested":true}'),
       (2, 'banana', 20, NULL, 'null'::jsonb),
       (3, 'cherry', 30, 'third', NULL),
       (4, 'date', 40, 'fourth', '{}')`,
-    `INSERT INTO audit_spike.spike_items (id, title) VALUES (1, 'audit apple')`,
+    `INSERT INTO draft_audit.draft_items (id, title) VALUES (1, 'audit apple')`,
   ]
   for (const statement of setup) await db.execute(sql.raw(statement))
   await syncSchema(db, tenantSchema)
   tracked = createDrizzleTracker(db)
 })
 
-describe('central JSONB + SQL draft contender', () => {
+describe('durable central draft overlay', () => {
   test('keeps immutable first-touch original across A to B to C and distinguishes null states', async () => {
     const draft = tracked.withDraft('d-null')
 
@@ -88,7 +88,7 @@ describe('central JSONB + SQL draft contender', () => {
     const effective = await draft.from(items).where(eq('id', 1)).first()
     expect(effective).toEqual({ id: 1, title: 'C', score: 10, note: null, payload: null })
 
-    const changes = await draft.changes()
+    const changes = await enumerateDraftRowChanges(db, 'd-null')
     expect(changes).toHaveLength(1)
     expect(changes[0]?.fields['title']).toEqual({
       original: { kind: 'value', value: 'apple' },
@@ -132,6 +132,17 @@ describe('central JSONB + SQL draft contender', () => {
     )
   })
 
+  test('updates a newly drafted row through the same effective filter path', async () => {
+    const draft = tracked.withDraft('d-new-update')
+    await draft.into(items).insert({ id: 5, title: 'elderberry', score: 50 })
+
+    const updated = await draft.from(items).where(eq('title', 'elderberry')).update({ score: 55 })
+
+    expect(updated).toEqual([{ id: 5, title: 'elderberry', score: 55, note: null, payload: null }])
+    expect((await draft.from(items).where(eq('id', 5)).first())?.score).toBe(55)
+    expect(await tracked.from(items).where(eq('id', 5)).first()).toBeNull()
+  })
+
   test('schema-qualified table keys isolate same-named tables', async () => {
     const draft = tracked.withDraft('d-schema')
     await draft.from(items).where(eq('id', 1)).update({ title: 'public changed' })
@@ -139,17 +150,25 @@ describe('central JSONB + SQL draft contender', () => {
 
     expect((await draft.from(items).first())?.title).toBe('public changed')
     expect((await draft.from(auditItems).first())?.title).toBe('audit changed')
-    expect((await draft.changes()).map((change) => change.tableKey)).toEqual([
-      'audit_spike.spike_items',
-      'spike_items',
-    ])
+    expect(
+      (await enumerateDraftRowChanges(db, 'd-schema')).map((change) => change.tableKey),
+    ).toEqual(['draft_audit.draft_items', 'draft_items'])
   })
 
   test('point lookup lowering pins both canonical PK and central composite key', () => {
     const lowered = tracked.withDraft('d-point').from(items).where(eq('id', 3)).toSql()
-    expect(lowered.sql).toContain('FROM (SELECT * FROM "spike_items" WHERE "id" =')
+    expect(lowered.sql).toContain('FROM (SELECT * FROM "draft_items" WHERE "id" =')
     expect(lowered.sql).toContain('"row_key_text" =')
-    expect(lowered.params).toContain('{"type":"integer","value":3}')
+    expect(lowered.params).toContain('3')
+  })
+
+  test('stores canonical scalar identity text instead of serialized documents', async () => {
+    await tracked.withDraft('d-key').from(items).where(eq('id', 3)).update({ title: 'changed' })
+    const result = await db.execute(
+      sql`SELECT row_key_text FROM wystack_draft_row_changes WHERE draft_id = 'd-key'`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
+    expect((result as any).rows[0].row_key_text).toBe('3')
   })
 
   test('typed tenant keys isolate one draft ID across tenants, and a fresh tracker restores state', async () => {

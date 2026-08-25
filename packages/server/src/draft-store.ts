@@ -16,7 +16,11 @@ export interface StoredTouchedTable {
   schema: string | undefined
   table: string
   pkColumn: string
-  shadowTag: string | undefined
+  pkType: string
+  tenantColumn: string | undefined
+  tenantType: string | undefined
+  revisionColumn: string | undefined
+  invalidationTag: string | undefined
 }
 
 const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_migrations (
@@ -25,7 +29,7 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-const draftStorageVersion = 2
+const draftStorageVersion = 3
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -37,7 +41,8 @@ const storageDdlV1 = [
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`),
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_draft_commands (
-    draft_id TEXT NOT NULL REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE,
+    draft_id TEXT NOT NULL CONSTRAINT wystack_draft_commands_draft_fk
+      REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     command JSONB NOT NULL,
     PRIMARY KEY (draft_id, position)
@@ -47,25 +52,65 @@ const storageDdlV1 = [
     schema_name TEXT NOT NULL DEFAULT '',
     table_name TEXT NOT NULL,
     pk_column TEXT NOT NULL,
-    shadow_tag TEXT,
+    invalidation_tag TEXT,
     PRIMARY KEY (draft_id, schema_name, table_name)
   )`),
 ]
 
 const storageDdlV2 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_draft_row_changes (
-    draft_id TEXT NOT NULL,
+    draft_id TEXT NOT NULL REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE,
     table_key TEXT NOT NULL,
     tenant_key_text TEXT NOT NULL DEFAULT '',
     tenant_key JSONB,
     row_key_text TEXT NOT NULL,
     row_key JSONB NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('insert', 'update', 'delete')),
+    operation TEXT NOT NULL CONSTRAINT wystack_draft_row_changes_operation_check
+      CHECK (operation IN ('insert', 'update', 'delete')),
     base_exists BOOLEAN NOT NULL,
     base_revision JSONB,
     fields JSONB NOT NULL DEFAULT '{}'::jsonb,
     PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
   )`),
+]
+
+const storageDdlV3 = [
+  sql.raw(`DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'wystack_draft_tables' AND column_name = 'shadow_tag'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'wystack_draft_tables' AND column_name = 'invalidation_tag'
+      ) THEN
+        ALTER TABLE wystack_draft_tables RENAME COLUMN shadow_tag TO invalidation_tag;
+      END IF;
+    END $$`),
+  sql.raw(`ALTER TABLE wystack_draft_tables
+    ADD COLUMN IF NOT EXISTS pk_type TEXT NOT NULL DEFAULT 'text'`),
+  sql.raw(`ALTER TABLE wystack_draft_tables
+    ADD COLUMN IF NOT EXISTS tenant_column TEXT`),
+  sql.raw(`ALTER TABLE wystack_draft_tables
+    ADD COLUMN IF NOT EXISTS tenant_type TEXT`),
+  sql.raw(`ALTER TABLE wystack_draft_tables
+    ADD COLUMN IF NOT EXISTS revision_column TEXT`),
+  sql.raw(`CREATE INDEX IF NOT EXISTS wystack_draft_row_changes_draft_table_idx
+    ON wystack_draft_row_changes (draft_id, table_key, tenant_key_text)`),
+  sql.raw(`DO $$
+    BEGIN
+      ALTER TABLE wystack_draft_row_changes
+        ADD CONSTRAINT wystack_draft_row_changes_draft_fk
+        FOREIGN KEY (draft_id) REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE;
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$`),
+  sql.raw(`DO $$
+    BEGIN
+      ALTER TABLE wystack_draft_row_changes
+        ADD CONSTRAINT wystack_draft_row_changes_operation_check
+        CHECK (operation IN ('insert', 'update', 'delete'));
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$`),
 ]
 
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
@@ -90,6 +135,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   }
   if (installedVersion < 2) {
     for (const statement of storageDdlV2) await raw.execute(statement)
+  }
+  if (installedVersion < 3) {
+    for (const statement of storageDdlV3) await raw.execute(statement)
   }
   await raw.execute(sql`
     INSERT INTO wystack_framework_migrations (migration_name, version)
@@ -191,13 +239,23 @@ export async function upsertStoredTouchedTables(
   for (const table of tables) {
     await raw.execute(sql`
       INSERT INTO wystack_draft_tables
-        (draft_id, schema_name, table_name, pk_column, shadow_tag)
+        (draft_id, schema_name, table_name, pk_column, pk_type,
+         tenant_column, tenant_type, revision_column, invalidation_tag)
       VALUES
-        (${draftId}, ${table.schema ?? ''}, ${table.table}, ${table.pkColumn}, ${table.shadowTag ?? null})
+        (${draftId}, ${table.schema ?? ''}, ${table.table}, ${table.pkColumn}, ${table.pkType},
+         ${table.tenantColumn ?? null}, ${table.tenantType ?? null},
+         ${table.revisionColumn ?? null}, ${table.invalidationTag ?? null})
       ON CONFLICT (draft_id, schema_name, table_name)
       DO UPDATE SET
         pk_column = EXCLUDED.pk_column,
-        shadow_tag = COALESCE(EXCLUDED.shadow_tag, wystack_draft_tables.shadow_tag)
+        pk_type = EXCLUDED.pk_type,
+        tenant_column = EXCLUDED.tenant_column,
+        tenant_type = EXCLUDED.tenant_type,
+        revision_column = EXCLUDED.revision_column,
+        invalidation_tag = COALESCE(
+          EXCLUDED.invalidation_tag,
+          wystack_draft_tables.invalidation_tag
+        )
     `)
   }
 }
@@ -208,7 +266,8 @@ export async function readStoredTouchedTables(
 ): Promise<StoredTouchedTable[]> {
   const rows = normalizeRows(
     await raw.execute(sql`
-      SELECT schema_name, table_name, pk_column, shadow_tag
+      SELECT schema_name, table_name, pk_column, pk_type,
+             tenant_column, tenant_type, revision_column, invalidation_tag
       FROM wystack_draft_tables
       WHERE draft_id = ${draftId}
       ORDER BY schema_name, table_name
@@ -218,8 +277,34 @@ export async function readStoredTouchedTables(
     schema: row['schema_name'] === '' ? undefined : String(row['schema_name']),
     table: String(row['table_name']),
     pkColumn: String(row['pk_column']),
-    shadowTag: row['shadow_tag'] == null ? undefined : String(row['shadow_tag']),
+    pkType: String(row['pk_type']),
+    tenantColumn: row['tenant_column'] == null ? undefined : String(row['tenant_column']),
+    tenantType: row['tenant_type'] == null ? undefined : String(row['tenant_type']),
+    revisionColumn: row['revision_column'] == null ? undefined : String(row['revision_column']),
+    invalidationTag: row['invalidation_tag'] == null ? undefined : String(row['invalidation_tag']),
   }))
+}
+
+export async function replaceStoredDraftBase(
+  raw: RawDb,
+  draftId: string,
+  baseVersion: Version,
+  expectedRevision: number,
+): Promise<void> {
+  const encoded = encodeEnvelope(baseVersion, 'base version')
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      UPDATE wystack_drafts
+      SET base_version = ${encoded}::jsonb,
+          log_revision = log_revision + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE draft_id = ${draftId} AND log_revision = ${expectedRevision}
+      RETURNING log_revision
+    `),
+  )
+  if (rows.length !== 1) {
+    throw new Error(`draft lifecycle: draft "${draftId}" changed concurrently`)
+  }
 }
 
 export async function deleteStoredTouchedTables(raw: RawDb, draftId: string): Promise<void> {

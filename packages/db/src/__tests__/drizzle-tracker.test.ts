@@ -300,31 +300,26 @@ const snakeTodos = pgTable('snake_todos', {
   ownerName: pgText('owner_name').notNull(),
 })
 
-/**
- * The shadow table the draft coalesce joins against. One definition for the whole
- * file: three describes needed it, and a copy that drifts from the real shadow
- * shape produces a `42703` from the emitted SQL — a test failure that reads like a
- * builder bug when it is only the fixture.
- */
-const createShadow = () =>
+/** The migration-managed relation used by every draftable table in this file. */
+const createDraftStorage = () =>
   tracked.raw.execute(`
-    CREATE TABLE IF NOT EXISTS todos__draft (
-      id INTEGER NOT NULL,
+    CREATE TABLE IF NOT EXISTS wystack_draft_row_changes (
       draft_id TEXT NOT NULL,
-      title TEXT,
-      done BOOLEAN,
-      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-      __tombstone BOOLEAN DEFAULT false,
-      PRIMARY KEY (id, draft_id)
+      table_key TEXT NOT NULL,
+      tenant_key_text TEXT NOT NULL DEFAULT '',
+      tenant_key JSONB,
+      row_key_text TEXT NOT NULL,
+      row_key JSONB NOT NULL,
+      operation TEXT NOT NULL,
+      base_exists BOOLEAN NOT NULL,
+      base_revision JSONB,
+      fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
     )
   `)
 
-/**
- * `snakeTodos` and, optionally, its shadow. Paired with `createShadow` above for
- * the same reason: the DDL must track the Drizzle declaration, and a copy that
- * drifts fails as a `42703` from the emitted SQL rather than as a fixture error.
- */
-const createSnakeTodos = async ({ withShadow = false } = {}) => {
+/** Create the migration-managed snake-case fixture and optional draft storage. */
+const createSnakeTodos = async ({ withDraftStorage = false } = {}) => {
   await tracked.raw.execute(`
     CREATE TABLE IF NOT EXISTS snake_todos (
       id INTEGER PRIMARY KEY,
@@ -332,18 +327,7 @@ const createSnakeTodos = async ({ withShadow = false } = {}) => {
       owner_name TEXT NOT NULL
     )
   `)
-  if (!withShadow) return
-  await tracked.raw.execute(`
-    CREATE TABLE IF NOT EXISTS snake_todos__draft (
-      id INTEGER NOT NULL,
-      draft_id TEXT NOT NULL,
-      todo_title TEXT,
-      owner_name TEXT,
-      __overrides TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-      __tombstone BOOLEAN DEFAULT false,
-      PRIMARY KEY (id, draft_id)
-    )
-  `)
+  if (withDraftStorage) await createDraftStorage()
 }
 
 describe('SelectBuilder projection', () => {
@@ -431,11 +415,11 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft read projects the coalesce, matching the canonical builder', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'base', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'overridden')`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({
+      title: 'overridden',
+    })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
 
@@ -444,12 +428,10 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft projection omitting the PK still joins, orders and suppresses tombstones', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'kept', done: false })
     await tracked.into(schema.todos).insert({ title: 'deleted', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (2, 'd1', true)`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 2)).delete()
 
     const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
 
@@ -477,14 +459,12 @@ describe('SelectBuilder projection', () => {
 
 describe('DraftSelectBuilder orderBy / limit', () => {
   test('orders by the COALESCED value, so a draft override moves the row', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
     // Row 1 is renamed to sort LAST. Ordering on `b."title"` would still see
     // 'aaa' and put it first — this is the assertion that pins COALESCE.
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'zzz')`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({ title: 'zzz' })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
 
@@ -492,13 +472,15 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('a draft-INSERTED row sorts by its draft value, not as NULL', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'mmm', done: false })
     // No base row for id 99 — `b."title"` is NULL on this side of the FULL OUTER
     // JOIN, so only the coalesced expression can place it correctly.
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title, done) VALUES (99, 'd1', 'aaa', false)`,
-    )
+    await tracked.withDraft('d1').into(schema.todos).insert({
+      id: 99,
+      title: 'aaa',
+      done: false,
+    })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
 
@@ -506,7 +488,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('desc reverses the order', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
 
@@ -516,7 +498,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('limit caps the coalesced set, and composes with orderBy as top-N', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'ccc', done: false })
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
@@ -529,12 +511,10 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('a tombstoned row does not consume a limit slot', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'first', done: false })
     await tracked.into(schema.todos).insert({ title: 'second', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (1, 'd1', true)`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).delete()
 
     // LIMIT applies after the tombstone WHERE. If the order were reversed, the
     // suppressed row would eat the only slot and this would come back empty.
@@ -544,7 +524,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('ties on the ordering column stay deterministic via the PK tiebreaker', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
@@ -557,7 +537,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('first() returns one row and no longer fetches the whole set', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
 
@@ -567,7 +547,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('an unknown orderBy column throws instead of falling back to PK order', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
 
     await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
@@ -576,7 +556,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('orderBy lowers the JS property key to its SQL column name', async () => {
-    await createSnakeTodos({ withShadow: true })
+    await createSnakeTodos({ withDraftStorage: true })
     await tracked.raw.execute(
       `INSERT INTO snake_todos (id, todo_title, owner_name) VALUES (1, 'bbb', 'x'), (2, 'aaa', 'y')`,
     )
@@ -652,7 +632,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('the draft write path rejects the same clauses', async () => {
-    await createShadow()
+    await createDraftStorage()
     const draft = () => tracked.withDraft('d1').from(schema.todos)
 
     await expect(draft().select('title').where(eq('id', 1)).update({ done: true })).rejects.toThrow(
@@ -666,8 +646,8 @@ describe('read clauses are rejected on write terminals', () => {
     ).rejects.toThrow('orderBy() cannot precede update()')
   })
 
-  test('a draft write with no read clauses still lands in the shadow', async () => {
-    await createShadow()
+  test('a draft write with no read clauses still lands in derived storage', async () => {
+    await createDraftStorage()
 
     await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({ done: true })
 
@@ -697,7 +677,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('draft first() then a write on the same builder is not rejected either', async () => {
-    await createShadow()
+    await createDraftStorage()
     const b = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
 
     expect((await b.first())?.id).toBe(1)
@@ -708,7 +688,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('the prescribed two-step alternative works, in a draft too', async () => {
-    await createShadow()
+    await createDraftStorage()
     const handle = tracked.withDraft('d1')
 
     // This is what the error message tells a caller to write.
@@ -778,7 +758,7 @@ describe('clause methods return a copy, not the receiver', () => {
   })
 
   test('the draft builder copies too — same property, same reasons', async () => {
-    await createShadow()
+    await createDraftStorage()
     const base = tracked.withDraft('d1').from(schema.todos)
     const limited = base.limit(1)
 
@@ -788,7 +768,7 @@ describe('clause methods return a copy, not the receiver', () => {
   })
 
   test('a draft read branch does not block a write off the same base', async () => {
-    await createShadow()
+    await createDraftStorage()
     const base = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
 
     expect(await base.orderBy('title').all()).toHaveLength(1)
@@ -829,7 +809,7 @@ describe('clause column resolution is total', () => {
   })
 
   test('a draft orderBy naming an unknown column throws', async () => {
-    await createShadow()
+    await createDraftStorage()
     await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
       'Unknown column: nope',
     )
@@ -882,7 +862,7 @@ describe('canonical and draft reads agree on tied rows', () => {
   })
 
   test('canonical and draft return tied rows in the same order', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'x', done: true })
     await tracked.into(schema.todos).insert({ title: 'y', done: true })
     await tracked.into(schema.todos).insert({ title: 'z', done: true })
@@ -894,7 +874,7 @@ describe('canonical and draft reads agree on tied rows', () => {
   })
 
   test('limit(1) over a tie picks the same row on both paths', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'x', done: true })
     await tracked.into(schema.todos).insert({ title: 'y', done: true })
 

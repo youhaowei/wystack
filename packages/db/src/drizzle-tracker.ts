@@ -61,7 +61,7 @@ export type DraftStoredValue =
   | { kind: 'json'; value: unknown }
   | { kind: 'value'; value: unknown }
 
-/** One indexed scan for review, conflict classification, rebuild, or diagnostics. */
+/** One indexed scan for review, conflict classification, rebase, or diagnostics. */
 export async function enumerateDraftRowChanges(
   raw: DrizzleDb,
   draftId: string,
@@ -131,17 +131,36 @@ function qualifiedTableName(table: AnyTable): string {
 }
 
 function tableTrackingTag(table: AnyTable, tenantScope: TenantScope): string {
-  const tableName = qualifiedTableName(table)
   const tenant = requireTenantScope(table, tenantScope)
-  if (!tenant) return tableName
-  return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}`
+  return publishedInvalidationIdentity(table, tenant?.tenantId)
 }
 
 function draftTableTrackingTag(table: AnyTable, tenantScope: TenantScope, draftId: string): string {
-  const tableName = `${qualifiedTableName(table)}__draft`
   const tenant = requireTenantScope(table, tenantScope)
-  if (!tenant) return tableName
-  return `tenant:${encodeURIComponent(String(tenant.tenantId))}:${tableName}:draft:${encodeURIComponent(draftId)}`
+  return draftInvalidationIdentity(table, draftId, tenant?.tenantId)
+}
+
+export function publishedInvalidationIdentity(table: AnyTable, tenantId?: unknown): string {
+  const tableName = qualifiedTableName(table)
+  if (!tryGetTableCapabilities(table)?.tenancy) return tableName
+  if (tenantId === undefined || tenantId === null) {
+    throw new Error(`Table "${getTableName(table)}" requires a tenant invalidation identity`)
+  }
+  return `tenant:${encodeURIComponent(String(tenantId))}:${tableName}`
+}
+
+export function draftInvalidationIdentity(
+  table: AnyTable,
+  draftId: string,
+  tenantId?: unknown,
+): string {
+  const tableName = qualifiedTableName(table)
+  const draft = encodeURIComponent(draftId)
+  if (!tryGetTableCapabilities(table)?.tenancy) return `draft:${draft}:${tableName}`
+  if (tenantId === undefined || tenantId === null) {
+    throw new Error(`Table "${getTableName(table)}" requires a tenant invalidation identity`)
+  }
+  return `tenant:${encodeURIComponent(String(tenantId))}:draft:${draft}:${tableName}`
 }
 
 /**
@@ -218,9 +237,17 @@ function draftCastType(column: { getSQLType(): string }): string {
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
-function encodeTypedKey(column: any, value: unknown): { envelope: unknown; text: string } {
-  const envelope = { type: draftCastType(column), value: mapColumnValue(column, value) }
-  return { envelope, text: JSON.stringify(envelope) }
+function encodeTypedKey(column: any, rawValue: unknown): { envelope: unknown; text: string } {
+  const type = draftCastType(column)
+  const encoded = mapColumnValue(column, rawValue)
+  const value = encoded instanceof Date ? encoded.toISOString() : encoded
+  const envelope = { type, value }
+  if (type === 'uuid') return { envelope, text: String(value).toLowerCase() }
+  if (type === 'integer' || type === 'bigint' || type === 'smallint') {
+    return { envelope, text: String(value) }
+  }
+  if (type === 'text' || type === 'varchar') return { envelope, text: String(value) }
+  throw new Error(`Draft identity columns must be scalar int, text, or uuid; received ${type}`)
 }
 
 function isDraftJsonNull(value: unknown): value is DraftJsonNull {
@@ -341,8 +368,6 @@ export interface DraftDrizzleTracker {
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
   into<T extends AnyTable>(table: T): DraftInsertBuilder<T>
-  /** Enumerate the entire derived change set through the central draft index. */
-  changes(): Promise<DraftRowChange[]>
   /** Always throws — drafts have no per-handler transaction (publish owns atomicity). */
   transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
@@ -840,7 +865,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
       const updated: Record<string, unknown>[] = []
       for (const match of matches) {
         const pkValue = match[pkProperty]
-        await writeShadowRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
+        await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
           pkValue,
           values: patch,
           tombstone: false,
@@ -862,12 +887,12 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   /**
-   * Tombstone the row in the shadow: upsert `(draft_id, <pk>, __tombstone=true)`
+   * Record a delete operation in the central draft relation.
    * so the coalesce read suppresses it. Mirrors the canonical
    * `from(t).where(eq('id', x)).delete()` a command handler emits.
    *
    * Filters have full effective-row parity with canonical deletes; every match
-   * receives a tombstone in the shadow.
+   * receives a delete marker in derived storage.
    */
   async delete(): Promise<Record<string, unknown>[]> {
     assertNoReadClauses('delete', this._clauses)
@@ -884,7 +909,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
       committedTracker = txDraft
       const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
       for (const match of matches) {
-        await writeShadowRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
+        await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
           pkValue: match[pkProperty],
           values: {},
           tombstone: true,
@@ -1242,10 +1267,10 @@ export function decodeRowFromDriver(
  *   - table-level `primaryKey({...})`  → only visible in `config.primaryKeys`
  *   - no explicit PK                  → fall back to a column literally named `id`
  *
- * Composite PKs (2+ columns) are unsupported — the shadow join/upsert is
+ * Composite PKs (2+ columns) are unsupported — the overlay join/upsert is
  * single-key — so we throw a clear error rather than silently keying on the
  * wrong column. Shared by the draft READ coalesce (`DraftSelectBuilder.all`)
- * and the draft WRITE path (`writeShadowRow` / `DraftSelectBuilder.update/delete`)
+ * and the draft WRITE path (`writeDraftRow` / `DraftSelectBuilder.update/delete`)
  * so both key on the identical column.
  */
 export function resolvePkColumnName(
@@ -1261,7 +1286,7 @@ export function resolvePkColumnName(
       throw new Error(
         `draft overlay: table "${tableName}" has a composite primary key ` +
           `(${pk.columns.map((c) => c.name).join(', ')}). Composite PKs are not supported ` +
-          `by the draft overlay (single-key shadow join/upsert).`,
+          `by the draft overlay (single-key join/upsert).`,
       )
     }
     return pk.columns[0].name
@@ -1273,7 +1298,7 @@ export function resolvePkColumnName(
     throw new Error(
       `draft overlay: table "${tableName}" has multiple primary-key columns ` +
         `(${inlinePks.map((c) => c.name).join(', ')}). Composite PKs are not supported ` +
-        `by the draft overlay (single-key shadow join/upsert).`,
+        `by the draft overlay (single-key join/upsert).`,
     )
   }
   if (inlinePks.length === 1) return inlinePks[0].name
@@ -1282,14 +1307,14 @@ export function resolvePkColumnName(
   // `id` column is the row identity (it is for every defineSchema table —
   // serial PKs are now marked primary above — and the documented convention
   // for raw pgTable callers). If a table has a non-unique `id` that is NOT the
-  // identity, the shadow join/upsert would mis-key; such a table must declare an
+  // identity, the overlay join/upsert would mis-key; such a table must declare an
   // explicit primary key so resolution takes a branch above instead.
   const idCol = config.columns.find((c) => c.name === 'id')
   if (idCol) return idCol.name
 
   throw new Error(
     `draft overlay: table "${tableName}" has no primary key column and no column named "id". ` +
-      `Cannot key the draft shadow.`,
+      `Cannot key the draft overlay.`,
   )
 }
 
@@ -1298,7 +1323,7 @@ export function resolvePkColumnName(
  * INSERT/UPDATE lowering. A `null`/`undefined` is passed through untouched: a
  * codec like `jsonb`'s `JSON.stringify` would otherwise turn `null` into the
  * literal string `"null"` (and `undefined` into `undefined`), corrupting the
- * "no override" sentinel the shadow read relies on. For every supported column
+ * "no override" sentinel the sparse overlay read relies on. For every supported column
  * type, a real value (`fields: [...]`, `done: true`) is the only case that needs
  * a non-identity codec, and those are never null.
  */
@@ -1338,10 +1363,10 @@ function mapColumnValueFromDriver(col: any, value: unknown): unknown {
  * tag (guard-the-sink). Table/column names come from schema introspection (not
  * user input) and are double-quoted, safe as raw SQL fragments.
  *
- * Records the existing virtual `<table>__draft` invalidation tag so this write
- * invalidates only draft-coalesced readers, not canonical readers.
+ * Records the explicit draft invalidation identity so this write invalidates
+ * only readers of this draft, not canonical or other-draft readers.
  */
-async function writeShadowRow(
+async function writeDraftRow(
   db: DrizzleDb,
   tracker: { tablesWritten: Set<string> },
   table: AnyTable,
@@ -1419,9 +1444,8 @@ async function writeShadowRow(
     ? sql`${sql.raw('jsonb_build_object(')}${sql.join(fieldPairs, sql.raw(''))}${sql.raw(')')}`
     : sql.raw("'{}'::jsonb")
 
-  const revisionColumn = Object.values(columns).find(
-    (column) => (column.name as string) === 'revision',
-  )
+  const revisionProperty = tryGetTableCapabilities(table)?.revisionProperty
+  const revisionColumn = revisionProperty ? requireColumn(columns, revisionProperty) : undefined
   const baseRevision = revisionColumn
     ? sql.raw(`to_jsonb(b.${quoteSqlIdentifier(revisionColumn.name as string)})`)
     : sql.raw('NULL::jsonb')
@@ -1507,12 +1531,12 @@ export class DraftInsertBuilder<T extends AnyTable> {
       if (pkValue === undefined || pkValue === null) {
         throw new Error(
           `DraftInsertBuilder.insert(): row is missing primary key "${pkPropKey ?? pkColName}". ` +
-            `Draft inserts require a client-minted PK so the shadow row is addressable.`,
+            `Draft inserts require a client-minted PK so the derived row is addressable.`,
         )
       }
-      // Pass the full row as sparse values; writeShadowRow drops the PK column
-      // (carried separately) and any reserved shadow columns.
-      await writeShadowRow(this._db, this._tracker, this._table, this._draftId, this._tenantScope, {
+      // Pass the full row as sparse values; writeDraftRow drops the PK column,
+      // which is carried separately as the stable row identity.
+      await writeDraftRow(this._db, this._tracker, this._table, this._draftId, this._tenantScope, {
         pkValue,
         values: r,
         tombstone: false,
@@ -1615,9 +1639,6 @@ export function createDrizzleTracker(
             )
           }
           return new DraftInsertBuilder(table, drizzleDb, draftId, draftHandle, tenantScope)
-        },
-        changes() {
-          return enumerateDraftRowChanges(drizzleDb, draftId)
         },
         transaction<R>(
           _fn: (tx: DrizzleTracker) => Promise<R>,

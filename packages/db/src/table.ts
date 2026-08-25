@@ -1,4 +1,4 @@
-import type { AnyColumnDef } from './dsl'
+import { uuid, type AnyColumnDef } from './dsl'
 
 export type ColumnDefinitions = Record<string, AnyColumnDef>
 
@@ -19,6 +19,7 @@ export interface TenantCapability extends TenantKeyDefinition {
 export interface TableCapabilities {
   draftable: boolean
   tenancy?: TenantCapability
+  revisionProperty?: string
 }
 
 export class TableDefinition<
@@ -35,6 +36,20 @@ export class TableDefinition<
 
   draftable(): TableDefinition<TColumns, true> {
     return new TableDefinition(this.columns, { ...this.capabilities, draftable: true })
+  }
+
+  revision<TKey extends Extract<keyof TColumns, string>>(
+    property: TKey,
+  ): TableDefinition<TColumns, TDraftable> {
+    const definition = this.columns[property]
+    if (!definition) throw new Error(`Unknown revision property "${property}"`)
+    if (definition.opts.isArray || definition.opts.isOptional || definition.opts.isNullable) {
+      throw new Error(`Revision property "${property}" must be a required, non-null scalar`)
+    }
+    return new TableDefinition(this.columns, {
+      ...this.capabilities,
+      revisionProperty: property,
+    })
   }
 }
 
@@ -56,9 +71,19 @@ export interface MultiTenantDescriptor<TKey extends TenantKeyDefinition> {
   ): TableDefinition<WithTenantKey<TColumns, TKey>, false>
 }
 
+const defaultTenantKey = {
+  property: 'tenantId',
+  column: 'tenant_id',
+  type: uuid,
+} as const
+
+export function multiTenant(): MultiTenantDescriptor<typeof defaultTenantKey>
 export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
   key: TKey
-}): MultiTenantDescriptor<TKey> {
+}): MultiTenantDescriptor<TKey>
+export function multiTenant(
+  opts: { key: TenantKeyDefinition } = { key: defaultTenantKey },
+): MultiTenantDescriptor<TenantKeyDefinition> {
   const { key } = opts
   if (key.property.length === 0) throw new Error('multiTenant key.property cannot be empty')
   if (key.column.length === 0) throw new Error('multiTenant key.column cannot be empty')
@@ -81,7 +106,7 @@ export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
       const withTenant = {
         ...columns,
         [key.property]: key.type,
-      } as WithTenantKey<TColumns, TKey>
+      } as WithTenantKey<TColumns, TenantKeyDefinition>
       return new TableDefinition(withTenant, {
         draftable: false,
         tenancy: { ...key, descriptorId },

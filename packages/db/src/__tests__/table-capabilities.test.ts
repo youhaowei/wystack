@@ -74,6 +74,37 @@ describe('composable table capabilities', () => {
     ).toThrow('workspaceId')
   })
 
+  test('multiTenant defaults to the conventional tenantId/tenant_id UUID key', () => {
+    const schema = defineSchema({
+      records: multiTenant().table({ id: uuid.primaryKey(), name: text }),
+    })
+
+    expect(getTableCapabilities(schema.records).tenancy).toMatchObject({
+      property: 'tenantId',
+      column: 'tenant_id',
+    })
+    expect(getTableColumns(schema.records).tenantId.getSQLType()).toBe('uuid')
+  })
+
+  test('revision and draft capabilities compose in either order', () => {
+    const first = table({ id: uuid.primaryKey(), revision: int, name: text })
+      .revision('revision')
+      .draftable()
+    const second = table({ id: uuid.primaryKey(), version: int, name: text })
+      .draftable()
+      .revision('version')
+    const schema = defineSchema({ first, second })
+
+    expect(getTableCapabilities(schema.first)).toMatchObject({
+      draftable: true,
+      revisionProperty: 'revision',
+    })
+    expect(getTableCapabilities(schema.second)).toMatchObject({
+      draftable: true,
+      revisionProperty: 'version',
+    })
+  })
+
   test('one schema cannot mix tenancy descriptors', () => {
     const first = multiTenant({
       key: { property: 'tenantId', column: 'tenant_id', type: text },
@@ -103,7 +134,7 @@ describe('composable table capabilities', () => {
     ).toThrow('scalar text, uuid, or int')
   })
 
-  test('draftable tables generate presence-aware shadow schemas', () => {
+  test('draftable tables share one central sparse change relation', () => {
     const tenancy = multiTenant({
       key: {
         property: 'workspaceId',
@@ -118,27 +149,34 @@ describe('composable table capabilities', () => {
 
     const generated = getGeneratedTables(schema)
     expect(generated.map((generatedTable) => getTableConfig(generatedTable).name)).toEqual([
-      'templates__draft',
-      'insights__draft',
+      'wystack_draft_row_changes',
     ])
 
-    const tenantShadow = getTableConfig(generated[1])
-    expect(tenantShadow.columns.map((column) => column.name)).toEqual([
+    const changes = getTableConfig(generated[0])
+    expect(changes.columns.map((column) => column.name)).toEqual([
       'draft_id',
-      'workspace_id',
-      'id',
-      'description',
-      '__overrides',
-      '__tombstone',
+      'table_key',
+      'tenant_key_text',
+      'tenant_key',
+      'row_key_text',
+      'row_key',
+      'operation',
+      'base_exists',
+      'base_revision',
+      'fields',
     ])
-    expect(tenantShadow.primaryKeys[0].columns.map((column) => column.name)).toEqual([
+    expect(changes.primaryKeys[0].columns.map((column) => column.name)).toEqual([
       'draft_id',
-      'workspace_id',
-      'id',
+      'table_key',
+      'tenant_key_text',
+      'row_key_text',
     ])
-    expect(tenantShadow.columns.find((column) => column.name === 'description')?.notNull).toBe(
-      false,
-    )
+  })
+
+  test('draftable tables reject non-scalar stable identities', () => {
+    expect(() =>
+      defineSchema({ invalid: table({ id: jsonb.primaryKey(), name: text }).draftable() }),
+    ).toThrow('scalar int, text, or uuid')
   })
 
   test('tenant-local uniqueness and references include the tenant key', () => {

@@ -61,8 +61,8 @@ export interface WyStackApp {
    *
    * `tracked` may also be a `DraftDrizzleTracker` (a `base.withDraft(draftId)` handle):
    * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
-   * command handler's writes (`ctx.db.into/update/delete`) into the
-   * `<table>__draft` overlay. Handlers are authored against `DrizzleTracker` and only
+   * command handler's writes (`ctx.db.into/update/delete`) into the durable
+   * draft overlay. Handlers are authored against `DrizzleTracker` and only
    * touch the from/into/where/all/insert/update/delete surface both handles
    * share — so the substitution is transparent to them.
    */

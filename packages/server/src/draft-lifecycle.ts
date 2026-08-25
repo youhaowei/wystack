@@ -14,7 +14,7 @@
 // drives append, chooses a conflict POLICY); this layer is the mechanism, a
 // sibling to `applyCommands`/`transaction` with the same "app conducts" posture.
 //
-// The load-bearing correction (from the convergence spike): PUBLISH = REPLAY THE
+// PUBLISH = REPLAY THE
 // ORDERED COMMAND LOG via `applyCommands(app, log, {commit})`, NOT "apply a
 // row-delta onto canonical." The command log is the publish unit because it
 // preserves INTENT GROUPING (e.g. an `add_to_dashboard` command merges into the
@@ -23,17 +23,23 @@
 // two are different artifacts with different jobs.
 //
 // ATOMIC PUBLISH: `publish` adopts the `applyCommands` outer-tx seam
-// to wrap command-log replay + shadow-sweep in ONE transaction.
+// to wrap command-log replay + derived-state sweep in ONE transaction.
 // This eliminates the crash window that previously existed between "canonical
-// committed" and "shadow cleared" — if either step fails, both roll back. The
+// committed" and "derived state cleared" — if either step fails, both roll back. The
 // draft stays live and publish is retryable. This is the wystack-internal adoption
 // of the primitive; an application's draft controller adopts separately
 // (the durable-log delete is the analogous bookkeeping step there).
 
-import { resolvePkColumnName, type DraftDrizzleTracker, type DrizzleTracker } from '@wystack/db'
+import {
+  draftInvalidationIdentity,
+  tryGetTableCapabilities,
+  resolvePkColumnName,
+  type DraftDrizzleTracker,
+  type DrizzleTracker,
+} from '@wystack/db'
 import { isPrincipal } from '@wystack/identity'
 import { getTableConfig } from 'drizzle-orm/pg-core'
-import { getTableName, sql } from 'drizzle-orm'
+import { getTableColumns, getTableName, sql } from 'drizzle-orm'
 import {
   applyCommands,
   type Command,
@@ -50,6 +56,7 @@ import {
   readStoredCommands,
   readStoredDraft,
   readStoredTouchedTables,
+  replaceStoredDraftBase,
   replaceStoredCommands,
   upsertStoredTouchedTables,
   type StoredDraft,
@@ -124,6 +131,22 @@ export interface ConflictReport {
   overlappingCells: Cell[]
 }
 
+export interface DraftRowConflict {
+  table: string
+  id: unknown
+  reason: 'created' | 'deleted' | 'revision'
+}
+
+export class DraftConflictError extends Error {
+  readonly conflicts: DraftRowConflict[]
+
+  constructor(draftId: string, conflicts: DraftRowConflict[]) {
+    super(`draft lifecycle: draft "${draftId}" conflicts with published data`)
+    this.name = 'DraftConflictError'
+    this.conflicts = conflicts
+  }
+}
+
 export interface OpenOptions {
   /** Current request context used to bind tenant and owner custody. Never persisted. */
   context?: Record<string, unknown>
@@ -134,16 +157,29 @@ export interface DraftOperationOptions {
   context?: Record<string, unknown>
 }
 
+export interface RebaseOptions extends DraftOperationOptions {
+  acceptConflicts?: (report: ConflictReport) => boolean | Promise<boolean>
+}
+
 export interface DraftLifecycleOptions {
   versionProbe?: VersionProbe
   /** Resolve the stable owner/custodian key. Defaults to the Principal's kind and stable ID. */
   resolveOwner?: (context: Record<string, unknown>) => unknown | Promise<unknown>
   /** Override owner-only access for explicit collaboration/product policy. Tenant scope still applies. */
   authorizeDraft?: (request: DraftAuthorizationRequest) => boolean | Promise<boolean>
+  /** Application-owned cross-row validation, run inside publish/rebase transactions. */
+  validateGraph?: (request: DraftGraphValidationRequest) => void | Promise<void>
+}
+
+export interface DraftGraphValidationRequest {
+  phase: 'effective' | 'published'
+  draftId: string
+  db: DrizzleTracker | DraftDrizzleTracker
+  context: Record<string, unknown>
 }
 
 export interface DraftAuthorizationRequest {
-  action: 'append' | 'publish' | 'discard' | 'rebuild' | 'detectConflict' | 'getLog'
+  action: 'append' | 'publish' | 'discard' | 'rebase' | 'detectConflict' | 'inspect' | 'getLog'
   draft: {
     draftId: string
     tenantId: unknown | undefined
@@ -151,6 +187,29 @@ export interface DraftAuthorizationRequest {
   }
   context: Record<string, unknown>
 }
+
+export interface DraftInspectionRow {
+  draftId: string
+  table: string
+  tenantKey: unknown
+  rowKey: unknown
+  operation: 'insert' | 'update' | 'delete'
+  baseExists: boolean
+  baseRevision: unknown
+  fields: Record<
+    string,
+    {
+      original: DraftInspectionValue
+      value: DraftInspectionValue
+    }
+  >
+}
+
+export type DraftInspectionValue =
+  | { kind: 'absent' }
+  | { kind: 'sql-null' }
+  | { kind: 'json'; value: unknown }
+  | { kind: 'value'; value: unknown }
 
 export interface DraftLifecycle {
   /** Open a draft over a base snapshot. Returns the new draft id. */
@@ -182,7 +241,7 @@ export interface DraftLifecycle {
    * `applyCommands(app, log, {commit})`, calling `resolve(log)` IMMEDIATELY
    * before the commit (the ONLY app injection inside publish — it binds
    * late-bound operands). Atomic via `applyCommands`'s tracked tx. The
-   * draft's shadow, command log, and metadata are cleared on success.
+   * draft's derived changes, command log, and metadata are cleared on success.
    *
    * Invalidation is the LIFECYCLE's job, not the host's: publish emits the
    * canonical tags from the replay plus virtual per-table draft tags for the sweep
@@ -195,7 +254,7 @@ export interface DraftLifecycle {
    * The resolve hook runs outside the transaction. Publish then row-locks the
    * draft and compares its persisted log revision; an append during resolution
    * advances that revision and makes this attempt fail for a safe retry. Replay,
-   * shadow sweep, and metadata/log deletion share the locked transaction.
+   * derived-state sweep, and metadata/log deletion share the locked transaction.
    */
   publish(
     draftId: string,
@@ -204,11 +263,11 @@ export interface DraftLifecycle {
   ): Promise<CommitResult>
   /**
    * Drop the draft: row-lock its metadata, clear every persisted touched-table
-   * shadow, and delete its command log and metadata in one transaction.
+   * derived state, and delete its command log and metadata in one transaction.
    */
   discard(draftId: string, opts?: DraftOperationOptions): Promise<void>
-  /** Rebuild the derived central change set by replaying the authoritative command log. */
-  rebuild(draftId: string, opts?: DraftOperationOptions): Promise<void>
+  /** Explicitly replay the log over newer canonical data after application conflict policy. */
+  rebase(draftId: string, opts?: RebaseOptions): Promise<ConflictReport>
   /**
    * Detect whether canonical moved under the draft. Returns the two generic
    * signals; makes NO policy decision. Reads the draft's touched cells straight
@@ -216,6 +275,8 @@ export interface DraftLifecycle {
    * app's `VersionProbe` which canonical also wrote.
    */
   detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
+  /** Authorized review state across the whole draft, ordered by table and stable row identity. */
+  inspect(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionRow[]>
   /** Read-only peek at a draft's current command log (post-compaction). */
   getLog(draftId: string, opts?: DraftOperationOptions): Promise<DraftCommand[]>
 }
@@ -366,27 +427,58 @@ function qualifiedTableKey(table: AnyTable): string {
 
 function describeTouchedTables(
   touchedTables: Map<string, AnyTable>,
-  shadowWrites: Set<string>,
+  draftWrites: Set<string>,
+  draftId: string,
+  tenantId: unknown | undefined,
 ): StoredTouchedTable[] {
   return [...touchedTables.values()].flatMap((table) => {
     const tableName = getTableName(table)
     const config = getTableConfig(table)
     const qualifiedName = qualifiedTableKey(table)
-    const globalTag = `${qualifiedName}__draft`
-    const tenantMarker = `:${qualifiedName}__draft:draft:`
-    const shadowTag = [...shadowWrites].find(
-      (tag) => tag === globalTag || tag.includes(tenantMarker),
-    )
-    if (!shadowTag) return []
+    const draftTag = draftInvalidationIdentity(table, draftId, tenantId)
+    if (!draftWrites.has(draftTag)) return []
+    const columns = getTableColumns(table) as Record<string, { name: string; getSQLType(): string }>
+    const pkColumn = resolvePkColumnName(table, config)
+    const pk = Object.values(columns).find((column) => column.name === pkColumn)
+    if (!pk) throw new Error(`draft lifecycle: cannot resolve primary key for "${qualifiedName}"`)
+    const capabilities = tryGetTableCapabilities(table)
+    const revision = capabilities?.revisionProperty
+      ? columns[capabilities.revisionProperty]
+      : undefined
+    const tenant = capabilities?.tenancy ? columns[capabilities.tenancy.property] : undefined
     return [
       {
         schema: config.schema,
         table: tableName,
-        pkColumn: resolvePkColumnName(table, config),
-        shadowTag,
+        pkColumn,
+        pkType: normalizeSqlType(pk.getSQLType()),
+        tenantColumn: tenant?.name,
+        tenantType: tenant ? normalizeSqlType(tenant.getSQLType()) : undefined,
+        revisionColumn: revision?.name,
+        invalidationTag: draftTag,
       },
     ]
   })
+}
+
+function normalizeSqlType(type: string): string {
+  const normalized = type.toLowerCase()
+  if (normalized === 'serial') return 'integer'
+  if (normalized === 'bigserial') return 'bigint'
+  if (normalized === 'smallserial') return 'smallint'
+  return normalized
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function identityCast(type: string): string {
+  const normalized = normalizeSqlType(type)
+  if (!['integer', 'bigint', 'smallint', 'text', 'uuid', 'varchar'].includes(normalized)) {
+    throw new Error(`draft lifecycle: unsupported persisted identity type "${type}"`)
+  }
+  return normalized
 }
 
 function sameJsonValue(left: unknown, right: unknown): boolean {
@@ -421,7 +513,7 @@ function defaultOwnerKey(context: Record<string, unknown>): unknown {
  * Build the generic draft lifecycle over a WyStack app.
  *
  * @param app    the app whose function registry resolves command paths and whose
- *               connection backs both the shadow writes and the publish replay.
+ *               connection backs both the derived writes and the publish replay.
  * @param opts.versionProbe  the ONLY app injection for conflict DETECTION; speaks
  *               `(table, id, version)` only. Omit it and `detectConflict` reports
  *               a no-conflict report (the app opted out of detection).
@@ -430,7 +522,7 @@ export function createDraftLifecycle(
   app: WyStackApp,
   opts: DraftLifecycleOptions = {},
 ): DraftLifecycle {
-  const { versionProbe, resolveOwner, authorizeDraft } = opts
+  const { versionProbe, resolveOwner, authorizeDraft, validateGraph } = opts
   let storageInitialization: Promise<void> | undefined
 
   function storageReady(): Promise<void> {
@@ -452,6 +544,10 @@ export function createDraftLifecycle(
     return draft
   }
 
+  function notFound(draftId: string): Error {
+    return new Error(`draft lifecycle: unknown draft "${draftId}"`)
+  }
+
   async function authorizeTracker(
     tracked: DrizzleTracker,
     draft: StoredDraft,
@@ -460,7 +556,7 @@ export function createDraftLifecycle(
   ): Promise<DrizzleTracker> {
     const scoped = await app.scopeTracked(tracked, context)
     if (!sameJsonValue(scoped.tenantId, draft.tenantId)) {
-      throw new Error(`draft lifecycle: access denied for draft "${draft.draftId}"`)
+      throw notFound(draft.draftId)
     }
     const currentOwner = await ownerKey(context)
     if (sameJsonValue(currentOwner, draft.ownerKey)) return scoped
@@ -476,7 +572,7 @@ export function createDraftLifecycle(
       })
       if (allowed) return scoped
     }
-    throw new Error(`draft lifecycle: access denied for draft "${draft.draftId}"`)
+    throw notFound(draft.draftId)
   }
 
   return {
@@ -506,7 +602,7 @@ export function createDraftLifecycle(
         }
       }
       const outer = app.createTracked()
-      let shadowWrites = new Set<string>()
+      let draftWrites = new Set<string>()
       const results = await outer.transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
         const scopedTx = await authorizeTracker(tx, stored, context, 'append')
@@ -528,13 +624,13 @@ export function createDraftLifecycle(
         await upsertStoredTouchedTables(
           tx.raw,
           draftId,
-          describeTouchedTables(touchedTables, draftDb.tablesWritten),
+          describeTouchedTables(touchedTables, draftDb.tablesWritten, draftId, scopedTx.tenantId),
         )
         await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
-        shadowWrites = new Set(draftDb.tablesWritten)
+        draftWrites = new Set(draftDb.tablesWritten)
         return results
       })
-      if (shadowWrites.size > 0) app.emit(shadowWrites)
+      if (draftWrites.size > 0) app.emit(draftWrites)
       return results
     },
 
@@ -546,7 +642,7 @@ export function createDraftLifecycle(
       const snapshotLog = await readStoredCommands(app.createTracked().raw, draftId)
       const boundLog = resolve ? await resolve([...snapshotLog]) : [...snapshotLog]
 
-      let shadowWrites = new Set<string>()
+      let draftWrites = new Set<string>()
       const result = await app.createTracked().transaction(async (tx) => {
         const current = await requireStored(tx.raw, draftId, true)
         const scopedTx = await authorizeTracker(tx, current, context, 'publish')
@@ -554,20 +650,28 @@ export function createDraftLifecycle(
           throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
         }
         const touched = await readStoredTouchedTables(tx.raw, draftId)
+        await assertDraftRowsUnchanged(tx.raw, draftId, touched)
+        await validateGraph?.({
+          phase: 'effective',
+          draftId,
+          db: scopedTx.withDraft(draftId),
+          context,
+        })
         const committed = (await applyCommands(app, boundLog, {
           mode: 'commit',
           context,
           tx: scopedTx,
         })) as CommitResult
+        await validateGraph?.({ phase: 'published', draftId, db: scopedTx, context })
         await clearDerivedChanges(tx.raw, draftId)
         await deleteStoredDraft(tx.raw, draftId)
-        shadowWrites = new Set(
-          touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+        draftWrites = new Set(
+          touched.flatMap((table) => (table.invalidationTag ? [table.invalidationTag] : [])),
         )
         return committed
       })
 
-      const tags = new Set([...result.tablesWritten, ...shadowWrites])
+      const tags = new Set([...result.tablesWritten, ...draftWrites])
       if (tags.size > 0) app.emit(tags)
       return result
     },
@@ -575,29 +679,50 @@ export function createDraftLifecycle(
     async discard(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
-      let shadowWrites = new Set<string>()
+      let draftWrites = new Set<string>()
       await app.createTracked().transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
         await authorizeTracker(tx, stored, context, 'discard')
         const touched = await readStoredTouchedTables(tx.raw, draftId)
         await clearDerivedChanges(tx.raw, draftId)
         await deleteStoredDraft(tx.raw, draftId)
-        shadowWrites = new Set(
-          touched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+        draftWrites = new Set(
+          touched.flatMap((table) => (table.invalidationTag ? [table.invalidationTag] : [])),
         )
       })
-      if (shadowWrites.size > 0) app.emit(shadowWrites)
+      if (draftWrites.size > 0) app.emit(draftWrites)
     },
 
-    async rebuild(draftId, operationOpts = {}) {
+    async rebase(draftId, operationOpts = {}) {
       await storageReady()
+      if (!versionProbe) {
+        throw new Error('draft lifecycle: rebase requires a versionProbe')
+      }
       const context = operationOpts.context ?? {}
       let emitted = new Set<string>()
+      let report: ConflictReport = { staleBase: false, overlappingCells: [] }
       await app.createTracked().transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
-        const scopedTx = await authorizeTracker(tx, stored, context, 'rebuild')
+        const scopedTx = await authorizeTracker(tx, stored, context, 'rebase')
         const log = await readStoredCommands(tx.raw, draftId)
         const previousTouched = await readStoredTouchedTables(tx.raw, draftId)
+        const currentVersion = await versionProbe.current()
+        const touchedCells = await enumerateTouchedCells(tx.raw, draftId, previousTouched)
+        report = {
+          staleBase: versionProbe.isNewerThan(currentVersion, stored.baseVersion),
+          overlappingCells:
+            touchedCells.length > 0
+              ? await versionProbe.cellsWrittenSince(stored.baseVersion, touchedCells)
+              : [],
+        }
+        if (report.overlappingCells.length > 0) {
+          const accepted = operationOpts.acceptConflicts
+            ? await operationOpts.acceptConflicts(report)
+            : false
+          if (!accepted) {
+            throw new Error(`draft lifecycle: draft "${draftId}" has unresolved rebase conflicts`)
+          }
+        }
         await clearDerivedChanges(tx.raw, draftId)
         await deleteStoredTouchedTables(tx.raw, draftId)
 
@@ -606,15 +731,24 @@ export function createDraftLifecycle(
         for (const command of log) {
           await app.runHandler(command.path, command.args, draftDb, context)
         }
-        const rebuiltTouched = describeTouchedTables(touchedTables, draftDb.tablesWritten)
+        const rebuiltTouched = describeTouchedTables(
+          touchedTables,
+          draftDb.tablesWritten,
+          draftId,
+          scopedTx.tenantId,
+        )
         await upsertStoredTouchedTables(tx.raw, draftId, rebuiltTouched)
-        await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
+        await validateGraph?.({ phase: 'effective', draftId, db: draftDb, context })
+        await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
         emitted = new Set([
-          ...previousTouched.flatMap((table) => (table.shadowTag ? [table.shadowTag] : [])),
+          ...previousTouched.flatMap((table) =>
+            table.invalidationTag ? [table.invalidationTag] : [],
+          ),
           ...draftDb.tablesWritten,
         ])
       })
       if (emitted.size > 0) app.emit(emitted)
+      return report
     },
 
     async detectConflict(draftId, operationOpts = {}) {
@@ -633,7 +767,7 @@ export function createDraftLifecycle(
 
       // Fine signal: enumerate THIS draft's touched cells from central changes,
       // then ask the probe which canonical also
-      // wrote at/after base. Reading the shadow keeps detection artifact-blind.
+      // wrote at/after base. Reading derived identities keeps detection artifact-blind.
       const touched = await readStoredTouchedTables(scoped.raw, draftId)
       const touchedCells = await enumerateTouchedCells(scoped.raw, draftId, touched)
       const overlappingCells =
@@ -642,6 +776,14 @@ export function createDraftLifecycle(
           : []
 
       return { staleBase, overlappingCells }
+    },
+
+    async inspect(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const stored = await requireStored(app.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'inspect')
+      return inspectDraftRows(scoped.raw, draftId)
     },
 
     async getLog(draftId, operationOpts = {}) {
@@ -659,7 +801,7 @@ export function createDraftLifecycle(
  * table OBJECT (keyed by SQL name) as a candidate. We capture reads too because
  * `from(t).where(...).delete()` routes through `from`; after execution,
  * `describeTouchedTables` keeps only candidates whose draft write tag actually
- * committed. Canonical-only reads therefore never become shadow sweep targets.
+ * committed. Canonical-only reads therefore never become draft sweep targets.
  */
 function recordTouchedTables(
   draftDb: DraftDrizzleTracker,
@@ -669,7 +811,7 @@ function recordTouchedTables(
     // Key by SCHEMA-QUALIFIED name. A bare `getTableName` would collide
     // `app.accounts` with `audit.accounts` (same base name, different schema),
     // so the later record would drop the earlier table object — leaving one
-    // shadow uncleaned + one set of cells invisible to conflict detection.
+    // derived state uncleaned + one set of cells invisible to conflict detection.
     touchedTables.set(qualifiedTableKey(table), table)
   }
   return {
@@ -684,11 +826,65 @@ function recordTouchedTables(
       record(table)
       return draftDb.into(table)
     },
-    changes: draftDb.changes.bind(draftDb),
     // Delegate to the underlying draft handle's transaction, which throws the
     // named "drafts have no per-handler transaction" contract error.
     transaction: draftDb.transaction.bind(draftDb),
   }
+}
+
+async function assertDraftRowsUnchanged(
+  raw: DrizzleTracker['raw'],
+  draftId: string,
+  touchedTables: StoredTouchedTable[],
+): Promise<void> {
+  const conflicts: DraftRowConflict[] = []
+  for (const table of touchedTables) {
+    const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
+    const relation = table.schema
+      ? `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.table)}`
+      : quoteIdentifier(table.table)
+    const pk = quoteIdentifier(table.pkColumn)
+    const pkValue = `(d.row_key #>> '{value}')::${identityCast(table.pkType)}`
+    const tenantJoin =
+      table.tenantColumn && table.tenantType
+        ? ` AND c.${quoteIdentifier(table.tenantColumn)} = (d.tenant_key #>> '{value}')::${identityCast(table.tenantType)}`
+        : ''
+
+    await raw.execute(
+      sql`${sql.raw(
+        `SELECT c.${pk} FROM ${relation} c JOIN wystack_draft_row_changes d ` +
+          `ON c.${pk} = ${pkValue}${tenantJoin} WHERE d.draft_id = `,
+      )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}${sql.raw(' FOR UPDATE OF c')}`,
+    )
+
+    const revisionConflict = table.revisionColumn
+      ? ` OR (d.base_exists AND d.base_revision IS DISTINCT FROM to_jsonb(c.${quoteIdentifier(table.revisionColumn)}))`
+      : ''
+    const rows = normalizeRows(
+      await raw.execute(
+        sql`${sql.raw(
+          `SELECT d.row_key, CASE ` +
+            `WHEN NOT d.base_exists AND c.${pk} IS NOT NULL THEN 'created' ` +
+            `WHEN d.base_exists AND c.${pk} IS NULL THEN 'deleted' ` +
+            `ELSE 'revision' END AS reason ` +
+            `FROM wystack_draft_row_changes d LEFT JOIN ${relation} c ` +
+            `ON c.${pk} = ${pkValue}${tenantJoin} WHERE d.draft_id = `,
+        )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}${sql.raw(
+          ` AND ((NOT d.base_exists AND c.${pk} IS NOT NULL) ` +
+            `OR (d.base_exists AND c.${pk} IS NULL)${revisionConflict})`,
+        )}`,
+      ),
+    )
+    for (const row of rows) {
+      const key = decodeJsonColumn(row['row_key']) as { value?: unknown }
+      conflicts.push({
+        table: tableIdentity,
+        id: key.value,
+        reason: String(row['reason']) as DraftRowConflict['reason'],
+      })
+    }
+  }
+  if (conflicts.length > 0) throw new DraftConflictError(draftId, conflicts)
 }
 
 /**
@@ -719,6 +915,31 @@ async function enumerateTouchedCells(
     }
   }
   return cells
+}
+
+async function inspectDraftRows(
+  raw: DrizzleTracker['raw'],
+  draftId: string,
+): Promise<DraftInspectionRow[]> {
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      SELECT draft_id, table_key, tenant_key, row_key, operation,
+             base_exists, base_revision, fields
+      FROM wystack_draft_row_changes
+      WHERE draft_id = ${draftId}
+      ORDER BY table_key, tenant_key_text, row_key_text
+    `),
+  )
+  return rows.map((row) => ({
+    draftId: String(row['draft_id']),
+    table: String(row['table_key']),
+    tenantKey: decodeJsonColumn(row['tenant_key']),
+    rowKey: decodeJsonColumn(row['row_key']),
+    operation: String(row['operation']) as DraftInspectionRow['operation'],
+    baseExists: Boolean(row['base_exists']),
+    baseRevision: decodeJsonColumn(row['base_revision']),
+    fields: decodeJsonColumn(row['fields']) as DraftInspectionRow['fields'],
+  }))
 }
 
 /**

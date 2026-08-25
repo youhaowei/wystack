@@ -95,7 +95,7 @@ async function applyEquivalentChanges() {
   await tracked.from(canonicalTwin).where(eq('id', 8)).update({ title: 'aardvark' })
 }
 
-describe('central JSONB + bounded SQL candidate plan', () => {
+describe('bounded SQL effective-query plan', () => {
   test('lowers top L + M base candidates plus every changed canonical key', async () => {
     await applyEquivalentChanges()
     const lowered = tracked

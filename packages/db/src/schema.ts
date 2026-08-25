@@ -206,12 +206,9 @@ function buildTable(
 }
 
 /**
- * Contender B stores every draft row delta in one relation. `row_key` and
- * `tenant_key` retain a typed JSON envelope for inspection/rebuild while their
+ * Every draft row delta is stored in one relation. `row_key` and `tenant_key`
+ * retain a typed JSON envelope for inspection and diagnostics while their
  * canonical text forms make the btree identity lossless and indexable.
- *
- * This is intentionally a spike schema: production migration ownership and
- * foreign keys to the lifecycle tables are decision-followups.
  */
 function buildDraftChangesTable() {
   return pgTable(
@@ -274,10 +271,16 @@ export function defineSchema<const T extends Record<string, unknown>>(
   )
   for (const [tableName, definition] of draftableEntries) {
     const { columns } = normalizeTableDefinition(definition)
-    const primaryKeys = Object.values(columns).filter((column) => column.opts.isPrimaryKey)
+    const primaryKeys = Object.entries(columns).filter(([, column]) => column.opts.isPrimaryKey)
     if (primaryKeys.length !== 1) {
       throw new Error(
         `Draftable table "${tableName}" requires exactly one explicitly declared primary key`,
+      )
+    }
+    const [primaryProperty, primaryKey] = primaryKeys[0]
+    if (primaryKey.opts.isArray || !['int', 'text', 'uuid'].includes(primaryKey.opts.type)) {
+      throw new Error(
+        `Draftable table "${tableName}" primary key "${primaryProperty}" must be a scalar int, text, or uuid`,
       )
     }
   }

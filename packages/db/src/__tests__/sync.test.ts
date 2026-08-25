@@ -70,7 +70,7 @@ describe('renderCreateTableIfNotExists', () => {
 })
 
 describe('syncSchema', () => {
-  test('creates generated tenant-aware draft shadows', async () => {
+  test('creates one central draft relation for tenant-aware draft tables', async () => {
     const tenancy = multiTenant({
       key: { property: 'workspaceId', column: 'workspace_id', type: wyUuid },
     })
@@ -88,16 +88,20 @@ describe('syncSchema', () => {
     const result = await client.query<{ column_name: string }>(`
       SELECT column_name
       FROM information_schema.columns
-      WHERE table_name = 'insights__draft'
+      WHERE table_name = 'wystack_draft_row_changes'
       ORDER BY ordinal_position
     `)
     expect(result.rows.map((row) => row.column_name)).toEqual([
       'draft_id',
-      'workspace_id',
-      'id',
-      'description',
-      '__overrides',
-      '__tombstone',
+      'table_key',
+      'tenant_key_text',
+      'tenant_key',
+      'row_key_text',
+      'row_key',
+      'operation',
+      'base_exists',
+      'base_revision',
+      'fields',
     ])
   })
 
