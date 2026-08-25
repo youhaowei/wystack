@@ -97,6 +97,18 @@ describe('compactLog — net-effect collapse', () => {
     expect(out.map((c) => c.kind)).toEqual(['create', 'update', 'update'])
   })
 
+  test('a later create supersedes earlier same-key draft history', () => {
+    const log: DraftCommand[] = [
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
+      { path: 'addTodo', args: { id: 1, title: 'c' }, compactionKey: 'todo:1', kind: 'create' },
+    ]
+
+    const out = compactLog(log)
+
+    expect(out).toEqual([log[2]])
+  })
+
   test('delete of a canonical row supersedes prior updates of the same key', () => {
     const log: DraftCommand[] = [
       { path: 'renameTodo', args: { id: 9, title: 'x' }, compactionKey: 'todo:9', kind: 'update' },

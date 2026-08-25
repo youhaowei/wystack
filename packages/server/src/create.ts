@@ -225,9 +225,9 @@ export async function buildWyStack(opts: {
     ) {
       const fn = getFunction(path)
       // Handlers receive only the tracked read/write/transaction surface. A
-      // draft tracker implements transaction() as a fail-loud guard because
-      // publish owns its atomic boundary; raw SQL and scope-changing methods are
-      // intentionally unavailable in both the type and the runtime object.
+      // draft tracker implements transaction() as a fail-loud nested-transaction
+      // guard because lifecycle append/publish own the outer boundaries. Raw SQL
+      // and scope-changing methods are unavailable in both type and runtime.
       const ctx = { ...context, db: toProcedureDb(tracked) } as FunctionContext
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)

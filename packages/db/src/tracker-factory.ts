@@ -127,12 +127,11 @@ export function createDrizzleTracker(
           _opts?: TransactionOptions,
         ): Promise<R> {
           // ProcedureDb exposes transaction() on both canonical and draft handles.
-          // Draft execution rejects it here because publish owns the only atomic
-          // boundary for replaying the authoritative command log.
+          // A draft handler cannot nest a transaction; lifecycle append and
+          // publish own their respective outer operation boundaries.
           throw new Error(
             'DraftDrizzleTracker.transaction() is not supported: a draft handler cannot open its own ' +
-              'transaction — the draft atomic boundary is the lifecycle `publish` (which replays ' +
-              'the command log inside one tracked transaction).',
+              'transaction — lifecycle `append` and `publish` own the draft operation transactions.',
           )
         },
       }

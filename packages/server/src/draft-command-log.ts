@@ -11,7 +11,8 @@ export interface DraftCommand extends Command {
 /**
  * Conservatively compact commands that name the same logical cell. Updates
  * remain ordered because an opaque key cannot prove two commands are safely
- * mergeable; only histories made irrelevant by a delete are removed.
+ * mergeable. A later create supersedes earlier same-key draft history; a delete
+ * cancels a draft-local create history or supersedes canonical updates.
  */
 export function compactLog(log: DraftCommand[]): DraftCommand[] {
   const survivingCreate = new Map<string, number>()

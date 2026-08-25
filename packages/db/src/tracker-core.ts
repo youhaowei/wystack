@@ -386,9 +386,10 @@ export const drizzleOpMap = {
  * is writing into a draft.
  *
  * `transaction` is present but THROWS: ProcedureDb intentionally exposes the
- * same facade to canonical and draft handlers, while a draft's atomic boundary
- * is lifecycle publish. The explicit method keeps that substitution uniform
- * and provides the contract error at runtime.
+ * same facade to canonical and draft handlers, but draft handlers cannot open
+ * nested transactions. The lifecycle owns the outer operation boundaries:
+ * append commits derived writes with log metadata, and publish commits canonical
+ * replay with the derived-state sweep.
  */
 export interface DraftDrizzleTracker {
   tablesRead: Set<string>
@@ -397,7 +398,7 @@ export interface DraftDrizzleTracker {
   raw: DrizzleDb
   from<T extends AnyTable>(table: T): DraftSelectBuilder<T>
   into<T extends AnyTable>(table: T): DraftInsertBuilder<T>
-  /** Always throws — drafts have no per-handler transaction (publish owns atomicity). */
+  /** Always throws — lifecycle operations, not handlers, own draft transactions. */
   transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
