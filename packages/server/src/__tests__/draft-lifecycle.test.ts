@@ -225,7 +225,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(3)
+    expect((migration as any).rows[0].version).toBe(4)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -501,6 +501,27 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
 })
 
 describe('draft lifecycle — row-local revision conflicts', () => {
+  test('publishing one draft advances the revision so a stale sibling cannot overwrite it', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const first = await lifecycle.open(0)
+    const second = await lifecycle.open(0)
+    await lifecycle.append(first, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'first draft' } },
+    ])
+    await lifecycle.append(second, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'second draft' } },
+    ])
+
+    await lifecycle.publish(first)
+    await expect(lifecycle.publish(second)).rejects.toMatchObject({
+      conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
+    })
+
+    const { result } = await app.call('listVersionedTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'first draft', revision: 2 }])
+    expect(await lifecycle.getLog(second)).toHaveLength(1)
+  })
+
   test('publish rejects a concurrent revision change and leaves the draft retryable', async () => {
     const lifecycle = createDraftLifecycle(app)
     const draftId = await lifecycle.open(0)

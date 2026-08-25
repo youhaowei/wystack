@@ -113,6 +113,17 @@ beforeEach(async () => {
       canWithThrowingCheck: wy.procedure
         .input({})
         .query(async (ctx) => ctx.can(throwingPermission)),
+      inspectDbSurface: wy.procedure.input({}).query(async (ctx) => {
+        const dbSurface = ctx.db as unknown as Record<string, unknown>
+        return {
+          raw: 'raw' in dbSurface,
+          withTenant: 'withTenant' in dbSurface,
+          withDraft: 'withDraft' in dbSurface,
+          tablesRead: 'tablesRead' in dbSurface,
+          tablesWritten: 'tablesWritten' in dbSurface,
+          transaction: typeof dbSurface['transaction'] === 'function',
+        }
+      }),
     },
   })
 })
@@ -121,6 +132,18 @@ describe('defineApp().build()', () => {
   test('registers functions', () => {
     expect(app.functions.has('listTodos')).toBe(true)
     expect(app.functions.has('addTodo')).toBe(true)
+  })
+
+  test('keeps raw SQL, scope changes, and tracking state out of procedure custody', async () => {
+    const { result } = await app.call('inspectDbSurface', {})
+    expect(result).toEqual({
+      raw: false,
+      withTenant: false,
+      withDraft: false,
+      tablesRead: false,
+      tablesWritten: false,
+      transaction: true,
+    })
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

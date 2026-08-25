@@ -86,6 +86,17 @@ describe('composable table capabilities', () => {
     expect(getTableColumns(schema.records).tenantId.getSQLType()).toBe('uuid')
   })
 
+  test('multiTenant rejects a domain property that collides with the tenant SQL column', () => {
+    expect(() =>
+      multiTenant({
+        key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+      }).table({
+        id: uuid.primaryKey(),
+        workspace_id: text,
+      }),
+    ).toThrow('SQL column "workspace_id"')
+  })
+
   test('revision and draft capabilities compose in either order', () => {
     const first = table({ id: uuid.primaryKey(), revision: int, name: text })
       .revision('revision')
@@ -103,6 +114,12 @@ describe('composable table capabilities', () => {
       draftable: true,
       revisionProperty: 'version',
     })
+  })
+
+  test('revision columns are framework-managed integers', () => {
+    expect(() => table({ id: uuid.primaryKey(), revision: text }).revision('revision')).toThrow(
+      'must be an integer',
+    )
   })
 
   test('one schema cannot mix tenancy descriptors', () => {

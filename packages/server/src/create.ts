@@ -2,7 +2,7 @@
 import { createDrizzleTracker, createDb } from '@wystack/db'
 import type { DbConfig, DrizzleTracker, DraftDrizzleTracker } from '@wystack/db'
 import { evaluate, type Permission } from '@wystack/permissions'
-import type { FunctionDef, FunctionContext, DbInput } from './types'
+import type { FunctionDef, FunctionContext, DbInput, ProcedureDb } from './types'
 import { assertPermissionIds } from './permissions'
 import { createSubscriptionManager } from './subscriptions'
 import {
@@ -99,6 +99,17 @@ function resolveDbConfig(db: DbInput): DbConfig | null {
   return null // Pre-built Drizzle instance
 }
 
+function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
+  return {
+    from: tracked.from.bind(tracked) as ProcedureDb['from'],
+    into: tracked.into.bind(tracked) as ProcedureDb['into'],
+    transaction: async <R>(
+      fn: (tx: ProcedureDb) => Promise<R>,
+      opts?: Parameters<ProcedureDb['transaction']>[1],
+    ) => tracked.transaction((tx) => fn(toProcedureDb(tx)), opts),
+  }
+}
+
 export async function buildWyStack(opts: {
   db: DbInput
   dialect?: 'postgres'
@@ -178,12 +189,11 @@ export async function buildWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      // A DraftDrizzleTracker shares the from/into/where/all/insert/update/delete
-      // surface handlers use; the cast bridges the structural difference in
-      // builder return types (DraftSelectBuilder vs SelectBuilder) that handlers
-      // never observe. The draft handle has no `transaction` (publish owns the
-      // atomic boundary), which a command handler must not call directly.
-      const ctx = { ...context, db: tracked as DrizzleTracker } as FunctionContext
+      // Handlers receive only the tracked read/write/transaction surface. A
+      // draft tracker implements transaction() as a fail-loud guard because
+      // publish owns its atomic boundary; raw SQL and scope-changing methods are
+      // intentionally unavailable in both the type and the runtime object.
+      const ctx = { ...context, db: toProcedureDb(tracked) } as FunctionContext
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
       return fn.handler(ctx, args)

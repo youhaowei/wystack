@@ -31,6 +31,7 @@ export type {
   MutationDef,
   ActionDef,
   FunctionContext,
+  ProcedureDb,
   FunctionDef,
   InferArgs,
   InferArg,

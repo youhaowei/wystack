@@ -18,6 +18,11 @@ const items = pgTable('draft_items', {
   payload: jsonb('payload'),
 })
 
+const defaultedItems = pgTable('draft_defaulted_items', {
+  id: integer('id').primaryKey(),
+  label: text('label').notNull().default('new'),
+})
+
 const audit = pgSchema('draft_audit')
 const auditItems = audit.table('draft_items', {
   id: integer('id').primaryKey(),
@@ -45,6 +50,10 @@ beforeEach(async () => {
       score INTEGER NOT NULL,
       note TEXT,
       payload JSONB
+    )`,
+    `CREATE TABLE draft_defaulted_items (
+      id INTEGER PRIMARY KEY,
+      label TEXT NOT NULL DEFAULT 'new'
     )`,
     `CREATE SCHEMA draft_audit`,
     `CREATE TABLE draft_audit.draft_items (
@@ -130,6 +139,18 @@ describe('durable central draft overlay', () => {
     expect((await enumerateDraftRowChanges(db, 'd-ops')).map((change) => change.operation)).toEqual(
       ['delete', 'insert'],
     )
+  })
+
+  test('materializes database defaults in a draft insert', async () => {
+    const draft = tracked.withDraft('d-default')
+
+    expect(await draft.into(defaultedItems).insert({ id: 1 })).toEqual([{ id: 1, label: 'new' }])
+    expect(await draft.from(defaultedItems).where(eq('label', 'new')).all()).toEqual([
+      { id: 1, label: 'new' },
+    ])
+    expect(await tracked.from(defaultedItems).all()).toEqual([])
+
+    expect(await tracked.into(defaultedItems).insert({ id: 2 })).toEqual([{ id: 2, label: 'new' }])
   })
 
   test('updates a newly drafted row through the same effective filter path', async () => {

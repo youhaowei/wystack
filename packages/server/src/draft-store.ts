@@ -29,7 +29,7 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-const draftStorageVersion = 3
+const draftStorageVersion = 4
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -113,6 +113,41 @@ const storageDdlV3 = [
     END $$`),
 ]
 
+// v3 had to add pk_type to the v2 touched-table shape, but its DEFAULT 'text'
+// silently mislabeled live integer and UUID drafts. Rebuild the metadata from
+// PostgreSQL's catalog. If a referenced canonical table/column is gone or has
+// an unsupported identity type, stop the migration instead of preserving a
+// draft that can only fail later during publish with an invalid cast.
+const storageDdlV4 = [
+  sql.raw(`ALTER TABLE wystack_draft_tables ALTER COLUMN pk_type DROP NOT NULL`),
+  sql.raw(`ALTER TABLE wystack_draft_tables ALTER COLUMN pk_type DROP DEFAULT`),
+  sql.raw(`UPDATE wystack_draft_tables SET pk_type = NULL`),
+  sql.raw(`UPDATE wystack_draft_tables d
+    SET pk_type = CASE t.typname
+      WHEN 'int2' THEN 'smallint'
+      WHEN 'int4' THEN 'integer'
+      WHEN 'int8' THEN 'bigint'
+      WHEN 'text' THEN 'text'
+      WHEN 'varchar' THEN 'varchar'
+      WHEN 'uuid' THEN 'uuid'
+      ELSE NULL
+    END
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+    WHERE n.nspname = COALESCE(NULLIF(d.schema_name, ''), current_schema())
+      AND c.relname = d.table_name
+      AND a.attname = d.pk_column`),
+  sql.raw(`DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM wystack_draft_tables WHERE pk_type IS NULL) THEN
+        RAISE EXCEPTION 'draft storage migration cannot resolve an active draft primary-key type';
+      END IF;
+    END $$`),
+  sql.raw(`ALTER TABLE wystack_draft_tables ALTER COLUMN pk_type SET NOT NULL`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await raw.execute(migrationTableDdl)
   const rows = normalizeRows(
@@ -138,6 +173,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   }
   if (installedVersion < 3) {
     for (const statement of storageDdlV3) await raw.execute(statement)
+  }
+  if (installedVersion < 4) {
+    for (const statement of storageDdlV4) await raw.execute(statement)
   }
   await raw.execute(sql`
     INSERT INTO wystack_framework_migrations (migration_name, version)

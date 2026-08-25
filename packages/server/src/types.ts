@@ -1,4 +1,11 @@
-import type { DrizzleTracker, AnyColumnDef, ColumnDef, InferColumn, DbConfig } from '@wystack/db'
+import type {
+  DrizzleTracker,
+  AnyColumnDef,
+  ColumnDef,
+  InferColumn,
+  DbConfig,
+  TransactionOptions,
+} from '@wystack/db'
 import type { Permission } from '@wystack/permissions'
 
 /** Replaces properties in T with the corresponding properties from U. */
@@ -21,9 +28,15 @@ export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
 // oxlint-disable-next-line typescript/no-explicit-any -- permissions remain contravariant over app-specific contexts
 export type Can = (permission: Permission<any>) => Promise<boolean>
 
+/** Database surface available to application procedures. Tenant/draft binding,
+ * raw SQL, and tracking sets remain framework custody. */
+export type ProcedureDb = Pick<DrizzleTracker, 'from' | 'into'> & {
+  transaction<R>(fn: (tx: ProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+}
+
 /** Function context passed to every query/mutation/action handler. */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
-  db: DrizzleTracker
+  db: ProcedureDb
   can: Can
 }
 

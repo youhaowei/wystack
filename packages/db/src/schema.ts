@@ -142,7 +142,11 @@ function buildTable(
   for (const [property, definition] of Object.entries(columns)) {
     const sqlName =
       capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
-    colDefs[property] = buildColumn(property, definition.opts, allTables, sqlName)
+    const opts =
+      capabilities.revisionProperty === property
+        ? { ...definition.opts, hasDefault: true, defaultValue: 1 }
+        : definition.opts
+    colDefs[property] = buildColumn(property, opts, allTables, sqlName)
   }
 
   const tenant = capabilities.tenancy

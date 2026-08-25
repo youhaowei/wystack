@@ -46,6 +46,9 @@ export class TableDefinition<
     if (definition.opts.isArray || definition.opts.isOptional || definition.opts.isNullable) {
       throw new Error(`Revision property "${property}" must be a required, non-null scalar`)
     }
+    if (definition.opts.type !== 'int') {
+      throw new Error(`Revision property "${property}" must be an integer`)
+    }
     return new TableDefinition(this.columns, {
       ...this.capabilities,
       revisionProperty: property,
@@ -101,6 +104,11 @@ export function multiTenant(
       if (Object.hasOwn(columns, key.property)) {
         throw new Error(
           `multiTenant table cannot declare tenant property "${key.property}"; it is injected by the tenancy descriptor`,
+        )
+      }
+      if (key.column !== key.property && Object.hasOwn(columns, key.column)) {
+        throw new Error(
+          `multiTenant table cannot declare SQL column "${key.column}"; it is reserved for the injected tenant key`,
         )
       }
       const withTenant = {
