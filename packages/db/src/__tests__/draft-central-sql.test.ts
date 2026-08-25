@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { integer, jsonb, pgSchema, pgTable, text, timestamp } from 'drizzle-orm/pg-core'
+import { integer, jsonb, pgSchema, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { createDrizzleTracker, draftJsonNull, enumerateDraftRowChanges } from '../drizzle-tracker'
 import { eq, gt, lt } from '../operators'
@@ -26,6 +26,11 @@ const defaultedItems = pgTable('draft_defaulted_items', {
 const dynamicDefaultItems = pgTable('draft_dynamic_default_items', {
   id: integer('id').primaryKey(),
   createdAt: timestamp('created_at').notNull().defaultNow(),
+})
+
+const generatedDefaultItems = pgTable('draft_generated_default_items', {
+  id: integer('id').primaryKey(),
+  sequenceNumber: serial('sequence_number').notNull(),
 })
 
 const audit = pgSchema('draft_audit')
@@ -63,6 +68,10 @@ beforeEach(async () => {
     `CREATE TABLE draft_dynamic_default_items (
       id INTEGER PRIMARY KEY,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE draft_generated_default_items (
+      id INTEGER PRIMARY KEY,
+      sequence_number SERIAL NOT NULL
     )`,
     `CREATE SCHEMA draft_audit`,
     `CREATE TABLE draft_audit.draft_items (
@@ -169,6 +178,15 @@ describe('durable central draft overlay', () => {
       'resolve it into the command input',
     )
     expect(await enumerateDraftRowChanges(db, 'd-dynamic-default')).toEqual([])
+  })
+
+  test('rejects omitted generated defaults that have no durable literal value', async () => {
+    const draft = tracked.withDraft('d-generated-default')
+
+    await expect(draft.into(generatedDefaultItems).insert({ id: 1 })).rejects.toThrow(
+      'resolve it into the command input',
+    )
+    expect(await enumerateDraftRowChanges(db, 'd-generated-default')).toEqual([])
   })
 
   test('updates a newly drafted row through the same effective filter path', async () => {

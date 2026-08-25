@@ -18,6 +18,7 @@ export {
   draftInvalidationIdentity,
 } from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
+export { ensureRowRevisionStorage } from './row-revisions'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
 export { eq, ne, gt, gte, lt, lte } from './operators'
 

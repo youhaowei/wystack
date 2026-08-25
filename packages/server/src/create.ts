@@ -1,5 +1,5 @@
 /** Wires DB, functions, and reactive subscriptions into a running app. */
-import { createDrizzleTracker, createDb } from '@wystack/db'
+import { createDrizzleTracker, createDb, ensureRowRevisionStorage } from '@wystack/db'
 import type { DbConfig, DrizzleTracker, DraftDrizzleTracker } from '@wystack/db'
 import { evaluate, type Permission } from '@wystack/permissions'
 import type { FunctionDef, FunctionContext, DbInput, ProcedureDb } from './types'
@@ -166,6 +166,7 @@ export async function buildWyStack(opts: {
   // Resolve DB: either use createDb for config, or treat as raw Drizzle instance
   const dbConfig = resolveDbConfig(opts.db)
   const drizzleDb = dbConfig ? await createDb(dbConfig) : opts.db
+  await ensureRowRevisionStorage(drizzleDb)
 
   for (const [path, def] of Object.entries(opts.functions)) {
     def.path = path

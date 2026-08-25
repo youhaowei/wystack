@@ -386,7 +386,14 @@ export class DraftSelectBuilder<T extends AnyTable> {
     const orderBy = sql.raw(orderByClause)
     const limitVal = limitOverride ?? this._clauses.limitVal
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
-    const sqlOperators = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' } as const
+    const sqlOperators = {
+      eq: '=',
+      ne: '<>',
+      gt: '>',
+      gte: '>=',
+      lt: '<',
+      lte: '<=',
+    } as const
     const filterFragments = this._clauses.filters.map((filter) => {
       const column = requireColumn(columns, filter.column)
       return sql`${sql.raw(
@@ -476,17 +483,9 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   /**
-   * Coalesced first-row read. Mirrors `SelectBuilder.first()` so an UNMODIFIED
-   * handler that calls `ctx.db.from(table).where(eq('id', x)).first()` works
-   * inside a draft (the `runHandler` widening hides the structural gap from the
-   * typechecker). Shares the effective-row filter lowering with `all()`;
-   * any supported canonical filter can select the first matching draft row.
-   *
-   * Lowers `LIMIT 1` as an override rather than setting `_clauses.limitVal`, for the
-   * same reason as `SelectBuilder.first()` — that field is what the write guard
-   * reads to tell a caller-attached `limit()` from an internal one. Before the
-   * limit was pushed down at all, this had to fetch the whole coalesced set to
-   * return one row.
+   * Mirrors canonical `first()` through the same effective-row filter lowering.
+   * `LIMIT 1` is an override, not `_clauses.limitVal`, because the write guard
+   * reserves that field for a limit explicitly attached by the caller.
    */
   async first(): Promise<Record<string, unknown> | null> {
     const rows = await this._coalescedRead(1)

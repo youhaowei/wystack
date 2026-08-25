@@ -60,14 +60,31 @@ export async function writeDraftRow(
   const tenantKey = tenantColumn
     ? encodeTypedKey(tenantColumn, tenant?.tenantId)
     : { envelope: null, text: '' }
+  const revisionProperty = tryGetTableCapabilities(table)?.revisionProperty
+  const revisionColumn = revisionProperty ? requireColumn(columns, revisionProperty) : undefined
 
   const valueCols = Object.entries(opts.values).flatMap(([property, value]) => {
     if (value === undefined || !Object.hasOwn(columns, property)) return []
     const column = columns[property]
     const sqlName = column.name as string
     if (sqlName === pkColName || sqlName === tenant?.tenancy.column) return []
-    return [{ column, sqlName, proposed: encodeProposedDraftValue(column, value) }]
+    return [
+      {
+        column,
+        sqlName,
+        proposed: encodeProposedDraftValue(column, value),
+        plannedRevision: false,
+      },
+    ]
   })
+  if (opts.intent === 'insert' && revisionColumn) {
+    valueCols.push({
+      column: revisionColumn,
+      sqlName: revisionColumn.name as string,
+      proposed: encodeProposedDraftValue(revisionColumn, 1),
+      plannedRevision: true,
+    })
+  }
 
   const basePredicates: SQL[] = [
     sql`${sql.raw(`${quoteSqlIdentifier(pkColName)} = `)}${sql.param(pkValue)}`,
@@ -77,33 +94,50 @@ export async function writeDraftRow(
       sql`${sql.raw(`${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(tenantValue)}`,
     )
   }
+  const revisionCte = revisionColumn
+    ? sql`${sql.raw(', revision_state AS (INSERT INTO wystack_row_revisions (table_key, tenant_key_text, row_key_text, revision) VALUES (')}${sql.param(
+        tableKey,
+      )}${sql.raw(', ')}${sql.param(tenantKey.text)}${sql.raw(', ')}${sql.param(
+        rowKey.text,
+      )}${sql.raw(
+        ', 0) ON CONFLICT (table_key, tenant_key_text, row_key_text) DO UPDATE SET revision = wystack_row_revisions.revision RETURNING revision)',
+      )}`
+    : sql.empty()
   const baseCte = sql`${sql.raw(`WITH base AS (SELECT * FROM ${baseRel} WHERE `)}${sql.join(
     basePredicates,
     sql.raw(' AND '),
-  )}${sql.raw(' FOR UPDATE) ')}`
+  )}${sql.raw(' FOR UPDATE)')}${revisionCte}${sql.raw(' ')}`
 
   const basePresent = `b.${quoteSqlIdentifier(pkColName)} IS NOT NULL`
-  const fieldPairs = valueCols.flatMap(({ column, sqlName, proposed }, index) => {
+  const fieldPairs = valueCols.flatMap(({ column, sqlName, proposed, plannedRevision }, index) => {
     const kind = ['json', 'jsonb'].includes(draftCastType(column)) ? 'json' : 'value'
     const original =
       `CASE WHEN NOT (${basePresent}) THEN '{"kind":"absent"}'::jsonb ` +
       `WHEN b.${quoteSqlIdentifier(sqlName)} IS NULL THEN '{"kind":"sql-null"}'::jsonb ` +
       `ELSE jsonb_build_object('kind', ${sqlLiteral(kind)}, 'value', to_jsonb(b.${quoteSqlIdentifier(sqlName)})) END`
+    const proposedValue = plannedRevision
+      ? sql.raw(
+          `jsonb_build_object('kind', 'value', 'value', to_jsonb(CASE WHEN ${basePresent} ` +
+            `THEN b.${quoteSqlIdentifier(sqlName)} + 1 ` +
+            `ELSE COALESCE((SELECT revision FROM revision_state), 0) + 1 END))`,
+        )
+      : sql`${sql.param(JSON.stringify(proposed))}${sql.raw('::jsonb')}`
     const separator = index === 0 ? '' : ', '
     return [
       sql`${sql.raw(
         `${separator}${sqlLiteral(sqlName)}, jsonb_build_object('original', ${original}, 'value', `,
-      )}${sql.param(JSON.stringify(proposed))}${sql.raw('::jsonb)')}`,
+      )}${proposedValue}${sql.raw(')')}`,
     ]
   })
   const fieldsExpression = fieldPairs.length
     ? sql`${sql.raw('jsonb_build_object(')}${sql.join(fieldPairs, sql.raw(''))}${sql.raw(')')}`
     : sql.raw("'{}'::jsonb")
 
-  const revisionProperty = tryGetTableCapabilities(table)?.revisionProperty
-  const revisionColumn = revisionProperty ? requireColumn(columns, revisionProperty) : undefined
   const baseRevision = revisionColumn
-    ? sql.raw(`to_jsonb(b.${quoteSqlIdentifier(revisionColumn.name as string)})`)
+    ? sql.raw(
+        `CASE WHEN ${basePresent} THEN to_jsonb(b.${quoteSqlIdentifier(revisionColumn.name as string)}) ` +
+          `ELSE (SELECT to_jsonb(revision) FROM revision_state) END`,
+      )
     : sql.raw('NULL::jsonb')
   const tenantJson = tenantColumn
     ? sql`${sql.param(JSON.stringify(tenantKey.envelope))}${sql.raw('::jsonb')}`
@@ -144,27 +178,39 @@ function materializeDraftInsertDefaults(
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
   columns: Record<string, any>,
   supplied: Record<string, unknown>,
-  pkProperty: string,
+  systemProperties: Set<string>,
 ): Record<string, unknown> {
   const row = withoutUndefined(supplied)
   for (const [property, column] of Object.entries(columns)) {
-    if (property === pkProperty || Object.hasOwn(row, property) || !column.hasDefault) continue
-    if (typeof column.defaultFn === 'function') {
-      throw new Error(
-        `Draft insert default for "${property}" is generated at execution time; resolve it into the command input so publish reuses the same value`,
-      )
+    if (systemProperties.has(property) || Object.hasOwn(row, property)) continue
+    if (column.hasDefault) {
+      if (typeof column.defaultFn === 'function') {
+        throw new Error(
+          `Draft insert default for "${property}" is generated at execution time; resolve it into the command input so publish reuses the same value`,
+        )
+      }
+      if (
+        column.default !== null &&
+        typeof column.default === 'object' &&
+        typeof column.default.getSQL === 'function'
+      ) {
+        throw new Error(
+          `Draft insert default for "${property}" is generated by SQL; resolve it into the command input so publish reuses the same value`,
+        )
+      }
+      if (column.default === undefined) {
+        throw new Error(
+          `Draft insert default for "${property}" is generated at execution time; resolve it into the command input so publish reuses the same value`,
+        )
+      }
+      row[property] = column.default
+      continue
     }
-    if (column.default === undefined) continue
-    if (
-      column.default !== null &&
-      typeof column.default === 'object' &&
-      typeof column.default.getSQL === 'function'
-    ) {
-      throw new Error(
-        `Draft insert default for "${property}" is generated by SQL; resolve it into the command input so publish reuses the same value`,
-      )
+    if (!column.notNull) {
+      row[property] = null
+      continue
     }
-    row[property] = column.default
+    throw new Error(`Draft insert is missing required property "${property}"`)
   }
   return row
 }
@@ -213,8 +259,16 @@ export class DraftInsertBuilder<T extends AnyTable> {
       const supplied = row as Record<string, unknown>
       assertRevisionInput(this._table, supplied)
       const revision = revisionProperty(this._table)
-      const withRevision = revision ? { ...supplied, [revision]: 1 } : supplied
-      const r = materializeDraftInsertDefaults(columns, withRevision, pkPropKey ?? pkColName)
+      const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
+      const r = materializeDraftInsertDefaults(
+        columns,
+        supplied,
+        new Set([
+          pkPropKey ?? pkColName,
+          ...(tenantProperty ? [tenantProperty] : []),
+          ...(revision ? [revision] : []),
+        ]),
+      )
       assertTenantInput(this._table, r)
       const pkValue = pkPropKey !== undefined ? r[pkPropKey] : r[pkColName]
       if (pkValue === undefined || pkValue === null) {

@@ -29,7 +29,10 @@ function normalizeTableDefinition(definition: unknown): {
   capabilities: TableCapabilities
 } {
   if (definition instanceof TableDefinition) {
-    return { columns: definition.columns, capabilities: definition.capabilities }
+    return {
+      columns: definition.columns,
+      capabilities: definition.capabilities,
+    }
   }
   throw new Error('defineSchema entries must use table(...) or multiTenant(...).table(...)')
 }
@@ -237,6 +240,24 @@ function buildDraftChangesTable() {
   )
 }
 
+/** Durable per-row incarnation tokens prevent delete/reinsert from resetting CAS to 1. */
+function buildRowRevisionsTable() {
+  return pgTable(
+    'wystack_row_revisions',
+    {
+      tableKey: pgText('table_key').notNull(),
+      tenantKeyText: pgText('tenant_key_text').notNull().default(''),
+      rowKeyText: pgText('row_key_text').notNull(),
+      revision: integer('revision').notNull(),
+    },
+    (row) => [
+      primaryKey({
+        columns: [row.tableKey, row.tenantKeyText, row.rowKeyText],
+      }),
+    ],
+  )
+}
+
 export function defineSchema<const T extends Record<string, unknown>>(
   tables: T & { [K in keyof T]: AnyTableDefinition },
 ) {
@@ -288,7 +309,13 @@ export function defineSchema<const T extends Record<string, unknown>>(
       )
     }
   }
-  const generated: PgTable[] = draftableEntries.length > 0 ? [buildDraftChangesTable()] : []
+  const revisionedEntries = Object.values(tables).filter(
+    (definition) => normalizeTableDefinition(definition).capabilities.revisionProperty,
+  )
+  const generated: PgTable[] = [
+    ...(draftableEntries.length > 0 ? [buildDraftChangesTable()] : []),
+    ...(revisionedEntries.length > 0 ? [buildRowRevisionsTable()] : []),
+  ]
   generatedTables.set(compiled, generated)
   return compiled
 }

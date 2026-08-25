@@ -107,9 +107,10 @@ export function resolvePkColumnName(
  * INSERT/UPDATE lowering. A `null`/`undefined` is passed through untouched: a
  * codec like `jsonb`'s `JSON.stringify` would otherwise turn `null` into the
  * literal string `"null"` (and `undefined` into `undefined`), corrupting the
- * "no override" sentinel the sparse overlay read relies on. For every supported column
- * type, a real value (`fields: [...]`, `done: true`) is the only case that needs
- * a non-identity codec, and those are never null.
+ * sparse-overlay semantics. Callers omit `undefined` before encoding; a
+ * preserved `null` is an explicit SQL NULL and is encoded as `sql-null`.
+ * Concrete values (`fields: [...]`, `done: true`) are the cases that need a
+ * non-identity codec.
  */
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
 export function mapColumnValue(col: any, value: unknown): unknown {
@@ -124,11 +125,11 @@ export function mapColumnValue(col: any, value: unknown): unknown {
  * method — defined as identity on the base `Column` and overridden per type
  * (jsonb/json → `JSON.parse`-when-string, timestamp → `Date`, …).
  *
- * `null`/`undefined` is passed through untouched, mirroring the write side: a
- * coalesced row carries already-merged columns (no `__tombstone` column in the
- * output), and a NULL there means "no override / SQL NULL" — never a value to
- * decode. (jsonb's `mapFromDriverValue` is string-guarded, so it would no-op on
- * null anyway, but the explicit passthrough keeps the read/write symmetry exact.)
+ * `null`/`undefined` is passed through untouched, mirroring the write side.
+ * Callers omit `undefined`; a NULL in a coalesced row is the explicit SQL NULL
+ * selected by canonical data or a draft override, never a no-change sentinel.
+ * (jsonb's decoder would already no-op on null, but the explicit passthrough
+ * keeps read/write symmetry exact.)
  */
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
 export function mapColumnValueFromDriver(col: any, value: unknown): unknown {
@@ -136,20 +137,6 @@ export function mapColumnValueFromDriver(col: any, value: unknown): unknown {
   return col.mapFromDriverValue(value)
 }
 
-/**
- * Core draft WRITE primitive: upsert ONE sparse row into the central change relation.
- *
- * Sparse semantics — `fields` contains only proposals supplied by this write.
- * ON CONFLICT it preserves every first-touch `original` and replaces only the
- * current proposal, so successive edits accumulate without clobbering.
- *
- * `draftId` and every value are sent as BOUND parameters via the Drizzle `sql`
- * tag (guard-the-sink). Table/column names come from schema introspection (not
- * user input) and are double-quoted, safe as raw SQL fragments.
- *
- * Records the explicit draft invalidation identity so this write invalidates
- * only readers of this draft, not canonical or other-draft readers.
- */
 import { getTableName } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { AnyTable } from './tracker-core'

@@ -21,6 +21,7 @@ import {
 import { SelectBuilder } from './select-builder'
 import { DraftSelectBuilder } from './draft-select-builder'
 import { DraftInsertBuilder } from './draft-mutations'
+import { allocateRowRevision } from './row-revisions'
 
 export class InsertBuilder<T extends AnyTable> {
   private _table: T
@@ -38,15 +39,24 @@ export class InsertBuilder<T extends AnyTable> {
   async insert(values: T['$inferInsert'] | T['$inferInsert'][]) {
     const rows = Array.isArray(values) ? values : [values]
     const tenant = requireTenantScope(this._table, this._tenantScope)
+    const revision = revisionProperty(this._table)
     const scopedRows = rows.map((row) => {
       const record = row as Record<string, unknown>
       assertTenantInput(this._table, record)
       assertRevisionInput(this._table, record)
-      const revision = revisionProperty(this._table)
-      const sanitized = withoutUndefined(revision ? { ...record, [revision]: 1 } : record)
+      const sanitized = withoutUndefined(record)
       return tenant ? { ...sanitized, [tenant.tenancy.property]: tenant.tenantId } : sanitized
     })
-    const inserted = await this._db.insert(this._table).values(scopedRows).returning()
+    const inserted = revision
+      ? await this._db.transaction(async (tx: DrizzleDb) => {
+          const rowsWithRevisions = []
+          for (const row of scopedRows) {
+            const token = await allocateRowRevision(tx, this._table, this._tenantScope, row)
+            rowsWithRevisions.push({ ...row, [revision]: token })
+          }
+          return tx.insert(this._table).values(rowsWithRevisions).returning()
+        })
+      : await this._db.insert(this._table).values(scopedRows).returning()
     this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return inserted
   }
@@ -116,10 +126,9 @@ export function createDrizzleTracker(
           _fn: (tx: DrizzleTracker) => Promise<R>,
           _opts?: TransactionOptions,
         ): Promise<R> {
-          // A command handler must not open its own transaction inside a draft —
-          // the draft's atomic boundary is the lifecycle's `publish` (one tracked
-          // tx via applyCommands). Fail loud with a named contract message rather
-          // than a cryptic `undefined is not a function` from the runHandler cast.
+          // ProcedureDb exposes transaction() on both canonical and draft handles.
+          // Draft execution rejects it here because publish owns the only atomic
+          // boundary for replaying the authoritative command log.
           throw new Error(
             'DraftDrizzleTracker.transaction() is not supported: a draft handler cannot open its own ' +
               'transaction — the draft atomic boundary is the lifecycle `publish` (which replays ' +

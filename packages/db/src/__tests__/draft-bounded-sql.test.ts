@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgTable, text } from 'drizzle-orm/pg-core'
@@ -8,6 +8,8 @@ import { eq, gt, gte, lt, lte, ne, type FilterDescriptor } from '../operators'
 import { defineSchema } from '../schema'
 import { syncSchema } from '../sync'
 import { multiTenant } from '../table'
+
+const DRAFT_ID = 'bounded-draft'
 
 const sourceItems = pgTable('bounded_source_items', {
   id: integer('id').primaryKey(),
@@ -32,13 +34,39 @@ const tenantSchema = defineSchema({
     .draftable(),
 })
 
-let pg: PGlite
-let db: ReturnType<typeof drizzle>
-let tracked: ReturnType<typeof createDrizzleTracker>
+const parityCases: Array<{
+  name: string
+  filter: FilterDescriptor
+  direction: 'asc' | 'desc'
+  limit: number
+}> = [
+  {
+    name: 'greater than',
+    filter: gt('score', 50),
+    direction: 'desc',
+    limit: 3,
+  },
+  {
+    name: 'greater than or equal',
+    filter: gte('score', 40),
+    direction: 'asc',
+    limit: 4,
+  },
+  { name: 'less than', filter: lt('score', 90), direction: 'desc', limit: 2 },
+  {
+    name: 'less than or equal',
+    filter: lte('score', 80),
+    direction: 'asc',
+    limit: 5,
+  },
+  { name: 'not equal', filter: ne('score', 70), direction: 'desc', limit: 6 },
+  { name: 'equal', filter: eq('score', 80), direction: 'asc', limit: 1 },
+]
 
-beforeEach(async () => {
-  pg = new PGlite()
-  db = drizzle(pg)
+async function createBoundedReadHarness() {
+  const pg = new PGlite()
+  const db = drizzle(pg)
+
   await pg.exec(`
     CREATE TABLE bounded_source_items (
       id INTEGER PRIMARY KEY,
@@ -74,33 +102,59 @@ beforeEach(async () => {
       (7, 'seven', 40, 'seven-note'), (8, 'eight', 30, 'eight-note');
     INSERT INTO bounded_canonical_twin SELECT * FROM bounded_source_items;
   `)
+
   await syncSchema(db, tenantSchema)
-  tracked = createDrizzleTracker(db)
-})
+  const tracker = createDrizzleTracker(db)
 
-async function applyEquivalentChanges() {
-  const draft = tracked.withDraft('bounded-draft')
-  await draft.from(sourceItems).where(eq('id', 1)).update({ score: 5 })
-  await draft.from(sourceItems).where(eq('id', 2)).delete()
-  await draft.from(sourceItems).where(eq('id', 7)).update({ score: 95 })
-  await draft.into(sourceItems).insert({ id: 9, title: 'nine', score: 85, note: 'nine-note' })
-  await draft.from(sourceItems).where(eq('id', 6)).update({ note: null })
-  await draft.from(sourceItems).where(eq('id', 8)).update({ title: 'aardvark' })
+  async function updateBoth(id: number, values: Partial<typeof sourceItems.$inferInsert>) {
+    await tracker.withDraft(DRAFT_ID).from(sourceItems).where(eq('id', id)).update(values)
+    await tracker.from(canonicalTwin).where(eq('id', id)).update(values)
+  }
 
-  await tracked.from(canonicalTwin).where(eq('id', 1)).update({ score: 5 })
-  await tracked.from(canonicalTwin).where(eq('id', 2)).delete()
-  await tracked.from(canonicalTwin).where(eq('id', 7)).update({ score: 95 })
-  await tracked.into(canonicalTwin).insert({ id: 9, title: 'nine', score: 85, note: 'nine-note' })
-  await tracked.from(canonicalTwin).where(eq('id', 6)).update({ note: null })
-  await tracked.from(canonicalTwin).where(eq('id', 8)).update({ title: 'aardvark' })
+  async function deleteBoth(id: number) {
+    await tracker.withDraft(DRAFT_ID).from(sourceItems).where(eq('id', id)).delete()
+    await tracker.from(canonicalTwin).where(eq('id', id)).delete()
+  }
+
+  async function insertBoth(row: typeof sourceItems.$inferInsert) {
+    await tracker.withDraft(DRAFT_ID).into(sourceItems).insert(row)
+    await tracker.into(canonicalTwin).insert(row)
+  }
+
+  return {
+    tracker,
+    draftItems: () => tracker.withDraft(DRAFT_ID).from(sourceItems),
+    canonicalItems: () => tracker.from(canonicalTwin),
+    async applyBoundaryCrossingScenario() {
+      await updateBoth(1, { score: 5 })
+      await deleteBoth(2)
+      await updateBoth(7, { score: 95 })
+      await insertBoth({ id: 9, title: 'nine', score: 85, note: 'nine-note' })
+      await updateBoth(6, { note: null })
+      await updateBoth(8, { title: 'aardvark' })
+    },
+    close: () => pg.close(),
+  }
 }
 
-describe('bounded SQL effective-query plan', () => {
-  test('lowers top L + M base candidates plus every changed canonical key', async () => {
-    await applyEquivalentChanges()
-    const lowered = tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
+type BoundedReadHarness = Awaited<ReturnType<typeof createBoundedReadHarness>>
+
+let harness: BoundedReadHarness
+
+beforeEach(async () => {
+  harness = await createBoundedReadHarness()
+})
+
+afterEach(async () => {
+  await harness.close()
+})
+
+describe('bounded SQL plan shape', () => {
+  test('selects canonical L + M candidates and every changed canonical key', async () => {
+    await harness.applyBoundaryCrossingScenario()
+
+    const lowered = harness
+      .draftItems()
       .where(gte('score', 50))
       .orderBy('score', 'desc')
       .limit(3)
@@ -117,46 +171,53 @@ describe('bounded SQL effective-query plan', () => {
     expect(lowered.sql).toContain('ORDER BY c."score" DESC, c."id"')
   })
 
-  test('matches an independently materialized canonical twin across filter operators and limits', async () => {
-    await applyEquivalentChanges()
-    const cases: Array<{
-      filter: FilterDescriptor
-      direction: 'asc' | 'desc'
-      limit: number
-    }> = [
-      { filter: gt('score', 50), direction: 'desc', limit: 3 },
-      { filter: gte('score', 40), direction: 'asc', limit: 4 },
-      { filter: lt('score', 90), direction: 'desc', limit: 2 },
-      { filter: lte('score', 80), direction: 'asc', limit: 5 },
-      { filter: ne('score', 70), direction: 'desc', limit: 6 },
-      { filter: eq('score', 80), direction: 'asc', limit: 1 },
-    ]
+  test('uses filtered candidates when a filtered read has no limit', async () => {
+    await harness.applyBoundaryCrossingScenario()
 
-    for (const current of cases) {
-      const effective = await tracked
-        .withDraft('bounded-draft')
-        .from(sourceItems)
+    const filtered = harness.draftItems().where(gte('score', 50)).toSql()
+
+    expect(filtered.sql).toContain('WITH draft_delta AS')
+    expect(filtered.sql).not.toContain('(SELECT COUNT(*) FROM draft_delta)')
+    expect(filtered.sql).not.toContain('ORDER BY c.')
+  })
+
+  test('uses the exact full-join fallback for an unfiltered read', async () => {
+    await harness.applyBoundaryCrossingScenario()
+
+    const unfiltered = harness.draftItems().toSql()
+
+    expect(unfiltered.sql).not.toContain('WITH draft_delta AS')
+    expect(unfiltered.sql).toContain('FULL OUTER JOIN')
+  })
+})
+
+describe('bounded SQL result parity', () => {
+  for (const current of parityCases) {
+    test(`matches a materialized canonical twin for ${current.name} filters`, async () => {
+      await harness.applyBoundaryCrossingScenario()
+
+      const effective = await harness
+        .draftItems()
         .where(current.filter)
         .orderBy('score', current.direction)
         .limit(current.limit)
         .all()
-      const expected = await tracked
-        .from(canonicalTwin)
+      const expected = await harness
+        .canonicalItems()
         .where(current.filter)
         .orderBy('score', current.direction)
         .limit(current.limit)
         .all()
 
       expect(effective).toEqual(expected)
-    }
-  })
+    })
+  }
 
-  test('returns the expected top rows when changes enter, leave, insert, and delete', async () => {
-    await applyEquivalentChanges()
+  test('includes promoted and inserted rows while excluding demoted and deleted rows', async () => {
+    await harness.applyBoundaryCrossingScenario()
 
-    const rows = await tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
+    const rows = await harness
+      .draftItems()
       .where(gte('score', 50))
       .orderBy('score', 'desc')
       .limit(3)
@@ -169,85 +230,75 @@ describe('bounded SQL effective-query plan', () => {
     ])
   })
 
-  test('uses filtered candidates without a limit and retains a full-plan fallback for unfiltered reads', async () => {
-    await applyEquivalentChanges()
+  test('first returns the same row as the materialized canonical twin', async () => {
+    await harness.applyBoundaryCrossingScenario()
 
-    const filtered = tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
-      .where(gte('score', 50))
-      .toSql()
-    const unfiltered = tracked.withDraft('bounded-draft').from(sourceItems).toSql()
-
-    expect(filtered.sql).toContain('WITH draft_delta AS')
-    expect(filtered.sql).not.toContain('(SELECT COUNT(*) FROM draft_delta)')
-    expect(filtered.sql).not.toContain('ORDER BY c.')
-    expect(unfiltered.sql).not.toContain('WITH draft_delta AS')
-    expect(unfiltered.sql).toContain('FULL OUTER JOIN')
-  })
-
-  test('first and limit zero preserve canonical behavior', async () => {
-    await applyEquivalentChanges()
-
-    const effectiveFirst = await tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
+    const effective = await harness
+      .draftItems()
       .where(gte('score', 50))
       .orderBy('score', 'desc')
       .first()
-    const canonicalFirst = await tracked
-      .from(canonicalTwin)
+    const expected = await harness
+      .canonicalItems()
       .where(gte('score', 50))
       .orderBy('score', 'desc')
       .first()
-    const none = await tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
-      .where(gte('score', 50))
-      .limit(0)
-      .all()
 
-    expect(effectiveFirst).toEqual(canonicalFirst)
-    expect(none).toEqual([])
+    expect(effective).toEqual(expected)
   })
 
-  test('keeps SQL text and null ordering while projecting the bounded result', async () => {
-    await applyEquivalentChanges()
+  test('limit zero returns no rows', async () => {
+    await harness.applyBoundaryCrossingScenario()
 
-    const effectiveByNote = await tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
-      .select('id', 'note')
-      .orderBy('note', 'asc')
-      .limit(4)
-      .all()
-    const canonicalByNote = await tracked
-      .from(canonicalTwin)
-      .select('id', 'note')
-      .orderBy('note', 'asc')
-      .limit(4)
-      .all()
-    const effectiveByTitle = await tracked
-      .withDraft('bounded-draft')
-      .from(sourceItems)
+    const rows = await harness.draftItems().where(gte('score', 50)).limit(0).all()
+
+    expect(rows).toEqual([])
+  })
+
+  test('preserves PostgreSQL text ordering through a projection', async () => {
+    await harness.applyBoundaryCrossingScenario()
+
+    const effective = await harness
+      .draftItems()
       .select('id', 'title')
       .orderBy('title', 'asc')
       .limit(3)
       .all()
-    const canonicalByTitle = await tracked
-      .from(canonicalTwin)
+    const expected = await harness
+      .canonicalItems()
       .select('id', 'title')
       .orderBy('title', 'asc')
       .limit(3)
       .all()
 
-    expect(effectiveByNote).toEqual(canonicalByNote)
-    expect(effectiveByTitle).toEqual(canonicalByTitle)
+    expect(effective).toEqual(expected)
   })
 
-  test('scopes bounded candidates and changes to one tenant', async () => {
-    const alpha = tracked.withTenant('alpha')
-    const beta = tracked.withTenant('beta')
+  test('preserves PostgreSQL null ordering through a projection', async () => {
+    await harness.applyBoundaryCrossingScenario()
+
+    const effective = await harness
+      .draftItems()
+      .select('id', 'note')
+      .orderBy('note', 'asc')
+      .limit(4)
+      .all()
+    const expected = await harness
+      .canonicalItems()
+      .select('id', 'note')
+      .orderBy('note', 'asc')
+      .limit(4)
+      .all()
+
+    expect(effective).toEqual(expected)
+  })
+})
+
+describe('bounded SQL tenant isolation', () => {
+  test("the same draft ID cannot mix another tenant's candidates or changes", async () => {
+    const alpha = harness.tracker.withTenant('alpha')
+    const beta = harness.tracker.withTenant('beta')
+
     await alpha
       .into(tenantSchema.bounded_tenant_items)
       .insert({ id: 1, title: 'alpha one', score: 10 })

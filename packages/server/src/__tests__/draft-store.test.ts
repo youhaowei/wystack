@@ -22,8 +22,12 @@ describe('draft storage migrations', () => {
       `SELECT indexname FROM pg_indexes
        WHERE indexname = 'wystack_draft_row_changes_draft_table_idx'`,
     )
+    const revisionLedger = await db.execute(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name = 'wystack_row_revisions'`,
+    )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((migration as any).rows[0].version).toBe(4)
+    expect((migration as any).rows[0].version).toBe(5)
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((tables as any).rows.map((row: { table_name: string }) => row.table_name)).toEqual([
       'wystack_draft_commands',
@@ -33,6 +37,7 @@ describe('draft storage migrations', () => {
     ])
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((indexes as any).rows).toHaveLength(1)
+    expect((revisionLedger as { rows: unknown[] }).rows).toHaveLength(1)
   })
 
   test('upgrades v2 touched-table metadata without replacing durable rows', async () => {
@@ -141,5 +146,44 @@ describe('draft storage migrations', () => {
     ])
     expect((joined as { rows: unknown[] }).rows).toEqual([{ id: 7 }])
     expect((command as { rows: unknown[] }).rows).toHaveLength(1)
+  })
+
+  test('a v5 upgrade forces active revisioned drafts to rebase', async () => {
+    const pg = new PGlite()
+    const db = drizzle(pg)
+    await ensureDraftStorage(db)
+    await db.execute(`
+      INSERT INTO wystack_drafts (draft_id, base_version, tenant_scope, owner_key)
+      VALUES ('pre-v5', '{"present":true,"value":0}', '{"present":false}', '{"present":false}')
+    `)
+    await db.execute(`
+      INSERT INTO wystack_draft_tables
+        (draft_id, schema_name, table_name, pk_column, pk_type, revision_column)
+      VALUES ('pre-v5', '', 'versioned_items', 'id', 'integer', 'revision')
+    `)
+    await db.execute(`
+      INSERT INTO wystack_draft_row_changes
+        (draft_id, table_key, row_key_text, row_key, operation, base_exists, base_revision, fields)
+      VALUES ('pre-v5', 'versioned_items', '7', '{"type":"integer","value":7}',
+        'update', true, '1', '{}')
+    `)
+    await db.execute(`
+      UPDATE wystack_framework_migrations SET version = 4
+      WHERE migration_name = 'draft-storage'
+    `)
+
+    await ensureDraftStorage(db)
+
+    const change = await db.execute(`
+      SELECT base_revision FROM wystack_draft_row_changes WHERE draft_id = 'pre-v5'
+    `)
+    expect((change as { rows: Array<{ base_revision: unknown }> }).rows).toEqual([
+      {
+        base_revision: {
+          wystack: 'rebase-required',
+          reason: 'revision-ledger-upgrade',
+        },
+      },
+    ])
   })
 })

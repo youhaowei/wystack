@@ -123,8 +123,8 @@ export function assertTenantInput(table: AnyTable, values: Record<string, unknow
 }
 
 // Revision columns are framework-managed compare-and-swap tokens. Application
-// writes cannot choose them: inserts start at 1 and every successful update
-// advances the token in the same SQL statement as the domain change.
+// writes cannot choose them: inserts allocate a durable row-incarnation token
+// and every successful update advances it with the domain change.
 export function revisionProperty(table: AnyTable): string | undefined {
   return tryGetTableCapabilities(table)?.revisionProperty
 }
@@ -221,7 +221,10 @@ export interface ReadClauses {
 
 /** Fresh state for a builder with nothing attached. A factory, not a shared
  *  constant, so no two builders can ever alias one `filters` array. */
-export const emptyClauses = (): ReadClauses => ({ filters: [], orderDir: 'asc' })
+export const emptyClauses = (): ReadClauses => ({
+  filters: [],
+  orderDir: 'asc',
+})
 
 /**
  * Resolve a JS property key to its Drizzle column, or throw.
@@ -289,7 +292,10 @@ export function encodeProposedDraftValue(column: any, value: unknown): DraftStor
   const type = draftCastType(column)
   if (type === 'json' || type === 'jsonb') return { kind: 'json', value }
   const encoded = mapColumnValue(column, value)
-  return { kind: 'value', value: encoded instanceof Date ? encoded.toISOString() : encoded }
+  return {
+    kind: 'value',
+    value: encoded instanceof Date ? encoded.toISOString() : encoded,
+  }
 }
 
 function decodeJsonDriverValue(value: unknown): unknown {
@@ -379,13 +385,10 @@ export const drizzleOpMap = {
  * UNMODIFIED when `ctx.db = base.withDraft(draftId)`. The handler is unaware it
  * is writing into a draft.
  *
- * `transaction` is present but THROWS: a draft's atomic boundary is the
- * lifecycle's `publish` (which replays the command log inside `applyCommands`'s
- * tracked tx), not a per-handler transaction. It exists (rather than being
- * omitted) so a command handler that mistakenly opens a transaction inside a
- * draft fails with a clear named error instead of a cryptic
- * `undefined is not a function` — the `runHandler` widening erases the
- * structural difference, so the runtime guard is the only signal.
+ * `transaction` is present but THROWS: ProcedureDb intentionally exposes the
+ * same facade to canonical and draft handlers, while a draft's atomic boundary
+ * is lifecycle publish. The explicit method keeps that substitution uniform
+ * and provides the contract error at runtime.
  */
 export interface DraftDrizzleTracker {
   tablesRead: Set<string>

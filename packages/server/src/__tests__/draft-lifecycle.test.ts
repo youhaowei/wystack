@@ -26,6 +26,7 @@ import {
   int,
   boolean,
   jsonb,
+  timestamp,
   eq,
   draftInvalidationIdentity,
 } from '@wystack/db'
@@ -41,10 +42,19 @@ import { defineApp } from '../define-app'
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
-  todos: table({ id: int.primaryKey(), title: text, done: boolean }).draftable(),
+  todos: table({
+    id: int.primaryKey(),
+    title: text,
+    done: boolean,
+  }).draftable(),
   versionedTodos: table({ id: int.primaryKey(), title: text, revision: int })
     .revision('revision')
     .draftable(),
+  replaceableTodos: table({
+    id: int.primaryKey(),
+    title: text,
+    note: text.nullable(),
+  }).draftable(),
   settings: table({ id: int.primaryKey(), prefix: text }),
   // A "dashboard" with a jsonb-ish text column holding a comma-joined id list —
   // stands in for the intent-grouping case (add_to_dashboard merges into a node).
@@ -72,10 +82,16 @@ beforeEach(async () => {
   await db.execute(
     `CREATE TABLE "versionedTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, revision INTEGER NOT NULL)`,
   )
+  await db.execute(
+    `CREATE TABLE "replaceableTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, note TEXT)`,
+  )
   await db.execute(`CREATE TABLE settings (id INTEGER PRIMARY KEY, prefix TEXT NOT NULL)`)
   await db.execute(`INSERT INTO todos (id,title,done) VALUES (1,'apple',false),(2,'banana',false)`)
   await db.execute(`INSERT INTO dashboards (id,items) VALUES (1,'a')`)
   await db.execute(`INSERT INTO "versionedTodos" (id,title,revision) VALUES (1,'apple',1)`)
+  await db.execute(
+    `INSERT INTO "replaceableTodos" (id,title,note) VALUES (1,'original','old note')`,
+  )
   await db.execute(`INSERT INTO settings (id,prefix) VALUES (1,'from-setting')`)
 
   app = await wy.build({
@@ -85,10 +101,40 @@ beforeEach(async () => {
       listVersionedTodos: wy.procedure
         .input({})
         .query(async (ctx) => ctx.db.from(schema.versionedTodos).all()),
+      listReplaceableTodos: wy.procedure
+        .input({})
+        .query(async (ctx) => ctx.db.from(schema.replaceableTodos).all()),
       addTodo: wy.procedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      addTodoAt: wy.procedure.input({ id: int, createdAt: timestamp }).mutation(async (ctx, args) =>
+        ctx.db.into(schema.todos).insert({
+          id: args.id,
+          title: args.createdAt.toISOString(),
+          done: false,
+        }),
+      ),
+      addVersionedTodo: wy.procedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.versionedTodos).insert({ id: args.id, title: args.title }),
+        ),
+      removeVersionedTodo: wy.procedure
+        .input({ id: int })
+        .mutation(async (ctx, args) =>
+          ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).delete(),
+        ),
+      addReplaceableTodo: wy.procedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.replaceableTodos).insert({ id: args.id, title: args.title }),
+        ),
+      removeReplaceableTodo: wy.procedure
+        .input({ id: int })
+        .mutation(async (ctx, args) =>
+          ctx.db.from(schema.replaceableTodos).where(eq('id', args.id)).delete(),
         ),
       // Writes, and carries a jsonb argument — jsonb validates as `unknown`, so
       // a non-cloneable value (a function) reaches the lifecycle through ordinary
@@ -98,6 +144,13 @@ beforeEach(async () => {
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
+      addTodoFromMeta: wy.procedure.input({ id: int, meta: jsonb }).mutation(async (ctx, args) =>
+        ctx.db.into(schema.todos).insert({
+          id: args.id,
+          title: Object.hasOwn(args.meta as object, '__proto__') ? 'present' : 'missing',
+          done: false,
+        }),
+      ),
       addTodoUsingSetting: wy.procedure.input({ id: int }).mutation(async (ctx, args) => {
         const setting = await ctx.db.from(schema.settings).first()
         return ctx.db.into(schema.todos).insert({
@@ -225,7 +278,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(4)
+    expect((migration as any).rows[0].version).toBe(5)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -402,7 +455,12 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       },
     ])
     await lc.append(draftId, [
-      { path: 'removeTodo', args: { id: 3 }, compactionKey: 'todo:3', kind: 'delete' },
+      {
+        path: 'removeTodo',
+        args: { id: 3 },
+        compactionKey: 'todo:3',
+        kind: 'delete',
+      },
     ])
     expect(await lc.getLog(draftId)).toHaveLength(0)
 
@@ -546,6 +604,116 @@ describe('draft lifecycle — row-local revision conflicts', () => {
     expect(result).toEqual([{ id: 1, title: 'external', revision: 2 }])
   })
 
+  test('delete and reinsert creates a new row incarnation that conflicts with a stale draft', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'draft title' } },
+    ])
+
+    await app.call('removeVersionedTodo', { id: 1 })
+    await app.call('addVersionedTodo', { id: 1, title: 'replacement' })
+
+    const { result: replacement } = await app.call('listVersionedTodos', {})
+    expect(replacement).toEqual([{ id: 1, title: 'replacement', revision: 2 }])
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
+    })
+
+    const { result: afterConflict } = await app.call('listVersionedTodos', {})
+    expect(afterConflict).toEqual([{ id: 1, title: 'replacement', revision: 2 }])
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('publishing a delete preserves the next incarnation token', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'removeVersionedTodo', args: { id: 1 } }])
+
+    await lifecycle.publish(draftId)
+    await app.call('addVersionedTodo', { id: 1, title: 'replacement' })
+
+    const { result } = await app.call('listVersionedTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'replacement', revision: 2 }])
+  })
+
+  test('replacement revisions match between the overlay and published replay', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'removeVersionedTodo', args: { id: 1 } },
+      { path: 'addVersionedTodo', args: { id: 1, title: 'replacement' } },
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'final title' } },
+    ])
+
+    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    expect(effective).toEqual([{ id: 1, title: 'final title', revision: 3 }])
+
+    await lifecycle.publish(draftId)
+    const { result: published } = await app.call('listVersionedTodos', {})
+    expect(published).toEqual(effective)
+  })
+
+  test('ordered keyed updates preserve the effective revision when published', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'renameVersionedTodo',
+        args: { id: 1, title: 'first title' },
+        compactionKey: 'versioned-todo:1',
+        kind: 'update',
+      },
+      {
+        path: 'renameVersionedTodo',
+        args: { id: 1, title: 'final title' },
+        compactionKey: 'versioned-todo:1',
+        kind: 'update',
+      },
+    ])
+
+    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    expect(effective).toEqual([{ id: 1, title: 'final title', revision: 3 }])
+    expect(await lifecycle.getLog(draftId)).toHaveLength(2)
+
+    await lifecycle.publish(draftId)
+    const { result: published } = await app.call('listVersionedTodos', {})
+    expect(published).toEqual(effective)
+  })
+
+  test('an absent reused identity keeps its planned token unless the ledger changes', async () => {
+    await app.call('removeVersionedTodo', { id: 1 })
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'addVersionedTodo', args: { id: 1, title: 'draft replacement' } },
+    ])
+
+    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    expect(effective).toEqual([{ id: 1, title: 'draft replacement', revision: 2 }])
+
+    await app.call('addVersionedTodo', { id: 1, title: 'concurrent replacement' })
+    await app.call('removeVersionedTodo', { id: 1 })
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
+    })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('a missing revision reservation fails closed and leaves the draft intact', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'draft title' } },
+    ])
+    await db.execute(`DELETE FROM wystack_row_revisions WHERE table_key = 'versionedTodos'`)
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
+    })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
   test('graph validation failure rolls replay back with the draft intact', async () => {
     const lifecycle = createDraftLifecycle(app, {
       validateGraph({ phase }) {
@@ -591,7 +759,10 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'X' } }])
-    expect(await lc.detectConflict(draftId)).toEqual({ staleBase: false, overlappingCells: [] })
+    expect(await lc.detectConflict(draftId)).toEqual({
+      staleBase: false,
+      overlappingCells: [],
+    })
   })
 
   test('probe present but canonical unchanged ⇒ clean (the common publish case)', async () => {
@@ -601,7 +772,10 @@ describe('draft lifecycle — detectConflict (generic, artifact-agnostic)', () =
     const draftId = await lc.open(base)
     await lc.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'DRAFT-1' } }])
     // No canonical bump between open and detect — nothing moved.
-    expect(await lc.detectConflict(draftId)).toEqual({ staleBase: false, overlappingCells: [] })
+    expect(await lc.detectConflict(draftId)).toEqual({
+      staleBase: false,
+      overlappingCells: [],
+    })
   })
 
   test('staleBase fires when canonical advances; overlappingCells empty if disjoint', async () => {
@@ -696,12 +870,7 @@ describe('draft lifecycle — discard', () => {
 })
 
 describe('draft lifecycle — a command that cannot be snapshotted', () => {
-  test('an uncloneable command fails BEFORE its write, leaving the draft untouched', async () => {
-    // append clones each command into the log because the log is the publish
-    // unit. When the clone ran AFTER the handler, a non-cloneable argument left
-    // a durable overlay row whose command never reached the log — publish then
-    // silently omitted it. The clone now runs first, so the failure lands ahead
-    // of any write.
+  test('a non-JSON command fails before its write, leaving the draft untouched', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
 
@@ -709,15 +878,10 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
       lc.append(draftId, [
         {
           path: 'addTodoWithMeta',
-          // A function is not structured-cloneable. `meta` is jsonb, which
-          // validates as `unknown`, so nothing rejects it earlier.
           args: { id: 3, title: 'cherry', meta: { onDone: () => {} } },
         },
       ]),
-      // Assert the CLONE is what failed. A plain `rejects.toThrow()` would also
-      // pass if validation had rejected the function first, which would make
-      // this test prove nothing about the ordering.
-    ).rejects.toThrow('can not be cloned')
+    ).rejects.toThrow('must be JSON-compatible')
 
     // Neither half of the draft moved: no command logged, no overlay row.
     expect(await lc.getLog(draftId)).toHaveLength(0)
@@ -732,6 +896,91 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
     expect(await lc.getLog(draftId)).toHaveLength(1)
   })
+
+  test('normalizes undefined object properties before execution and persistence', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+
+    await lifecycle.append(draftId, [
+      {
+        path: 'addTodoWithMeta',
+        args: { id: 3, title: 'cherry', meta: { flag: undefined } },
+      },
+    ])
+
+    expect(await lifecycle.getLog(draftId)).toEqual([
+      { path: 'addTodoWithMeta', args: { id: 3, title: 'cherry', meta: {} } },
+    ])
+    await lifecycle.publish(draftId)
+    const { result } = await app.call('listTodos', {})
+    expect((result as Array<{ id: number }>).some((row) => row.id === 3)).toBe(true)
+  })
+
+  test('canonicalizes Date arguments before persistence and lifecycle reopen', async () => {
+    const createdAt = new Date('2026-08-25T12:34:56.000Z')
+    const firstLifecycle = createDraftLifecycle(app)
+    const draftId = await firstLifecycle.open(0)
+    await firstLifecycle.append(draftId, [{ path: 'addTodoAt', args: { id: 3, createdAt } }])
+
+    const reopenedLifecycle = createDraftLifecycle(app)
+    expect(await reopenedLifecycle.getLog(draftId)).toEqual([
+      { path: 'addTodoAt', args: { id: 3, createdAt: createdAt.toISOString() } },
+    ])
+    await reopenedLifecycle.publish(draftId)
+
+    const { result } = await app.call('listTodos', {})
+    expect(
+      (result as Array<{ id: number; title: string }>).find((row) => row.id === 3)?.title,
+    ).toBe(createdAt.toISOString())
+  })
+
+  test('preserves an own __proto__ key across append, reopen, and publish', async () => {
+    const meta = JSON.parse('{"__proto__":{"x":1}}') as Record<string, unknown>
+    const firstLifecycle = createDraftLifecycle(app)
+    const draftId = await firstLifecycle.open(0)
+    await firstLifecycle.append(draftId, [{ path: 'addTodoFromMeta', args: { id: 3, meta } }])
+
+    const reopenedLifecycle = createDraftLifecycle(app)
+    const storedMeta = (await reopenedLifecycle.getLog(draftId))[0]?.args as {
+      meta: Record<string, unknown>
+    }
+    expect(Object.hasOwn(storedMeta.meta, '__proto__')).toBe(true)
+    await reopenedLifecycle.publish(draftId)
+
+    const { result } = await app.call('listTodos', {})
+    expect(
+      (result as Array<{ id: number; title: string }>).find((row) => row.id === 3)?.title,
+    ).toBe('present')
+  })
+
+  const nonJsonCases: Array<{ name: string; meta: unknown }> = [
+    { name: 'Map', meta: new Map([['flag', true]]) },
+    { name: 'Set', meta: new Set(['flag']) },
+    { name: 'NaN', meta: Number.NaN },
+    { name: 'Infinity', meta: Number.POSITIVE_INFINITY },
+  ]
+
+  for (const current of nonJsonCases) {
+    test(`rejects ${current.name} before derived execution`, async () => {
+      const lc = createDraftLifecycle(app)
+      const draftId = await lc.open(0)
+
+      await expect(
+        lc.append(draftId, [
+          {
+            path: 'addTodoWithMeta',
+            args: { id: 3, title: 'cherry', meta: current.meta },
+          },
+        ]),
+      ).rejects.toThrow('draft lifecycle: command args')
+
+      expect(await lc.getLog(draftId)).toEqual([])
+      const overlay = await db.execute(
+        `SELECT row_key_text FROM wystack_draft_row_changes WHERE draft_id = '${draftId}'`,
+      )
+      expect((overlay as { rows: unknown[] }).rows).toEqual([])
+    })
+  }
 })
 
 describe('draft lifecycle — command envelope ownership', () => {
@@ -940,7 +1189,11 @@ describe('draft lifecycle — invalidation fan-out', () => {
     const unsubscribe = app.invalidationSource.onInvalidation((tables) => {
       emitted.push(new Set(tables))
     })
-    return { emitted, unsubscribe, tags: () => emitted.flatMap((s) => [...s]).sort() }
+    return {
+      emitted,
+      unsubscribe,
+      tags: () => emitted.flatMap((s) => [...s]).sort(),
+    }
   }
 
   test('append announces the OVERLAY write so draft-scoped subscriptions refetch', async () => {
@@ -1098,7 +1351,12 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
     const draftId = await lc.open(0)
 
     await lc.append(draftId, [
-      { path: 'removeTodo', args: { id: 1 }, compactionKey: 'todo:1', kind: 'delete' },
+      {
+        path: 'removeTodo',
+        args: { id: 1 },
+        compactionKey: 'todo:1',
+        kind: 'delete',
+      },
       {
         path: 'addTodo',
         args: { id: 1, title: 'REPLACED' },
@@ -1121,5 +1379,36 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
     const rows = canonical as { id: number; title: string }[]
     expect(rows).toHaveLength(2)
     expect(rows.find((r) => r.id === 1)?.title).toBe('REPLACED')
+  })
+
+  test('a replacement does not inherit an omitted nullable field from the deleted row', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'removeReplaceableTodo',
+        args: { id: 1 },
+        compactionKey: 'replaceable:1',
+        kind: 'delete',
+      },
+      {
+        path: 'addReplaceableTodo',
+        args: { id: 1, title: 'replacement' },
+        compactionKey: 'replaceable:1',
+        kind: 'create',
+      },
+    ])
+
+    const effective = await app
+      .createTracked()
+      .withDraft(draftId)
+      .from(schema.replaceableTodos)
+      .all()
+    expect(effective).toEqual([{ id: 1, title: 'replacement', note: null }])
+
+    await lifecycle.publish(draftId)
+
+    const { result: published } = await app.call('listReplaceableTodos', {})
+    expect(published).toEqual(effective)
   })
 })

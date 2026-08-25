@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
-import type { DraftCommand, Version } from './draft-lifecycle'
+import type { DraftCommand } from './draft-command-log'
+import type { Version } from './draft-lifecycle-types'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- the server supports multiple Drizzle Postgres drivers
 type RawDb = any
@@ -29,7 +30,7 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-const draftStorageVersion = 4
+const draftStorageVersion = 5
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -148,6 +149,29 @@ const storageDdlV4 = [
   sql.raw(`ALTER TABLE wystack_draft_tables ALTER COLUMN pk_type SET NOT NULL`),
 ]
 
+// Revisioned canonical rows retain an incarnation token after deletion. A
+// later insert of the same stable scalar identity receives a new token, so CAS
+// cannot mistake a replacement row for the base row a draft observed.
+const storageDdlV5 = [
+  sql.raw(`CREATE TABLE IF NOT EXISTS wystack_row_revisions (
+    table_key TEXT NOT NULL,
+    tenant_key_text TEXT NOT NULL DEFAULT '',
+    row_key_text TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    PRIMARY KEY (table_key, tenant_key_text, row_key_text)
+  )`),
+  // A pre-v5 active draft has no durable identity reservation. Its old
+  // base_revision cannot prove that a deleted row was not replaced before the
+  // ledger existed, so force an explicit rebase instead of guessing a token.
+  sql.raw(`UPDATE wystack_draft_row_changes d
+    SET base_revision = '{"wystack":"rebase-required","reason":"revision-ledger-upgrade"}'::jsonb
+    FROM wystack_draft_tables t
+    WHERE t.draft_id = d.draft_id
+      AND d.table_key = CASE WHEN t.schema_name = '' THEN t.table_name
+        ELSE t.schema_name || '.' || t.table_name END
+      AND t.revision_column IS NOT NULL`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await raw.execute(migrationTableDdl)
   await raw.execute(sql`
@@ -184,6 +208,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     }
     if (installedVersion < 4) {
       for (const statement of storageDdlV4) await tx.execute(statement)
+    }
+    if (installedVersion < 5) {
+      for (const statement of storageDdlV5) await tx.execute(statement)
     }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
@@ -366,7 +393,10 @@ function encodeEnvelope(value: unknown, label: string): string {
 }
 
 function decodeEnvelope(value: unknown): unknown {
-  const envelope = decodeJsonColumn(value) as { present?: boolean; value?: unknown }
+  const envelope = decodeJsonColumn(value) as {
+    present?: boolean
+    value?: unknown
+  }
   return envelope.present ? envelope.value : undefined
 }
 
@@ -376,7 +406,9 @@ function encodeJson(value: unknown, label: string): string {
     if (encoded === undefined) throw new TypeError('value is not JSON-serializable')
     return encoded
   } catch (cause) {
-    throw new Error(`draft lifecycle: ${label} must be JSON-serializable`, { cause })
+    throw new Error(`draft lifecycle: ${label} must be JSON-serializable`, {
+      cause,
+    })
   }
 }
 

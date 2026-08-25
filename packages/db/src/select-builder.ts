@@ -24,6 +24,7 @@ import {
   withoutUndefined,
 } from './tracker-core'
 import { resolvePkColumnName } from './tracker-codecs'
+import { lockRowRevision, preserveRowRevision, rowRevisionSortKey } from './row-revisions'
 
 export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   private _table: T
@@ -281,13 +282,41 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
   async delete() {
     if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('delete', this._clauses)
-    let q = this._db.delete(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const conditions = this._buildConditions(getTableColumns(this._table) as Record<string, any>)
-    if (conditions.length > 0) {
-      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
-    }
-    const rows = await q.returning()
+    const columns = getTableColumns(this._table) as Record<string, any>
+    const conditions = this._buildConditions(columns)
+    const predicate = conditions.length === 1 ? conditions[0] : and(...conditions)
+    const revision = revisionProperty(this._table)
+    const rows = revision
+      ? await this._db.transaction(async (tx: DrizzleDb) => {
+          let candidatesQuery = tx.select().from(this._table)
+          if (conditions.length > 0) candidatesQuery = candidatesQuery.where(predicate)
+          const candidates = (await candidatesQuery) as Record<string, unknown>[]
+          candidates.sort((left, right) =>
+            rowRevisionSortKey(this._table, this._tenantScope, left).localeCompare(
+              rowRevisionSortKey(this._table, this._tenantScope, right),
+            ),
+          )
+          for (const row of candidates) {
+            await lockRowRevision(tx, this._table, this._tenantScope, row)
+          }
+
+          let lockQuery = tx.select().from(this._table)
+          if (conditions.length > 0) lockQuery = lockQuery.where(predicate)
+          const locked = (await lockQuery.for('update')) as Record<string, unknown>[]
+          for (const row of locked) {
+            await preserveRowRevision(tx, this._table, this._tenantScope, row, revision)
+          }
+
+          let deletion = tx.delete(this._table)
+          if (conditions.length > 0) deletion = deletion.where(predicate)
+          return deletion.returning()
+        })
+      : await (() => {
+          let deletion = this._db.delete(this._table)
+          if (conditions.length > 0) deletion = deletion.where(predicate)
+          return deletion.returning()
+        })()
     this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return rows
   }
