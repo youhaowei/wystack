@@ -88,6 +88,27 @@ describe('server tenant resolution', () => {
     expect(rows.map((row) => row.name)).toEqual(['batched'])
   })
 
+  test('public outer-transaction batches still resolve tenant scope from context', async () => {
+    const outer = app.system.createTracked()
+    await outer.transaction((tx) =>
+      applyCommands(
+        app,
+        [
+          {
+            path: 'addInsight',
+            args: { id: '00000000-0000-4000-8000-000000000008', name: 'outer-alpha' },
+          },
+        ],
+        { mode: 'commit', context: alpha, tx },
+      ),
+    )
+
+    const alphaRows = (await app.call('listInsights', {}, alpha)).result as { name: string }[]
+    const betaRows = (await app.call('listInsights', {}, beta)).result as { name: string }[]
+    expect(alphaRows.map((row) => row.name)).toEqual(['outer-alpha'])
+    expect(betaRows).toEqual([])
+  })
+
   test('plain tables remain usable without tenant resolution', async () => {
     const appWithoutResolver = await wy.build({
       db: app.system.createTracked().raw,

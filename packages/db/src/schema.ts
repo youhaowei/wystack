@@ -19,13 +19,13 @@ import type { AnyColumnDef, ColumnDefOptions } from './dsl'
 import { TableDefinition, type TableCapabilities, type WithSystemManagedProperties } from './table'
 
 type ColumnMap = Record<string, AnyColumnDef>
-type AnyTableDefinition = TableDefinition<ColumnMap, boolean, string>
+type AnyTableDefinition = TableDefinition<ColumnMap, boolean, string, string>
 type CompiledTable<TDefinition> = WithSystemManagedProperties<
   ReturnType<typeof pgTable>,
   TDefinition
 >
 
-const tableCapabilities = new WeakMap<object, TableCapabilities>()
+const tableCapabilities = new WeakMap<object, Readonly<TableCapabilities>>()
 const generatedTables = new WeakMap<object, PgTable[]>()
 
 function normalizeTableDefinition(definition: unknown): {
@@ -49,6 +49,18 @@ export function getTableCapabilities(table: object): TableCapabilities {
 
 export function tryGetTableCapabilities(table: object): TableCapabilities | undefined {
   return tableCapabilities.get(table)
+}
+
+/** Internal registration seam for low-level SQL fixtures that exercise the
+ * tracker against hand-authored Drizzle tables. It is intentionally absent
+ * from the package barrel; application code opts in through `table(...).draftable()`.
+ */
+export function registerTableCapabilities(
+  table: object,
+  capabilities: TableCapabilities,
+): void {
+  const tenancy = capabilities.tenancy ? Object.freeze({ ...capabilities.tenancy }) : undefined
+  tableCapabilities.set(table, Object.freeze({ ...capabilities, tenancy }))
 }
 
 export function getGeneratedTables(schema: object): PgTable[] {
@@ -288,7 +300,7 @@ export function defineSchema<const T extends Record<string, unknown>>(
   for (const [tableName, definition] of Object.entries(tables)) {
     const { columns, capabilities } = normalizeTableDefinition(definition)
     result[tableName] = buildTable(tableName, columns, capabilities, {})
-    tableCapabilities.set(result[tableName], capabilities)
+    registerTableCapabilities(result[tableName], capabilities)
   }
 
   // Pass 2: rebuild tables that have foreign key references (now all tables exist)
@@ -298,7 +310,7 @@ export function defineSchema<const T extends Record<string, unknown>>(
     if (!hasRefs) continue
 
     result[tableName] = buildTable(tableName, columns, capabilities, result)
-    tableCapabilities.set(result[tableName], capabilities)
+    registerTableCapabilities(result[tableName], capabilities)
   }
 
   const compiled = result as { [K in keyof T]: CompiledTable<T[K]> }

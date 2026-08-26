@@ -21,9 +21,9 @@ export interface TenantKeyDefinition<
   TColumn extends string = string,
   TType extends AnyColumnDef = AnyColumnDef,
 > {
-  property: TProperty
-  column: TColumn
-  type: TType
+  readonly property: TProperty
+  readonly column: TColumn
+  readonly type: TType
 }
 
 export interface TenantCapability extends TenantKeyDefinition {
@@ -31,41 +31,72 @@ export interface TenantCapability extends TenantKeyDefinition {
 }
 
 export interface TableCapabilities {
-  draftable: boolean
-  tenancy?: TenantCapability
-  revisionProperty?: string
+  readonly draftable: boolean
+  readonly tenancy?: TenantCapability
+  readonly revisionProperty?: string
+}
+
+function freezeCapabilities(capabilities: TableCapabilities): Readonly<TableCapabilities> {
+  const tenancy = capabilities.tenancy ? Object.freeze({ ...capabilities.tenancy }) : undefined
+  return Object.freeze({ ...capabilities, tenancy })
 }
 
 export class TableDefinition<
   TColumns extends ColumnDefinitions = ColumnDefinitions,
   TDraftable extends boolean = false,
   TSystemManaged extends string = never,
+  TRevisionProperty extends string = never,
 > {
   declare readonly [systemManagedProperties]: TSystemManaged
   readonly columns: TColumns
-  readonly capabilities: TableCapabilities & { draftable: TDraftable }
+  readonly capabilities: Readonly<TableCapabilities> & { readonly draftable: TDraftable }
 
   constructor(columns: TColumns, capabilities: TableCapabilities & { draftable: TDraftable }) {
     this.columns = columns
-    this.capabilities = capabilities
+    this.capabilities = freezeCapabilities(capabilities) as Readonly<TableCapabilities> & {
+      readonly draftable: TDraftable
+    }
   }
 
-  draftable(): TableDefinition<TColumns, true, TSystemManaged> {
-    return new TableDefinition(this.columns, { ...this.capabilities, draftable: true })
+  draftable(): TableDefinition<TColumns, true, TSystemManaged, TRevisionProperty> {
+    return new TableDefinition<TColumns, true, TSystemManaged, TRevisionProperty>(this.columns, {
+      ...this.capabilities,
+      draftable: true,
+    })
   }
 
   revision<TKey extends Extract<keyof TColumns, string>>(
+    this: [TRevisionProperty] extends [never]
+      ? TableDefinition<TColumns, TDraftable, TSystemManaged, TRevisionProperty>
+      : never,
     property: TKey,
-  ): TableDefinition<TColumns, TDraftable, TSystemManaged | TKey> {
+  ): TableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TKey> {
+    if (this.capabilities.revisionProperty) {
+      throw new Error(
+        `Revision property is already configured as "${this.capabilities.revisionProperty}"`,
+      )
+    }
     const definition = this.columns[property]
     if (!definition) throw new Error(`Unknown revision property "${property}"`)
+    if (this.capabilities.tenancy?.property === property) {
+      throw new Error(`Revision property "${property}" cannot be the tenant key`)
+    }
+    if (definition.opts.isPrimaryKey) {
+      throw new Error(`Revision property "${property}" cannot be a primary key`)
+    }
+    if (definition.opts.isUnique || definition.opts.isUniqueWithinTenant) {
+      throw new Error(`Revision property "${property}" cannot be unique`)
+    }
+    if (definition.opts.ref) {
+      throw new Error(`Revision property "${property}" cannot be a foreign key`)
+    }
     if (definition.opts.isArray || definition.opts.isOptional || definition.opts.isNullable) {
       throw new Error(`Revision property "${property}" must be a required, non-null scalar`)
     }
     if (definition.opts.type !== 'int') {
       throw new Error(`Revision property "${property}" must be an integer`)
     }
-    return new TableDefinition(this.columns, {
+    return new TableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TKey>(this.columns, {
       ...this.capabilities,
       revisionProperty: property,
     })
@@ -103,7 +134,7 @@ export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
 export function multiTenant(
   opts: { key: TenantKeyDefinition } = { key: defaultTenantKey },
 ): MultiTenantDescriptor<TenantKeyDefinition> {
-  const { key } = opts
+  const key = Object.freeze({ ...opts.key })
   if (key.property.length === 0) throw new Error('multiTenant key.property cannot be empty')
   if (key.column.length === 0) throw new Error('multiTenant key.column cannot be empty')
   if (key.type.opts.isOptional || key.type.opts.isNullable) {
@@ -114,7 +145,7 @@ export function multiTenant(
   }
   const descriptorId = Symbol('multiTenant descriptor')
 
-  return {
+  return Object.freeze({
     key,
     table<TColumns extends ColumnDefinitions>(columns: TColumns) {
       if (Object.hasOwn(columns, key.property)) {
@@ -136,5 +167,5 @@ export function multiTenant(
         tenancy: { ...key, descriptorId },
       })
     },
-  }
+  })
 }

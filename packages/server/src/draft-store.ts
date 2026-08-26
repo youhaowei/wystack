@@ -1,3 +1,4 @@
+import { withFrameworkBootstrapLock } from '@wystack/db'
 import { sql, type SQL } from 'drizzle-orm'
 import type { DraftCommand } from './draft-command-log'
 import { DraftIntegrityError, type Version } from './draft-lifecycle-types'
@@ -116,10 +117,12 @@ const storageDdlV3 = [
     BEGIN
       IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'wystack_draft_tables' AND column_name = 'shadow_tag'
+        WHERE table_schema = current_schema()
+          AND table_name = 'wystack_draft_tables' AND column_name = 'shadow_tag'
       ) AND NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'wystack_draft_tables' AND column_name = 'invalidation_tag'
+        WHERE table_schema = current_schema()
+          AND table_name = 'wystack_draft_tables' AND column_name = 'invalidation_tag'
       ) THEN
         ALTER TABLE wystack_draft_tables RENAME COLUMN shadow_tag TO invalidation_tag;
       END IF;
@@ -220,14 +223,13 @@ const storageDdlV6 = [
 ]
 
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
-  await raw.execute(migrationTableDdl)
-  await raw.execute(sql`
-    INSERT INTO wystack_framework_migrations (migration_name, version)
-    VALUES ('draft-storage', 0)
-    ON CONFLICT (migration_name) DO NOTHING
-  `)
-
-  await raw.transaction(async (tx: RawDb) => {
+  await withFrameworkBootstrapLock(raw, async (tx: RawDb) => {
+    await tx.execute(migrationTableDdl)
+    await tx.execute(sql`
+      INSERT INTO wystack_framework_migrations (migration_name, version)
+      VALUES ('draft-storage', 0)
+      ON CONFLICT (migration_name) DO NOTHING
+    `)
     const rows = normalizeRows(
       await tx.execute(sql`
       SELECT version

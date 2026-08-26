@@ -5,7 +5,7 @@ import { integer, pgTable, text } from 'drizzle-orm/pg-core'
 import { createDrizzleTracker } from '../drizzle-tracker'
 import { int, text as dslText } from '../dsl'
 import { eq, type FilterDescriptor } from '../operators'
-import { defineSchema } from '../schema'
+import { defineSchema, registerTableCapabilities } from '../schema'
 import { syncSchema } from '../sync'
 import { multiTenant } from '../table'
 
@@ -24,6 +24,8 @@ const canonicalTwin = pgTable('bounded_canonical_twin', {
   score: integer('score').notNull(),
   note: text('note'),
 })
+
+registerTableCapabilities(sourceItems, { draftable: true })
 
 const tenancy = multiTenant({
   key: { property: 'tenantId', column: 'tenant_id', type: dslText },

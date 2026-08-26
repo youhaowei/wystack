@@ -100,6 +100,48 @@ describe('composable table capabilities', () => {
     ).toThrow('workspaceId')
   })
 
+  test('tenant descriptors snapshot and freeze their configured key', () => {
+    const configuredKey = {
+      property: 'workspaceId',
+      column: 'workspace_id',
+      type: uuid,
+    } as const
+    const tenancy = multiTenant({ key: configuredKey })
+    const first = tenancy.table({ id: uuid.primaryKey() })
+
+    expect(Reflect.set(configuredKey, 'property', 'accountId')).toBe(true)
+    expect(Reflect.set(configuredKey, 'column', 'account_id')).toBe(true)
+    expect(Reflect.set(tenancy.key, 'property', 'mutatedId')).toBe(false)
+
+    const second = tenancy.table({ id: uuid.primaryKey() })
+    const schema = defineSchema({ first, second })
+    expect(Object.isFrozen(tenancy.key)).toBe(true)
+    expect(Object.keys(getTableColumns(schema.first))).toContain('workspaceId')
+    expect(Object.keys(getTableColumns(schema.second))).toContain('workspaceId')
+    expect(getTableCapabilities(schema.second).tenancy).toMatchObject({
+      property: 'workspaceId',
+      column: 'workspace_id',
+    })
+  })
+
+  test('compiled capabilities cannot be mutated to disable tenant isolation', () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+    })
+    const definition = tenancy.table({ id: uuid.primaryKey() })
+    const schema = defineSchema({ records: definition })
+    const compiledCapabilities = getTableCapabilities(schema.records)
+
+    expect(Reflect.set(definition.capabilities, 'tenancy', undefined)).toBe(false)
+    expect(Reflect.set(compiledCapabilities, 'tenancy', undefined)).toBe(false)
+    expect(Object.isFrozen(definition.capabilities)).toBe(true)
+    expect(Object.isFrozen(compiledCapabilities.tenancy)).toBe(true)
+    expect(getTableCapabilities(schema.records).tenancy).toMatchObject({
+      property: 'workspaceId',
+      column: 'workspace_id',
+    })
+  })
+
   test('multiTenant defaults to the conventional tenantId/tenant_id UUID key', () => {
     const schema = defineSchema({
       records: multiTenant().table({ id: uuid.primaryKey(), name: text }),
@@ -140,6 +182,32 @@ describe('composable table capabilities', () => {
       draftable: true,
       revisionProperty: 'version',
     })
+  })
+
+  test('revision columns cannot collide with identity, tenancy, uniqueness, or references', () => {
+    const intTenancy = multiTenant({
+      key: { property: 'tenantId', column: 'tenant_id', type: int },
+    })
+    expect(() =>
+      intTenancy.table({ id: int.primaryKey(), name: text }).revision('tenantId'),
+    ).toThrow('cannot be the tenant key')
+    expect(() => table({ id: int.primaryKey() }).revision('id')).toThrow('cannot be a primary key')
+    expect(() =>
+      table({ id: uuid.primaryKey(), revision: int.unique() }).revision('revision'),
+    ).toThrow('cannot be unique')
+    expect(() =>
+      table({ id: uuid.primaryKey(), revision: int.references('parents') }).revision('revision'),
+    ).toThrow('cannot be a foreign key')
+  })
+
+  test('a table cannot replace an already configured revision property', () => {
+    const revisioned = table({ id: uuid.primaryKey(), revision: int, version: int }).revision(
+      'revision',
+    )
+    expect(() =>
+      // @ts-expect-error — one table has exactly one framework-managed revision property
+      revisioned.revision('version'),
+    ).toThrow('already configured')
   })
 
   test('revision columns are framework-managed integers', () => {

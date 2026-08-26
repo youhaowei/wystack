@@ -50,6 +50,8 @@ describe('draft storage migrations', () => {
   test('upgrades v2 touched-table metadata without replacing durable rows', async () => {
     const pg = new PGlite()
     const db = drizzle(pg)
+    await db.execute(`CREATE SCHEMA other_storage`)
+    await db.execute(`CREATE TABLE other_storage.wystack_draft_tables (invalidation_tag TEXT)`)
     await db.execute(`
       CREATE TABLE wystack_framework_migrations (
         migration_name TEXT PRIMARY KEY, version INTEGER NOT NULL,

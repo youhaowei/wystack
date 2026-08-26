@@ -527,4 +527,39 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     expect(commitResult!.tablesWritten.has('tags')).toBe(false)
     expect(commitResult!.tablesWritten.size).toBe(1)
   })
+
+  test('tablesWritten retains a command write that overlaps a caller write', async () => {
+    const outer = app.system.createTracked()
+    let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
+    await outer.transaction(async (tx) => {
+      await tx.into(schema.todos).insert({ id: 1, title: 'caller-write', done: false })
+      commitResult = await applyCommands(app, [{ path: 'markDone', args: { id: 1 } }], {
+        mode: 'commit',
+        tx,
+      })
+    })
+
+    expect(commitResult!.tablesWritten).toEqual(new Set(['todos']))
+  })
+
+  test('a caught command failure keeps any committed partial write tracked', async () => {
+    const outer = app.system.createTracked()
+    await outer.transaction(async (tx) => {
+      try {
+        await applyCommands(
+          app,
+          [
+            { path: 'addTodo', args: { id: 1, title: 'committed-by-caller' } },
+            { path: 'boom', args: {} },
+          ],
+          { mode: 'commit', tx },
+        )
+      } catch {
+        // The outer-transaction owner deliberately commits the successful prefix.
+      }
+    })
+
+    expect(outer.tablesWritten).toEqual(new Set(['todos']))
+    expect((await app.call('listTodos', {})).result).toHaveLength(1)
+  })
 })

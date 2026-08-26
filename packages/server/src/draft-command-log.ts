@@ -55,7 +55,11 @@ export function compactLog(log: DraftCommand[]): DraftCommand[] {
   )
 }
 
-function snapshotJsonValue(value: unknown, path: string, ancestors = new Set<object>()): unknown {
+export function snapshotJsonValue(
+  value: unknown,
+  path: string,
+  ancestors = new Set<object>(),
+): unknown {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {

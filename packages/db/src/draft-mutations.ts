@@ -109,10 +109,17 @@ export async function writeDraftRow(
         ', 0) ON CONFLICT (table_key, tenant_key_text, row_key_text) DO UPDATE SET revision = wystack_row_revisions.revision RETURNING revision)',
       )}`
     : sql.empty()
+  const existingChangeCte = sql`${sql.raw(
+    `, existing_change AS (SELECT "operation" FROM ${draftChangesRelation} WHERE "draft_id" = `,
+  )}${sql.param(draftId)}${sql.raw(' AND "table_key" = ')}${sql.param(tableKey)}${sql.raw(
+    ' AND "tenant_key_text" = ',
+  )}${sql.param(tenantKey.text)}${sql.raw(' AND "row_key_text" = ')}${sql.param(
+    rowKey.text,
+  )}${sql.raw(' FOR UPDATE)')}`
   const baseCte = sql`${sql.raw(`WITH base AS (SELECT * FROM ${baseRel} WHERE `)}${sql.join(
     basePredicates,
     sql.raw(' AND '),
-  )}${sql.raw(' FOR UPDATE)')}${revisionCte}${sql.raw(' ')}`
+  )}${sql.raw(' FOR UPDATE)')}${revisionCte}${existingChangeCte}${sql.raw(' ')}`
 
   const basePresent = `b.${quoteSqlIdentifier(pkColName)} IS NOT NULL`
   const fieldPairs = valueCols.flatMap(({ column, sqlName, proposed, plannedRevision }, index) => {
@@ -149,6 +156,14 @@ export async function writeDraftRow(
     ? sql`${sql.param(JSON.stringify(tenantKey.envelope))}${sql.raw('::jsonb')}`
     : sql.raw('NULL::jsonb')
   const operation = opts.tombstone ? 'delete' : opts.intent
+  const insertUniquenessGuard =
+    opts.intent === 'insert'
+      ? sql.raw(
+          ` WHERE NOT (` +
+            `EXISTS (SELECT 1 FROM existing_change WHERE "operation" <> 'delete') ` +
+            `OR (NOT EXISTS (SELECT 1 FROM existing_change) AND ${basePresent}))`,
+        )
+      : sql.empty()
 
   const query = sql`${baseCte}${sql.raw(
     `INSERT INTO ${draftChangesRelation} ` +
@@ -161,7 +176,9 @@ export async function writeDraftRow(
   )}${sql.param(JSON.stringify(rowKey.envelope))}${sql.raw('::jsonb, ')}${sql.param(
     operation,
   )}${sql.raw(`, ${basePresent}, `)}${baseRevision}${sql.raw(', ')}${fieldsExpression}${sql.raw(
-    ` FROM (SELECT 1) seed LEFT JOIN base b ON TRUE ` +
+    ` FROM (SELECT 1) seed LEFT JOIN base b ON TRUE`,
+  )}${insertUniquenessGuard}${sql.raw(
+    ` ` +
       `ON CONFLICT ("draft_id", "table_key", "tenant_key_text", "row_key_text") DO UPDATE SET ` +
       `"operation" = CASE ` +
       `WHEN EXCLUDED."operation" = 'delete' THEN 'delete' ` +
@@ -176,8 +193,14 @@ export async function writeDraftRow(
   )}`
 
   const result = await db.execute(query)
+  const rows = normalizeExecuteRows(result)
+  if (opts.intent === 'insert' && rows.length === 0) {
+    throw new Error(
+      `Draft insert cannot create "${tableKey}" row ${JSON.stringify(opts.pkValue)} because it already exists`,
+    )
+  }
   tracker.tablesWritten.add(draftTableTrackingTag(table, tenantScope, draftId))
-  return normalizeExecuteRows(result)
+  return rows
 }
 
 function materializeDraftInsertDefaults(

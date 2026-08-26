@@ -25,6 +25,10 @@ const schema = defineSchema({
   insights: tenancy.table({ id: uuid.primaryKey(), name: text }).draftable(),
 })
 
+const uuidTenantSchema = defineSchema({
+  uuid_insights: multiTenant().table({ id: uuid.primaryKey(), name: text }).draftable(),
+})
+
 let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
@@ -32,6 +36,7 @@ beforeEach(async () => {
   await client.waitReady
   const db = drizzle(client)
   await syncSchema(db, schema)
+  await syncSchema(db, uuidTenantSchema)
   tracked = createDrizzleTracker(db)
 })
 
@@ -197,5 +202,20 @@ describe('tenant-scoped database access', () => {
     expect([...alphaTracker.tablesRead].some((tag) => betaTracker.tablesWritten.has(tag))).toBe(
       false,
     )
+  })
+
+  test('UUID tenant tags use the canonical database identity regardless of case', async () => {
+    const upperTenant = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'
+    const lowerTenant = upperTenant.toLowerCase()
+    const reader = createDrizzleTracker(tracked.raw).withTenant(upperTenant)
+    const writer = createDrizzleTracker(tracked.raw).withTenant(lowerTenant)
+
+    await reader.withDraft('uuid-draft').from(uuidTenantSchema.uuid_insights).all()
+    await writer.withDraft('uuid-draft').into(uuidTenantSchema.uuid_insights).insert({
+      id: '00000000-0000-4000-8000-000000000091',
+      name: 'same tenant',
+    })
+
+    expect([...reader.tablesRead].some((tag) => writer.tablesWritten.has(tag))).toBe(true)
   })
 })

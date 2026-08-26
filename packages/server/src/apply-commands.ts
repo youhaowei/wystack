@@ -37,7 +37,7 @@
 // reinvent those frameworks. This is a focused engine: one entry point, no
 // middleware pipeline, no decorators.
 
-import type { DrizzleTracker } from '@wystack/db'
+import { createDrizzleTracker, type DrizzleTracker } from '@wystack/db'
 import type { WyStackApp } from './create'
 
 /**
@@ -195,6 +195,26 @@ export async function applyCommands(
   batch: Command[],
   opts: ApplyCommandsOptions,
 ): Promise<ApplyResult> {
+  return executeCommands(app, batch, opts, false)
+}
+
+/** Internal lifecycle seam: the supplied transaction has already been scoped
+ * and authorized by the draft custody boundary. Deliberately not re-exported
+ * from the package barrel. */
+export async function applyCommandsWithAuthorizedTx(
+  app: WyStackApp,
+  batch: Command[],
+  opts: ApplyCommandsOptions & { tx: DrizzleTracker },
+): Promise<ApplyResult> {
+  return executeCommands(app, batch, opts, true)
+}
+
+async function executeCommands(
+  app: WyStackApp,
+  batch: Command[],
+  opts: ApplyCommandsOptions,
+  preserveOuterTxScope: boolean,
+): Promise<ApplyResult> {
   const { mode, context = {}, tx: outerTx } = opts
   const commands = batch.map(snapshotCommand)
 
@@ -226,12 +246,33 @@ export async function applyCommands(
       // "COMMAND-BATCH writes only" contract — callers flush only command-
       // relevant tables to invalidation, not pre-existing bookkeeping writes.
       // The caller must NOT flush this set until AFTER the outer tx resolves.
-      const scopedTx = await app.system.scopeTracked(outerTx, context)
-      const tablesWrittenBefore = new Set(scopedTx.tablesWritten)
-      const results = await applyAll(app, commands, scopedTx, context)
-      const tablesWritten = new Set(
-        [...scopedTx.tablesWritten].filter((t) => !tablesWrittenBefore.has(t)),
-      )
+      // Track this batch through a fresh view over the SAME native tx. Set
+      // subtraction cannot identify an overlapping write (caller and command
+      // both write `todos`), so it can suppress a required invalidation. A
+      // separate view records the exact batch delta. Ordinary public calls
+      // still resolve tenant scope from context; the draft lifecycle's internal
+      // seam preserves its already-authorized scope, including explicit global
+      // authority.
+      const authorizedTx = preserveOuterTxScope
+        ? outerTx
+        : await app.system.scopeTracked(outerTx, context)
+      const commandTx = createDrizzleTracker(authorizedTx.raw)
+      const scopedTx =
+        authorizedTx.tenantId === undefined
+          ? commandTx
+          : commandTx.withTenant(authorizedTx.tenantId)
+      let results: CommandResult[]
+      try {
+        results = await applyAll(app, commands, scopedTx, context)
+      } finally {
+        // A caller owns the outer transaction and may catch a command failure.
+        // Merge attempted writes even on throw so any partial work it chooses
+        // to commit remains tracked. If the outer callback propagates instead,
+        // its transaction rollback suppresses the merge to the outermost set.
+        for (const table of scopedTx.tablesRead) authorizedTx.tablesRead.add(table)
+        for (const table of scopedTx.tablesWritten) authorizedTx.tablesWritten.add(table)
+      }
+      const tablesWritten = new Set(scopedTx.tablesWritten)
       return {
         mode: 'commit',
         commands,

@@ -182,11 +182,17 @@ export function draftTableTrackingTag(
 
 export function publishedInvalidationIdentity(table: AnyTable, tenantId?: unknown): string {
   const tableName = qualifiedTableName(table)
-  if (!tryGetTableCapabilities(table)?.tenancy) return tableName
+  const tenancy = tryGetTableCapabilities(table)?.tenancy
+  if (!tenancy) return tableName
   if (tenantId === undefined || tenantId === null) {
     throw new Error(`Table "${getTableName(table)}" requires a tenant invalidation identity`)
   }
-  return `tenant:${encodeURIComponent(String(tenantId))}:${tableName}`
+  const tenantColumn = requireColumn(
+    getTableColumns(table) as Record<string, { name: string; getSQLType(): string }>,
+    tenancy.property,
+  )
+  const tenantKey = encodeTypedKey(tenantColumn, tenantId).text
+  return `tenant:${encodeURIComponent(tenantKey)}:${tableName}`
 }
 
 export function draftInvalidationIdentity(
@@ -196,11 +202,17 @@ export function draftInvalidationIdentity(
 ): string {
   const tableName = qualifiedTableName(table)
   const draft = encodeURIComponent(draftId)
-  if (!tryGetTableCapabilities(table)?.tenancy) return `draft:${draft}:${tableName}`
+  const tenancy = tryGetTableCapabilities(table)?.tenancy
+  if (!tenancy) return `draft:${draft}:${tableName}`
   if (tenantId === undefined || tenantId === null) {
     throw new Error(`Table "${getTableName(table)}" requires a tenant invalidation identity`)
   }
-  return `tenant:${encodeURIComponent(String(tenantId))}:draft:${draft}:${tableName}`
+  const tenantColumn = requireColumn(
+    getTableColumns(table) as Record<string, { name: string; getSQLType(): string }>,
+    tenancy.property,
+  )
+  const tenantKey = encodeTypedKey(tenantColumn, tenantId).text
+  return `tenant:${encodeURIComponent(tenantKey)}:draft:${draft}:${tableName}`
 }
 
 /**

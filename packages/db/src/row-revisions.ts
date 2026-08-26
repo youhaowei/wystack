@@ -3,6 +3,7 @@ import { getTableConfig } from 'drizzle-orm/pg-core'
 import { encodeTypedKey, noTenantScope, requireTenantScope } from './tracker-core'
 import type { AnyTable, DrizzleDb, TenantScope } from './tracker-core'
 import { normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
+import { withFrameworkBootstrapLock } from './framework-storage'
 
 export const rowRevisionStorageDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_row_revisions (
   table_key TEXT NOT NULL,
@@ -13,7 +14,9 @@ export const rowRevisionStorageDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack
 )`)
 
 export async function ensureRowRevisionStorage(raw: DrizzleDb): Promise<void> {
-  await raw.execute(rowRevisionStorageDdl)
+  await withFrameworkBootstrapLock(raw, async (tx) => {
+    await tx.execute(rowRevisionStorageDdl)
+  })
 }
 
 function revisionIdentity(table: AnyTable, tenantScope: TenantScope, row: Record<string, unknown>) {

@@ -32,10 +32,15 @@
 
 import type { DrizzleTracker } from '@wystack/db'
 import { isPrincipal } from '@wystack/identity'
-import { applyCommands, type CommandResult, type CommitResult } from './apply-commands'
+import {
+  applyCommandsWithAuthorizedTx,
+  type CommandResult,
+  type CommitResult,
+} from './apply-commands'
 import {
   compactLog,
   snapshotCommand,
+  snapshotJsonValue,
   type DraftCommand,
   type ResolveHook,
 } from './draft-command-log'
@@ -142,7 +147,9 @@ export function createDraftLifecycle(
   }
 
   async function ownerKey(context: Record<string, unknown>): Promise<unknown | undefined> {
-    return resolveOwner ? resolveOwner(context) : defaultOwnerKey(context)
+    const resolved = resolveOwner ? await resolveOwner(context) : defaultOwnerKey(context)
+    if (resolved === undefined || resolved === null) return resolved
+    return snapshotJsonValue(resolved, 'owner key')
   }
 
   function requireStableOwner(value: unknown): void {
@@ -322,7 +329,7 @@ export function createDraftLifecycle(
           db: scopedTx.withDraft(draftId),
           context,
         })
-        const committed = (await applyCommands(app, boundLog, {
+        const committed = (await applyCommandsWithAuthorizedTx(app, boundLog, {
           mode: 'commit',
           context,
           tx: scopedTx,

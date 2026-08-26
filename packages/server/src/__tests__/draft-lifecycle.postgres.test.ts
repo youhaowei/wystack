@@ -67,8 +67,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     )
     await firstClient.unsafe('CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL)')
     await firstClient.unsafe("INSERT INTO dashboards (id, items) VALUES (1, 'a')")
-    firstApp = await buildApp(firstClient)
-    secondApp = await buildApp(secondClient)
+    ;[firstApp, secondApp] = await Promise.all([buildApp(firstClient), buildApp(secondClient)])
   })
 
   afterAll(async () => {
@@ -77,6 +76,22 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       await admin.unsafe(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`)
       await admin.end({ timeout: 1 })
     }
+  })
+
+  test('concurrent first use installs framework storage across separate connections', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const [firstDraft, secondDraft] = await Promise.all([
+      first.open(0, { context: privilegedContext }),
+      second.open(0, { context: privilegedContext }),
+    ])
+
+    expect(
+      await Promise.all([
+        first.getLog(firstDraft, { context: privilegedContext }),
+        second.getLog(secondDraft, { context: privilegedContext }),
+      ]),
+    ).toEqual([[], []])
   })
 
   test('concurrent appends serialize one durable log across separate connections', async () => {

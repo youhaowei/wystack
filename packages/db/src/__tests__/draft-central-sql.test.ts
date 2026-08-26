@@ -6,7 +6,7 @@ import { sql } from 'drizzle-orm'
 import { createDrizzleTracker, enumerateDraftRowChanges } from '../drizzle-tracker'
 import { jsonNull } from '../index'
 import { eq, gt, lt } from '../operators'
-import { defineSchema } from '../schema'
+import { defineSchema, registerTableCapabilities } from '../schema'
 import { int, text as dslText } from '../dsl'
 import { multiTenant } from '../table'
 import { syncSchema } from '../sync'
@@ -39,6 +39,21 @@ const auditItems = audit.table('draft_items', {
   id: integer('id').primaryKey(),
   title: text('title').notNull(),
 })
+
+const unregisteredItems = pgTable('unregistered_items', {
+  id: integer('id').primaryKey(),
+  title: text('title').notNull(),
+})
+
+for (const draftableTable of [
+  items,
+  defaultedItems,
+  dynamicDefaultItems,
+  generatedDefaultItems,
+  auditItems,
+]) {
+  registerTableCapabilities(draftableTable, { draftable: true })
+}
 
 const tenancy = multiTenant({
   key: { property: 'tenantId', column: 'tenant_id', type: dslText },
@@ -79,6 +94,7 @@ beforeEach(async () => {
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL
     )`,
+    `CREATE TABLE unregistered_items (id INTEGER PRIMARY KEY, title TEXT NOT NULL)`,
     `CREATE TABLE wystack_draft_row_changes (
       draft_id TEXT NOT NULL,
       table_key TEXT NOT NULL,
@@ -158,6 +174,31 @@ describe('durable central draft overlay', () => {
     expect((await enumerateDraftRowChanges(db, 'd-ops')).map((change) => change.operation)).toEqual(
       ['delete', 'insert'],
     )
+  })
+
+  test('unregistered Drizzle tables remain canonical and reject draft writes', async () => {
+    const draft = tracked.withDraft('d-unregistered')
+
+    expect(await draft.from(unregisteredItems).all()).toEqual([])
+    await expect(
+      draft.from(unregisteredItems).update({ title: 'not draftable' }),
+    ).rejects.toThrow('not draftable')
+    expect(() => draft.into(unregisteredItems)).toThrow('not draftable')
+    expect(await enumerateDraftRowChanges(db, 'd-unregistered')).toEqual([])
+  })
+
+  test('rejects duplicate effective inserts but permits create after a draft tombstone', async () => {
+    const draft = tracked.withDraft('d-insert-uniqueness')
+
+    await expect(
+      draft.into(items).insert({ id: 1, title: 'duplicate', score: 99 }),
+    ).rejects.toThrow('because it already exists')
+    expect(await enumerateDraftRowChanges(db, 'd-insert-uniqueness')).toEqual([])
+
+    await draft.from(items).where(eq('id', 1)).delete()
+    expect(await draft.into(items).insert({ id: 1, title: 'replacement', score: 99 })).toEqual([
+      { id: 1, title: 'replacement', score: 99, note: null, payload: null },
+    ])
   })
 
   test('materializes database defaults in a draft insert', async () => {

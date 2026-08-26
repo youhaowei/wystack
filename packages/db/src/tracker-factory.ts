@@ -100,7 +100,7 @@ export function createDrizzleTracker(
         from<T extends AnyTable>(table: T) {
           const capabilities = tryGetTableCapabilities(table)
           const isTenantReadingGlobal = tenantScope !== noTenantScope && !capabilities?.tenancy
-          if (capabilities?.draftable === false || isTenantReadingGlobal) {
+          if (capabilities?.draftable !== true || isTenantReadingGlobal) {
             const writeError = isTenantReadingGlobal
               ? `Tenant-scoped drafts cannot write global table "${getTableName(table)}"`
               : `Table "${getTableName(table)}" is not draftable; declare it with .draftable() before writing through withDraft()`
@@ -116,7 +116,7 @@ export function createDrizzleTracker(
           return new DraftSelectBuilder(table, drizzleDb, draftId, draftHandle, tenantScope)
         },
         into<T extends AnyTable>(table: T) {
-          if (tryGetTableCapabilities(table)?.draftable === false) {
+          if (tryGetTableCapabilities(table)?.draftable !== true) {
             throw new Error(
               `Table "${getTableName(table)}" is not draftable; declare it with .draftable() before writing through withDraft()`,
             )

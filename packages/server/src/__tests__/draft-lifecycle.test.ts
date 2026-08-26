@@ -292,10 +292,31 @@ describe('draft lifecycle — global authority and custody', () => {
     expect(await lifecycle.getLog(draftId, { context: privileged })).toHaveLength(1)
   })
 
+  test('owner keys are canonically persisted and compared after lifecycle recreation', async () => {
+    const resolveOwner = () => new Date('2026-01-01T00:00:00.000Z')
+    const first = createProductionDraftLifecycle(app, {
+      resolveOwner,
+      authorizeGlobalDraft: () => true,
+    })
+    const draftId = await first.open(0)
+    await first.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'date-owned' } }])
+
+    const reopened = createProductionDraftLifecycle(app, {
+      resolveOwner,
+      authorizeGlobalDraft: () => true,
+    })
+    expect(await reopened.getLog(draftId)).toHaveLength(1)
+    expect(await reopened.inspect(draftId)).toHaveLength(1)
+  })
+
   test('explicit global authority bypasses tenant resolution for a mixed application', async () => {
+    let tenantResolutionCalls = 0
     const mixedApp = await wy.build({
       db,
-      resolveTenant: () => 'tenant-1',
+      resolveTenant: () => {
+        tenantResolutionCalls += 1
+        throw new Error('global draft must not resolve tenant scope')
+      },
       functions: {
         addGlobalTodo: wy.procedure
           .input({ id: int, title: text })
@@ -315,6 +336,13 @@ describe('draft lifecycle — global authority and custody', () => {
     expect(await lifecycle.inspect(draftId, { context: ownerContext })).toMatchObject([
       { table: 'todos', tenantKey: null, rowKey: { value: 3 } },
     ])
+    await lifecycle.publish(draftId, undefined, { context: ownerContext })
+    expect(await db.select().from(schema.todos)).toContainEqual({
+      id: 3,
+      title: 'global',
+      done: false,
+    })
+    expect(tenantResolutionCalls).toBe(0)
   })
 })
 

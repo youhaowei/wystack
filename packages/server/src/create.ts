@@ -38,7 +38,8 @@ export interface WyStackSystem {
    * `call`, so a batch command and a plain RPC to the same path validate identically. The
    * caller owns the DrizzleTracker lifecycle (creation, transaction, tracking-set
    * collection); this method injects runtime context and invokes the composed
-   * handler with `{ ...context, db: tracked, can }`, which then validates args.
+   * handler with `{ ...context, db: procedureFacade, can }`, which then validates
+   * args without exposing raw SQL, scope changes, or tracking custody.
    *
    * Calling it directly bypasses the transaction envelope, so the privileged
    * host caller is responsible for atomicity and invalidation.
