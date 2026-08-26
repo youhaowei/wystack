@@ -180,9 +180,9 @@ describe('durable central draft overlay', () => {
     const draft = tracked.withDraft('d-unregistered')
 
     expect(await draft.from(unregisteredItems).all()).toEqual([])
-    await expect(
-      draft.from(unregisteredItems).update({ title: 'not draftable' }),
-    ).rejects.toThrow('not draftable')
+    await expect(draft.from(unregisteredItems).update({ title: 'not draftable' })).rejects.toThrow(
+      'not draftable',
+    )
     expect(() => draft.into(unregisteredItems)).toThrow('not draftable')
     expect(await enumerateDraftRowChanges(db, 'd-unregistered')).toEqual([])
   })

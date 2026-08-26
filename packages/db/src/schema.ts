@@ -55,10 +55,7 @@ export function tryGetTableCapabilities(table: object): TableCapabilities | unde
  * tracker against hand-authored Drizzle tables. It is intentionally absent
  * from the package barrel; application code opts in through `table(...).draftable()`.
  */
-export function registerTableCapabilities(
-  table: object,
-  capabilities: TableCapabilities,
-): void {
+export function registerTableCapabilities(table: object, capabilities: TableCapabilities): void {
   const tenancy = capabilities.tenancy ? Object.freeze({ ...capabilities.tenancy }) : undefined
   tableCapabilities.set(table, Object.freeze({ ...capabilities, tenancy }))
 }
