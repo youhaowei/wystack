@@ -195,11 +195,19 @@ export class TableDefinition<
   }
 
   static [Symbol.hasInstance](value: unknown): boolean {
-    return typeof value === 'object' && value !== null && #constructionBrand in value
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      #constructionBrand in value &&
+      value.#constructionBrand === tableDefinitionConstructionToken
+    )
   }
 
   static #assertAuthentic(value: object): void {
-    if (!(#constructionBrand in value)) {
+    if (
+      !(#constructionBrand in value) ||
+      value.#constructionBrand !== tableDefinitionConstructionToken
+    ) {
       throw new Error('TableDefinition capability methods require a factory-created definition')
     }
   }
