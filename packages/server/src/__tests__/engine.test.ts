@@ -707,7 +707,7 @@ function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
   const subscriptionStore = createInMemorySubscriptionStore()
 
   // Single router — NOT per-connection — wired to the APP's source. `app.call`
-  // fuses invalidation there, and `app.emit` drives it from "outside" (a
+  // fuses invalidation there, and `app.system.emit` drives it from "outside" (a
   // runHandler-path writer, or a test simulating a write on another connection).
   createInvalidationRouter({
     source: app.invalidationSource,
@@ -722,7 +722,7 @@ function makeReactiveShared(app: Awaited<ReturnType<typeof makeApp>>) {
     },
   })
 
-  return { subscriptionStore, publishInvalidation: app.emit }
+  return { subscriptionStore, publishInvalidation: app.system.emit }
 }
 
 /**

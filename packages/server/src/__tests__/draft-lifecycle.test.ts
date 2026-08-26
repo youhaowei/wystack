@@ -31,11 +31,13 @@ import {
   draftInvalidationIdentity,
 } from '@wystack/db'
 import {
-  createDraftLifecycle,
+  createDraftLifecycle as createProductionDraftLifecycle,
   DraftConflictError,
+  DraftIntegrityError,
   type VersionProbe,
   type Cell,
   type Command,
+  type DraftLifecycleOptions,
 } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
 
@@ -71,6 +73,18 @@ const auditAccounts = pgSchema('audit').table('accounts', {
 
 let app: Awaited<ReturnType<typeof wy.build>>
 let db: ReturnType<typeof drizzle>
+
+/** Most lifecycle scenarios exercise mechanics under an explicitly privileged test host. */
+function createDraftLifecycle(
+  currentApp: Awaited<ReturnType<typeof wy.build>>,
+  opts: DraftLifecycleOptions = {},
+) {
+  return createProductionDraftLifecycle(currentApp, {
+    resolveOwner: () => 'test-owner',
+    authorizeGlobalDraft: () => true,
+    ...opts,
+  })
+}
 
 beforeEach(async () => {
   const pg = new PGlite()
@@ -238,8 +252,74 @@ function makeProbe(): VersionProbe & {
   }
 }
 
+describe('draft lifecycle — global authority and custody', () => {
+  const ownerContext = {
+    principal: { kind: 'user' as const, userId: 'system-test' },
+  }
+
+  test('global drafts require explicit privileged host authorization', async () => {
+    const lifecycle = createProductionDraftLifecycle(app)
+
+    await expect(lifecycle.open(0, { context: ownerContext })).rejects.toThrow(
+      'global drafts require privileged host context',
+    )
+  })
+
+  test('global drafts require a stable non-null owner', async () => {
+    for (const resolvedOwner of [undefined, null]) {
+      const lifecycle = createProductionDraftLifecycle(app, {
+        resolveOwner: () => resolvedOwner,
+        authorizeGlobalDraft: () => true,
+      })
+
+      await expect(lifecycle.open(0)).rejects.toThrow('stable owner')
+    }
+  })
+
+  test('global privilege is reauthorized on every operation without leaking the draft', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      authorizeGlobalDraft: ({ context }) => context.globalDraftAccess === true,
+    })
+    const privileged = { ...ownerContext, globalDraftAccess: true }
+    const draftId = await lifecycle.open(0, { context: privileged })
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      context: privileged,
+    })
+
+    await expect(lifecycle.getLog(draftId, { context: ownerContext })).rejects.toThrow(
+      'unknown draft',
+    )
+    expect(await lifecycle.getLog(draftId, { context: privileged })).toHaveLength(1)
+  })
+
+  test('explicit global authority bypasses tenant resolution for a mixed application', async () => {
+    const mixedApp = await wy.build({
+      db,
+      resolveTenant: () => 'tenant-1',
+      functions: {
+        addGlobalTodo: wy.procedure
+          .input({ id: int, title: text })
+          .mutation(async (ctx, args) =>
+            ctx.db.into(schema.todos).insert({ ...args, done: false }),
+          ),
+      },
+    })
+    const lifecycle = createProductionDraftLifecycle(mixedApp, {
+      authorizeGlobalDraft: () => true,
+    })
+    const draftId = await lifecycle.open(0, { context: ownerContext })
+
+    await lifecycle.append(draftId, [{ path: 'addGlobalTodo', args: { id: 3, title: 'global' } }], {
+      context: ownerContext,
+    })
+    expect(await lifecycle.inspect(draftId, { context: ownerContext })).toMatchObject([
+      { table: 'todos', tenantKey: null, rowKey: { value: 3 } },
+    ])
+  })
+})
+
 describe('draft lifecycle — golden path (open→append→read→publish)', () => {
-  test('explicit rebase restores derived state from the authoritative command log', async () => {
+  test('rebase fails closed when materialized row changes disagree with the command log', async () => {
     const lifecycle = createDraftLifecycle(app, { versionProbe: makeProbe() })
     const draftId = await lifecycle.open(0)
     await lifecycle.append(draftId, [
@@ -252,17 +332,78 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     ])
 
     await db.execute(`DELETE FROM wystack_draft_row_changes WHERE draft_id = '${draftId}'`)
+    await expect(lifecycle.rebase(draftId)).rejects.toBeInstanceOf(DraftIntegrityError)
     expect(
-      await app.createTracked().withDraft(draftId).from(schema.todos).where(eq('id', 3)).first(),
+      await app.system
+        .createTracked()
+        .withDraft(draftId)
+        .from(schema.todos)
+        .where(eq('id', 3))
+        .first(),
     ).toBeNull()
-
-    await lifecycle.rebase(draftId)
-
-    expect(
-      (await app.createTracked().withDraft(draftId).from(schema.todos).where(eq('id', 3)).first())
-        ?.title,
-    ).toBe('cherry')
     expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('rebase fails closed when a stored command changes without changing command count', async () => {
+    const lifecycle = createDraftLifecycle(app, { versionProbe: makeProbe() })
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    await db.execute(
+      `UPDATE wystack_draft_commands
+       SET command = '{"path":"addTodo","args":{"id":4,"title":"tampered"}}'
+       WHERE draft_id = '${draftId}' AND position = 0`,
+    )
+
+    await expect(lifecycle.rebase(draftId)).rejects.toBeInstanceOf(DraftIntegrityError)
+    expect(
+      (
+        await app.system
+          .createTracked()
+          .withDraft(draftId)
+          .from(schema.todos)
+          .where(eq('id', 3))
+          .first()
+      )?.title,
+    ).toBe('cherry')
+  })
+
+  test('publish rejects corrupt artifacts before invoking the resolve hook', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    await db.execute(`DELETE FROM wystack_draft_row_changes WHERE draft_id = '${draftId}'`)
+    let resolveCalled = false
+
+    await expect(
+      lifecycle.publish(draftId, (log) => {
+        resolveCalled = true
+        return log
+      }),
+    ).rejects.toBeInstanceOf(DraftIntegrityError)
+    expect(resolveCalled).toBe(false)
+  })
+
+  test('explicit rebase rebuilds an intact draft on a newer canonical base', async () => {
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
+    probe.bump([{ table: 'todos', id: 2 }])
+
+    await expect(lifecycle.rebase(draftId)).resolves.toEqual({
+      staleBase: true,
+      overlappingCells: [],
+    })
+    expect(
+      (
+        await app.system
+          .createTracked()
+          .withDraft(draftId)
+          .from(schema.todos)
+          .where(eq('id', 3))
+          .first()
+      )?.title,
+    ).toBe('cherry')
   })
 
   test('draft metadata and command log survive lifecycle recreation', async () => {
@@ -278,7 +419,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(5)
+    expect((migration as any).rows[0].version).toBe(6)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -287,7 +428,9 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
   })
 
   test('default custody follows stable principal identity, not mutable profile fields', async () => {
-    const lifecycle = createDraftLifecycle(app)
+    const lifecycle = createProductionDraftLifecycle(app, {
+      authorizeGlobalDraft: () => true,
+    })
     const draftId = await lifecycle.open(0, {
       context: {
         principal: {
@@ -299,7 +442,9 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     })
 
     expect(
-      await createDraftLifecycle(app).getLog(draftId, {
+      await createProductionDraftLifecycle(app, {
+        authorizeGlobalDraft: () => true,
+      }).getLog(draftId, {
         context: {
           principal: {
             kind: 'user',
@@ -341,7 +486,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     expect(canonical as unknown[]).toHaveLength(2)
 
     // Draft-coalesced read sees the overlay: id=1 renamed + id=3 added.
-    const draftRows = await app.createTracked().withDraft(draftId).from(schema.todos).all()
+    const draftRows = await app.system.createTracked().withDraft(draftId).from(schema.todos).all()
     const byId = Object.fromEntries(draftRows.map((r) => [r['id'], r]))
     expect(byId[1]['title']).toBe('APPLE')
     expect(byId[3]['title']).toBe('cherry')
@@ -646,7 +791,11 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       { path: 'renameVersionedTodo', args: { id: 1, title: 'final title' } },
     ])
 
-    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    const effective = await app.system
+      .createTracked()
+      .withDraft(draftId)
+      .from(schema.versionedTodos)
+      .all()
     expect(effective).toEqual([{ id: 1, title: 'final title', revision: 3 }])
 
     await lifecycle.publish(draftId)
@@ -672,7 +821,11 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       },
     ])
 
-    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    const effective = await app.system
+      .createTracked()
+      .withDraft(draftId)
+      .from(schema.versionedTodos)
+      .all()
     expect(effective).toEqual([{ id: 1, title: 'final title', revision: 3 }])
     expect(await lifecycle.getLog(draftId)).toHaveLength(2)
 
@@ -689,7 +842,11 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       { path: 'addVersionedTodo', args: { id: 1, title: 'draft replacement' } },
     ])
 
-    const effective = await app.createTracked().withDraft(draftId).from(schema.versionedTodos).all()
+    const effective = await app.system
+      .createTracked()
+      .withDraft(draftId)
+      .from(schema.versionedTodos)
+      .all()
     expect(effective).toEqual([{ id: 1, title: 'draft replacement', revision: 2 }])
 
     await app.call('addVersionedTodo', { id: 1, title: 'concurrent replacement' })
@@ -1370,7 +1527,7 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
 
     // And the overlay already shows the replacement (the derived write is a
     // sparse upsert, so the create clears the tombstone the delete set).
-    const draftRows = await app.createTracked().withDraft(draftId).from(schema.todos).all()
+    const draftRows = await app.system.createTracked().withDraft(draftId).from(schema.todos).all()
     expect(Object.fromEntries(draftRows.map((r) => [r['id'], r['title']]))[1]).toBe('REPLACED')
 
     await lc.publish(draftId)
@@ -1399,7 +1556,7 @@ describe('draft lifecycle — replacing a canonical row (#89)', () => {
       },
     ])
 
-    const effective = await app
+    const effective = await app.system
       .createTracked()
       .withDraft(draftId)
       .from(schema.replaceableTodos)

@@ -13,7 +13,7 @@ export {
   createDrizzleTracker,
   resetTracking,
   resolvePkColumnName,
-  draftJsonNull,
+  jsonNull,
   publishedInvalidationIdentity,
   draftInvalidationIdentity,
 } from './drizzle-tracker'

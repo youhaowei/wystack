@@ -16,10 +16,14 @@ import {
 } from 'drizzle-orm/pg-core'
 import type { PgTable, PgTableExtraConfigValue } from 'drizzle-orm/pg-core'
 import type { AnyColumnDef, ColumnDefOptions } from './dsl'
-import { TableDefinition, type TableCapabilities } from './table'
+import { TableDefinition, type TableCapabilities, type WithSystemManagedProperties } from './table'
 
 type ColumnMap = Record<string, AnyColumnDef>
-type AnyTableDefinition = TableDefinition<ColumnMap, boolean>
+type AnyTableDefinition = TableDefinition<ColumnMap, boolean, string>
+type CompiledTable<TDefinition> = WithSystemManagedProperties<
+  ReturnType<typeof pgTable>,
+  TDefinition
+>
 
 const tableCapabilities = new WeakMap<object, TableCapabilities>()
 const generatedTables = new WeakMap<object, PgTable[]>()
@@ -261,6 +265,13 @@ function buildRowRevisionsTable() {
 export function defineSchema<const T extends Record<string, unknown>>(
   tables: T & { [K in keyof T]: AnyTableDefinition },
 ) {
+  const reservedTable = Object.keys(tables).find((tableName) => tableName.startsWith('wystack_'))
+  if (reservedTable) {
+    throw new Error(
+      `Table name "${reservedTable}" uses the reserved "wystack_" framework namespace`,
+    )
+  }
+
   const tenancyDescriptors = new Set(
     Object.values(tables)
       .map((definition) => normalizeTableDefinition(definition).capabilities.tenancy?.descriptorId)
@@ -290,7 +301,7 @@ export function defineSchema<const T extends Record<string, unknown>>(
     tableCapabilities.set(result[tableName], capabilities)
   }
 
-  const compiled = result as { [K in keyof T]: ReturnType<typeof pgTable> }
+  const compiled = result as { [K in keyof T]: CompiledTable<T[K]> }
   const draftableEntries = Object.entries(tables).filter(
     ([, definition]) => normalizeTableDefinition(definition).capabilities.draftable,
   )

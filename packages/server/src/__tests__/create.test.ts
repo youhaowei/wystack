@@ -144,6 +144,22 @@ describe('defineApp().build()', () => {
     expect(app.functions.has('addTodo')).toBe(true)
   })
 
+  test('keeps privileged tracker custody behind one frozen system capability', () => {
+    const root = app as unknown as Record<string, unknown>
+
+    expect(root['createTracked']).toBeUndefined()
+    expect(root['runHandler']).toBeUndefined()
+    expect(root['scopeTracked']).toBeUndefined()
+    expect(root['emit']).toBeUndefined()
+    expect(Object.keys(app.system).sort()).toEqual([
+      'createTracked',
+      'emit',
+      'runHandler',
+      'scopeTracked',
+    ])
+    expect(Object.isFrozen(app.system)).toBe(true)
+  })
+
   test('keeps raw SQL, scope changes, and tracking state out of procedure custody', async () => {
     const { result } = await app.call('inspectDbSurface', {})
     expect(result).toEqual({

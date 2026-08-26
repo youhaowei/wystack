@@ -8,6 +8,7 @@ import type {
   DrizzleDb,
   ReadClauses,
   TenantScope,
+  TrackedUpdateValues,
 } from './tracker-core'
 import {
   assertDraftWriteScope,
@@ -133,7 +134,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * resulting effective rows. Read-only select/order/limit clauses are rejected
    * because a write cannot honor their return-shaping semantics.
    */
-  async update(values: Partial<T['$inferInsert']>): Promise<Record<string, unknown>[]> {
+  async update(values: TrackedUpdateValues<T>): Promise<Record<string, unknown>[]> {
     assertNoReadClauses('update', this._clauses)
     assertDraftWriteScope(this._table, this._tenantScope)
     const patch = withoutUndefined(values as Record<string, unknown>)

@@ -335,7 +335,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
   // "log deleted" across which a restart could double-replay.
 
   test('commands run inside the caller-supplied tx and persist on outer commit', async () => {
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
     await outer.transaction(async (tx) => {
       commitResult = await applyCommands(
@@ -356,7 +356,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // Simulate the crash-window scenario in reverse: caller throws AFTER
     // applyCommands returns (e.g. log sweep failed) — the whole tx must roll back,
     // including the command replay that already ran inside it.
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     await expect(
       outer.transaction(async (tx) => {
         await applyCommands(
@@ -375,7 +375,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
   })
 
   test('tablesWritten is populated from the supplied tx and reflects command writes', async () => {
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
     await outer.transaction(async (tx) => {
       commitResult = await applyCommands(
@@ -400,7 +400,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // confirming writes accumulate on the supplied handle. An incorrect implementation
     // that opened its own inner tx would accumulate writes on a DIFFERENT inner handle —
     // `tx.tablesWritten` would remain empty until the inner tx committed.
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     let txTablesWrittenMidCallback: Set<string> | undefined
     let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
     await outer.transaction(async (tx) => {
@@ -421,7 +421,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
   })
 
   test('a mid-batch failure inside the outer tx rolls back all commands', async () => {
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     await expect(
       outer.transaction(async (tx) => {
         await applyCommands(
@@ -446,7 +446,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // A nested tx would commit before the outer (caller) tx, re-opening the crash
     // window. We verify the flat-dispatch contract by intercepting tx.transaction:
     // if it is ever called, the spy throws, failing the test.
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     await outer.transaction(async (tx) => {
       // Wrap the tx in a Proxy that throws if .transaction() is called. A correct
       // implementation never calls it; an incorrect implementation (nested tx) would
@@ -484,7 +484,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // bare createTracked() (not inside a transaction callback) — we are not
     // testing transaction nesting here, only that the tx param has no effect
     // on preview semantics (no persistence, mode === 'preview').
-    const strayTx = app.createTracked()
+    const strayTx = app.system.createTracked()
     const previewResult = await applyCommands(
       app,
       [{ path: 'addTodo', args: { id: 1, title: 'preview-ignored-tx' } }],
@@ -506,7 +506,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     // We simulate a realistic scenario: the caller inserts a "lock" row into the
     // `tags` table via `tx.into()` before replaying, then applyCommands adds a
     // `todos` write. tablesWritten must contain only `todos`, not `tags`.
-    const outer = app.createTracked()
+    const outer = app.system.createTracked()
     let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
     await outer.transaction(async (tx) => {
       // Pre-existing write through the tx handle itself — this is how a caller

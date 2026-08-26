@@ -2,7 +2,13 @@ import { getTableColumns, getTableName, sql } from 'drizzle-orm'
 import type { SQL } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import { tryGetTableCapabilities } from './schema'
-import type { AnyTable, DraftDrizzleTracker, DrizzleDb, TenantScope } from './tracker-core'
+import type {
+  AnyTable,
+  DraftDrizzleTracker,
+  DrizzleDb,
+  TenantScope,
+  TrackedInsertValues,
+} from './tracker-core'
 import {
   assertDraftWriteScope,
   assertRevisionInput,
@@ -244,7 +250,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
   }
 
   async insert(
-    values: T['$inferInsert'] | T['$inferInsert'][],
+    values: TrackedInsertValues<T> | TrackedInsertValues<T>[],
   ): Promise<Record<string, unknown>[]> {
     assertDraftWriteScope(this._table, this._tenantScope)
     const rows = Array.isArray(values) ? values : [values]

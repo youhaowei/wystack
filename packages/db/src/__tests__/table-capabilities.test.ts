@@ -15,6 +15,32 @@ import {
 import { getTableConfig } from 'drizzle-orm/pg-core'
 
 describe('composable table capabilities', () => {
+  test('application tables cannot use the reserved wystack_ namespace', () => {
+    const reservedNames = [
+      'wystack_framework_migrations',
+      'wystack_drafts',
+      'wystack_draft_commands',
+      'wystack_draft_tables',
+      'wystack_draft_row_changes',
+      'wystack_row_revisions',
+      'wystack_future_internal',
+    ]
+
+    for (const tableName of reservedNames) {
+      expect(() =>
+        defineSchema({
+          [tableName]: table({ id: uuid.primaryKey() }),
+        }),
+      ).toThrow(`Table name "${tableName}" uses the reserved "wystack_" framework namespace`)
+    }
+
+    expect(() =>
+      defineSchema({
+        application_wystack_jobs: table({ id: uuid.primaryKey() }),
+      }),
+    ).not.toThrow()
+  })
+
   test('schema entries must declare table capabilities explicitly', () => {
     expect(() =>
       defineSchema({

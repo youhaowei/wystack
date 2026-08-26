@@ -9,6 +9,7 @@ import type {
   LoweredSelect,
   ReadClauses,
   TenantScope,
+  TrackedUpdateValues,
 } from './tracker-core'
 import {
   assertNoReadClauses,
@@ -256,7 +257,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
     return rows[0] ?? null
   }
 
-  async update(values: Partial<T['$inferInsert']>) {
+  async update(values: TrackedUpdateValues<T>) {
     if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('update', this._clauses)
     assertTenantInput(this._table, values as Record<string, unknown>)

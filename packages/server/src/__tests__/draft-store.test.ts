@@ -26,8 +26,12 @@ describe('draft storage migrations', () => {
       `SELECT table_name FROM information_schema.tables
        WHERE table_name = 'wystack_row_revisions'`,
     )
+    const integrityColumn = await db.execute(
+      `SELECT column_name, is_nullable FROM information_schema.columns
+       WHERE table_name = 'wystack_drafts' AND column_name = 'integrity_hash'`,
+    )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((migration as any).rows[0].version).toBe(5)
+    expect((migration as any).rows[0].version).toBe(6)
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((tables as any).rows.map((row: { table_name: string }) => row.table_name)).toEqual([
       'wystack_draft_commands',
@@ -38,6 +42,9 @@ describe('draft storage migrations', () => {
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((indexes as any).rows).toHaveLength(1)
     expect((revisionLedger as { rows: unknown[] }).rows).toHaveLength(1)
+    expect((integrityColumn as { rows: unknown[] }).rows).toEqual([
+      { column_name: 'integrity_hash', is_nullable: 'NO' },
+    ])
   })
 
   test('upgrades v2 touched-table metadata without replacing durable rows', async () => {
@@ -112,7 +119,9 @@ describe('draft storage migrations', () => {
       `SELECT column_name FROM information_schema.columns
        WHERE table_name = 'wystack_draft_tables' ORDER BY column_name`,
     )
-    const draft = await db.execute(`SELECT draft_id FROM wystack_drafts WHERE draft_id = 'kept'`)
+    const draft = await db.execute(
+      `SELECT draft_id, integrity_hash FROM wystack_drafts WHERE draft_id = 'kept'`,
+    )
     const touched = await db.execute(
       `SELECT table_name, pk_type, invalidation_tag FROM wystack_draft_tables
        WHERE draft_id = 'kept' ORDER BY table_name`,
@@ -131,7 +140,10 @@ describe('draft storage migrations', () => {
     expect(columnNames).toContain('invalidation_tag')
     expect(columnNames).not.toContain('shadow_tag')
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((draft as any).rows).toEqual([{ draft_id: 'kept' }])
+    // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
+    expect((draft as any).rows).toEqual([
+      { draft_id: 'kept', integrity_hash: expect.stringMatching(/^[0-9a-f]{32}$/) },
+    ])
     expect((touched as { rows: unknown[] }).rows).toEqual([
       {
         table_name: 'kept_documents',
@@ -153,8 +165,10 @@ describe('draft storage migrations', () => {
     const db = drizzle(pg)
     await ensureDraftStorage(db)
     await db.execute(`
-      INSERT INTO wystack_drafts (draft_id, base_version, tenant_scope, owner_key)
-      VALUES ('pre-v5', '{"present":true,"value":0}', '{"present":false}', '{"present":false}')
+      INSERT INTO wystack_drafts
+        (draft_id, base_version, tenant_scope, owner_key, integrity_hash)
+      VALUES
+        ('pre-v5', '{"present":true,"value":0}', '{"present":false}', '{"present":false}', 'legacy')
     `)
     await db.execute(`
       INSERT INTO wystack_draft_tables

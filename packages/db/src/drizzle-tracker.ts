@@ -3,7 +3,7 @@ export { SelectBuilder } from './select-builder'
 export { DraftSelectBuilder } from './draft-select-builder'
 export { DraftInsertBuilder } from './draft-mutations'
 export {
-  draftJsonNull,
+  jsonNull,
   enumerateDraftRowChanges,
   publishedInvalidationIdentity,
   draftInvalidationIdentity,

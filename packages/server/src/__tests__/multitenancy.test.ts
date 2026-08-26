@@ -90,7 +90,7 @@ describe('server tenant resolution', () => {
 
   test('plain tables remain usable without tenant resolution', async () => {
     const appWithoutResolver = await wy.build({
-      db: app.createTracked().raw,
+      db: app.system.createTracked().raw,
       functions: {
         addCatalog: wy.procedure
           .input({ id: uuid, name: text })

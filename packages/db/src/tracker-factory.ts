@@ -6,6 +6,7 @@ import type {
   DrizzleDb,
   DrizzleTracker,
   TenantScope,
+  TrackedInsertValues,
   TransactionOptions,
 } from './tracker-core'
 import {
@@ -36,7 +37,7 @@ export class InsertBuilder<T extends AnyTable> {
     this._tenantScope = tenantScope
   }
 
-  async insert(values: T['$inferInsert'] | T['$inferInsert'][]) {
+  async insert(values: TrackedInsertValues<T> | TrackedInsertValues<T>[]) {
     const rows = Array.isArray(values) ? values : [values]
     const tenant = requireTenantScope(this._table, this._tenantScope)
     const revision = revisionProperty(this._table)

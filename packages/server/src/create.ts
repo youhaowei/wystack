@@ -10,36 +10,24 @@ import {
   type InvalidationSource,
 } from './engine/invalidation-source'
 
-export interface WyStackApp {
-  functions: Map<string, FunctionDef>
-  subscriptions: ReturnType<typeof createSubscriptionManager>
+/**
+ * Explicit host-only capability for framework orchestration.
+ *
+ * This surface can mint trackers (and therefore reach raw SQL), change their
+ * tenant scope, dispatch handlers against supplied trackers, and publish
+ * invalidations. Application procedures never receive it. Keeping these seams
+ * under a named, frozen capability makes privileged use visible at every call
+ * site instead of presenting it as ordinary app behavior.
+ */
+export interface WyStackSystem {
   /**
-   * The app's single invalidation source. Every write dispatched through `call`,
-   * and every explicit `emit`, fans out on this one source. Transports wire their
-   * `InvalidationRouter` to it — they must NOT create their own source, or a
-   * write on one surface (REST) would be invisible to subscriptions served by
-   * another (WS). One app instance ⇒ one source ⇒ one live reactive tier.
-   */
-  invalidationSource: InvalidationSource
-  /**
-   * Publish a write-tag set to the app's invalidation source. `call` invokes this
-   * automatically after any dispatch that wrote (guarded on `tablesWritten.size`),
-   * so plain RPC/REST callers never need to. It is the explicit seam for the
+   * Publish a write-tag set to the app's invalidation source. `call` invokes
+   * this automatically after any dispatch that wrote. It is the explicit seam for the
    * runHandler-path writers that bypass `call` — `applyCommands`, draft `publish`,
    * direct `runHandler` — to flush their merged post-commit tag-set once the
    * transaction has durably committed. Fire-and-forget.
    */
   emit: (tablesWritten: Set<string>) => void
-  /** Internal dispatch — resolves DB, creates DrizzleTracker, runs handler with context */
-  call: (
-    path: string,
-    args: unknown,
-    context?: Record<string, unknown>,
-  ) => Promise<{
-    result: unknown
-    tablesRead: Set<string>
-    tablesWritten: Set<string>
-  }>
   /**
    * Run one registered function's handler against a SUPPLIED DrizzleTracker instead
    * of a fresh per-call one. This is the seam `applyCommands` uses to dispatch
@@ -52,12 +40,8 @@ export interface WyStackApp {
    * collection); this method injects runtime context and invokes the composed
    * handler with `{ ...context, db: tracked, can }`, which then validates args.
    *
-   * This is a LOW-LEVEL escape hatch, reachable on the exported `WyStackApp`
-   * type but not part of the intended public API — prefer `applyCommands` or
-   * `call`. Calling it directly bypasses the transaction envelope, so the
-   * caller is responsible for atomicity and invalidation. It exists so the
-   * in-package `applyCommands` engine can dispatch a handler against a supplied
-   * tx-bound tracker; external use is unsupported and may change.
+   * Calling it directly bypasses the transaction envelope, so the privileged
+   * host caller is responsible for atomicity and invalidation.
    *
    * `tracked` may also be a `DraftDrizzleTracker` (a `base.withDraft(draftId)` handle):
    * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
@@ -79,8 +63,7 @@ export interface WyStackApp {
    * Equivalent to the fresh-per-call tracker `call` builds internally, exposed
    * so the batch engine can own the transaction lifecycle.
    *
-   * Low-level escape hatch like `runHandler` — reachable on the exported type
-   * but not the intended public API; prefer `applyCommands`/`call`.
+   * This is privileged because a tracker also owns raw SQL and scope changes.
    */
   createTracked: () => DrizzleTracker
   /** Bind host-resolved tenant scope to a tracker for one request or batch. */
@@ -88,6 +71,31 @@ export interface WyStackApp {
     tracked: DrizzleTracker,
     context?: Record<string, unknown>,
   ) => Promise<DrizzleTracker>
+}
+
+export interface WyStackApp {
+  functions: Map<string, FunctionDef>
+  subscriptions: ReturnType<typeof createSubscriptionManager>
+  /**
+   * The app's single invalidation source. Every write dispatched through `call`,
+   * and every explicit `system.emit`, fans out on this one source. Transports wire
+   * their `InvalidationRouter` to it — they must NOT create their own source, or a
+   * write on one surface (REST) would be invisible to subscriptions served by
+   * another (WS). One app instance ⇒ one source ⇒ one live reactive tier.
+   */
+  invalidationSource: InvalidationSource
+  /** Host-only framework orchestration. Never pass this capability to procedures. */
+  readonly system: Readonly<WyStackSystem>
+  /** Internal dispatch — resolves DB, creates DrizzleTracker, runs handler with context */
+  call: (
+    path: string,
+    args: unknown,
+    context?: Record<string, unknown>,
+  ) => Promise<{
+    result: unknown
+    tablesRead: Set<string>
+    tablesWritten: Set<string>
+  }>
 }
 
 function resolveDbConfig(db: DbInput): DbConfig | null {
@@ -179,42 +187,17 @@ export async function buildWyStack(opts: {
     return fn
   }
 
-  const app: WyStackApp = {
-    functions,
-    subscriptions,
-    invalidationSource: invalidation.source,
+  const system: WyStackSystem = Object.freeze({
     emit: invalidation.emit,
 
     createTracked() {
       return createDrizzleTracker(drizzleDb)
     },
 
-    async scopeTracked(tracked, context = {}) {
+    async scopeTracked(tracked: DrizzleTracker, context = {}) {
       if (!opts.resolveTenant) return tracked
       const tenantId = await opts.resolveTenant(context)
       return tracked.withTenant(tenantId)
-    },
-
-    async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
-      // Fresh DrizzleTracker per call — no shared mutable state
-      const tracked = await app.scopeTracked(app.createTracked(), context)
-      let result: unknown
-      try {
-        result = await app.runHandler(path, args, tracked, context)
-      } finally {
-        // Fuse: any COMMITTED tracked write dispatched through `call` fans out
-        // on the app's source. The finally is load-bearing for Actions: a
-        // handler may commit a DB write, then fail during later external I/O.
-        // That durable write must still invalidate. Rolled-back transactions
-        // merge no write Tags, so they emit nothing here.
-        if (tracked.tablesWritten.size > 0) invalidation.emit(tracked.tablesWritten)
-      }
-
-      return {
-        result,
-        tablesRead: tracked.tablesRead,
-        tablesWritten: tracked.tablesWritten,
-      }
     },
 
     async runHandler(
@@ -232,6 +215,35 @@ export async function buildWyStack(opts: {
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
       return fn.handler(ctx, args)
+    },
+  })
+
+  const app: WyStackApp = {
+    functions,
+    subscriptions,
+    invalidationSource: invalidation.source,
+    system,
+
+    async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
+      // Fresh DrizzleTracker per call — no shared mutable state
+      const tracked = await system.scopeTracked(system.createTracked(), context)
+      let result: unknown
+      try {
+        result = await system.runHandler(path, args, tracked, context)
+      } finally {
+        // Fuse: any COMMITTED tracked write dispatched through `call` fans out
+        // on the app's source. The finally is load-bearing for Actions: a
+        // handler may commit a DB write, then fail during later external I/O.
+        // That durable write must still invalidate. Rolled-back transactions
+        // merge no write Tags, so they emit nothing here.
+        if (tracked.tablesWritten.size > 0) invalidation.emit(tracked.tablesWritten)
+      }
+
+      return {
+        result,
+        tablesRead: tracked.tablesRead,
+        tablesWritten: tracked.tablesWritten,
+      }
     },
   }
 

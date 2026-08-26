@@ -1,6 +1,6 @@
-import { sql } from 'drizzle-orm'
+import { sql, type SQL } from 'drizzle-orm'
 import type { DraftCommand } from './draft-command-log'
-import type { Version } from './draft-lifecycle-types'
+import { DraftIntegrityError, type Version } from './draft-lifecycle-types'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- the server supports multiple Drizzle Postgres drivers
 type RawDb = any
@@ -10,7 +10,7 @@ export interface StoredDraft {
   baseVersion: Version
   logRevision: number
   tenantId: unknown | undefined
-  ownerKey: unknown | undefined
+  ownerKey: unknown
 }
 
 export interface StoredTouchedTable {
@@ -30,7 +30,43 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-const draftStorageVersion = 5
+function draftIntegrityExpression(draftId: SQL): SQL {
+  return sql`md5(jsonb_build_object(
+    'commands', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_array(c.position, c.command)
+        ORDER BY c.position
+      )
+      FROM wystack_draft_commands c
+      WHERE c.draft_id = ${draftId}
+    ), '[]'::jsonb),
+    'tables', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_array(
+          t.schema_name, t.table_name, t.pk_column, t.pk_type,
+          t.tenant_column, t.tenant_type, t.revision_column, t.invalidation_tag
+        )
+        ORDER BY t.schema_name, t.table_name
+      )
+      FROM wystack_draft_tables t
+      WHERE t.draft_id = ${draftId}
+    ), '[]'::jsonb),
+    'changes', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_array(
+          r.table_key, r.tenant_key_text, r.tenant_key,
+          r.row_key_text, r.row_key, r.operation, r.base_exists,
+          r.base_revision, r.fields
+        )
+        ORDER BY r.table_key, r.tenant_key_text, r.row_key_text
+      )
+      FROM wystack_draft_row_changes r
+      WHERE r.draft_id = ${draftId}
+    ), '[]'::jsonb)
+  )::text)`
+}
+
+const draftStorageVersion = 6
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -172,6 +208,17 @@ const storageDdlV5 = [
       AND t.revision_column IS NOT NULL`),
 ]
 
+// The command log is publication authority while row changes and touched-table
+// metadata are its materialized read/review state. A deterministic fingerprint
+// makes accidental disagreement observable before a lifecycle operation can
+// bless, publish, or repair the inconsistent pair.
+const storageDdlV6 = [
+  sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS integrity_hash TEXT`),
+  sql`UPDATE wystack_drafts d
+    SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))}`,
+  sql.raw(`ALTER TABLE wystack_drafts ALTER COLUMN integrity_hash SET NOT NULL`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await raw.execute(migrationTableDdl)
   await raw.execute(sql`
@@ -212,6 +259,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     if (installedVersion < 5) {
       for (const statement of storageDdlV5) await tx.execute(statement)
     }
+    if (installedVersion < 6) {
+      for (const statement of storageDdlV6) await tx.execute(statement)
+    }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
       SET version = ${draftStorageVersion}, applied_at = CURRENT_TIMESTAMP
@@ -227,11 +277,13 @@ export async function insertStoredDraft(
   const baseVersion = encodeEnvelope(draft.baseVersion, 'base version')
   const tenantScope = encodeEnvelope(draft.tenantId, 'tenant scope')
   const ownerKey = encodeEnvelope(draft.ownerKey, 'owner key')
+  const integrityHash = draftIntegrityExpression(sql`${draft.draftId}`)
   await raw.execute(sql`
     INSERT INTO wystack_drafts
-      (draft_id, base_version, tenant_scope, owner_key, log_revision)
+      (draft_id, base_version, tenant_scope, owner_key, log_revision, integrity_hash)
     VALUES
-      (${draft.draftId}, ${baseVersion}::jsonb, ${tenantScope}::jsonb, ${ownerKey}::jsonb, 0)
+      (${draft.draftId}, ${baseVersion}::jsonb, ${tenantScope}::jsonb, ${ownerKey}::jsonb, 0,
+       ${integrityHash})
   `)
 }
 
@@ -283,6 +335,35 @@ export async function replaceStoredCommands(
       INSERT INTO wystack_draft_commands (draft_id, position, command)
       VALUES (${draftId}, ${position}, ${command}::jsonb)
     `)
+  }
+}
+
+export async function assertStoredDraftIntegrity(raw: RawDb, draftId: string): Promise<void> {
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      SELECT integrity_hash,
+             ${draftIntegrityExpression(sql.raw('d.draft_id'))} AS current_integrity_hash
+      FROM wystack_drafts d
+      WHERE d.draft_id = ${draftId}
+    `),
+  )
+  const row = rows[0]
+  if (!row || row['integrity_hash'] !== row['current_integrity_hash']) {
+    throw new DraftIntegrityError(draftId)
+  }
+}
+
+export async function refreshStoredDraftIntegrity(raw: RawDb, draftId: string): Promise<void> {
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      UPDATE wystack_drafts d
+      SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))}
+      WHERE d.draft_id = ${draftId}
+      RETURNING integrity_hash
+    `),
+  )
+  if (rows.length !== 1) {
+    throw new Error(`draft lifecycle: unknown draft "${draftId}"`)
   }
 }
 

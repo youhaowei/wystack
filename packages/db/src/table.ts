@@ -2,6 +2,20 @@ import { uuid, type AnyColumnDef } from './dsl'
 
 export type ColumnDefinitions = Record<string, AnyColumnDef>
 
+declare const systemManagedProperties: unique symbol
+
+export interface CarriesSystemManagedProperties<TProperties extends string> {
+  readonly [systemManagedProperties]: TProperties
+}
+
+/** Framework-owned property keys carried only through the type system. */
+export type SystemManagedProperties<T> =
+  T extends CarriesSystemManagedProperties<infer TProperties> ? TProperties : never
+
+/** Preserve framework-owned keys when a definition is compiled into a Drizzle table. */
+export type WithSystemManagedProperties<TTable, TDefinition> = TTable &
+  CarriesSystemManagedProperties<SystemManagedProperties<TDefinition>>
+
 export interface TenantKeyDefinition<
   TProperty extends string = string,
   TColumn extends string = string,
@@ -25,7 +39,9 @@ export interface TableCapabilities {
 export class TableDefinition<
   TColumns extends ColumnDefinitions = ColumnDefinitions,
   TDraftable extends boolean = false,
+  TSystemManaged extends string = never,
 > {
+  declare readonly [systemManagedProperties]: TSystemManaged
   readonly columns: TColumns
   readonly capabilities: TableCapabilities & { draftable: TDraftable }
 
@@ -34,13 +50,13 @@ export class TableDefinition<
     this.capabilities = capabilities
   }
 
-  draftable(): TableDefinition<TColumns, true> {
+  draftable(): TableDefinition<TColumns, true, TSystemManaged> {
     return new TableDefinition(this.columns, { ...this.capabilities, draftable: true })
   }
 
   revision<TKey extends Extract<keyof TColumns, string>>(
     property: TKey,
-  ): TableDefinition<TColumns, TDraftable> {
+  ): TableDefinition<TColumns, TDraftable, TSystemManaged | TKey> {
     const definition = this.columns[property]
     if (!definition) throw new Error(`Unknown revision property "${property}"`)
     if (definition.opts.isArray || definition.opts.isOptional || definition.opts.isNullable) {
@@ -71,7 +87,7 @@ export interface MultiTenantDescriptor<TKey extends TenantKeyDefinition> {
   readonly key: TKey
   table<TColumns extends ColumnDefinitions>(
     columns: TKey['property'] extends keyof TColumns ? never : TColumns,
-  ): TableDefinition<WithTenantKey<TColumns, TKey>, false>
+  ): TableDefinition<WithTenantKey<TColumns, TKey>, false, TKey['property']>
 }
 
 const defaultTenantKey = {

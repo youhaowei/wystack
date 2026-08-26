@@ -21,12 +21,29 @@ import type { SelectBuilder } from './select-builder'
 import type { DraftSelectBuilder } from './draft-select-builder'
 import type { DraftInsertBuilder } from './draft-mutations'
 import type { InsertBuilder } from './tracker-factory'
+import type { SystemManagedProperties } from './table'
 import { mapColumnValue, normalizeExecuteRows } from './tracker-codecs'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle DB instance type varies by driver; no common typed interface
 export type DrizzleDb = any
 // oxlint-disable-next-line typescript/no-explicit-any -- PgTableWithColumns requires a config generic; any is needed for polymorphic table usage
 export type AnyTable = PgTableWithColumns<any>
+
+type WithoutSystemManagedProperties<TTable, TValues> = Omit<
+  TValues,
+  SystemManagedProperties<TTable>
+> & {
+  [TProperty in SystemManagedProperties<TTable>]?: never
+}
+
+/** Values an application may provide to a tracked insert. */
+export type TrackedInsertValues<T extends AnyTable> = WithoutSystemManagedProperties<
+  T,
+  T['$inferInsert']
+>
+
+/** Sparse values an application may provide to a tracked update. */
+export type TrackedUpdateValues<T extends AnyTable> = Partial<TrackedInsertValues<T>>
 
 export const draftChangesRelation = '"wystack_draft_row_changes"'
 const draftJsonNullMarker = Symbol('wystack draft JSON null')
@@ -36,7 +53,7 @@ export interface DraftJsonNull {
   readonly [draftJsonNullMarker]: true
 }
 
-export function draftJsonNull(): DraftJsonNull {
+export function jsonNull(): DraftJsonNull {
   return Object.freeze({ [draftJsonNullMarker]: true as const })
 }
 

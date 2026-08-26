@@ -78,6 +78,7 @@ describe('tenant-scoped database access', () => {
       alpha.into(schema.insights).insert({
         id: '00000000-0000-4000-8000-000000000030',
         name: 'forged',
+        // @ts-expect-error — the runtime guard still protects untyped callers
         workspaceId: 'beta',
       }),
     ).rejects.toThrow('system-managed')
@@ -113,6 +114,7 @@ describe('tenant-scoped database access', () => {
 
   test('tenant property cannot be updated', async () => {
     const alpha = tracked.withTenant('alpha')
+    // @ts-expect-error — the runtime guard still protects untyped callers
     await expect(alpha.from(schema.insights).update({ workspaceId: 'beta' })).rejects.toThrow(
       'system-managed',
     )

@@ -6,7 +6,12 @@ export { createCaller } from './caller'
 export { authorize, AuthenticationRequiredError, requireAuth } from './functions'
 export { assertPermissionIds } from './permissions'
 export { applyCommands } from './apply-commands'
-export { createDraftLifecycle, compactLog, DraftConflictError } from './draft-lifecycle'
+export {
+  createDraftLifecycle,
+  compactLog,
+  DraftConflictError,
+  DraftIntegrityError,
+} from './draft-lifecycle'
 export { createRoutes } from './routes'
 // mountNodeRoutes is intentionally NOT re-exported here — it lives at the
 // `@wystack/server/node` entry (serve-node.ts). Re-exporting it from the root
@@ -44,7 +49,7 @@ export type {
 export type { CallerFromFunctions } from './caller'
 export type { DefineAppOptions, BuildOptions } from './define-app'
 export type { ProcedureBuilder } from './functions'
-export type { WyStackApp } from './create'
+export type { WyStackApp, WyStackSystem } from './create'
 export type {
   Command,
   CommandResult,
@@ -66,6 +71,8 @@ export type {
   RebaseOptions,
   DraftLifecycleOptions,
   DraftAuthorizationRequest,
+  GlobalDraftAuthorizationRequest,
+  DraftOperationAction,
   DraftGraphValidationRequest,
   DraftRowConflict,
   DraftInspectionRow,

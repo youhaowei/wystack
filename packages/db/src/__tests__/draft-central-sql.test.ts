@@ -3,7 +3,8 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, jsonb, pgSchema, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
-import { createDrizzleTracker, draftJsonNull, enumerateDraftRowChanges } from '../drizzle-tracker'
+import { createDrizzleTracker, enumerateDraftRowChanges } from '../drizzle-tracker'
+import { jsonNull } from '../index'
 import { eq, gt, lt } from '../operators'
 import { defineSchema } from '../schema'
 import { int, text as dslText } from '../dsl'
@@ -110,7 +111,7 @@ describe('durable central draft overlay', () => {
     expect(await draft.from(items).where(eq('id', 1)).update({ note: undefined })).toEqual([])
     await draft.from(items).where(eq('id', 1)).update({ title: 'B', note: null })
     await draft.from(items).where(eq('id', 1)).update({ title: 'C' })
-    await draft.from(items).where(eq('id', 1)).update({ payload: draftJsonNull() })
+    await draft.from(items).where(eq('id', 1)).update({ payload: jsonNull() })
 
     const effective = await draft.from(items).where(eq('id', 1)).first()
     expect(effective).toEqual({ id: 1, title: 'C', score: 10, note: null, payload: null })

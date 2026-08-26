@@ -3,7 +3,7 @@
 // `applyCommands` is the single write entry point for batched mutations. It is
 // the generic substrate under an application's artifact write-side: a frozen-API
 // primitive that knows NOTHING about concrete command types. It composes three
-// existing pieces — `WyStackApp.runHandler` (typed dispatch against a supplied
+// existing pieces — `WyStackApp.system.runHandler` (typed dispatch against a supplied
 // tracker), `DrizzleTracker.transaction` (atomic + Tag-tracked + rollback-emits-
 // nothing), and the Tracker's `tablesWritten` set (the invalidation feed) —
 // into a command bus with two modes:
@@ -226,7 +226,7 @@ export async function applyCommands(
       // "COMMAND-BATCH writes only" contract — callers flush only command-
       // relevant tables to invalidation, not pre-existing bookkeeping writes.
       // The caller must NOT flush this set until AFTER the outer tx resolves.
-      const scopedTx = await app.scopeTracked(outerTx, context)
+      const scopedTx = await app.system.scopeTracked(outerTx, context)
       const tablesWrittenBefore = new Set(scopedTx.tablesWritten)
       const results = await applyAll(app, commands, scopedTx, context)
       const tablesWritten = new Set(
@@ -246,7 +246,7 @@ export async function applyCommands(
     // `outer.tablesWritten` (the call-scope set that reaches invalidation).
     // `applyCommands` is a peer of `app.call`, which likewise mints its own fresh
     // tracker per dispatch.
-    const outer = await app.scopeTracked(app.createTracked(), context)
+    const outer = await app.system.scopeTracked(app.system.createTracked(), context)
     // Apply every command in order inside one transaction. Any throw rolls the
     // whole batch back (including commands applied before the failure) and the
     // tracked-transaction merge is skipped, so nothing flushes to invalidation.
@@ -273,7 +273,7 @@ export async function applyCommands(
   // sentinel outside; a real command error is NOT a sentinel and propagates.
   // `opts.tx` is intentionally ignored in preview mode — preview manages its
   // own rollback sentinel and has no defined semantics for an outer tx handle.
-  const previewOuter = await app.scopeTracked(app.createTracked(), context)
+  const previewOuter = await app.system.scopeTracked(app.system.createTracked(), context)
   try {
     await previewOuter.transaction(async (tx) => {
       const results = await applyAll(app, commands, tx, context)
@@ -333,7 +333,7 @@ async function applyAll(
     if (definition?.type === 'action') {
       throw new Error(`Command ${cmd.path} cannot reference an action`)
     }
-    const value = await app.runHandler(cmd.path, cmd.args, tx, context)
+    const value = await app.system.runHandler(cmd.path, cmd.args, tx, context)
     // Echo the command's opaque correlation id onto its result; the engine
     // never interprets it, only carries it from input to output.
     results.push({ id: cmd.id, value })

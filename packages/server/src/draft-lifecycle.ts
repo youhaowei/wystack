@@ -46,12 +46,14 @@ import {
   type DraftAuthorizationRequest,
   type DraftLifecycle,
   type DraftLifecycleOptions,
+  type GlobalDraftAuthorizationRequest,
 } from './draft-lifecycle-types'
-export { DraftConflictError } from './draft-lifecycle-types'
+export { DraftConflictError, DraftIntegrityError } from './draft-lifecycle-types'
 export type * from './draft-lifecycle-types'
 import type { WyStackApp } from './create'
 import {
   advanceStoredDraftRevision,
+  assertStoredDraftIntegrity,
   deleteStoredTouchedTables,
   deleteStoredDraft,
   ensureDraftStorage,
@@ -59,6 +61,7 @@ import {
   readStoredCommands,
   readStoredDraft,
   readStoredTouchedTables,
+  refreshStoredDraftIntegrity,
   replaceStoredDraftBase,
   replaceStoredCommands,
   upsertStoredTouchedTables,
@@ -124,12 +127,12 @@ export function createDraftLifecycle(
   app: WyStackApp,
   opts: DraftLifecycleOptions = {},
 ): DraftLifecycle {
-  const { versionProbe, resolveOwner, authorizeDraft, validateGraph } = opts
+  const { versionProbe, resolveOwner, authorizeDraft, authorizeGlobalDraft, validateGraph } = opts
   let storageInitialization: Promise<void> | undefined
 
   function storageReady(): Promise<void> {
     if (!storageInitialization) {
-      const attempt = ensureDraftStorage(app.createTracked().raw)
+      const attempt = ensureDraftStorage(app.system.createTracked().raw)
       storageInitialization = attempt
       void attempt.catch(() => {
         if (storageInitialization === attempt) storageInitialization = undefined
@@ -138,8 +141,27 @@ export function createDraftLifecycle(
     return storageInitialization
   }
 
-  async function ownerKey(context: Record<string, unknown>): Promise<unknown> {
+  async function ownerKey(context: Record<string, unknown>): Promise<unknown | undefined> {
     return resolveOwner ? resolveOwner(context) : defaultOwnerKey(context)
+  }
+
+  function requireStableOwner(value: unknown): void {
+    if (value === undefined || value === null) {
+      throw new Error(
+        'draft lifecycle: opening a draft requires a stable owner from context.principal or resolveOwner',
+      )
+    }
+  }
+
+  async function hasGlobalDraftAuthority(
+    action: GlobalDraftAuthorizationRequest['action'],
+    context: Record<string, unknown>,
+    draft?: GlobalDraftAuthorizationRequest['draft'],
+  ): Promise<boolean> {
+    return (
+      authorizeGlobalDraft !== undefined &&
+      (await authorizeGlobalDraft({ action, draft, context })) === true
+    )
   }
 
   async function requireStored(
@@ -162,12 +184,32 @@ export function createDraftLifecycle(
     context: Record<string, unknown>,
     action: DraftAuthorizationRequest['action'],
   ): Promise<DrizzleTracker> {
-    const scoped = await app.scopeTracked(tracked, context)
-    if (!sameJsonValue(scoped.tenantId, draft.tenantId)) {
-      throw notFound(draft.draftId)
+    let scoped: DrizzleTracker
+    if (draft.tenantId === undefined) {
+      if (
+        !(await hasGlobalDraftAuthority(action, context, {
+          draftId: draft.draftId,
+          ownerKey: draft.ownerKey,
+        }))
+      ) {
+        throw notFound(draft.draftId)
+      }
+      scoped = tracked
+    } else {
+      scoped = await app.system.scopeTracked(tracked, context)
+      if (!sameJsonValue(scoped.tenantId, draft.tenantId)) {
+        throw notFound(draft.draftId)
+      }
     }
+    if (draft.ownerKey === undefined || draft.ownerKey === null) throw notFound(draft.draftId)
     const currentOwner = await ownerKey(context)
-    if (sameJsonValue(currentOwner, draft.ownerKey)) return scoped
+    if (
+      currentOwner !== undefined &&
+      currentOwner !== null &&
+      sameJsonValue(currentOwner, draft.ownerKey)
+    ) {
+      return scoped
+    }
     if (authorizeDraft) {
       const allowed = await authorizeDraft({
         action,
@@ -185,10 +227,18 @@ export function createDraftLifecycle(
 
   return {
     async open(baseVersion, openOpts = {}) {
-      await storageReady()
       const context = openOpts.context ?? {}
-      const scoped = await app.scopeTracked(app.createTracked(), context)
       const resolvedOwnerKey = await ownerKey(context)
+      requireStableOwner(resolvedOwnerKey)
+      const unscoped = app.system.createTracked()
+      const hasGlobalAuthority = await hasGlobalDraftAuthority('open', context)
+      const scoped = hasGlobalAuthority
+        ? unscoped
+        : await app.system.scopeTracked(unscoped, context)
+      if (scoped.tenantId === undefined && !hasGlobalAuthority) {
+        throw new Error('draft lifecycle: global drafts require privileged host context')
+      }
+      await storageReady()
       const draftId = mintDraftId()
       await insertStoredDraft(scoped.raw, {
         draftId,
@@ -209,11 +259,12 @@ export function createDraftLifecycle(
           throw new Error(`Draft command ${command.path} cannot reference an action`)
         }
       }
-      const outer = app.createTracked()
+      const outer = app.system.createTracked()
       let draftWrites = new Set<string>()
       const results = await outer.transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
         const scopedTx = await authorizeTracker(tx, stored, context, 'append')
+        await assertStoredDraftIntegrity(tx.raw, draftId)
         const existingLog = await readStoredCommands(tx.raw, draftId)
         const touchedTables = new Map<string, AnyTable>()
         const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
@@ -223,7 +274,7 @@ export function createDraftLifecycle(
           if (definition?.type === 'action') {
             throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
           }
-          const value = await app.runHandler(snapshot.path, snapshot.args, draftDb, context)
+          const value = await app.system.runHandler(snapshot.path, snapshot.args, draftDb, context)
           results.push({ id: snapshot.id, value })
         }
 
@@ -234,31 +285,35 @@ export function createDraftLifecycle(
           draftId,
           describeTouchedTables(touchedTables, draftDb.tablesWritten, draftId, scopedTx.tenantId),
         )
+        await refreshStoredDraftIntegrity(tx.raw, draftId)
         await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
         draftWrites = new Set(draftDb.tablesWritten)
         return results
       })
-      if (draftWrites.size > 0) app.emit(draftWrites)
+      if (draftWrites.size > 0) app.system.emit(draftWrites)
       return results
     },
 
     async publish(draftId, resolve, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
-      const snapshot = await requireStored(app.createTracked().raw, draftId)
-      await authorizeTracker(app.createTracked(), snapshot, context, 'publish')
-      const snapshotLog = await readStoredCommands(app.createTracked().raw, draftId)
+      const snapshotTracked = app.system.createTracked()
+      const snapshot = await requireStored(snapshotTracked.raw, draftId)
+      const snapshotScoped = await authorizeTracker(snapshotTracked, snapshot, context, 'publish')
+      await assertStoredDraftIntegrity(snapshotScoped.raw, draftId)
+      const snapshotLog = await readStoredCommands(snapshotScoped.raw, draftId)
       const boundLog = resolve
         ? (await resolve([...snapshotLog])).map((command) => snapshotCommand(command))
         : [...snapshotLog]
 
       let draftWrites = new Set<string>()
-      const result = await app.createTracked().transaction(async (tx) => {
+      const result = await app.system.createTracked().transaction(async (tx) => {
         const current = await requireStored(tx.raw, draftId, true)
         const scopedTx = await authorizeTracker(tx, current, context, 'publish')
         if (current.logRevision !== snapshot.logRevision) {
           throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
         }
+        await assertStoredDraftIntegrity(tx.raw, draftId)
         const touched = await readStoredTouchedTables(tx.raw, draftId)
         await assertDraftRowsUnchanged(tx.raw, draftId, touched)
         await validateGraph?.({
@@ -287,7 +342,7 @@ export function createDraftLifecycle(
       })
 
       const tags = new Set([...result.tablesWritten, ...draftWrites])
-      if (tags.size > 0) app.emit(tags)
+      if (tags.size > 0) app.system.emit(tags)
       return result
     },
 
@@ -295,7 +350,7 @@ export function createDraftLifecycle(
       await storageReady()
       const context = operationOpts.context ?? {}
       let draftWrites = new Set<string>()
-      await app.createTracked().transaction(async (tx) => {
+      await app.system.createTracked().transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
         await authorizeTracker(tx, stored, context, 'discard')
         const touched = await readStoredTouchedTables(tx.raw, draftId)
@@ -305,7 +360,7 @@ export function createDraftLifecycle(
           touched.flatMap((table) => (table.invalidationTag ? [table.invalidationTag] : [])),
         )
       })
-      if (draftWrites.size > 0) app.emit(draftWrites)
+      if (draftWrites.size > 0) app.system.emit(draftWrites)
     },
 
     async rebase(draftId, operationOpts = {}) {
@@ -316,9 +371,10 @@ export function createDraftLifecycle(
       const context = operationOpts.context ?? {}
       let emitted = new Set<string>()
       let report: ConflictReport = { staleBase: false, overlappingCells: [] }
-      await app.createTracked().transaction(async (tx) => {
+      await app.system.createTracked().transaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId, true)
         const scopedTx = await authorizeTracker(tx, stored, context, 'rebase')
+        await assertStoredDraftIntegrity(tx.raw, draftId)
         const log = await readStoredCommands(tx.raw, draftId)
         const previousTouched = await readStoredTouchedTables(tx.raw, draftId)
         const currentVersion = await versionProbe.current()
@@ -344,7 +400,7 @@ export function createDraftLifecycle(
         const touchedTables = new Map<string, AnyTable>()
         const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
         for (const command of log) {
-          await app.runHandler(command.path, command.args, draftDb, context)
+          await app.system.runHandler(command.path, command.args, draftDb, context)
         }
         const rebuiltTouched = describeTouchedTables(
           touchedTables,
@@ -359,6 +415,7 @@ export function createDraftLifecycle(
           db: draftDb,
           context,
         })
+        await refreshStoredDraftIntegrity(tx.raw, draftId)
         await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
         emitted = new Set([
           ...previousTouched.flatMap((table) =>
@@ -367,15 +424,21 @@ export function createDraftLifecycle(
           ...draftDb.tablesWritten,
         ])
       })
-      if (emitted.size > 0) app.emit(emitted)
+      if (emitted.size > 0) app.system.emit(emitted)
       return report
     },
 
     async detectConflict(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
-      const stored = await requireStored(app.createTracked().raw, draftId)
-      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'detectConflict')
+      const stored = await requireStored(app.system.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(
+        app.system.createTracked(),
+        stored,
+        context,
+        'detectConflict',
+      )
+      await assertStoredDraftIntegrity(scoped.raw, draftId)
       if (!versionProbe) {
         // No probe ⇒ detection opted out. Report no conflict (the app chose not
         // to track canonical versions).
@@ -401,16 +464,17 @@ export function createDraftLifecycle(
     async inspect(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
-      const stored = await requireStored(app.createTracked().raw, draftId)
-      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'inspect')
+      const stored = await requireStored(app.system.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(app.system.createTracked(), stored, context, 'inspect')
+      await assertStoredDraftIntegrity(scoped.raw, draftId)
       return inspectDraftRows(scoped.raw, draftId)
     },
 
     async getLog(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
-      const stored = await requireStored(app.createTracked().raw, draftId)
-      const scoped = await authorizeTracker(app.createTracked(), stored, context, 'getLog')
+      const stored = await requireStored(app.system.createTracked().raw, draftId)
+      const scoped = await authorizeTracker(app.system.createTracked(), stored, context, 'getLog')
       return readStoredCommands(scoped.raw, draftId)
     },
   }

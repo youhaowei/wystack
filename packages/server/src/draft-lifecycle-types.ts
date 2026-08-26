@@ -39,6 +39,13 @@ export class DraftConflictError extends Error {
   }
 }
 
+export class DraftIntegrityError extends Error {
+  constructor(draftId: string) {
+    super(`draft lifecycle: draft "${draftId}" command log and materialized changes disagree`)
+    this.name = 'DraftIntegrityError'
+  }
+}
+
 export interface OpenOptions {
   context?: Record<string, unknown>
 }
@@ -55,6 +62,7 @@ export interface DraftLifecycleOptions {
   versionProbe?: VersionProbe
   resolveOwner?: (context: Record<string, unknown>) => unknown | Promise<unknown>
   authorizeDraft?: (request: DraftAuthorizationRequest) => boolean | Promise<boolean>
+  authorizeGlobalDraft?: (request: GlobalDraftAuthorizationRequest) => boolean | Promise<boolean>
   validateGraph?: (request: DraftGraphValidationRequest) => void | Promise<void>
 }
 
@@ -66,11 +74,29 @@ export interface DraftGraphValidationRequest {
 }
 
 export interface DraftAuthorizationRequest {
-  action: 'append' | 'publish' | 'discard' | 'rebase' | 'detectConflict' | 'inspect' | 'getLog'
+  action: DraftOperationAction
   draft: {
     draftId: string
     tenantId: unknown | undefined
-    ownerKey: unknown | undefined
+    ownerKey: unknown
+  }
+  context: Record<string, unknown>
+}
+
+export type DraftOperationAction =
+  | 'append'
+  | 'publish'
+  | 'discard'
+  | 'rebase'
+  | 'detectConflict'
+  | 'inspect'
+  | 'getLog'
+
+export interface GlobalDraftAuthorizationRequest {
+  action: 'open' | DraftOperationAction
+  draft?: {
+    draftId: string
+    ownerKey: unknown
   }
   context: Record<string, unknown>
 }
