@@ -201,6 +201,21 @@ describe('durable central draft overlay', () => {
     ])
   })
 
+  test('rolls back every row and tracking tag when a later draft insert fails', async () => {
+    const draft = tracked.withDraft('d-atomic-insert')
+
+    await expect(
+      draft.into(items).insert([
+        { id: 5, title: 'would escape', score: 50 },
+        { id: 1, title: 'already exists', score: 99 },
+      ]),
+    ).rejects.toThrow('because it already exists')
+
+    expect(await enumerateDraftRowChanges(db, 'd-atomic-insert')).toEqual([])
+    expect(await tracked.from(items).where(eq('id', 5)).first()).toBeNull()
+    expect(tracked.tablesWritten.size).toBe(0)
+  })
+
   test('materializes database defaults in a draft insert', async () => {
     const draft = tracked.withDraft('d-default')
 

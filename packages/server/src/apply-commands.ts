@@ -19,11 +19,15 @@
 //
 // OUTER-TX EXTENSION (commit mode only): `ApplyCommandsOptions.tx` threads an
 // already-open caller-supplied transaction handle into the engine. When supplied
-// the engine does NOT open its own transaction — all commands run directly
-// against `tx`, and the caller's transaction boundary governs atomicity. This
-// makes it possible to combine `applyCommands` with caller-side bookkeeping
-// (e.g. sweeping a durable command log) in a SINGLE commit, eliminating any
-// crash window between the two. See `ApplyCommandsOptions.tx` for semantics.
+// the engine opens a nested tracked transaction on the authorized tracker.
+// Drizzle lowers that nested boundary to a SAVEPOINT inside the caller's raw
+// transaction: releasing it does not independently commit, while failure rolls
+// back the whole command batch even if the outer caller catches and continues.
+// Only a successful savepoint merges its read/write Tags into the supplied
+// tracker. This makes it possible to combine `applyCommands` with caller-side
+// bookkeeping (e.g. sweeping a durable command log) in a SINGLE outer commit,
+// eliminating any crash window between the two. See `ApplyCommandsOptions.tx`
+// for semantics.
 //
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
 // command paths, Action-exclusion policy, artifact-grouped PreviewDiff
@@ -37,7 +41,7 @@
 // reinvent those frameworks. This is a focused engine: one entry point, no
 // middleware pipeline, no decorators.
 
-import { createDrizzleTracker, type DrizzleTracker } from '@wystack/db'
+import type { DrizzleTracker } from '@wystack/db'
 import type { WyStackApp } from './create'
 
 /**
@@ -128,10 +132,11 @@ export interface ApplyCommandsOptions {
   /**
    * ADDITIVE OPTIONAL — commit mode only.
    *
-   * When supplied, `applyCommands` runs every command directly against this
-   * already-open `DrizzleTracker` (a tx handle the CALLER opened) instead of
-   * opening its own transaction. The caller's transaction boundary governs
-   * atomicity: if the caller's tx rolls back, the command writes roll back too.
+   * When supplied, `applyCommands` opens a nested tracked transaction on this
+   * already-open `DrizzleTracker`. Drizzle lowers the nested boundary to a
+   * SAVEPOINT inside the same raw transaction, not an independent commit.
+   * The command batch is therefore all-or-nothing even if its error is caught
+   * inside the caller's outer transaction.
    *
    * PRIMARY USE CASE — atomic publish: the caller opens ONE transaction, calls
    * `applyCommands(app, log, { mode: 'commit', tx })` to replay the command
@@ -142,15 +147,19 @@ export interface ApplyCommandsOptions {
    * CONTRACT (caller must hold):
    *   - `tx` is the DrizzleTracker handle from INSIDE an already-open transaction
    *     (i.e. the argument passed to `DrizzleTracker.transaction(async (tx) => ...)`).
-   *   - `tablesWritten` on the returned `CommitResult` is snapshotted from
-   *     `tx.tablesWritten` directly (not from an outer wrapper) immediately
-   *     after command replay completes. It contains COMMAND-BATCH writes only —
-   *     any bookkeeping writes the caller performs in the same tx AFTER
-   *     `applyCommands` returns (e.g. the log delete) are intentionally
-   *     excluded, so the caller flushes only command-relevant tables to
-   *     invalidation. The caller must NOT flush this set to invalidation until
-   *     AFTER the outer transaction resolves successfully — side effects
-   *     (invalidation, pubsub) must never precede a durable commit.
+   *   - Commands run inside one savepoint on the authorized supplied tracker.
+   *     Releasing the savepoint leaves their writes pending in the outer raw
+   *     transaction; rolling it back removes the entire command batch while
+   *     allowing the outer transaction to continue.
+   *   - A successful savepoint synchronously merges its fresh read/write Tags
+   *     into the authorized supplied tracker before `applyCommands` resolves.
+   *     A failed savepoint merges no command Tags before the error rejects.
+   *   - `tablesWritten` on the returned `CommitResult` contains COMMAND-BATCH
+   *     writes only. Caller bookkeeping performed before or after replay is
+   *     excluded, including writes to a table the command batch also touches.
+   *     The caller must NOT flush this set to invalidation until AFTER the outer
+   *     transaction resolves successfully — side effects (invalidation, pubsub)
+   *     must never precede a durable commit.
    *   - Ignored when `mode === 'preview'` (preview manages its own rollback
    *     sentinel; threading an outer tx has no defined semantics there).
    */
@@ -233,46 +242,31 @@ async function executeCommands(
 
   if (mode === 'commit') {
     if (outerTx !== undefined) {
-      // OUTER-TX PATH: the caller already opened a transaction and supplies the
-      // tx-bound DrizzleTracker handle. Run all commands directly against it — no
-      // new transaction is opened here; the caller's commit boundary governs.
-      // This is the atomic-publish seam: replay + caller bookkeeping (e.g. log
-      // sweep) share one commit, so there is no crash window between them.
+      // OUTER-TX PATH: the caller already opened a transaction and supplies its
+      // tx-bound tracker. Public calls first resolve tenant scope; the draft
+      // lifecycle's internal seam preserves its already-authorized scope,
+      // including explicit global authority.
       //
-      // `tablesWritten` snapshots ONLY the delta introduced by this command
-      // batch. The baseline is captured before `applyAll` so any tables the
-      // caller wrote BEFORE calling `applyCommands` (bookkeeping, lock rows,
-      // etc.) are excluded from the returned set. This upholds the
-      // "COMMAND-BATCH writes only" contract — callers flush only command-
-      // relevant tables to invalidation, not pre-existing bookkeeping writes.
-      // The caller must NOT flush this set until AFTER the outer tx resolves.
-      // Track this batch through a fresh view over the SAME native tx. Set
-      // subtraction cannot identify an overlapping write (caller and command
-      // both write `todos`), so it can suppress a required invalidation. A
-      // separate view records the exact batch delta. Ordinary public calls
-      // still resolve tenant scope from context; the draft lifecycle's internal
-      // seam preserves its already-authorized scope, including explicit global
-      // authority.
+      // Run the batch in a nested tracked transaction. Drizzle lowers this to a
+      // SAVEPOINT on the SAME raw transaction, so releasing it does not commit
+      // independently and a failure rolls back the entire batch even when the
+      // outer caller catches the error and continues with bookkeeping.
+      //
+      // The nested tracker starts with fresh Tag sets. On successful savepoint
+      // release, DrizzleTracker.transaction synchronously merges its reads and
+      // writes into the authorized supplied tracker. On rollback it merges
+      // nothing. Capturing `tablesWritten` inside the callback preserves the
+      // exact command delta, including overlap with caller bookkeeping. The
+      // caller must not emit that set until the outer transaction commits.
       const authorizedTx = preserveOuterTxScope
         ? outerTx
         : await app.system.scopeTracked(outerTx, context)
-      const commandTx = createDrizzleTracker(authorizedTx.raw)
-      const scopedTx =
-        authorizedTx.tenantId === undefined
-          ? commandTx
-          : commandTx.withTenant(authorizedTx.tenantId)
-      let results: CommandResult[]
-      try {
-        results = await applyAll(app, commands, scopedTx, context)
-      } finally {
-        // A caller owns the outer transaction and may catch a command failure.
-        // Merge attempted writes even on throw so any partial work it chooses
-        // to commit remains tracked. If the outer callback propagates instead,
-        // its transaction rollback suppresses the merge to the outermost set.
-        for (const table of scopedTx.tablesRead) authorizedTx.tablesRead.add(table)
-        for (const table of scopedTx.tablesWritten) authorizedTx.tablesWritten.add(table)
-      }
-      const tablesWritten = new Set(scopedTx.tablesWritten)
+      let tablesWritten = new Set<string>()
+      const results = await authorizedTx.transaction(async (commandTx) => {
+        const commandResults = await applyAll(app, commands, commandTx, context)
+        tablesWritten = new Set(commandTx.tablesWritten)
+        return commandResults
+      })
       return {
         mode: 'commit',
         commands,

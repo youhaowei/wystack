@@ -329,10 +329,10 @@ describe('applyCommands — coexists with app.call', () => {
 
 describe('applyCommands — outer-tx param (commit mode)', () => {
   // These tests prove the atomic-publish contract: when `opts.tx` is supplied,
-  // applyCommands runs commands directly against it (no nested transaction), so
-  // caller bookkeeping (e.g. log sweep) and the command replay share ONE commit.
-  // This is the crash-window fix — no gap between "canonical committed" and
-  // "log deleted" across which a restart could double-replay.
+  // applyCommands uses a savepoint inside the same raw transaction. A successful
+  // batch merges its fresh Tags into the supplied tracker; a failed batch rolls
+  // back completely and merges nothing. Caller bookkeeping (e.g. log sweep) and
+  // command replay therefore share ONE outer commit, with no double-replay window.
 
   test('commands run inside the caller-supplied tx and persist on outer commit', async () => {
     const outer = app.system.createTracked()
@@ -393,31 +393,34 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     expect(commitResult!.tablesWritten.size).toBe(2)
   })
 
-  test('tablesWritten is snapshotted from the supplied tx handle, not from a separately-opened tracker', async () => {
-    // Load-bearing: the crash-window fix requires `applyCommands` to run against the
-    // CALLER'S tx, not to open its own inner transaction. Proof: we observe that
-    // `tx.tablesWritten` is populated INSIDE the outer callback (before outer commits),
-    // confirming writes accumulate on the supplied handle. An incorrect implementation
-    // that opened its own inner tx would accumulate writes on a DIFFERENT inner handle —
-    // `tx.tablesWritten` would remain empty until the inner tx committed.
+  test('a successful savepoint shares the outer raw transaction and merges tags before returning', async () => {
+    // The command row is visible inside the caller's transaction and disappears
+    // when that transaction rolls back. The supplied tracker also has the command
+    // Tag immediately after applyCommands returns, proving the successful
+    // savepoint merged its tracking state synchronously rather than deferring it.
     const outer = app.system.createTracked()
-    let txTablesWrittenMidCallback: Set<string> | undefined
+    let rowVisibleBeforeRollback = false
+    let txTablesWrittenAfterReplay: Set<string> | undefined
     let commitResult: Awaited<ReturnType<typeof applyCommands>> | undefined
-    await outer.transaction(async (tx) => {
-      commitResult = await applyCommands(
-        app,
-        [{ path: 'addTodo', args: { id: 1, title: 'source-check' } }],
-        { mode: 'commit', tx },
-      )
-      // Capture tx.tablesWritten INSIDE the callback (before outer tx commits).
-      // If applyCommands ran against the supplied tx directly, writes are already here.
-      txTablesWrittenMidCallback = new Set(tx.tablesWritten)
-    })
+    await expect(
+      outer.transaction(async (tx) => {
+        commitResult = await applyCommands(
+          app,
+          [{ path: 'addTodo', args: { id: 1, title: 'source-check' } }],
+          { mode: 'commit', tx },
+        )
+        rowVisibleBeforeRollback =
+          (await tx.from(schema.todos).where(eq('id', 1)).all()).length === 1
+        txTablesWrittenAfterReplay = new Set(tx.tablesWritten)
+        throw new Error('roll back proof')
+      }),
+    ).rejects.toThrow('roll back proof')
 
-    // The supplied tx's set was populated mid-callback — applyCommands ran flat against it.
-    expect(txTablesWrittenMidCallback!.has('todos')).toBe(true)
-    // The returned CommitResult snapshotted the same set.
-    expect(commitResult!.tablesWritten.has('todos')).toBe(true)
+    expect(rowVisibleBeforeRollback).toBe(true)
+    expect(txTablesWrittenAfterReplay).toEqual(new Set(['todos']))
+    expect(commitResult!.tablesWritten).toEqual(new Set(['todos']))
+    const { result: todos } = await app.call('listTodos', {})
+    expect(todos as unknown[]).toHaveLength(0)
   })
 
   test('a mid-batch failure inside the outer tx rolls back all commands', async () => {
@@ -440,38 +443,28 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     expect(todos as unknown[]).toHaveLength(0)
   })
 
-  test('outer-tx path dispatches flat — does not call tx.transaction() on the supplied handle', async () => {
-    // Load-bearing: the atomicity guarantee depends on commands running directly
-    // against the caller's tx, not inside a NESTED tx that commits independently.
-    // A nested tx would commit before the outer (caller) tx, re-opening the crash
-    // window. We verify the flat-dispatch contract by intercepting tx.transaction:
-    // if it is ever called, the spy throws, failing the test.
+  test('a database error rolls the whole batch back to its savepoint while outer work continues', async () => {
+    // The first command succeeds before the duplicate-key error. The savepoint
+    // must remove that prefix without aborting the caller's transaction, which
+    // remains usable for unrelated bookkeeping.
     const outer = app.system.createTracked()
     await outer.transaction(async (tx) => {
-      // Wrap the tx in a Proxy that throws if .transaction() is called. A correct
-      // implementation never calls it; an incorrect implementation (nested tx) would
-      // trigger the guard immediately.
-      const guardedTx = new Proxy(tx, {
-        get(target, prop) {
-          if (prop === 'transaction') {
-            return () => {
-              throw new Error(
-                'applyCommands (outer-tx path) must not call tx.transaction() — flat dispatch required',
-              )
-            }
-          }
-          return Reflect.get(target, prop)
-        },
-      })
-      // Should not throw — applyAll runs flat against guardedTx.
-      await applyCommands(app, [{ path: 'addTodo', args: { id: 99, title: 'flat' } }], {
-        mode: 'commit',
-        tx: guardedTx,
-      })
+      await expect(
+        applyCommands(
+          app,
+          [
+            { path: 'addTodo', args: { id: 1, title: 'rolled-back prefix' } },
+            { path: 'addTodo', args: { id: 1, title: 'duplicate' } },
+          ],
+          { mode: 'commit', tx },
+        ),
+      ).rejects.toThrow()
+      await tx.into(schema.tags).insert({ id: 1, label: 'outer bookkeeping' })
     })
 
-    const { result: todos } = await app.call('listTodos', {})
-    expect(todos as unknown[]).toHaveLength(1)
+    expect((await app.call('listTodos', {})).result).toHaveLength(0)
+    expect((await app.call('listTags', {})).result).toEqual([{ id: 1, label: 'outer bookkeeping' }])
+    expect(outer.tablesWritten).toEqual(new Set(['tags']))
   })
 
   test('opts.tx is silently ignored when mode is preview', async () => {
@@ -498,10 +491,9 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
   })
 
   test('tablesWritten excludes tables the caller wrote before calling applyCommands', async () => {
-    // Load-bearing: the "COMMAND-BATCH writes only" contract requires that any
-    // table the caller wrote to BEFORE calling applyCommands is excluded from the
-    // returned tablesWritten set. Without the baseline-snapshot fix, a pre-existing
-    // write on the tx contaminates the snapshot and causes over-broad invalidation.
+    // The fresh command view starts with empty tracking sets, so a caller write
+    // made before replay cannot contaminate the returned command-batch Tags.
+    // Reusing the supplied tracker's set would incorrectly include `tags`.
     //
     // We simulate a realistic scenario: the caller inserts a "lock" row into the
     // `tags` table via `tx.into()` before replaying, then applyCommands adds a
@@ -542,24 +534,32 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
     expect(commitResult!.tablesWritten).toEqual(new Set(['todos']))
   })
 
-  test('a caught command failure keeps any committed partial write tracked', async () => {
+  test('a caught command failure persists no prefix or batch tags while outer bookkeeping continues', async () => {
     const outer = app.system.createTracked()
+    let caught = false
     await outer.transaction(async (tx) => {
       try {
         await applyCommands(
           app,
           [
-            { path: 'addTodo', args: { id: 1, title: 'committed-by-caller' } },
+            { path: 'listTodos', args: {} },
+            { path: 'addTodo', args: { id: 1, title: 'rolled-back prefix' } },
             { path: 'boom', args: {} },
           ],
           { mode: 'commit', tx },
         )
       } catch {
-        // The outer-transaction owner deliberately commits the successful prefix.
+        caught = true
       }
+      expect(tx.tablesRead).toEqual(new Set())
+      expect(tx.tablesWritten).toEqual(new Set())
+      await tx.into(schema.tags).insert({ id: 1, label: 'caller continued' })
     })
 
-    expect(outer.tablesWritten).toEqual(new Set(['todos']))
-    expect((await app.call('listTodos', {})).result).toHaveLength(1)
+    expect(caught).toBe(true)
+    expect(outer.tablesRead).toEqual(new Set())
+    expect(outer.tablesWritten).toEqual(new Set(['tags']))
+    expect((await app.call('listTodos', {})).result).toHaveLength(0)
+    expect((await app.call('listTags', {})).result).toEqual([{ id: 1, label: 'caller continued' }])
   })
 })

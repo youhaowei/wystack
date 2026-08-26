@@ -30,6 +30,7 @@ import {
   eq,
   draftInvalidationIdentity,
 } from '@wystack/db'
+import { registerTableCapabilities } from '../../../db/src/schema'
 import {
   createDraftLifecycle as createProductionDraftLifecycle,
   DraftConflictError,
@@ -70,6 +71,8 @@ const auditAccounts = pgSchema('audit').table('accounts', {
   id: integer('id').primaryKey(),
   name: pgText('name').notNull(),
 })
+registerTableCapabilities(appAccounts, { draftable: true })
+registerTableCapabilities(auditAccounts, { draftable: true })
 
 let app: Awaited<ReturnType<typeof wy.build>>
 let db: ReturnType<typeof drizzle>

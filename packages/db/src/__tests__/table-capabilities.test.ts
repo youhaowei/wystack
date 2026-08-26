@@ -4,17 +4,126 @@ import {
   defineSchema,
   getGeneratedTables,
   getTableCapabilities,
+  ColumnDef,
   int,
   jsonb,
   multiTenant,
   renderCreateTableIfNotExists,
   table,
+  TableDefinition,
   text,
+  timestamp,
   uuid,
 } from '../index'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 
 describe('composable table capabilities', () => {
+  test('only table factories can construct authentic table definitions', () => {
+    const authentic = table({ id: uuid.primaryKey() })
+    expect(authentic).toBeInstanceOf(TableDefinition)
+
+    expect(
+      () =>
+        // @ts-expect-error — application code cannot construct table definitions directly
+        new TableDefinition(Symbol('forged'), { id: uuid.primaryKey() }, { draftable: false }),
+    ).toThrow('TableDefinition cannot be constructed directly')
+
+    const forged = Object.assign(Object.create(TableDefinition.prototype), {
+      columns: { id: uuid.primaryKey() },
+      capabilities: { draftable: false },
+    }) as typeof authentic
+    expect(Reflect.set(TableDefinition, Symbol.hasInstance, () => true)).toBe(false)
+
+    const originalWeakSetHas = WeakSet.prototype.has
+    let forgedInstanceof = true
+    let mintError: unknown
+    const weakSetHasPatched = Reflect.set(WeakSet.prototype, 'has', () => true)
+    let weakSetHasRestored = false
+    try {
+      forgedInstanceof = forged instanceof TableDefinition
+      try {
+        forged.draftable()
+      } catch (error) {
+        mintError = error
+      }
+    } finally {
+      weakSetHasRestored = Reflect.set(WeakSet.prototype, 'has', originalWeakSetHas)
+    }
+
+    expect(weakSetHasPatched).toBe(true)
+    expect(weakSetHasRestored).toBe(true)
+    expect(forgedInstanceof).toBe(false)
+    expect(mintError).toBeInstanceOf(Error)
+    expect((mintError as Error).message).toContain('require a factory-created definition')
+    expect(() => forged.revision('id')).toThrow('require a factory-created definition')
+    expect(() => defineSchema({ forged })).toThrow('table(...)')
+  })
+
+  test('table declarations reject ColumnDef subclasses instead of losing their state', () => {
+    class CustomColumnDef extends ColumnDef<string> {}
+
+    expect(() => table({ custom: new CustomColumnDef({ ...text.opts }) })).toThrow(
+      'plain ColumnDef instances; subclasses are unsupported',
+    )
+  })
+
+  test('table declarations reject augmented columns and hidden map state', () => {
+    const extended = Object.assign(new ColumnDef<string>({ ...text.opts }), {
+      marker: 'kept',
+      read() {
+        return this.marker
+      },
+    })
+    expect(() => table({ extended })).toThrow('cannot carry custom own state')
+
+    const columns = { id: uuid.primaryKey() }
+    Object.defineProperty(columns, 'hidden', {
+      value: text,
+      enumerable: false,
+    })
+    expect(() => table(columns)).toThrow('plain map of enumerable string properties')
+  })
+
+  test('date and structured defaults remain stable after table declaration', () => {
+    const originalDate = new Date('2025-01-02T03:04:05.000Z')
+    const structuredDefault = {
+      enabled: true,
+      filters: { status: 'open' },
+      labels: ['first'],
+    }
+    const records = table({
+      id: uuid.primaryKey(),
+      createdAt: timestamp.default(originalDate),
+      settings: jsonb.default(structuredDefault),
+    })
+
+    originalDate.setUTCFullYear(2030)
+    structuredDefault.filters.status = 'closed'
+    structuredDefault.labels.push('mutated')
+
+    const exposedDate = records.columns.createdAt.opts.defaultValue as Date
+    exposedDate.setUTCFullYear(2040)
+    const exposedSettings = records.columns.settings.opts.defaultValue as typeof structuredDefault
+    expect(Reflect.set(exposedSettings.filters, 'status', 'mutated_again')).toBe(false)
+    expect(Reflect.set(exposedSettings.labels, '0', 'mutated_again')).toBe(false)
+
+    const schema = defineSchema({ records })
+    expect(getTableColumns(schema.records).createdAt.default).toEqual(
+      new Date('2025-01-02T03:04:05.000Z'),
+    )
+    expect(getTableColumns(schema.records).settings.default).toEqual({
+      enabled: true,
+      filters: { status: 'open' },
+      labels: ['first'],
+    })
+  })
+
+  test('table declarations reject defaults that cannot be snapshotted safely', () => {
+    expect(() => table({ settings: jsonb.default(new Map([['enabled', true]])) })).toThrow(
+      'Column defaults must be primitives, Date values, arrays, or plain objects',
+    )
+  })
+
   test('application tables cannot use the reserved wystack_ namespace', () => {
     const reservedNames = [
       'wystack_framework_migrations',
@@ -124,6 +233,35 @@ describe('composable table capabilities', () => {
     })
   })
 
+  test('tenant descriptors retain the column type that passed validation', () => {
+    const tenantType = new ColumnDef<string>({ ...uuid.opts })
+    const tenancy = multiTenant({
+      key: {
+        property: 'workspaceId',
+        column: 'workspace_id',
+        type: tenantType,
+      },
+    })
+
+    expect(Reflect.set(tenantType.opts, 'type', 'jsonb')).toBe(true)
+    expect(Reflect.set(tenantType.opts, 'isNullable', true)).toBe(true)
+
+    const schema = defineSchema({
+      records: tenancy.table({ id: uuid.primaryKey() }),
+    })
+    expect(tenancy.key.type.opts).toMatchObject({
+      type: 'uuid',
+      isNullable: false,
+    })
+    expect(Object.isFrozen(tenancy.key.type.opts)).toBe(true)
+    expect(getTableCapabilities(schema.records).tenancy?.type.opts.type).toBe('uuid')
+    expect(getTableColumns(schema.records).workspaceId).toMatchObject({
+      dataType: 'string',
+      notNull: true,
+    })
+    expect(getTableColumns(schema.records).workspaceId.getSQLType()).toBe('uuid')
+  })
+
   test('compiled capabilities cannot be mutated to disable tenant isolation', () => {
     const tenancy = multiTenant({
       key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
@@ -223,6 +361,52 @@ describe('composable table capabilities', () => {
       notNull: true,
       default: 1,
     })
+  })
+
+  test('revision columns retain the definition that passed validation', () => {
+    const revisionColumn = new ColumnDef<number>({ ...int.opts })
+    const records = table({
+      id: uuid.primaryKey(),
+      revision: revisionColumn,
+    }).revision('revision')
+
+    expect(Reflect.set(revisionColumn.opts, 'type', 'text')).toBe(true)
+    expect(Reflect.set(revisionColumn.opts, 'isOptional', true)).toBe(true)
+    expect(
+      Reflect.set(revisionColumn.opts, 'ref', {
+        table: 'parents',
+        column: 'id',
+      }),
+    ).toBe(true)
+
+    const schema = defineSchema({ records })
+    expect(records.columns.revision.opts).toMatchObject({
+      type: 'int',
+      isOptional: false,
+    })
+    expect(records.columns.revision.opts.ref).toBeUndefined()
+    expect(Object.isFrozen(records.columns.revision.opts)).toBe(true)
+    expect(getTableCapabilities(schema.records).revisionProperty).toBe('revision')
+    expect(getTableColumns(schema.records).revision).toMatchObject({
+      hasDefault: true,
+      notNull: true,
+      default: 1,
+    })
+    expect(getTableColumns(schema.records).revision.getSQLType()).toBe('integer')
+  })
+
+  test('table definitions snapshot nested reference metadata', () => {
+    const accountReference = uuid.references('accounts')
+    const posts = table({ id: uuid.primaryKey(), accountId: accountReference })
+
+    expect(Reflect.set(accountReference.opts.ref!, 'table', 'mutated_accounts')).toBe(true)
+    expect(Reflect.set(accountReference.opts.ref!, 'column', 'mutated_id')).toBe(true)
+
+    const schema = defineSchema({
+      accounts: table({ id: uuid.primaryKey() }),
+      posts,
+    })
+    expect(renderCreateTableIfNotExists(schema.posts)).toContain('REFERENCES "accounts" ("id")')
   })
 
   test('one schema cannot mix tenancy descriptors', () => {

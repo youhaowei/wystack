@@ -5,12 +5,14 @@ import {
   createDrizzleTracker,
   defineSchema,
   eq,
+  int,
   multiTenant,
   syncSchema,
   table,
   text,
 } from '../index'
 import { uuid } from '../dsl'
+import { enumerateDraftRowChanges } from '../drizzle-tracker'
 
 const tenancy = multiTenant({
   key: {
@@ -29,6 +31,14 @@ const uuidTenantSchema = defineSchema({
   uuid_insights: multiTenant().table({ id: uuid.primaryKey(), name: text }).draftable(),
 })
 
+const intTenantSchema = defineSchema({
+  int_insights: multiTenant({
+    key: { property: 'tenantId', column: 'tenant_id', type: int },
+  })
+    .table({ id: uuid.primaryKey(), name: text })
+    .draftable(),
+})
+
 let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
@@ -37,6 +47,7 @@ beforeEach(async () => {
   const db = drizzle(client)
   await syncSchema(db, schema)
   await syncSchema(db, uuidTenantSchema)
+  await syncSchema(db, intTenantSchema)
   tracked = createDrizzleTracker(db)
 })
 
@@ -204,10 +215,12 @@ describe('tenant-scoped database access', () => {
     )
   })
 
-  test('UUID tenant tags use the canonical database identity regardless of case', async () => {
+  test('UUID tenant tags use the canonical database identity across accepted spellings', async () => {
     const upperTenant = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'
     const lowerTenant = upperTenant.toLowerCase()
-    const reader = createDrizzleTracker(tracked.raw).withTenant(upperTenant)
+    const reader = createDrizzleTracker(tracked.raw).withTenant(
+      `{${upperTenant.replaceAll('-', '')}}`,
+    )
     const writer = createDrizzleTracker(tracked.raw).withTenant(lowerTenant)
 
     await reader.withDraft('uuid-draft').from(uuidTenantSchema.uuid_insights).all()
@@ -217,5 +230,67 @@ describe('tenant-scoped database access', () => {
     })
 
     expect([...reader.tablesRead].some((tag) => writer.tablesWritten.has(tag))).toBe(true)
+    expect(await reader.withDraft('uuid-draft').from(uuidTenantSchema.uuid_insights).all()).toEqual(
+      [
+        {
+          id: '00000000-0000-4000-8000-000000000091',
+          name: 'same tenant',
+          tenantId: lowerTenant,
+        },
+      ],
+    )
+    expect((await enumerateDraftRowChanges(tracked.raw, 'uuid-draft'))[0]?.tenantKey).toEqual({
+      type: 'uuid',
+      value: lowerTenant,
+    })
+  })
+
+  test('integer tenant tags use the canonical database identity across accepted spellings', async () => {
+    const reader = createDrizzleTracker(tracked.raw).withTenant('01')
+    const writer = createDrizzleTracker(tracked.raw).withTenant(1)
+
+    await reader.withDraft('int-draft').from(intTenantSchema.int_insights).all()
+    await writer.withDraft('int-draft').into(intTenantSchema.int_insights).insert({
+      id: '00000000-0000-4000-8000-000000000092',
+      name: 'same tenant',
+    })
+
+    expect([...reader.tablesRead].some((tag) => writer.tablesWritten.has(tag))).toBe(true)
+    expect(await reader.withDraft('int-draft').from(intTenantSchema.int_insights).all()).toEqual([
+      {
+        id: '00000000-0000-4000-8000-000000000092',
+        name: 'same tenant',
+        tenantId: 1,
+      },
+    ])
+    expect((await enumerateDraftRowChanges(tracked.raw, 'int-draft'))[0]?.tenantKey).toEqual({
+      type: 'integer',
+      value: 1,
+    })
+  })
+
+  test('tenant identity validation rejects spellings PostgreSQL would reject', async () => {
+    for (const invalidInteger of ['', '0x10', '2147483648', '-2147483649', '\u00a01\u00a0']) {
+      await expect(
+        createDrizzleTracker(tracked.raw)
+          .withTenant(invalidInteger)
+          .from(intTenantSchema.int_insights)
+          .all(),
+      ).rejects.toThrow('Invalid integer identity')
+    }
+
+    await expect(
+      createDrizzleTracker(tracked.raw)
+        .withTenant('a-aaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa')
+        .from(uuidTenantSchema.uuid_insights)
+        .all(),
+    ).rejects.toThrow('Invalid UUID identity')
+
+    await expect(
+      createDrizzleTracker(tracked.raw)
+        .withTenant(' aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ')
+        .from(uuidTenantSchema.uuid_insights)
+        .all(),
+    ).rejects.toThrow('Invalid UUID identity')
   })
 })

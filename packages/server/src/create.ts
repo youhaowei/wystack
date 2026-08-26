@@ -29,10 +29,10 @@ export interface WyStackSystem {
    */
   emit: (tablesWritten: Set<string>) => void
   /**
-   * Run one registered function's handler against a SUPPLIED DrizzleTracker instead
-   * of a fresh per-call one. This is the seam `applyCommands` uses to dispatch
-   * every command in a batch through the same tx-bound tracker, so their writes
-   * land in one native transaction and one merged Tag-set.
+   * Run one registered function's handler using a SUPPLIED DrizzleTracker instead
+   * of a fresh per-call one. The handler receives a `ProcedureDb`, not the tracker
+   * itself. This is the seam `applyCommands` uses to dispatch every command in a
+   * batch through one native transaction and one merged Tag-set.
    *
    * Validation runs inside the composed handler after middleware exactly as in
    * `call`, so a batch command and a plain RPC to the same path validate identically. The
@@ -47,9 +47,10 @@ export interface WyStackSystem {
    * `tracked` may also be a `DraftDrizzleTracker` (a `base.withDraft(draftId)` handle):
    * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
    * command handler's writes (`ctx.db.into/update/delete`) into the durable
-   * draft overlay. Handlers are authored against `DrizzleTracker` and only
-   * touch the from/into/where/all/insert/update/delete surface both handles
-   * share — so the substitution is transparent to them.
+   * draft overlay. `runHandler` converts either tracker to the same restricted
+   * `ProcedureDb` surface (`from`, `into`, and `transaction`), so the substitution
+   * is transparent to handlers while raw SQL, scope changes, and tracking sets
+   * remain framework custody.
    */
   runHandler: (
     path: string,
@@ -208,7 +209,7 @@ export async function buildWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      // Handlers receive only the tracked read/write/transaction surface. A
+      // Handlers receive only the restricted ProcedureDb surface. A
       // draft tracker implements transaction() as a fail-loud nested-transaction
       // guard because lifecycle append/publish own the outer boundaries. Raw SQL
       // and scope-changing methods are unavailable in both type and runtime.

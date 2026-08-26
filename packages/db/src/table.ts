@@ -1,4 +1,4 @@
-import { uuid, type AnyColumnDef } from './dsl'
+import { ColumnDef, uuid, type AnyColumnDef } from './dsl'
 
 export type ColumnDefinitions = Record<string, AnyColumnDef>
 
@@ -36,10 +36,137 @@ export interface TableCapabilities {
   readonly revisionProperty?: string
 }
 
+const standardColumnDefinitionOwnKeys = new Set(Reflect.ownKeys(uuid))
+
+function snapshotDefaultValue(value: unknown, ancestors: readonly object[] = []): unknown {
+  if (
+    value === undefined ||
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return value
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error('Column default numbers must be finite')
+    }
+    return value
+  }
+  if (value instanceof Date) return new Date(value.getTime())
+  if (typeof value !== 'object') {
+    throw new Error('Column defaults must be primitives, Date values, arrays, or plain objects')
+  }
+  if (ancestors.includes(value)) {
+    throw new Error('Column defaults cannot contain circular references')
+  }
+  const nestedAncestors = [...ancestors, value]
+  if (Array.isArray(value)) {
+    return Object.freeze(
+      value.map((nestedValue) => snapshotDefaultValue(nestedValue, nestedAncestors)),
+    )
+  }
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error('Column defaults must be primitives, Date values, arrays, or plain objects')
+  }
+  return Object.freeze(
+    Object.fromEntries(
+      Object.entries(value).map(([key, nestedValue]) => [
+        key,
+        snapshotDefaultValue(nestedValue, nestedAncestors),
+      ]),
+    ),
+  )
+}
+
+function readDefaultValueSnapshot(value: unknown): unknown {
+  if (value instanceof Date) return new Date(value.getTime())
+  if (Array.isArray(value)) return Object.freeze(value.map(readDefaultValueSnapshot))
+  if (value && typeof value === 'object') {
+    return Object.freeze(
+      Object.fromEntries(
+        Object.entries(value).map(([key, nestedValue]) => [
+          key,
+          readDefaultValueSnapshot(nestedValue),
+        ]),
+      ),
+    )
+  }
+  return value
+}
+
+function snapshotColumnDefinition<TColumn extends AnyColumnDef>(definition: TColumn): TColumn {
+  if (Object.getPrototypeOf(definition) !== ColumnDef.prototype) {
+    throw new Error(
+      'Column definitions must be plain ColumnDef instances; subclasses are unsupported',
+    )
+  }
+  const ownKeys = Reflect.ownKeys(definition)
+  if (
+    ownKeys.length !== standardColumnDefinitionOwnKeys.size ||
+    ownKeys.some((key) => !standardColumnDefinitionOwnKeys.has(key))
+  ) {
+    throw new Error('Column definitions cannot carry custom own state')
+  }
+  const opts = { ...definition.opts }
+  if (Object.hasOwn(definition.opts, 'defaultValue')) {
+    const defaultValueSnapshot = snapshotDefaultValue(definition.opts.defaultValue)
+    Object.defineProperty(opts, 'defaultValue', {
+      get: () => readDefaultValueSnapshot(defaultValueSnapshot),
+      enumerable: true,
+      configurable: false,
+    })
+  }
+  if (opts.ref) opts.ref = Object.freeze({ ...opts.ref })
+
+  const snapshot = new ColumnDef(Object.freeze(opts)) as TColumn
+  return Object.freeze(snapshot)
+}
+
+function snapshotColumns<TColumns extends ColumnDefinitions>(columns: TColumns): TColumns {
+  const prototype = Object.getPrototypeOf(columns)
+  const ownKeys = Reflect.ownKeys(columns)
+  const hasHiddenOrSymbolKeys = ownKeys.some(
+    (key) =>
+      typeof key !== 'string' || Object.getOwnPropertyDescriptor(columns, key)?.enumerable !== true,
+  )
+  if ((prototype !== Object.prototype && prototype !== null) || hasHiddenOrSymbolKeys) {
+    throw new Error('Table columns must be a plain map of enumerable string properties')
+  }
+  return Object.freeze(
+    Object.fromEntries(
+      Object.entries(columns).map(([property, definition]) => [
+        property,
+        snapshotColumnDefinition(definition),
+      ]),
+    ),
+  ) as TColumns
+}
+
 function freezeCapabilities(capabilities: TableCapabilities): Readonly<TableCapabilities> {
-  const tenancy = capabilities.tenancy ? Object.freeze({ ...capabilities.tenancy }) : undefined
+  const tenancy = capabilities.tenancy
+    ? Object.freeze({
+        ...capabilities.tenancy,
+        type: snapshotColumnDefinition(capabilities.tenancy.type),
+      })
+    : undefined
   return Object.freeze({ ...capabilities, tenancy })
 }
+
+const tableDefinitionConstructionToken = Symbol('TableDefinition construction token')
+
+type CreateTableDefinition = <
+  TColumns extends ColumnDefinitions,
+  TDraftable extends boolean,
+  TSystemManaged extends string,
+  TRevisionProperty extends string,
+>(
+  columns: TColumns,
+  capabilities: TableCapabilities & { draftable: TDraftable },
+) => TableDefinition<TColumns, TDraftable, TSystemManaged, TRevisionProperty>
+
+let createTableDefinition: CreateTableDefinition
 
 export class TableDefinition<
   TColumns extends ColumnDefinitions = ColumnDefinitions,
@@ -47,19 +174,56 @@ export class TableDefinition<
   TSystemManaged extends string = never,
   TRevisionProperty extends string = never,
 > {
+  readonly #constructionBrand = tableDefinitionConstructionToken
   declare readonly [systemManagedProperties]: TSystemManaged
   readonly columns: TColumns
   readonly capabilities: Readonly<TableCapabilities> & { readonly draftable: TDraftable }
 
-  constructor(columns: TColumns, capabilities: TableCapabilities & { draftable: TDraftable }) {
-    this.columns = columns
+  private constructor(
+    token: typeof tableDefinitionConstructionToken,
+    columns: TColumns,
+    capabilities: TableCapabilities & { draftable: TDraftable },
+  ) {
+    if (token !== tableDefinitionConstructionToken) {
+      throw new Error('TableDefinition cannot be constructed directly; use table(...)')
+    }
+    this.columns = snapshotColumns(columns)
     this.capabilities = freezeCapabilities(capabilities) as Readonly<TableCapabilities> & {
       readonly draftable: TDraftable
     }
+    Object.freeze(this)
+  }
+
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return typeof value === 'object' && value !== null && #constructionBrand in value
+  }
+
+  static #assertAuthentic(value: object): void {
+    if (!(#constructionBrand in value)) {
+      throw new Error('TableDefinition capability methods require a factory-created definition')
+    }
+  }
+
+  static {
+    createTableDefinition = <
+      TColumns extends ColumnDefinitions,
+      TDraftable extends boolean,
+      TSystemManaged extends string,
+      TRevisionProperty extends string,
+    >(
+      columns: TColumns,
+      capabilities: TableCapabilities & { draftable: TDraftable },
+    ): TableDefinition<TColumns, TDraftable, TSystemManaged, TRevisionProperty> =>
+      new TableDefinition<TColumns, TDraftable, TSystemManaged, TRevisionProperty>(
+        tableDefinitionConstructionToken,
+        columns,
+        capabilities,
+      )
   }
 
   draftable(): TableDefinition<TColumns, true, TSystemManaged, TRevisionProperty> {
-    return new TableDefinition<TColumns, true, TSystemManaged, TRevisionProperty>(this.columns, {
+    TableDefinition.#assertAuthentic(this)
+    return createTableDefinition<TColumns, true, TSystemManaged, TRevisionProperty>(this.columns, {
       ...this.capabilities,
       draftable: true,
     })
@@ -71,6 +235,7 @@ export class TableDefinition<
       : never,
     property: TKey,
   ): TableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TKey> {
+    TableDefinition.#assertAuthentic(this)
     if (this.capabilities.revisionProperty) {
       throw new Error(
         `Revision property is already configured as "${this.capabilities.revisionProperty}"`,
@@ -96,17 +261,25 @@ export class TableDefinition<
     if (definition.opts.type !== 'int') {
       throw new Error(`Revision property "${property}" must be an integer`)
     }
-    return new TableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TKey>(this.columns, {
+    return createTableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TKey>(this.columns, {
       ...this.capabilities,
       revisionProperty: property,
     })
   }
 }
 
+Object.defineProperty(TableDefinition, Symbol.hasInstance, {
+  value: TableDefinition[Symbol.hasInstance],
+  configurable: false,
+  writable: false,
+})
+
 export function table<TColumns extends ColumnDefinitions>(
   columns: TColumns,
 ): TableDefinition<TColumns, false> {
-  return new TableDefinition(columns, { draftable: false })
+  return createTableDefinition<TColumns, false, never, never>(columns, {
+    draftable: false,
+  })
 }
 
 type WithTenantKey<
@@ -134,7 +307,10 @@ export function multiTenant<const TKey extends TenantKeyDefinition>(opts: {
 export function multiTenant(
   opts: { key: TenantKeyDefinition } = { key: defaultTenantKey },
 ): MultiTenantDescriptor<TenantKeyDefinition> {
-  const key = Object.freeze({ ...opts.key })
+  const key = Object.freeze({
+    ...opts.key,
+    type: snapshotColumnDefinition(opts.key.type),
+  })
   if (key.property.length === 0) throw new Error('multiTenant key.property cannot be empty')
   if (key.column.length === 0) throw new Error('multiTenant key.column cannot be empty')
   if (key.type.opts.isOptional || key.type.opts.isNullable) {
@@ -162,7 +338,7 @@ export function multiTenant(
         ...columns,
         [key.property]: key.type,
       } as WithTenantKey<TColumns, TenantKeyDefinition>
-      return new TableDefinition(withTenant, {
+      return createTableDefinition(withTenant, {
         draftable: false,
         tenancy: { ...key, descriptorId },
       })

@@ -27,6 +27,7 @@ import {
   withoutUndefined,
 } from './tracker-core'
 import { mapColumnValue, normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
+import { createDrizzleTracker } from './tracker-factory'
 
 export async function writeDraftRow(
   db: DrizzleDb,
@@ -164,6 +165,10 @@ export async function writeDraftRow(
             `OR (NOT EXISTS (SELECT 1 FROM existing_change) AND ${basePresent}))`,
         )
       : sql.empty()
+  const conflictUpdateGuard =
+    opts.intent === 'insert'
+      ? sql.raw(` WHERE ${draftChangesRelation}."operation" = 'delete'`)
+      : sql.empty()
 
   const query = sql`${baseCte}${sql.raw(
     `INSERT INTO ${draftChangesRelation} ` +
@@ -189,8 +194,8 @@ export async function writeDraftRow(
       `WHEN ${draftChangesRelation}."fields" ? entry.key ` +
       `THEN jsonb_set(${draftChangesRelation}."fields" -> entry.key, '{value}', entry.value -> 'value', true) ` +
       `ELSE entry.value END) FROM jsonb_each(EXCLUDED."fields") entry` +
-      `), '{}'::jsonb) RETURNING *`,
-  )}`
+      `), '{}'::jsonb)`,
+  )}${conflictUpdateGuard}${sql.raw(' RETURNING *')}`
 
   const result = await db.execute(query)
   const rows = normalizeExecuteRows(result)
@@ -283,42 +288,52 @@ export class DraftInsertBuilder<T extends AnyTable> {
     const columns = getTableColumns(this._table) as Record<string, any>
     const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
 
-    const out: Record<string, unknown>[] = []
-    for (const row of rows) {
-      const supplied = row as Record<string, unknown>
-      assertRevisionInput(this._table, supplied)
-      const revision = revisionProperty(this._table)
-      const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
-      const r = materializeDraftInsertDefaults(
-        columns,
-        supplied,
-        new Set([
-          pkPropKey ?? pkColName,
-          ...(tenantProperty ? [tenantProperty] : []),
-          ...(revision ? [revision] : []),
-        ]),
-      )
-      assertTenantInput(this._table, r)
-      const pkValue = pkPropKey !== undefined ? r[pkPropKey] : r[pkColName]
-      if (pkValue === undefined || pkValue === null) {
-        throw new Error(
-          `DraftInsertBuilder.insert(): row is missing primary key "${pkPropKey ?? pkColName}". ` +
-            `Draft inserts require a client-minted PK so the derived row is addressable.`,
+    let committedTracker: DraftDrizzleTracker | undefined
+    const out = await this._db.transaction(async (txDb: DrizzleDb) => {
+      const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
+      committedTracker = txDraft
+      const inserted: Record<string, unknown>[] = []
+      for (const row of rows) {
+        const supplied = row as Record<string, unknown>
+        assertRevisionInput(this._table, supplied)
+        const revision = revisionProperty(this._table)
+        const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
+        const r = materializeDraftInsertDefaults(
+          columns,
+          supplied,
+          new Set([
+            pkPropKey ?? pkColName,
+            ...(tenantProperty ? [tenantProperty] : []),
+            ...(revision ? [revision] : []),
+          ]),
         )
+        assertTenantInput(this._table, r)
+        const pkValue = pkPropKey !== undefined ? r[pkPropKey] : r[pkColName]
+        if (pkValue === undefined || pkValue === null) {
+          throw new Error(
+            `DraftInsertBuilder.insert(): row is missing primary key "${pkPropKey ?? pkColName}". ` +
+              `Draft inserts require a client-minted PK so the derived row is addressable.`,
+          )
+        }
+        // Pass the full row as sparse values; writeDraftRow drops the PK column,
+        // which is carried separately as the stable row identity.
+        await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
+          pkValue,
+          values: r,
+          tombstone: false,
+          intent: 'insert',
+        })
+        const effective = await txDraft
+          .from(this._table)
+          .where({ op: 'eq', column: pkPropKey ?? pkColName, value: pkValue })
+          .first()
+        if (effective) inserted.push(effective)
       }
-      // Pass the full row as sparse values; writeDraftRow drops the PK column,
-      // which is carried separately as the stable row identity.
-      await writeDraftRow(this._db, this._tracker, this._table, this._draftId, this._tenantScope, {
-        pkValue,
-        values: r,
-        tombstone: false,
-        intent: 'insert',
-      })
-      const effective = await this._tracker
-        .from(this._table)
-        .where({ op: 'eq', column: pkPropKey ?? pkColName, value: pkValue })
-        .first()
-      if (effective) out.push(effective)
+      return inserted
+    })
+    if (committedTracker) {
+      for (const tag of committedTracker.tablesRead) this._tracker.tablesRead.add(tag)
+      for (const tag of committedTracker.tablesWritten) this._tracker.tablesWritten.add(tag)
     }
     return out
   }
