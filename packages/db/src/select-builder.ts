@@ -195,7 +195,13 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
       const named = this._clauses.orderDir === 'desc' ? desc(col) : asc(col)
       q = pkCol && pkCol !== col ? q.orderBy(named, asc(pkCol)) : q.orderBy(named)
     }
-    const limit = limitOverride ?? this._clauses.limitVal
+    // `first()` narrows a read to one row; it never widens past a limit the
+    // caller attached, so `limit(0).first()` is null exactly as `limit(0).all()`
+    // is empty. The draft builder lowers the same rule.
+    const limit =
+      limitOverride === undefined
+        ? this._clauses.limitVal
+        : Math.min(limitOverride, this._clauses.limitVal ?? limitOverride)
     if (limit !== undefined) {
       q = q.limit(limit)
     }

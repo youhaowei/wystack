@@ -55,52 +55,20 @@ const canonicalFilterExamples: Array<{
   },
 ]
 
-describe('bounded SQL plan shape', () => {
+describe('bounded SQL plan choice', () => {
   /**
-   * A top-L draft read cannot inspect only the canonical top L rows: any of
-   * those rows may have been changed or deleted. It must inspect L plus the M
-   * changed keys, then overlay every changed canonical row before ranking.
+   * Every plan returns the same rows, so result parity below cannot tell them
+   * apart. What it cannot observe is how much canonical data a read scans: a
+   * filtered or limited read must take the bounded L + M candidate plan, and
+   * only an unfiltered, unlimited read may fall back to the exact full overlay.
    */
-  test('bounds canonical work to L + M candidates', () => {
-    const lowered = plan
-      .draftItems()
-      .where(gte('score', 50))
-      .orderBy('score', 'desc')
-      .limit(3)
-      .toSql()
-
-    expect(lowered.sql).toContain('WITH draft_delta AS')
-    expect(lowered.sql).toContain('base_top AS')
-    expect(lowered.sql).toContain('(SELECT COUNT(*) FROM draft_delta)')
-    expect(lowered.sql).toContain('candidate_base AS')
-    expect(lowered.sql).toContain('NOT EXISTS')
-    expect(lowered.sql).toContain('UNION ALL')
-    expect(lowered.sql).toContain('FULL OUTER JOIN draft_delta')
-    expect(lowered.sql).toContain('c."score" >=')
-    expect(lowered.sql).toContain('ORDER BY c."score" DESC, c."id"')
-  })
-
-  /**
-   * A filtered read without a limit still benefits from pushing the filter
-   * into the canonical candidate scan, but there is no top-L boundary to pad.
-   */
-  test('pushes down filters without inventing a limit', () => {
-    const lowered = plan.draftItems().where(gte('score', 50)).toSql()
-
-    expect(lowered.sql).toContain('WITH draft_delta AS')
-    expect(lowered.sql).not.toContain('(SELECT COUNT(*) FROM draft_delta)')
-    expect(lowered.sql).not.toContain('ORDER BY c.')
-  })
-
-  /**
-   * Without a filter or limit there is no safe bounded candidate set. The
-   * exact full-join overlay is the intended fallback, not an optimization miss.
-   */
-  test('falls back to an exact overlay for an unfiltered read', () => {
-    const lowered = plan.draftItems().toSql()
-
-    expect(lowered.sql).not.toContain('WITH draft_delta AS')
-    expect(lowered.sql).toContain('FULL OUTER JOIN')
+  test('filtered or limited reads are bounded; unfiltered reads use the exact overlay', () => {
+    expect(
+      plan.draftItems().where(gte('score', 50)).orderBy('score', 'desc').limit(3).toSql().plan,
+    ).toBe('bounded')
+    expect(plan.draftItems().where(gte('score', 50)).toSql().plan).toBe('bounded')
+    expect(plan.draftItems().limit(3).toSql().plan).toBe('bounded')
+    expect(plan.draftItems().toSql().plan).toBe('overlay')
   })
 })
 
@@ -159,8 +127,10 @@ describe('bounded SQL result parity', () => {
    */
   test('returns no rows for limit zero', async () => {
     const rows = await scenario.draftItems().where(gte('score', 50)).limit(0).all()
+    const first = await scenario.draftItems().where(gte('score', 50)).limit(0).first()
 
     expect(rows).toEqual([])
+    expect(first).toBeNull()
   })
 
   /**

@@ -127,6 +127,14 @@ describe('DrizzleTracker', () => {
     expect(row!.title).toBe('A')
   })
 
+  test('first never widens a caller limit of zero', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    tracked = resetTracking(tracked)
+
+    expect(await tracked.from(schema.todos).limit(0).all()).toEqual([])
+    expect(await tracked.from(schema.todos).limit(0).first()).toBeNull()
+  })
+
   test('update records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'A', done: false })
     tracked = resetTracking(tracked)
@@ -908,5 +916,42 @@ describe('canonical and draft reads agree on tied rows', () => {
     // arbitrary, and the draft coalesce cannot pin a single PK column either.
     const orderBy = sql.slice(sql.indexOf('order by'))
     expect(orderBy).toBe('order by "composite_members"."role" asc')
+  })
+})
+
+describe('draft writes to array columns', () => {
+  const arraySchema = defineSchema({
+    notes: table({
+      id: int.primaryKey(),
+      tags: text.array(),
+    }).draftable(),
+  })
+
+  beforeEach(async () => {
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, tags TEXT[] NOT NULL)`,
+    )
+    await createDraftStorage()
+  })
+
+  /**
+   * Drizzle encodes an array column as one PostgreSQL literal string. The draft
+   * read lowering rebuilds the column from a JSON array instead, so a proposed
+   * array has to be stored element by element or the draft can never be read.
+   */
+  test('an array proposed in a draft reads back as the array', async () => {
+    await tracked.into(arraySchema.notes).insert({ tags: ['a'] })
+
+    const draft = tracked.withDraft('d1').from(arraySchema.notes)
+    await draft.where(eq('id', 1)).update({ tags: ['b', 'c'] })
+    await tracked
+      .withDraft('d1')
+      .into(arraySchema.notes)
+      .insert({ id: 2, tags: ['x'] })
+
+    const rows = await tracked.withDraft('d1').from(arraySchema.notes).orderBy('id').all()
+    expect(rows.map((row) => row.tags)).toEqual([['b', 'c'], ['x']])
+    const canonical = await tracked.from(arraySchema.notes).all()
+    expect(canonical.map((row) => row.tags)).toEqual([['a']])
   })
 })

@@ -369,6 +369,18 @@ export function encodeProposedDraftValue(column: any, value: unknown): DraftStor
   if (isDraftJsonNull(value)) return { kind: 'json', value: null }
   const type = draftCastType(column)
   if (type === 'json' || type === 'jsonb') return { kind: 'json', value }
+  if (type.endsWith('[]') && Array.isArray(value)) {
+    // `draftFieldValueSql` rebuilds an array column from a JSON array of
+    // elements. Drizzle's array codec would instead produce the PostgreSQL
+    // literal (`{"a","b"}`) as one string, which that lowering cannot unpack, so
+    // encode each element through the element column's codec and keep the
+    // array shape.
+    const elements = value.map((element) => {
+      const encoded = mapColumnValue(column.baseColumn, element)
+      return encoded instanceof Date ? encoded.toISOString() : encoded
+    })
+    return { kind: 'value', value: elements }
+  }
   const encoded = mapColumnValue(column, value)
   return {
     kind: 'value',

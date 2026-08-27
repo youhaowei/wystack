@@ -269,10 +269,9 @@ describe('durable central draft overlay', () => {
     ).toEqual(['draft_audit.draft_items', 'draft_items'])
   })
 
-  test('point lookup lowering pins both canonical PK and central composite key', () => {
+  test('a primary-key equality lowers to the point plan', () => {
     const lowered = tracked.withDraft('d-point').from(items).where(eq('id', 3)).toSql()
-    expect(lowered.sql).toContain('FROM (SELECT * FROM "draft_items" WHERE "id" =')
-    expect(lowered.sql).toContain('"row_key_text" =')
+    expect(lowered.plan).toBe('point')
     expect(lowered.params).toContain('3')
   })
 

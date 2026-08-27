@@ -1,5 +1,15 @@
 import { getTableColumns, getTableName, sql } from 'drizzle-orm'
 import type { Query, SQL } from 'drizzle-orm'
+
+/**
+ * Which lowering a draft read chose. Every plan returns the same rows; they
+ * differ in how much canonical data they scan:
+ * - `point`   — a primary-key equality pushed into both sides of the overlay.
+ * - `bounded` — a filtered or limited read that scans only the canonical
+ *               top L + M candidates (M = this draft's changes to the table).
+ * - `overlay` — the exact full outer join over the whole canonical table.
+ */
+export type DraftReadPlan = 'point' | 'bounded' | 'overlay'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import type {
@@ -278,22 +288,25 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * lowers a query, it does not perform a read. `limitOverride` mirrors
    * `first()`'s `LIMIT 1` pushdown for the same reason it does there.
    */
-  toSql(limitOverride?: number): Query {
+  toSql(limitOverride?: number): Query & { plan: DraftReadPlan } {
     // The coalesce is a raw `sql` template, not a Drizzle query builder, so it
     // has no `.toSQL()` of its own — the dialect lowers it instead. Same
     // parameter binding either way; only the entry point differs.
-    return this._db.dialect.sqlToQuery(this._buildCoalesceQuery(limitOverride).query)
+    const lowered = this._buildCoalesceQuery(limitOverride)
+    return { ...this._db.dialect.sqlToQuery(lowered.query), plan: lowered.plan }
   }
 
   /**
    * Build the coalesce query and the column map its result must be decoded by.
    * Single source of truth shared by `_coalescedRead()` and `toSql()`, so the
-   * SQL a test asserts is the SQL a read executes.
+   * SQL a test asserts is the SQL a read executes. `plan` names which lowering
+   * was chosen — the one fact about the SQL that result parity cannot observe.
    */
   private _buildCoalesceQuery(limitOverride?: number): {
     query: SQL
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     colEntries: [string, any][]
+    plan: DraftReadPlan
   } {
     const tableName = getTableName(this._table)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -385,7 +398,12 @@ export class DraftSelectBuilder<T extends AnyTable> {
       orderByClause = ` ORDER BY ${effectiveExpression(col)}${dir}, ${pkOrder}`
     }
     const orderBy = sql.raw(orderByClause)
-    const limitVal = limitOverride ?? this._clauses.limitVal
+    // Same rule as the canonical builder: `first()` narrows, it never widens a
+    // caller-attached limit, so `limit(0).first()` stays null.
+    const limitVal =
+      limitOverride === undefined
+        ? this._clauses.limitVal
+        : Math.min(limitOverride, this._clauses.limitVal ?? limitOverride)
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
     const sqlOperators = {
       eq: '=',
@@ -475,12 +493,12 @@ export class DraftSelectBuilder<T extends AnyTable> {
         `) SELECT ${colSelects} FROM candidate_base b FULL OUTER JOIN draft_delta d ON b.${quoteSqlIdentifier(pkColName)} = ${keyFromChange} WHERE COALESCE(d."operation", 'update') <> 'delete'`,
       )}${filterPredicate}${orderBy}${limit}`
 
-      return { query: boundedQuery, colEntries }
+      return { query: boundedQuery, colEntries, plan: 'bounded' }
     }
 
     const query = sql`${prefix}${baseWhere}${change}${filterPredicate}${orderBy}${limit}`
 
-    return { query, colEntries }
+    return { query, colEntries, plan: pkFilter ? 'point' : 'overlay' }
   }
 
   /**
