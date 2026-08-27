@@ -152,6 +152,8 @@ function buildTable(
   capabilities: TableCapabilities,
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
   allTables: Record<string, any>,
+  /** False on the first compile pass, when no reference target exists yet. */
+  referencesResolved: boolean,
 ) {
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle column builders
   const colDefs: Record<string, any> = {}
@@ -182,6 +184,38 @@ function buildTable(
   }
   const [primaryProperty] = primaryEntries[0]
 
+  if (referencesResolved) {
+    // Reference checks run here, eagerly, because Drizzle evaluates the
+    // constraint callback below lazily — an error thrown there would surface on
+    // first use of the table, not at defineSchema().
+    for (const [property, definition] of Object.entries(columns)) {
+      const ref = definition.opts.ref
+      if (!ref) continue
+      const target = allTables[ref.table]
+      if (ref.withinTenant) {
+        // A plain `.references()` to an unknown table is skipped for backward
+        // compatibility; a tenant-local one is a declared isolation constraint,
+        // and silently emitting no constraint would leave the relationship
+        // free to cross tenants.
+        if (!target) {
+          throw new Error(
+            `Tenant-local reference "${tableName}.${property}" targets unknown table "${ref.table}"`,
+          )
+        }
+        continue
+      }
+      // A bare `.references()` between two tenant-isolated tables is a foreign
+      // key with no tenant predicate: a row could point at a parent in another
+      // tenant. Only the tenant-qualified form is structural, so require it.
+      // References to plain tables stay allowed — there is no tenant to cross.
+      if (target && tryGetTableCapabilities(target)?.tenancy) {
+        throw new Error(
+          `Reference "${tableName}.${property}" targets tenant-isolated table "${ref.table}"; use referencesWithinTenant()`,
+        )
+      }
+    }
+  }
+
   const compiled = pgTable(tableName, colDefs, (current) => {
     const constraints: PgTableExtraConfigValue[] = [
       unique(`${tableName}_${tenant.column}_${current[primaryProperty].name}_unique`).on(
@@ -200,8 +234,11 @@ function buildTable(
         )
       }
       const ref = definition.opts.ref
-      if (!ref?.withinTenant || !allTables[ref.table]) continue
+      if (!ref?.withinTenant) continue
+      // Unknown targets were rejected eagerly above; this callback runs lazily
+      // and only sees the first, reference-free compile pass otherwise.
       const target = allTables[ref.table]
+      if (!target) continue
       const targetTenant = tryGetTableCapabilities(target)?.tenancy
       if (!targetTenant) {
         throw new Error(
@@ -296,7 +333,7 @@ export function defineSchema<const T extends Record<string, unknown>>(
   // Pass 1: create all tables without foreign key references
   for (const [tableName, definition] of Object.entries(tables)) {
     const { columns, capabilities } = normalizeTableDefinition(definition)
-    result[tableName] = buildTable(tableName, columns, capabilities, {})
+    result[tableName] = buildTable(tableName, columns, capabilities, {}, false)
     registerTableCapabilities(result[tableName], capabilities)
   }
 
@@ -306,7 +343,7 @@ export function defineSchema<const T extends Record<string, unknown>>(
     const hasRefs = Object.values(columns).some((c) => c.opts.ref)
     if (!hasRefs) continue
 
-    result[tableName] = buildTable(tableName, columns, capabilities, result)
+    result[tableName] = buildTable(tableName, columns, capabilities, result, true)
     registerTableCapabilities(result[tableName], capabilities)
   }
 

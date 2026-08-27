@@ -518,4 +518,52 @@ describe('composable table capabilities', () => {
       }),
     ).toThrow('tenant-isolated')
   })
+
+  test('a tenant-local reference to an unknown table is an error, not a missing constraint', () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+    })
+    expect(() =>
+      defineSchema({
+        projects: tenancy.table({ id: uuid.primaryKey() }),
+        tasks: tenancy.table({
+          id: uuid.primaryKey(),
+          projectId: uuid.referencesWithinTenant('projcts'),
+        }),
+      }),
+    ).toThrow('unknown table "projcts"')
+  })
+
+  test('a tenant-local reference may name a table defined later in the schema', () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+    })
+    const schema = defineSchema({
+      tasks: tenancy.table({
+        id: uuid.primaryKey(),
+        projectId: uuid.referencesWithinTenant('projects'),
+      }),
+      projects: tenancy.table({ id: uuid.primaryKey() }),
+    })
+    expect(getTableConfig(schema.tasks).foreignKeys).toHaveLength(1)
+  })
+
+  test('a bare reference between tenant-isolated tables must be tenant-qualified', () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+    })
+    expect(() =>
+      defineSchema({
+        projects: tenancy.table({ id: uuid.primaryKey() }),
+        tasks: tenancy.table({ id: uuid.primaryKey(), projectId: uuid.references('projects') }),
+      }),
+    ).toThrow('use referencesWithinTenant()')
+
+    // A plain lookup table has no tenant to cross, so a bare reference to it stays legal.
+    const schema = defineSchema({
+      statuses: table({ id: uuid.primaryKey(), label: text }),
+      tasks: tenancy.table({ id: uuid.primaryKey(), statusId: uuid.references('statuses') }),
+    })
+    expect(getTableConfig(schema.tasks).foreignKeys).toHaveLength(1)
+  })
 })
