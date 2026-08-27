@@ -154,6 +154,7 @@ describe('defineApp().build()', () => {
     expect(Object.keys(app.system).sort()).toEqual([
       'createTracked',
       'emit',
+      'resolvesTenant',
       'runHandler',
       'scopeTracked',
     ])

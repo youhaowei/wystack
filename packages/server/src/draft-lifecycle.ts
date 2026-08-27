@@ -160,11 +160,20 @@ export function createDraftLifecycle(
     }
   }
 
+  // A draft with no tenant is "global". In a tenant-aware app that is a
+  // privileged scope and only the host's explicit hook may grant it. In an app
+  // with no tenant dimension every draft is app-scoped by construction, so the
+  // hook is an optional extra gate rather than a requirement — demanding it
+  // there would break every single-tenant app that used drafts before tenancy
+  // existed.
+  const globalDraftsArePrivileged = app.system.resolvesTenant || authorizeGlobalDraft !== undefined
+
   async function hasGlobalDraftAuthority(
     action: GlobalDraftAuthorizationRequest['action'],
     context: Record<string, unknown>,
     draft?: GlobalDraftAuthorizationRequest['draft'],
   ): Promise<boolean> {
+    if (!globalDraftsArePrivileged) return true
     return (
       authorizeGlobalDraft !== undefined &&
       (await authorizeGlobalDraft({ action, draft, context })) === true

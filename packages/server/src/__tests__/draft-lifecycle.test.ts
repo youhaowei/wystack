@@ -260,12 +260,37 @@ describe('draft lifecycle — global authority and custody', () => {
     principal: { kind: 'user' as const, userId: 'system-test' },
   }
 
-  test('global drafts require explicit privileged host authorization', async () => {
-    const lifecycle = createProductionDraftLifecycle(app)
+  test('tenant-aware apps require explicit privileged host authorization for global drafts', async () => {
+    const tenantAware = await wy.build({
+      db,
+      functions: {
+        listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      },
+      resolveTenant: () => undefined,
+    })
+    const lifecycle = createProductionDraftLifecycle(tenantAware)
 
+    // Without the hook the only scope a tenant-aware app can bind is the
+    // resolved tenant, and there is none — fail closed either way.
     await expect(lifecycle.open(0, { context: ownerContext })).rejects.toThrow(
-      'global drafts require privileged host context',
+      /privileged host context|trusted tenant ID/,
     )
+    const privileged = createProductionDraftLifecycle(tenantAware, {
+      authorizeGlobalDraft: () => true,
+    })
+    await expect(privileged.open(0, { context: ownerContext })).resolves.toBeString()
+  })
+
+  test('apps without a tenant dimension open drafts without a global authorization hook', async () => {
+    const lifecycle = createProductionDraftLifecycle(app)
+    const draftId = await lifecycle.open(0, { context: ownerContext })
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      context: ownerContext,
+    })
+    await lifecycle.publish(draftId, undefined, { context: ownerContext })
+
+    const { result } = await app.call('listTodos', {})
+    expect(result).toContainEqual(expect.objectContaining({ id: 3, title: 'cherry' }))
   })
 
   test('global drafts require a stable non-null owner', async () => {
@@ -778,6 +803,34 @@ describe('draft lifecycle — row-local revision conflicts', () => {
     expect(await lifecycle.getLog(draftId)).toHaveLength(1)
     const { result } = await app.call('listVersionedTodos', {})
     expect(result).toEqual([{ id: 1, title: 'external', revision: 2 }])
+  })
+
+  /**
+   * The touched-table descriptor is a snapshot from the last append. If the
+   * table gains a revision column afterwards, publish must not silently skip
+   * the compare-and-swap that snapshot cannot express: a canonical write
+   * through the tracker leaves a revision ledger row, and that alone is enough
+   * to fail closed until a rebase rebuilds the descriptor.
+   */
+  test('publish fails closed when a touched table was revisioned after its descriptor was stored', async () => {
+    // The draft touched `todos` while it had no revision column, so its stored
+    // descriptor carries none and the ordinary compare-and-swap has nothing to
+    // check. A row-revision ledger entry for that same row is the trace a later
+    // schema change plus canonical write leaves behind; publish must treat it as
+    // a conflict rather than overwrite a row it cannot prove unchanged.
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft title' } }])
+    await db.execute(
+      `INSERT INTO wystack_row_revisions (table_key, tenant_key_text, row_key_text, revision) VALUES ('todos', '', '1', 2)`,
+    )
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'todos', id: 1, reason: 'revision' }],
+    })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    const { result } = await app.call('listTodos', {})
+    expect((result as Array<{ title: string }>).map((row) => row.title)).toContain('apple')
   })
 
   test('delete and reinsert creates a new row incarnation that conflicts with a stale draft', async () => {

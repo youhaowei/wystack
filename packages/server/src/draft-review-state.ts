@@ -124,6 +124,29 @@ export async function assertDraftRowsUnchanged(
         `AND r.tenant_key_text = d.tenant_key_text AND r.row_key_text = d.row_key_text`
       : ''
 
+    if (!table.revisionColumn) {
+      // The stored descriptor is a snapshot from the last append. A revision
+      // ledger row for a canonical row this draft changed means the table has
+      // been revisioned since — canonical writes only touch the ledger for
+      // revisioned tables — so the snapshot cannot express the CAS this
+      // publish owes. Fail closed; rebase rebuilds the descriptor and base
+      // revisions from the live schema.
+      const staleRows = normalizeRows(
+        await raw.execute(
+          sql`${sql.raw(
+            `SELECT d.row_key FROM wystack_draft_row_changes d ` +
+              `JOIN wystack_row_revisions r ON r.table_key = d.table_key ` +
+              `AND r.tenant_key_text = d.tenant_key_text AND r.row_key_text = d.row_key_text ` +
+              `WHERE d.base_exists AND d.draft_id = `,
+          )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}`,
+        ),
+      )
+      for (const row of staleRows) {
+        const key = decodeJsonColumn(row['row_key']) as { value?: unknown }
+        conflicts.push({ table: tableIdentity, id: key.value, reason: 'revision' })
+      }
+    }
+
     if (table.revisionColumn) {
       await raw.execute(
         sql`${sql.raw(

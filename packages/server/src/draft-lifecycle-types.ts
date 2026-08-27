@@ -62,6 +62,13 @@ export interface DraftLifecycleOptions {
   versionProbe?: VersionProbe
   resolveOwner?: (context: Record<string, unknown>) => unknown | Promise<unknown>
   authorizeDraft?: (request: DraftAuthorizationRequest) => boolean | Promise<boolean>
+  /**
+   * Grants access to drafts that have no tenant. Required for a tenant-aware app
+   * (one built with `resolveTenant`), where such a draft is a privileged scope.
+   * Optional for an app with no tenant dimension: there every draft is
+   * app-scoped by construction, and installing this hook adds a gate rather
+   * than satisfying one.
+   */
   authorizeGlobalDraft?: (request: GlobalDraftAuthorizationRequest) => boolean | Promise<boolean>
   validateGraph?: (request: DraftGraphValidationRequest) => void | Promise<void>
 }

@@ -12,7 +12,7 @@ import type { WyStackApp } from './create'
 type Expect<T extends true> = T
 type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
 
-type PrivilegedKeys = 'createTracked' | 'emit' | 'runHandler' | 'scopeTracked'
+type PrivilegedKeys = 'createTracked' | 'emit' | 'resolvesTenant' | 'runHandler' | 'scopeTracked'
 
 type _RootOmitsPrivilegedSeams = Expect<Equal<Extract<keyof WyStackApp, PrivilegedKeys>, never>>
 type _SystemExposesExactlyPrivilegedSeams = Expect<

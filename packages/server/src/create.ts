@@ -73,6 +73,12 @@ export interface WyStackSystem {
     tracked: DrizzleTracker,
     context?: Record<string, unknown>,
   ) => Promise<DrizzleTracker>
+  /**
+   * Whether the host installed `resolveTenant`. When false the app has no tenant
+   * dimension: `scopeTracked` is the identity and an unscoped tracker is the
+   * only scope there is, not a privileged one.
+   */
+  readonly resolvesTenant: boolean
 }
 
 export interface WyStackApp {
@@ -191,6 +197,7 @@ export async function buildWyStack(opts: {
 
   const system: WyStackSystem = Object.freeze({
     emit: invalidation.emit,
+    resolvesTenant: opts.resolveTenant !== undefined,
 
     createTracked() {
       return createDrizzleTracker(drizzleDb)
