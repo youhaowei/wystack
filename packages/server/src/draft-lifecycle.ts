@@ -74,10 +74,12 @@ import {
 } from './draft-store'
 import {
   assertDraftRowsUnchanged,
+  assertStoredDescriptorsCurrent,
   clearDerivedChanges,
   describeTouchedTables,
   enumerateTouchedCells,
   inspectDraftRows,
+  recordCanonicalTouchedTables,
   recordTouchedTables,
 } from './draft-review-state'
 
@@ -338,11 +340,13 @@ export function createDraftLifecycle(
           db: scopedTx.withDraft(draftId),
           context,
         })
+        const liveTables = new Map<string, AnyTable>()
         const committed = (await applyCommandsWithAuthorizedTx(app, boundLog, {
           mode: 'commit',
           context,
-          tx: scopedTx,
+          tx: recordCanonicalTouchedTables(scopedTx, liveTables),
         })) as CommitResult
+        await assertStoredDescriptorsCurrent(tx.raw, draftId, touched, liveTables)
         await validateGraph?.({
           phase: 'published',
           draftId,

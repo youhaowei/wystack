@@ -41,6 +41,7 @@ import {
   type DraftLifecycleOptions,
 } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
+import { refreshStoredDraftIntegrity } from '../draft-store'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -813,11 +814,34 @@ describe('draft lifecycle — row-local revision conflicts', () => {
    * to fail closed until a rebase rebuilds the descriptor.
    */
   test('publish fails closed when a touched table was revisioned after its descriptor was stored', async () => {
-    // The draft touched `todos` while it had no revision column, so its stored
-    // descriptor carries none and the ordinary compare-and-swap has nothing to
-    // check. A row-revision ledger entry for that same row is the trace a later
-    // schema change plus canonical write leaves behind; publish must treat it as
-    // a conflict rather than overwrite a row it cannot prove unchanged.
+    // The stored descriptor is the table as it was at append time. Clearing its
+    // revision column models a table that gained .revision() afterwards: the
+    // compare-and-swap then has nothing to check, and a plain canonical update
+    // (which bumps the row inline and leaves no other trace) would be
+    // overwritten. Publish must roll back with a revision conflict instead.
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'draft title' } },
+    ])
+    await db.execute(
+      `UPDATE wystack_draft_tables SET revision_column = NULL WHERE draft_id = '${draftId}' AND table_name = 'versionedTodos'`,
+    )
+    await refreshStoredDraftIntegrity(db, draftId)
+    await app.call('renameVersionedTodo', { id: 1, title: 'external' })
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
+    })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    const { result } = await app.call('listVersionedTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'external', revision: 2 }])
+  })
+
+  test('a leftover row-revision ledger entry does not block publishing an unrevisioned table', async () => {
+    // Nothing deletes ledger rows when a table drops .revision(). They are not
+    // evidence of drift on their own; only a descriptor that disagrees with the
+    // live schema is.
     const lifecycle = createDraftLifecycle(app)
     const draftId = await lifecycle.open(0)
     await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft title' } }])
@@ -825,12 +849,11 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       `INSERT INTO wystack_row_revisions (table_key, tenant_key_text, row_key_text, revision) VALUES ('todos', '', '1', 2)`,
     )
 
-    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
-      conflicts: [{ table: 'todos', id: 1, reason: 'revision' }],
-    })
-    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    await lifecycle.publish(draftId)
     const { result } = await app.call('listTodos', {})
-    expect((result as Array<{ title: string }>).map((row) => row.title)).toContain('apple')
+    expect(
+      (result as Array<{ id: number; title: string }>).find((row) => row.id === 1)?.title,
+    ).toBe('draft title')
   })
 
   test('delete and reinsert creates a new row incarnation that conflicts with a stale draft', async () => {

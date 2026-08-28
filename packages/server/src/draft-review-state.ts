@@ -61,9 +61,6 @@ export function describeTouchedTables(
     const pk = Object.values(columns).find((column) => column.name === pkColumn)
     if (!pk) throw new Error(`draft lifecycle: cannot resolve primary key for "${qualifiedName}"`)
     const capabilities = tryGetTableCapabilities(table)
-    const revision = capabilities?.revisionProperty
-      ? columns[capabilities.revisionProperty]
-      : undefined
     const tenant = capabilities?.tenancy ? columns[capabilities.tenancy.property] : undefined
     return [
       {
@@ -73,11 +70,90 @@ export function describeTouchedTables(
         pkType: normalizeSqlType(pk.getSQLType()),
         tenantColumn: tenant?.name,
         tenantType: tenant ? normalizeSqlType(tenant.getSQLType()) : undefined,
-        revisionColumn: revision?.name,
+        revisionColumn: liveRevisionColumn(table),
         invalidationTag: draftTag,
       },
     ]
   })
+}
+
+/** The revision column the live schema declares for `table`, if any. */
+function liveRevisionColumn(table: AnyTable): string | undefined {
+  const property = tryGetTableCapabilities(table)?.revisionProperty
+  if (!property) return undefined
+  const columns = getTableColumns(table) as Record<string, { name: string }>
+  return columns[property]?.name
+}
+
+/**
+ * Wrap a canonical tracker so every table a replayed command touches is
+ * captured, including through nested transactions and tenant rebinding. The
+ * handles a handler receives are derived from the wrapped one, so recording
+ * has to follow each derivation.
+ */
+export function recordCanonicalTouchedTables(
+  tracker: DrizzleTracker,
+  touchedTables: Map<string, AnyTable>,
+): DrizzleTracker {
+  const record = (table: AnyTable) => touchedTables.set(qualifiedTableKey(table), table)
+  const wrap = (target: DrizzleTracker): DrizzleTracker =>
+    new Proxy(target, {
+      get(inner, property) {
+        if (property === 'from' || property === 'into') {
+          return (table: AnyTable) => {
+            record(table)
+            return inner[property](table)
+          }
+        }
+        if (property === 'withTenant') {
+          return (tenantId: unknown) => wrap(inner.withTenant(tenantId))
+        }
+        if (property === 'transaction') {
+          return <R>(
+            fn: (tx: DrizzleTracker) => Promise<R>,
+            opts?: Parameters<DrizzleTracker['transaction']>[1],
+          ) => inner.transaction((tx) => fn(wrap(tx)), opts)
+        }
+        const value = Reflect.get(inner, property, inner)
+        return typeof value === 'function' ? value.bind(inner) : value
+      },
+    })
+  return wrap(tracker)
+}
+
+/**
+ * The stored descriptor is a snapshot of each touched table as it was at the
+ * last append; the compare-and-swap in `assertDraftRowsUnchanged` can only
+ * express what that snapshot knew. If the live schema has since added or
+ * removed a table's revision column, the check just performed did not cover
+ * what it now owes, so publish fails closed. Runs after the replay, inside the
+ * same transaction, so the conflict rolls the whole publish back. Rebase
+ * rebuilds the descriptor and base revisions from the live schema.
+ */
+export async function assertStoredDescriptorsCurrent(
+  raw: DrizzleTracker['raw'],
+  draftId: string,
+  stored: StoredTouchedTable[],
+  liveTables: Map<string, AnyTable>,
+): Promise<void> {
+  const conflicts: DraftRowConflict[] = []
+  for (const table of stored) {
+    const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
+    const live = liveTables.get(tableIdentity)
+    if (!live || liveRevisionColumn(live) === table.revisionColumn) continue
+    const rows = normalizeRows(
+      await raw.execute(sql`
+        SELECT row_key FROM wystack_draft_row_changes
+        WHERE base_exists AND draft_id = ${draftId} AND table_key = ${tableIdentity}
+        ORDER BY tenant_key_text, row_key_text
+      `),
+    )
+    for (const row of rows) {
+      const key = decodeJsonColumn(row['row_key']) as { value?: unknown }
+      conflicts.push({ table: tableIdentity, id: key.value, reason: 'revision' })
+    }
+  }
+  if (conflicts.length > 0) throw new DraftConflictError(draftId, conflicts)
 }
 
 /** Capture table objects; the committed draft tag later filters read-only candidates. */
@@ -123,29 +199,6 @@ export async function assertDraftRowsUnchanged(
       ? ` LEFT JOIN wystack_row_revisions r ON r.table_key = d.table_key ` +
         `AND r.tenant_key_text = d.tenant_key_text AND r.row_key_text = d.row_key_text`
       : ''
-
-    if (!table.revisionColumn) {
-      // The stored descriptor is a snapshot from the last append. A revision
-      // ledger row for a canonical row this draft changed means the table has
-      // been revisioned since — canonical writes only touch the ledger for
-      // revisioned tables — so the snapshot cannot express the CAS this
-      // publish owes. Fail closed; rebase rebuilds the descriptor and base
-      // revisions from the live schema.
-      const staleRows = normalizeRows(
-        await raw.execute(
-          sql`${sql.raw(
-            `SELECT d.row_key FROM wystack_draft_row_changes d ` +
-              `JOIN wystack_row_revisions r ON r.table_key = d.table_key ` +
-              `AND r.tenant_key_text = d.tenant_key_text AND r.row_key_text = d.row_key_text ` +
-              `WHERE d.base_exists AND d.draft_id = `,
-          )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}`,
-        ),
-      )
-      for (const row of staleRows) {
-        const key = decodeJsonColumn(row['row_key']) as { value?: unknown }
-        conflicts.push({ table: tableIdentity, id: key.value, reason: 'revision' })
-      }
-    }
 
     if (table.revisionColumn) {
       await raw.execute(
