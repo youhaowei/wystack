@@ -67,7 +67,7 @@ function draftIntegrityExpression(draftId: SQL): SQL {
   )::text)`
 }
 
-const draftStorageVersion = 6
+const draftStorageVersion = 7
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -222,6 +222,30 @@ const storageDdlV6 = [
   sql.raw(`ALTER TABLE wystack_drafts ALTER COLUMN integrity_hash SET NOT NULL`),
 ]
 
+// Child writes happen before lifecycle hooks and the final parent-row CAS.
+// Defer every FK to the draft row—including the duplicate named/unnamed
+// row-change constraints created by older migrations—so those writes do not
+// acquire a parent KEY SHARE lock while host callbacks are running.
+const storageDdlV7 = [
+  sql.raw(`DO $$
+    DECLARE fk RECORD;
+    BEGIN
+      FOR fk IN
+        SELECT n.nspname AS schema_name, c.relname AS table_name, con.conname
+        FROM pg_catalog.pg_constraint con
+        JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype = 'f'
+          AND con.confrelid = 'wystack_drafts'::regclass
+      LOOP
+        EXECUTE format(
+          'ALTER TABLE %I.%I ALTER CONSTRAINT %I DEFERRABLE INITIALLY DEFERRED',
+          fk.schema_name, fk.table_name, fk.conname
+        );
+      END LOOP;
+    END $$`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await withFrameworkBootstrapLock(raw, async (tx: RawDb) => {
     await tx.execute(migrationTableDdl)
@@ -264,6 +288,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     if (installedVersion < 6) {
       for (const statement of storageDdlV6) await tx.execute(statement)
     }
+    if (installedVersion < 7) {
+      for (const statement of storageDdlV7) await tx.execute(statement)
+    }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
       SET version = ${draftStorageVersion}, applied_at = CURRENT_TIMESTAMP
@@ -292,14 +319,12 @@ export async function insertStoredDraft(
 export async function readStoredDraft(
   raw: RawDb,
   draftId: string,
-  lock = false,
 ): Promise<StoredDraft | undefined> {
-  const lockClause = lock ? sql.raw(' FOR UPDATE') : sql.empty()
   const rows = normalizeRows(
     await raw.execute(sql`
       SELECT draft_id, base_version, tenant_scope, owner_key, log_revision
       FROM wystack_drafts
-      WHERE draft_id = ${draftId}${lockClause}
+      WHERE draft_id = ${draftId}
     `),
   )
   const row = rows[0]
@@ -330,14 +355,19 @@ export async function replaceStoredCommands(
   draftId: string,
   commands: DraftCommand[],
 ): Promise<void> {
-  await raw.execute(sql`DELETE FROM wystack_draft_commands WHERE draft_id = ${draftId}`)
   for (let position = 0; position < commands.length; position++) {
     const command = encodeJson(commands[position], 'draft command')
     await raw.execute(sql`
       INSERT INTO wystack_draft_commands (draft_id, position, command)
       VALUES (${draftId}, ${position}, ${command}::jsonb)
+      ON CONFLICT (draft_id, position)
+      DO UPDATE SET command = EXCLUDED.command
     `)
   }
+  await raw.execute(sql`
+    DELETE FROM wystack_draft_commands
+    WHERE draft_id = ${draftId} AND position >= ${commands.length}
+  `)
 }
 
 export async function assertStoredDraftIntegrity(raw: RawDb, draftId: string): Promise<void> {
@@ -369,21 +399,28 @@ export async function refreshStoredDraftIntegrity(raw: RawDb, draftId: string): 
   }
 }
 
-export async function advanceStoredDraftRevision(
+export async function refreshStoredDraftIntegrityAndAdvance(
   raw: RawDb,
   draftId: string,
   expectedRevision: number,
 ): Promise<void> {
   const rows = normalizeRows(
     await raw.execute(sql`
-      UPDATE wystack_drafts
-      SET log_revision = log_revision + 1, updated_at = CURRENT_TIMESTAMP
-      WHERE draft_id = ${draftId} AND log_revision = ${expectedRevision}
+      UPDATE wystack_drafts d
+      SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))},
+          log_revision = log_revision + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE d.draft_id = ${draftId} AND d.log_revision = ${expectedRevision}
       RETURNING log_revision
     `),
   )
-  if (rows.length !== 1) {
-    throw new Error(`draft lifecycle: draft "${draftId}" changed concurrently`)
+  if (rows.length !== 1) throw new StoredDraftRevisionChangedError(draftId)
+}
+
+export class StoredDraftRevisionChangedError extends Error {
+  constructor(draftId: string) {
+    super(`draft lifecycle: draft "${draftId}" changed concurrently`)
+    this.name = 'StoredDraftRevisionChangedError'
   }
 }
 
@@ -450,11 +487,12 @@ export async function replaceStoredDraftBase(
   const encoded = encodeEnvelope(baseVersion, 'base version')
   const rows = normalizeRows(
     await raw.execute(sql`
-      UPDATE wystack_drafts
+      UPDATE wystack_drafts d
       SET base_version = ${encoded}::jsonb,
+          integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))},
           log_revision = log_revision + 1,
           updated_at = CURRENT_TIMESTAMP
-      WHERE draft_id = ${draftId} AND log_revision = ${expectedRevision}
+      WHERE d.draft_id = ${draftId} AND d.log_revision = ${expectedRevision}
       RETURNING log_revision
     `),
   )
@@ -467,8 +505,23 @@ export async function deleteStoredTouchedTables(raw: RawDb, draftId: string): Pr
   await raw.execute(sql`DELETE FROM wystack_draft_tables WHERE draft_id = ${draftId}`)
 }
 
-export async function deleteStoredDraft(raw: RawDb, draftId: string): Promise<void> {
-  await raw.execute(sql`DELETE FROM wystack_drafts WHERE draft_id = ${draftId}`)
+export async function deleteStoredCommands(raw: RawDb, draftId: string): Promise<void> {
+  await raw.execute(sql`DELETE FROM wystack_draft_commands WHERE draft_id = ${draftId}`)
+}
+
+export async function deleteStoredDraftAtRevision(
+  raw: RawDb,
+  draftId: string,
+  expectedRevision: number,
+): Promise<boolean> {
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      DELETE FROM wystack_drafts
+      WHERE draft_id = ${draftId} AND log_revision = ${expectedRevision}
+      RETURNING draft_id
+    `),
+  )
+  return rows.length === 1
 }
 
 function encodeEnvelope(value: unknown, label: string): string {

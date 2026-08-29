@@ -38,7 +38,10 @@ function quoteIdentifier(identifier: string): string {
 
 function identityCast(type: string): string {
   const normalized = normalizeSqlType(type)
-  if (!['integer', 'bigint', 'smallint', 'text', 'uuid', 'varchar'].includes(normalized)) {
+  if (
+    !['integer', 'bigint', 'smallint', 'text', 'uuid'].includes(normalized) &&
+    !/^varchar(?:\(\d+\))?$/.test(normalized)
+  ) {
     throw new Error(`draft lifecycle: unsupported persisted identity type "${type}"`)
   }
   return normalized
@@ -208,7 +211,7 @@ export async function assertDraftRowsUnchanged(
             `AND r.tenant_key_text = d.tenant_key_text AND r.row_key_text = d.row_key_text ` +
             `WHERE d.draft_id = `,
         )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}${sql.raw(
-          ' ORDER BY r.table_key, r.tenant_key_text, r.row_key_text FOR UPDATE OF r',
+          ' ORDER BY r.table_key COLLATE "C", r.tenant_key_text COLLATE "C", r.row_key_text COLLATE "C" FOR UPDATE OF r',
         )}`,
       )
     }
@@ -217,7 +220,9 @@ export async function assertDraftRowsUnchanged(
       sql`${sql.raw(
         `SELECT c.${pk} FROM ${relation} c JOIN wystack_draft_row_changes d ` +
           `ON c.${pk} = ${pkValue}${tenantJoin} WHERE d.draft_id = `,
-      )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}${sql.raw(' FOR UPDATE OF c')}`,
+      )}${draftId}${sql.raw(' AND d.table_key = ')}${tableIdentity}${sql.raw(
+        ' ORDER BY d.table_key COLLATE "C", d.tenant_key_text COLLATE "C", d.row_key_text COLLATE "C" FOR UPDATE OF c',
+      )}`,
     )
 
     const revisionConflict = table.revisionColumn

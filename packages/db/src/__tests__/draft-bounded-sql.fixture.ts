@@ -8,8 +8,12 @@ import { eq, type FilterDescriptor } from '../operators'
 import { defineSchema, registerTableCapabilities } from '../schema'
 import { syncSchema } from '../sync'
 import { multiTenant } from '../table'
+import type { DrizzleDb } from '../tracker-core'
+import { draftChangesTableDdl } from './draft-storage.fixture'
 
 const DRAFT_ID = 'bounded-draft'
+const SOURCE_ROW_COUNT = 120
+const EXPECTED_DRAFT_CHANGE_COUNT = 8
 
 const sourceItems = pgTable('bounded_source_items', {
   id: integer('id').primaryKey(),
@@ -48,11 +52,7 @@ interface ComparableItemsRead {
   first(): Promise<Partial<BoundedRow> | null>
 }
 
-async function createHarness() {
-  const pg = new PGlite()
-  const db = drizzle(pg)
-
-  await pg.exec(`
+export const boundedDraftSetupSql = `
     CREATE TABLE bounded_source_items (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL,
@@ -67,27 +67,24 @@ async function createHarness() {
       score INTEGER NOT NULL,
       note TEXT
     );
-    CREATE TABLE wystack_draft_row_changes (
-      draft_id TEXT NOT NULL,
-      table_key TEXT NOT NULL,
-      tenant_key_text TEXT NOT NULL DEFAULT '',
-      tenant_key JSONB,
-      row_key_text TEXT NOT NULL,
-      row_key JSONB NOT NULL,
-      operation TEXT NOT NULL,
-      base_exists BOOLEAN NOT NULL,
-      base_revision JSONB,
-      fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-      PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
-    );
-    INSERT INTO bounded_source_items (id, title, score, note) VALUES
-      (1, 'one', 100, 'one-note'), (2, 'two', 90, 'two-note'),
-      (3, 'three', 80, NULL), (4, 'four', 70, 'four-note'),
-      (5, 'five', 60, 'five-note'), (6, 'six', 50, 'six-note'),
-      (7, 'seven', 40, 'seven-note'), (8, 'eight', 30, 'eight-note');
+    ${draftChangesTableDdl}
+    INSERT INTO bounded_source_items (id, title, score, note)
+    SELECT
+      id,
+      'item-' || lpad(id::text, 3, '0'),
+      121 - ((id + 1) / 2),
+      CASE
+        WHEN id IN (3, 100) THEN NULL
+        ELSE 'group-' || lpad((id % 7)::text, 2, '0')
+      END
+    FROM generate_series(1, ${SOURCE_ROW_COUNT}) AS id;
     INSERT INTO bounded_canonical_twin SELECT * FROM bounded_source_items;
-  `)
+  `
 
+export async function createBoundedDraftHarness(
+  db: DrizzleDb,
+  countDraftChanges: () => Promise<number>,
+) {
   await syncSchema(db, tenantSchema)
   const tracker = createDrizzleTracker(db)
 
@@ -97,17 +94,28 @@ async function createHarness() {
   }
 
   async function applyBoundaryCrossingChanges() {
-    await updateBoth(1, { score: 5 })
+    // Move or remove both rows from the original descending boundary.
+    await updateBoth(1, { score: 10, note: null })
     await tracker.withDraft(DRAFT_ID).from(sourceItems).where(eq('id', 2)).delete()
     await tracker.from(canonicalTwin).where(eq('id', 2)).delete()
-    await updateBoth(7, { score: 95 })
 
-    const inserted = { id: 9, title: 'nine', score: 85, note: 'nine-note' }
-    await tracker.withDraft(DRAFT_ID).into(sourceItems).insert(inserted)
-    await tracker.into(canonicalTwin).insert(inserted)
+    // Start far below the ascending boundary, then enter it with a tied score.
+    await updateBoth(10, { score: 60, title: 'aardvark', note: 'aaa-note' })
+    await tracker.withDraft(DRAFT_ID).from(sourceItems).where(eq('id', 118)).delete()
+    await tracker.from(canonicalTwin).where(eq('id', 118)).delete()
 
-    await updateBoth(6, { note: null })
-    await updateBoth(8, { title: 'aardvark' })
+    // Start far below the descending boundary, then enter it as a deterministic tie.
+    await updateBoth(119, { score: 130, title: 'boundary-first', note: null })
+    await updateBoth(120, { score: 130, title: 'boundary-second', note: 'zzzz-note' })
+
+    const insertedRows = [
+      { id: 121, title: 'inserted-high', score: 129, note: null },
+      { id: 122, title: 'inserted-low', score: 60, note: 'aaa-note' },
+    ]
+    for (const inserted of insertedRows) {
+      await tracker.withDraft(DRAFT_ID).into(sourceItems).insert(inserted)
+      await tracker.into(canonicalTwin).insert(inserted)
+    }
   }
 
   await applyBoundaryCrossingChanges()
@@ -116,8 +124,35 @@ async function createHarness() {
     tracker,
     draftItems: () => tracker.withDraft(DRAFT_ID).from(sourceItems),
     canonicalItems: () => tracker.from(canonicalTwin),
-    close: () => pg.close(),
+    async readBoth<TResult>(read: (items: ComparableItemsRead) => Promise<TResult>) {
+      const effective = await read(tracker.withDraft(DRAFT_ID).from(sourceItems))
+      const canonical = await read(tracker.from(canonicalTwin))
+      return { effective, canonical }
+    },
+    async pruningDimensions() {
+      const canonicalRows = await tracker.from(canonicalTwin).all()
+      return {
+        canonicalRows: canonicalRows.length,
+        draftChanges: await countDraftChanges(),
+      }
+    },
   }
+}
+
+async function createHarness() {
+  const pg = new PGlite()
+  const db = drizzle(pg)
+  await pg.exec(boundedDraftSetupSql)
+  const harness = await createBoundedDraftHarness(db, async () => {
+    const changes = await pg.query<{ count: number }>(
+      `SELECT COUNT(*)::integer AS count
+       FROM wystack_draft_row_changes
+       WHERE draft_id = $1 AND table_key = $2`,
+      [DRAFT_ID, 'bounded_source_items'],
+    )
+    return changes.rows[0]?.count ?? 0
+  })
+  return { ...harness, close: () => pg.close() }
 }
 
 type Harness = Awaited<ReturnType<typeof createHarness>>
@@ -155,10 +190,17 @@ export function boundedDraftScenario() {
     draftItems: () => current().draftItems(),
 
     async readBoth<TResult>(read: (items: ComparableItemsRead) => Promise<TResult>) {
-      const active = current()
-      const effective = await read(active.draftItems() as unknown as ComparableItemsRead)
-      const canonical = await read(active.canonicalItems() as unknown as ComparableItemsRead)
-      return { effective, canonical }
+      return current().readBoth(read)
+    },
+
+    async pruningDimensions() {
+      const dimensions = await current().pruningDimensions()
+      if (dimensions.draftChanges !== EXPECTED_DRAFT_CHANGE_COUNT) {
+        throw new Error(
+          `Fixture expected ${EXPECTED_DRAFT_CHANGE_COUNT} draft changes, got ${dimensions.draftChanges}`,
+        )
+      }
+      return dimensions
     },
 
     async sharedDraftAcrossTwoTenants() {

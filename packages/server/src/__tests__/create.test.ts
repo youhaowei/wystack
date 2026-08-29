@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { table, defineSchema, text, int, boolean, eq } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
@@ -139,6 +139,39 @@ beforeEach(async () => {
 })
 
 describe('defineApp().build()', () => {
+  /** Tenant-aware applications must provide both the trusted descriptor and its request resolver. */
+  test('requires tenancy and tenant resolution to be configured together', async () => {
+    const pg = createTestDatabase()
+    const isolatedDb = drizzle(pg)
+
+    await expect(
+      wy.build({
+        db: isolatedDb,
+        functions: {},
+        resolveTenant: () => 'tenant-1',
+      }),
+    ).rejects.toThrow('requires tenancy and resolveTenant together')
+    await expect(
+      wy.build({
+        db: isolatedDb,
+        functions: {},
+        tenancy: multiTenant({
+          key: { property: 'tenantId', column: 'tenant_id', type: text },
+        }),
+      }),
+    ).rejects.toThrow('requires tenancy and resolveTenant together')
+  })
+
+  /** Building an application performs no schema DDL, so a migrated runtime role needs only data access. */
+  test('does not require application runtime roles to execute framework DDL at startup', async () => {
+    const frameworkTables = await app.system.createTracked().raw.execute(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name = 'wystack_row_revisions'`,
+    )
+
+    expect(frameworkTables.rows).toEqual([])
+  })
+
   test('registers functions', () => {
     expect(app.functions.has('listTodos')).toBe(true)
     expect(app.functions.has('addTodo')).toBe(true)

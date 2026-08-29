@@ -15,15 +15,54 @@ import {
   foreignKey,
 } from 'drizzle-orm/pg-core'
 import type { PgTable, PgTableExtraConfigValue } from 'drizzle-orm/pg-core'
-import type { AnyColumnDef, ColumnDefOptions } from './dsl'
-import { TableDefinition, type TableCapabilities, type WithSystemManagedProperties } from './table'
+import type { AnyColumnDef, ColumnDef, ColumnDefOptions } from './dsl'
+import {
+  TableDefinition,
+  type TableCapabilities,
+  type WithSelectedRow,
+  type WithSystemManagedProperties,
+} from './table'
 
 type ColumnMap = Record<string, AnyColumnDef>
 type AnyTableDefinition = TableDefinition<ColumnMap, boolean, string, string>
+type DefinitionColumns<TDefinition> =
+  TDefinition extends TableDefinition<
+    infer TColumns,
+    infer _Draftable,
+    infer _Managed,
+    infer _Revision
+  >
+    ? TColumns
+    : never
+
+type SelectedColumnValue<TColumn> =
+  TColumn extends ColumnDef<infer TValue, infer TOptional, infer TNullable>
+    ? TValue | (TOptional extends true ? null : never) | (TNullable extends true ? null : never)
+    : never
+
+type DefinitionSelectedRow<TDefinition> = {
+  [K in keyof DefinitionColumns<TDefinition>]: SelectedColumnValue<
+    DefinitionColumns<TDefinition>[K]
+  >
+}
+
 type CompiledTable<TDefinition> = WithSystemManagedProperties<
-  ReturnType<typeof pgTable>,
+  WithSelectedRow<ReturnType<typeof pgTable>, DefinitionSelectedRow<TDefinition>>,
   TDefinition
 >
+interface NormalizedTableDefinition {
+  name: string
+  columns: ColumnMap
+  capabilities: TableCapabilities
+}
+type NormalizedSchema = Record<string, NormalizedTableDefinition>
+// oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
+type CompiledSchema = Record<string, any>
+
+interface ReferenceContext {
+  tables: CompiledSchema
+  definitions: NormalizedSchema
+}
 
 const tableCapabilities = new WeakMap<object, Readonly<TableCapabilities>>()
 const generatedTables = new WeakMap<object, PgTable[]>()
@@ -39,6 +78,124 @@ function normalizeTableDefinition(definition: unknown): {
     }
   }
   throw new Error('defineSchema entries must use table(...) or multiTenant(...).table(...)')
+}
+
+function normalizeSchema(tables: Record<string, unknown>): NormalizedSchema {
+  return Object.fromEntries(
+    Object.entries(tables).map(([name, definition]) => [
+      name,
+      { name, ...normalizeTableDefinition(definition) },
+    ]),
+  )
+}
+
+function primaryKeyEntries(definition: NormalizedTableDefinition) {
+  return Object.entries(definition.columns).filter(([, column]) => column.opts.isPrimaryKey)
+}
+
+function validateTableReferences(
+  definition: NormalizedTableDefinition,
+  schema: NormalizedSchema,
+): void {
+  const tenant = definition.capabilities.tenancy
+
+  for (const [property, column] of Object.entries(definition.columns)) {
+    const reference = column.opts.ref
+    if (!reference) continue
+    const target = schema[reference.table]
+
+    if (reference.withinTenant) {
+      if (!tenant) {
+        throw new Error(
+          `Table "${definition.name}" uses tenant-local constraints but is not tenant-isolated`,
+        )
+      }
+      if (!target) {
+        throw new Error(
+          `Tenant-local reference "${definition.name}.${property}" targets unknown table "${reference.table}"`,
+        )
+      }
+      const targetTenant = target.capabilities.tenancy
+      if (!targetTenant) {
+        throw new Error(
+          `Tenant-local reference "${definition.name}.${property}" targets non-tenant table "${reference.table}"`,
+        )
+      }
+      if (targetTenant.property !== tenant.property || targetTenant.column !== tenant.column) {
+        throw new Error(
+          `Tenant-local reference "${definition.name}.${property}" targets a different tenancy descriptor`,
+        )
+      }
+      if (reference.onDelete === 'set null') {
+        throw new Error(
+          `Tenant-local reference "${definition.name}.${property}" cannot use ON DELETE SET NULL because the composite foreign key includes the required tenant key`,
+        )
+      }
+      continue
+    }
+
+    // A bare reference between tenant tables omits the tenant predicate and can
+    // cross scopes. References to a global lookup table remain valid.
+    if (tenant && target?.capabilities.tenancy) {
+      throw new Error(
+        `Reference "${definition.name}.${property}" targets tenant-isolated table "${reference.table}"; use referencesWithinTenant()`,
+      )
+    }
+  }
+}
+
+function validateTableDefinition(
+  definition: NormalizedTableDefinition,
+  schema: NormalizedSchema,
+): void {
+  const tenantLocalColumns = Object.values(definition.columns).filter(
+    (column) => column.opts.isUniqueWithinTenant || column.opts.ref?.withinTenant,
+  )
+  if (!definition.capabilities.tenancy && tenantLocalColumns.length > 0) {
+    throw new Error(
+      `Table "${definition.name}" uses tenant-local constraints but is not tenant-isolated`,
+    )
+  }
+
+  const primaryKeys = primaryKeyEntries(definition)
+  if (definition.capabilities.tenancy && primaryKeys.length !== 1) {
+    throw new Error(`Tenant-isolated table "${definition.name}" requires exactly one primary key`)
+  }
+  if (definition.capabilities.draftable) {
+    if (primaryKeys.length !== 1) {
+      throw new Error(
+        `Draftable table "${definition.name}" requires exactly one explicitly declared primary key`,
+      )
+    }
+    const [primaryProperty, primaryKey] = primaryKeys[0]
+    if (primaryKey.opts.isArray || !['int', 'text', 'uuid'].includes(primaryKey.opts.type)) {
+      throw new Error(
+        `Draftable table "${definition.name}" primary key "${primaryProperty}" must be a scalar int, text, or uuid`,
+      )
+    }
+  }
+
+  validateTableReferences(definition, schema)
+}
+
+function validateSchema(schema: NormalizedSchema): void {
+  const reservedTable = Object.keys(schema).find((tableName) => tableName.startsWith('wystack_'))
+  if (reservedTable) {
+    throw new Error(
+      `Table name "${reservedTable}" uses the reserved "wystack_" framework namespace`,
+    )
+  }
+
+  const tenancyDescriptors = new Set(
+    Object.values(schema)
+      .map((definition) => definition.capabilities.tenancy?.descriptorId)
+      .filter((descriptorId): descriptorId is symbol => descriptorId !== undefined),
+  )
+  if (tenancyDescriptors.size > 1) {
+    throw new Error('defineSchema supports exactly one multiTenant descriptor')
+  }
+
+  for (const definition of Object.values(schema)) validateTableDefinition(definition, schema)
 }
 
 export function getTableCapabilities(table: object): TableCapabilities {
@@ -139,117 +296,61 @@ function buildColumn(
     if (refTable) {
       const refOpts: Record<string, unknown> = {}
       if (opts.ref.onDelete) refOpts.onDelete = opts.ref.onDelete
-      col = col.references(() => refTable[opts.ref!.column], refOpts)
+      // Resolve lazily because the second compile pass may replace a referenced
+      // table after this column is built.
+      col = col.references(() => allTables[opts.ref!.table][opts.ref!.column], refOpts)
     }
   }
 
   return col
 }
 
-function buildTable(
-  tableName: string,
-  columns: ColumnMap,
-  capabilities: TableCapabilities,
-  // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
-  allTables: Record<string, any>,
-  /** False on the first compile pass, when no reference target exists yet. */
-  referencesResolved: boolean,
-) {
+function compileColumns(definition: NormalizedTableDefinition, references?: ReferenceContext) {
   // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle column builders
   const colDefs: Record<string, any> = {}
-  for (const [property, definition] of Object.entries(columns)) {
+  for (const [property, column] of Object.entries(definition.columns)) {
     const sqlName =
-      capabilities.tenancy?.property === property ? capabilities.tenancy.column : property
+      definition.capabilities.tenancy?.property === property
+        ? definition.capabilities.tenancy.column
+        : property
     const opts =
-      capabilities.revisionProperty === property
-        ? { ...definition.opts, hasDefault: true, defaultValue: 1 }
-        : definition.opts
-    colDefs[property] = buildColumn(property, opts, allTables, sqlName)
+      definition.capabilities.revisionProperty === property
+        ? { ...column.opts, hasDefault: true, defaultValue: 1 }
+        : column.opts
+    colDefs[property] = buildColumn(property, opts, references?.tables ?? {}, sqlName)
   }
+  return colDefs
+}
 
-  const tenant = capabilities.tenancy
-  const tenantLocalColumns = Object.entries(columns).filter(
-    ([, definition]) => definition.opts.isUniqueWithinTenant || definition.opts.ref?.withinTenant,
-  )
-  if (!tenant && tenantLocalColumns.length > 0) {
-    throw new Error(`Table "${tableName}" uses tenant-local constraints but is not tenant-isolated`)
-  }
-  if (!tenant) return pgTable(tableName, colDefs)
+function compileTable(definition: NormalizedTableDefinition, references?: ReferenceContext) {
+  const colDefs = compileColumns(definition, references)
+  const tenant = definition.capabilities.tenancy
+  if (!tenant) return pgTable(definition.name, colDefs)
 
-  const primaryEntries = Object.entries(columns).filter(
-    ([, definition]) => definition.opts.isPrimaryKey,
-  )
-  if (primaryEntries.length !== 1) {
-    throw new Error(`Tenant-isolated table "${tableName}" requires exactly one primary key`)
-  }
-  const [primaryProperty] = primaryEntries[0]
+  const [primaryProperty] = primaryKeyEntries(definition)[0]
 
-  if (referencesResolved) {
-    // Reference checks run here, eagerly, because Drizzle evaluates the
-    // constraint callback below lazily — an error thrown there would surface on
-    // first use of the table, not at defineSchema().
-    for (const [property, definition] of Object.entries(columns)) {
-      const ref = definition.opts.ref
-      if (!ref) continue
-      const target = allTables[ref.table]
-      if (ref.withinTenant) {
-        // A plain `.references()` to an unknown table is skipped for backward
-        // compatibility; a tenant-local one is a declared isolation constraint,
-        // and silently emitting no constraint would leave the relationship
-        // free to cross tenants.
-        if (!target) {
-          throw new Error(
-            `Tenant-local reference "${tableName}.${property}" targets unknown table "${ref.table}"`,
-          )
-        }
-        continue
-      }
-      // A bare `.references()` between two tenant-isolated tables is a foreign
-      // key with no tenant predicate: a row could point at a parent in another
-      // tenant. Only the tenant-qualified form is structural, so require it.
-      // References to plain tables stay allowed — there is no tenant to cross.
-      if (target && tryGetTableCapabilities(target)?.tenancy) {
-        throw new Error(
-          `Reference "${tableName}.${property}" targets tenant-isolated table "${ref.table}"; use referencesWithinTenant()`,
-        )
-      }
-    }
-  }
-
-  const compiled = pgTable(tableName, colDefs, (current) => {
+  return pgTable(definition.name, colDefs, (current) => {
     const constraints: PgTableExtraConfigValue[] = [
-      unique(`${tableName}_${tenant.column}_${current[primaryProperty].name}_unique`).on(
+      unique(`${definition.name}_${tenant.column}_${current[primaryProperty].name}_unique`).on(
         current[tenant.property],
         current[primaryProperty],
       ),
     ]
 
-    for (const [property, definition] of Object.entries(columns)) {
-      if (definition.opts.isUniqueWithinTenant) {
+    for (const [property, column] of Object.entries(definition.columns)) {
+      if (column.opts.isUniqueWithinTenant) {
         constraints.push(
-          unique(`${tableName}_${tenant.column}_${current[property].name}_unique`).on(
+          unique(`${definition.name}_${tenant.column}_${current[property].name}_unique`).on(
             current[tenant.property],
             current[property],
           ),
         )
       }
-      const ref = definition.opts.ref
-      if (!ref?.withinTenant) continue
-      // Unknown targets were rejected eagerly above; this callback runs lazily
-      // and only sees the first, reference-free compile pass otherwise.
-      const target = allTables[ref.table]
+      const ref = column.opts.ref
+      if (!ref?.withinTenant || !references) continue
+      const target = references.tables[ref.table]
       if (!target) continue
-      const targetTenant = tryGetTableCapabilities(target)?.tenancy
-      if (!targetTenant) {
-        throw new Error(
-          `Tenant-local reference "${tableName}.${property}" targets non-tenant table "${ref.table}"`,
-        )
-      }
-      if (targetTenant.property !== tenant.property || targetTenant.column !== tenant.column) {
-        throw new Error(
-          `Tenant-local reference "${tableName}.${property}" targets a different tenancy descriptor`,
-        )
-      }
+      const targetTenant = references.definitions[ref.table].capabilities.tenancy!
       let constraint = foreignKey({
         columns: [current[tenant.property], current[property]],
         foreignColumns: [target[targetTenant.property], target[ref.column]],
@@ -259,6 +360,28 @@ function buildTable(
     }
     return constraints
   })
+}
+
+function hasReferences(definition: NormalizedTableDefinition): boolean {
+  return Object.values(definition.columns).some((column) => column.opts.ref !== undefined)
+}
+
+function compileSchema(schema: NormalizedSchema): CompiledSchema {
+  const compiled: CompiledSchema = {}
+
+  // First compile every table without references so all targets exist.
+  for (const definition of Object.values(schema)) {
+    compiled[definition.name] = compileTable(definition)
+    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+  }
+
+  // Then rebuild only tables that declare references against the complete map.
+  const references = { tables: compiled, definitions: schema }
+  for (const definition of Object.values(schema).filter(hasReferences)) {
+    compiled[definition.name] = compileTable(definition, references)
+    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+  }
+
   return compiled
 }
 
@@ -308,71 +431,24 @@ function buildRowRevisionsTable() {
   )
 }
 
+function buildGeneratedTables(schema: NormalizedSchema): PgTable[] {
+  const definitions = Object.values(schema)
+  return [
+    ...(definitions.some((definition) => definition.capabilities.draftable)
+      ? [buildDraftChangesTable()]
+      : []),
+    ...(definitions.some((definition) => definition.capabilities.revisionProperty)
+      ? [buildRowRevisionsTable()]
+      : []),
+  ]
+}
+
 export function defineSchema<const T extends Record<string, unknown>>(
   tables: T & { [K in keyof T]: AnyTableDefinition },
 ) {
-  const reservedTable = Object.keys(tables).find((tableName) => tableName.startsWith('wystack_'))
-  if (reservedTable) {
-    throw new Error(
-      `Table name "${reservedTable}" uses the reserved "wystack_" framework namespace`,
-    )
-  }
-
-  const tenancyDescriptors = new Set(
-    Object.values(tables)
-      .map((definition) => normalizeTableDefinition(definition).capabilities.tenancy?.descriptorId)
-      .filter((descriptorId): descriptorId is symbol => descriptorId !== undefined),
-  )
-  if (tenancyDescriptors.size > 1) {
-    throw new Error('defineSchema supports exactly one multiTenant descriptor')
-  }
-
-  // oxlint-disable-next-line typescript/no-explicit-any -- accumulates Drizzle pgTable objects passed to buildColumn for references
-  const result: Record<string, any> = {}
-
-  // Pass 1: create all tables without foreign key references
-  for (const [tableName, definition] of Object.entries(tables)) {
-    const { columns, capabilities } = normalizeTableDefinition(definition)
-    result[tableName] = buildTable(tableName, columns, capabilities, {}, false)
-    registerTableCapabilities(result[tableName], capabilities)
-  }
-
-  // Pass 2: rebuild tables that have foreign key references (now all tables exist)
-  for (const [tableName, definition] of Object.entries(tables)) {
-    const { columns, capabilities } = normalizeTableDefinition(definition)
-    const hasRefs = Object.values(columns).some((c) => c.opts.ref)
-    if (!hasRefs) continue
-
-    result[tableName] = buildTable(tableName, columns, capabilities, result, true)
-    registerTableCapabilities(result[tableName], capabilities)
-  }
-
-  const compiled = result as { [K in keyof T]: CompiledTable<T[K]> }
-  const draftableEntries = Object.entries(tables).filter(
-    ([, definition]) => normalizeTableDefinition(definition).capabilities.draftable,
-  )
-  for (const [tableName, definition] of draftableEntries) {
-    const { columns } = normalizeTableDefinition(definition)
-    const primaryKeys = Object.entries(columns).filter(([, column]) => column.opts.isPrimaryKey)
-    if (primaryKeys.length !== 1) {
-      throw new Error(
-        `Draftable table "${tableName}" requires exactly one explicitly declared primary key`,
-      )
-    }
-    const [primaryProperty, primaryKey] = primaryKeys[0]
-    if (primaryKey.opts.isArray || !['int', 'text', 'uuid'].includes(primaryKey.opts.type)) {
-      throw new Error(
-        `Draftable table "${tableName}" primary key "${primaryProperty}" must be a scalar int, text, or uuid`,
-      )
-    }
-  }
-  const revisionedEntries = Object.values(tables).filter(
-    (definition) => normalizeTableDefinition(definition).capabilities.revisionProperty,
-  )
-  const generated: PgTable[] = [
-    ...(draftableEntries.length > 0 ? [buildDraftChangesTable()] : []),
-    ...(revisionedEntries.length > 0 ? [buildRowRevisionsTable()] : []),
-  ]
-  generatedTables.set(compiled, generated)
+  const definitions = normalizeSchema(tables)
+  validateSchema(definitions)
+  const compiled = compileSchema(definitions) as { [K in keyof T]: CompiledTable<T[K]> }
+  generatedTables.set(compiled, buildGeneratedTables(definitions))
   return compiled
 }

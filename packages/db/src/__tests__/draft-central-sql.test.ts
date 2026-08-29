@@ -1,7 +1,16 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { integer, jsonb, pgSchema, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core'
+import {
+  integer,
+  jsonb,
+  pgSchema,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  varchar,
+} from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { createDrizzleTracker, enumerateDraftRowChanges } from '../drizzle-tracker'
 import { jsonNull } from '../index'
@@ -10,6 +19,7 @@ import { defineSchema, registerTableCapabilities } from '../schema'
 import { int, text as dslText } from '../dsl'
 import { multiTenant } from '../table'
 import { syncSchema } from '../sync'
+import { draftChangesTableDdl } from './draft-storage.fixture'
 
 const items = pgTable('draft_items', {
   id: integer('id').primaryKey(),
@@ -34,6 +44,11 @@ const generatedDefaultItems = pgTable('draft_generated_default_items', {
   sequenceNumber: serial('sequence_number').notNull(),
 })
 
+const varcharItems = pgTable('draft_varchar_items', {
+  id: varchar('id', { length: 12 }).primaryKey(),
+  title: text('title').notNull(),
+})
+
 const audit = pgSchema('draft_audit')
 const auditItems = audit.table('draft_items', {
   id: integer('id').primaryKey(),
@@ -50,6 +65,7 @@ for (const draftableTable of [
   defaultedItems,
   dynamicDefaultItems,
   generatedDefaultItems,
+  varcharItems,
   auditItems,
 ]) {
   registerTableCapabilities(draftableTable, { draftable: true })
@@ -89,25 +105,14 @@ beforeEach(async () => {
       id INTEGER PRIMARY KEY,
       sequence_number SERIAL NOT NULL
     )`,
+    `CREATE TABLE draft_varchar_items (id VARCHAR(12) PRIMARY KEY, title TEXT NOT NULL)`,
     `CREATE SCHEMA draft_audit`,
     `CREATE TABLE draft_audit.draft_items (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL
     )`,
     `CREATE TABLE unregistered_items (id INTEGER PRIMARY KEY, title TEXT NOT NULL)`,
-    `CREATE TABLE wystack_draft_row_changes (
-      draft_id TEXT NOT NULL,
-      table_key TEXT NOT NULL,
-      tenant_key_text TEXT NOT NULL DEFAULT '',
-      tenant_key JSONB,
-      row_key_text TEXT NOT NULL,
-      row_key JSONB NOT NULL,
-      operation TEXT NOT NULL,
-      base_exists BOOLEAN NOT NULL,
-      base_revision JSONB,
-      fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-      PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
-    )`,
+    draftChangesTableDdl,
     `INSERT INTO draft_items (id, title, score, note, payload) VALUES
       (1, 'apple', 10, 'original note', '{"nested":true}'),
       (2, 'banana', 20, NULL, 'null'::jsonb),
@@ -118,6 +123,10 @@ beforeEach(async () => {
   for (const statement of setup) await db.execute(sql.raw(statement))
   await syncSchema(db, tenantSchema)
   tracked = createDrizzleTracker(db)
+})
+
+afterEach(async () => {
+  await pg.close()
 })
 
 describe('durable central draft overlay', () => {
@@ -282,6 +291,19 @@ describe('durable central draft overlay', () => {
     )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((result as any).rows[0].row_key_text).toBe('3')
+  })
+
+  /** A varchar length modifier does not change the stable text identity used by the draft overlay. */
+  test('accepts length-qualified varchar identities in draft writes and reads', async () => {
+    const draft = tracked.withDraft('d-varchar')
+
+    expect(await draft.into(varcharItems).insert({ id: 'item-0001', title: 'draft' })).toEqual([
+      { id: 'item-0001', title: 'draft' },
+    ])
+    expect(await draft.from(varcharItems).where(eq('id', 'item-0001')).first()).toEqual({
+      id: 'item-0001',
+      title: 'draft',
+    })
   })
 
   test('typed tenant keys isolate one draft ID across tenants, and a fresh tracker restores state', async () => {

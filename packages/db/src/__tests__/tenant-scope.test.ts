@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
@@ -40,15 +40,20 @@ const intTenantSchema = defineSchema({
 })
 
 let tracked: ReturnType<typeof createDrizzleTracker>
+let client: PGlite
 
 beforeEach(async () => {
-  const client = new PGlite()
+  client = new PGlite()
   await client.waitReady
   const db = drizzle(client)
   await syncSchema(db, schema)
   await syncSchema(db, uuidTenantSchema)
   await syncSchema(db, intTenantSchema)
   tracked = createDrizzleTracker(db)
+})
+
+afterEach(async () => {
+  await client.close()
 })
 
 describe('tenant-scoped database access', () => {

@@ -15,10 +15,10 @@
  *   5. the resolve(log) hook binds late-bound operands immediately before commit.
  *   6. discard drops the overlay with no canonical effect.
  */
-import { describe, test, expect, beforeEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { integer, pgSchema, text as pgText } from 'drizzle-orm/pg-core'
+import { integer, pgSchema, pgTable, text as pgText, varchar } from 'drizzle-orm/pg-core'
 import {
   table,
   defineSchema,
@@ -29,6 +29,8 @@ import {
   timestamp,
   eq,
   draftInvalidationIdentity,
+  ensureRowRevisionStorage,
+  multiTenant,
 } from '@wystack/db'
 import { registerTableCapabilities } from '../../../db/src/schema'
 import {
@@ -44,6 +46,7 @@ import { defineApp } from '../define-app'
 import { refreshStoredDraftIntegrity } from '../draft-store'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
+const tenantAwareDescriptor = multiTenant()
 
 const schema = defineSchema({
   todos: table({
@@ -72,11 +75,17 @@ const auditAccounts = pgSchema('audit').table('accounts', {
   id: integer('id').primaryKey(),
   name: pgText('name').notNull(),
 })
+const varcharItems = pgTable('varchar_items', {
+  id: varchar('id', { length: 12 }).primaryKey(),
+  title: pgText('title').notNull(),
+})
 registerTableCapabilities(appAccounts, { draftable: true })
 registerTableCapabilities(auditAccounts, { draftable: true })
+registerTableCapabilities(varcharItems, { draftable: true })
 
 let app: Awaited<ReturnType<typeof wy.build>>
 let db: ReturnType<typeof drizzle>
+let pg: PGlite
 
 /** Most lifecycle scenarios exercise mechanics under an explicitly privileged test host. */
 function createDraftLifecycle(
@@ -90,8 +99,12 @@ function createDraftLifecycle(
   })
 }
 
+afterEach(async () => {
+  await pg.close()
+})
+
 beforeEach(async () => {
-  const pg = new PGlite()
+  pg = new PGlite()
   db = drizzle(pg)
   await db.execute(
     `CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
@@ -104,6 +117,8 @@ beforeEach(async () => {
     `CREATE TABLE "replaceableTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, note TEXT)`,
   )
   await db.execute(`CREATE TABLE settings (id INTEGER PRIMARY KEY, prefix TEXT NOT NULL)`)
+  await db.execute(`CREATE TABLE varchar_items (id VARCHAR(12) PRIMARY KEY, title TEXT NOT NULL)`)
+  await ensureRowRevisionStorage(db)
   await db.execute(`INSERT INTO todos (id,title,done) VALUES (1,'apple',false),(2,'banana',false)`)
   await db.execute(`INSERT INTO dashboards (id,items) VALUES (1,'a')`)
   await db.execute(`INSERT INTO "versionedTodos" (id,title,revision) VALUES (1,'apple',1)`)
@@ -148,6 +163,11 @@ beforeEach(async () => {
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.replaceableTodos).insert({ id: args.id, title: args.title }),
+        ),
+      renameVarcharItem: wy.procedure
+        .input({ id: text, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.from(varcharItems).where(eq('id', args.id)).update({ title: args.title }),
         ),
       removeReplaceableTodo: wy.procedure
         .input({ id: int })
@@ -267,6 +287,7 @@ describe('draft lifecycle — global authority and custody', () => {
       functions: {
         listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
       },
+      tenancy: tenantAwareDescriptor,
       resolveTenant: () => undefined,
     })
     const lifecycle = createProductionDraftLifecycle(tenantAware)
@@ -342,6 +363,7 @@ describe('draft lifecycle — global authority and custody', () => {
     let tenantResolutionCalls = 0
     const mixedApp = await wy.build({
       db,
+      tenancy: tenantAwareDescriptor,
       resolveTenant: () => {
         tenantResolutionCalls += 1
         throw new Error('global draft must not resolve tenant scope')
@@ -463,6 +485,74 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     ).toBe('cherry')
   })
 
+  /** Conflict acceptance runs without a draft-row lock; a concurrent append wins and the stale rebase fails CAS. */
+  test('rebase decisions do not hold the draft row lock while host callbacks run', async () => {
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft' } }])
+    probe.bump([{ table: 'todos', id: 1 }])
+
+    let callbackStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      callbackStarted = resolve
+    })
+    let releaseCallback!: () => void
+    const release = new Promise<void>((resolve) => {
+      releaseCallback = resolve
+    })
+    const rebasing = lifecycle.rebase(draftId, {
+      acceptConflicts: async () => {
+        callbackStarted()
+        await release
+        return true
+      },
+    })
+
+    await started
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 2, title: 'concurrent' } }])
+    releaseCallback()
+
+    await expect(rebasing).rejects.toThrow('changed during rebase')
+    expect(await lifecycle.getLog(draftId)).toHaveLength(2)
+  })
+
+  /** A host callback that changes canonical state invalidates the report it accepted and leaves the draft intact. */
+  test('rebase rejects canonical version drift introduced during conflict acceptance', async () => {
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft-title' } }])
+    probe.bump([{ table: 'todos', id: 1 }])
+
+    await expect(
+      lifecycle.rebase(draftId, {
+        acceptConflicts: async () => {
+          await app.call('renameTodo', { id: 1, title: 'canonical-v2' })
+          probe.bump([{ table: 'todos', id: 1 }])
+          return true
+        },
+      }),
+    ).rejects.toThrow('canonical version changed during rebase')
+
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    await expect(lifecycle.detectConflict(draftId)).resolves.toMatchObject({ staleBase: true })
+  })
+
+  /** Persisted varchar(n) identities cast back to their canonical row during publish. */
+  test('publishes drafts whose persisted identity is a length-qualified varchar', async () => {
+    await db.execute(`INSERT INTO varchar_items (id, title) VALUES ('item-0001', 'canonical')`)
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameVarcharItem', args: { id: 'item-0001', title: 'draft' } },
+    ])
+
+    await lifecycle.publish(draftId)
+
+    expect((await db.select().from(varcharItems))[0]?.title).toBe('draft')
+  })
+
   test('draft metadata and command log survive lifecycle recreation', async () => {
     const firstProcess = createDraftLifecycle(app)
     const draftId = await firstProcess.open(0)
@@ -476,7 +566,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(6)
+    expect((migration as any).rows[0].version).toBe(7)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -1293,6 +1383,97 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     })
     return { gate, release }
   }
+
+  /** SQLSTATE 40001 rolls back the first attempt, then replays exactly one command and one derived change. */
+  test('replays the whole mutation transaction after a serialization rollback', async () => {
+    const definition = app.functions.get('addTodo')
+    if (!definition || definition.type !== 'mutation') throw new Error('missing addTodo mutation')
+    let handlerRuns = 0
+    app.functions.set('addTodo', {
+      ...definition,
+      handler: async (ctx, args) => {
+        handlerRuns += 1
+        const result = await definition.handler(ctx, args)
+        if (handlerRuns === 1) {
+          throw Object.assign(new Error('forced serialization rollback'), { code: '40001' })
+        }
+        return result
+      },
+    })
+
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'addTodo', args: { id: 3, title: 'serialization-safe' } },
+    ])
+
+    expect(handlerRuns).toBe(2)
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+
+  /** Every lifecycle authorization callback may wait while another operation advances the same draft. */
+  test('authorization callbacks never run while the draft row is locked', async () => {
+    const actions = ['append', 'publish', 'rebase', 'discard'] as const
+
+    for (const [index, action] of actions.entries()) {
+      const probe = makeProbe()
+      const owner = createDraftLifecycle(app, { versionProbe: probe })
+      const draftId = await owner.open(await probe.current())
+      await owner.append(draftId, [
+        { path: 'renameTodo', args: { id: 1, title: `${action}-initial` } },
+      ])
+
+      const callbackStarted = deferred()
+      const releaseCallback = deferred()
+      const collaborator = createProductionDraftLifecycle(app, {
+        versionProbe: probe,
+        resolveOwner: () => 'collaborator',
+        authorizeGlobalDraft: () => true,
+        authorizeDraft: async (request) => {
+          if (request.action === action) {
+            callbackStarted.release()
+            await releaseCallback.gate
+          }
+          return true
+        },
+      })
+
+      const operation =
+        action === 'append'
+          ? collaborator.append(draftId, [
+              { path: 'renameTodo', args: { id: 1, title: 'collaborator' } },
+            ])
+          : action === 'publish'
+            ? collaborator.publish(draftId)
+            : action === 'rebase'
+              ? collaborator.rebase(draftId)
+              : collaborator.discard(draftId)
+
+      await callbackStarted.gate
+      const concurrentAppend = owner.append(draftId, [
+        { path: 'renameTodo', args: { id: 2, title: `${action}-${index}` } },
+      ])
+      const appendCompletedBeforeRelease = await Promise.race([
+        concurrentAppend.then(
+          () => true,
+          () => false,
+        ),
+        Bun.sleep(1_000).then(() => false),
+      ])
+      releaseCallback.release()
+
+      expect(appendCompletedBeforeRelease).toBe(true)
+      await expect(concurrentAppend).resolves.toBeArray()
+      if (action === 'publish' || action === 'rebase') {
+        await expect(operation).rejects.toThrow(`changed during ${action}`)
+      } else if (action === 'discard') {
+        await expect(operation).rejects.toThrow('changed during discard')
+      } else {
+        await expect(operation).resolves.toBeDefined()
+      }
+    }
+  })
 
   test('an append during publish resolution advances CAS and forces a safe retry', async () => {
     const lc = createDraftLifecycle(app)

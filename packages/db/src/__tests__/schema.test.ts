@@ -48,14 +48,20 @@ describe('defineSchema', () => {
     expect(cols.description.notNull).toBe(false)
   })
 
-  test('explicitly nullable columns are nullable without becoming optional', () => {
+  /**
+   * A nullable field accepts SQL NULL on stored rows but remains required in
+   * mutation input unless the caller separately marks it optional.
+   */
+  test('keeps an explicitly nullable field required in mutation input', () => {
+    const assigneeId = uuid.nullable()
     const schema = defineSchema({
       items: table({
         id: int.primaryKey(),
-        assigneeId: uuid.nullable(),
+        assigneeId,
       }),
     })
 
+    expect(assigneeId.opts.isOptional).toBe(false)
     expect(getTableColumns(schema.items).assigneeId.notNull).toBe(false)
   })
 

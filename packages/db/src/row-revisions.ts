@@ -46,13 +46,32 @@ function revisionIdentity(table: AnyTable, tenantScope: TenantScope, row: Record
   }
 }
 
-export function rowRevisionSortKey(
+function compareUtf8Text(left: string, right: string): number {
+  const encoder = new TextEncoder()
+  const leftBytes = encoder.encode(left)
+  const rightBytes = encoder.encode(right)
+  const length = Math.min(leftBytes.length, rightBytes.length)
+  for (let index = 0; index < length; index += 1) {
+    const difference = leftBytes[index]! - rightBytes[index]!
+    if (difference !== 0) return difference
+  }
+  return leftBytes.length - rightBytes.length
+}
+
+/** Match PostgreSQL's explicit `COLLATE "C"` revision-ledger lock order. */
+export function compareRowRevisionRows(
   table: AnyTable,
   tenantScope: TenantScope,
-  row: Record<string, unknown>,
-): string {
-  const identity = revisionIdentity(table, tenantScope, row)
-  return `${identity.tableKey}\u0000${identity.tenantKey}\u0000${identity.rowKey}`
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftIdentity = revisionIdentity(table, tenantScope, left)
+  const rightIdentity = revisionIdentity(table, tenantScope, right)
+  for (const property of ['tableKey', 'tenantKey', 'rowKey'] as const) {
+    const comparison = compareUtf8Text(leftIdentity[property], rightIdentity[property])
+    if (comparison !== 0) return comparison
+  }
+  return 0
 }
 
 /** Establish and row-lock an identity, including one never inserted before. */

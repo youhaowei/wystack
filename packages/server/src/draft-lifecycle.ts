@@ -37,13 +37,7 @@ import {
   type CommandResult,
   type CommitResult,
 } from './apply-commands'
-import {
-  compactLog,
-  snapshotCommand,
-  snapshotJsonValue,
-  type DraftCommand,
-  type ResolveHook,
-} from './draft-command-log'
+import { compactLog, snapshotCommand, snapshotJsonValue } from './draft-command-log'
 export { compactLog } from './draft-command-log'
 export type { DraftCommand, ResolveHook } from './draft-command-log'
 import {
@@ -57,18 +51,19 @@ export { DraftConflictError, DraftIntegrityError } from './draft-lifecycle-types
 export type * from './draft-lifecycle-types'
 import type { WyStackApp } from './create'
 import {
-  advanceStoredDraftRevision,
   assertStoredDraftIntegrity,
+  deleteStoredCommands,
   deleteStoredTouchedTables,
-  deleteStoredDraft,
+  deleteStoredDraftAtRevision,
   ensureDraftStorage,
   insertStoredDraft,
   readStoredCommands,
   readStoredDraft,
   readStoredTouchedTables,
-  refreshStoredDraftIntegrity,
+  refreshStoredDraftIntegrityAndAdvance,
   replaceStoredDraftBase,
   replaceStoredCommands,
+  StoredDraftRevisionChangedError,
   upsertStoredTouchedTables,
   type StoredDraft,
 } from './draft-store'
@@ -85,6 +80,21 @@ import {
 
 // oxlint-disable-next-line typescript/no-explicit-any -- polymorphic Drizzle table metadata
 type AnyTable = any
+
+const retryableTransactionCodes = new Set(['40P01', '40001'])
+const maxTransactionAttempts = 3
+
+function transactionErrorCode(error: unknown): string | undefined {
+  let candidate = error
+  const seen = new Set<unknown>()
+  while (candidate && typeof candidate === 'object' && !seen.has(candidate)) {
+    seen.add(candidate)
+    const record = candidate as Record<string, unknown>
+    if (typeof record['code'] === 'string') return record['code']
+    candidate = record['cause']
+  }
+  return undefined
+}
 
 let draftCounter = 0
 function mintDraftId(): string {
@@ -182,14 +192,36 @@ export function createDraftLifecycle(
     )
   }
 
-  async function requireStored(
-    raw: DrizzleTracker['raw'],
-    draftId: string,
-    lock = false,
-  ): Promise<StoredDraft> {
-    const draft = await readStoredDraft(raw, draftId, lock)
+  async function requireStored(raw: DrizzleTracker['raw'], draftId: string): Promise<StoredDraft> {
+    const draft = await readStoredDraft(raw, draftId)
     if (!draft) throw new Error(`draft lifecycle: unknown draft "${draftId}"`)
     return draft
+  }
+
+  /**
+   * PostgreSQL can abort either participant when independently valid command
+   * handlers acquire canonical rows in opposite orders. Retry only the whole,
+   * framework-owned lifecycle transaction: command mutations are already
+   * replayable by the draft contract, Actions are rejected, and invalidation is
+   * emitted only after the final commit. Authorization, resolution, and
+   * conflict-acceptance hooks remain outside this boundary.
+   */
+  async function runReplayableTransaction<T>(
+    callback: (tx: DrizzleTracker) => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
+      try {
+        return await app.system.createTracked().transaction(callback)
+      } catch (error) {
+        if (
+          !retryableTransactionCodes.has(transactionErrorCode(error) ?? '') ||
+          attempt === maxTransactionAttempts
+        ) {
+          throw error
+        }
+      }
+    }
+    throw new Error('draft lifecycle: unreachable transaction retry state')
   }
 
   function notFound(draftId: string): Error {
@@ -243,6 +275,22 @@ export function createDraftLifecycle(
     throw notFound(draft.draftId)
   }
 
+  function assertAuthorizedSnapshot(current: StoredDraft, authorized: StoredDraft): void {
+    if (
+      !sameJsonValue(current.tenantId, authorized.tenantId) ||
+      !sameJsonValue(current.ownerKey, authorized.ownerKey)
+    ) {
+      throw notFound(current.draftId)
+    }
+  }
+
+  function scopeFromAuthorizedSnapshot(
+    tracked: DrizzleTracker,
+    authorized: StoredDraft,
+  ): DrizzleTracker {
+    return authorized.tenantId === undefined ? tracked : tracked.withTenant(authorized.tenantId)
+  }
+
   return {
     async open(baseVersion, openOpts = {}) {
       const context = openOpts.context ?? {}
@@ -277,37 +325,63 @@ export function createDraftLifecycle(
           throw new Error(`Draft command ${command.path} cannot reference an action`)
         }
       }
-      const outer = app.system.createTracked()
+      const authorizationTracker = app.system.createTracked()
+      const authorized = await requireStored(authorizationTracker.raw, draftId)
+      await authorizeTracker(authorizationTracker, authorized, context, 'append')
       let draftWrites = new Set<string>()
-      const results = await outer.transaction(async (tx) => {
-        const stored = await requireStored(tx.raw, draftId, true)
-        const scopedTx = await authorizeTracker(tx, stored, context, 'append')
-        await assertStoredDraftIntegrity(tx.raw, draftId)
-        const existingLog = await readStoredCommands(tx.raw, draftId)
-        const touchedTables = new Map<string, AnyTable>()
-        const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
-        const results: CommandResult[] = []
-        for (const snapshot of commands) {
-          const definition = app.functions.get(snapshot.path)
-          if (definition?.type === 'action') {
-            throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
-          }
-          const value = await app.system.runHandler(snapshot.path, snapshot.args, draftDb, context)
-          results.push({ id: snapshot.id, value })
-        }
+      let results: CommandResult[] | undefined
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          results = await runReplayableTransaction(async (tx) => {
+            const stored = await requireStored(tx.raw, draftId)
+            assertAuthorizedSnapshot(stored, authorized)
+            const scopedTx = scopeFromAuthorizedSnapshot(tx, authorized)
+            await assertStoredDraftIntegrity(tx.raw, draftId)
+            const existingLog = await readStoredCommands(tx.raw, draftId)
+            const touchedTables = new Map<string, AnyTable>()
+            const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
+            const attemptResults: CommandResult[] = []
+            for (const snapshot of commands) {
+              const definition = app.functions.get(snapshot.path)
+              if (definition?.type === 'action') {
+                throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
+              }
+              const value = await app.system.runHandler(
+                snapshot.path,
+                snapshot.args,
+                draftDb,
+                context,
+              )
+              attemptResults.push({ id: snapshot.id, value })
+            }
 
-        const compactedLog = compactLog([...existingLog, ...commands])
-        await replaceStoredCommands(tx.raw, draftId, compactedLog)
-        await upsertStoredTouchedTables(
-          tx.raw,
-          draftId,
-          describeTouchedTables(touchedTables, draftDb.tablesWritten, draftId, scopedTx.tenantId),
-        )
-        await refreshStoredDraftIntegrity(tx.raw, draftId)
-        await advanceStoredDraftRevision(tx.raw, draftId, stored.logRevision)
-        draftWrites = new Set(draftDb.tablesWritten)
-        return results
-      })
+            const compactedLog = compactLog([...existingLog, ...commands])
+            await replaceStoredCommands(tx.raw, draftId, compactedLog)
+            await upsertStoredTouchedTables(
+              tx.raw,
+              draftId,
+              describeTouchedTables(
+                touchedTables,
+                draftDb.tablesWritten,
+                draftId,
+                scopedTx.tenantId,
+              ),
+            )
+            // The draft row is the final resource in every mutation. A losing
+            // optimistic append rolls the whole attempt back and retries from
+            // the newly committed log.
+            await refreshStoredDraftIntegrityAndAdvance(tx.raw, draftId, stored.logRevision)
+            draftWrites = new Set(draftDb.tablesWritten)
+            return attemptResults
+          })
+          break
+        } catch (error) {
+          if (!(error instanceof StoredDraftRevisionChangedError) || attempt === 4) throw error
+        }
+      }
+      if (!results) {
+        throw new Error(`draft lifecycle: draft "${draftId}" changed concurrently`)
+      }
       if (draftWrites.size > 0) app.system.emit(draftWrites)
       return results
     },
@@ -325,9 +399,10 @@ export function createDraftLifecycle(
         : [...snapshotLog]
 
       let draftWrites = new Set<string>()
-      const result = await app.system.createTracked().transaction(async (tx) => {
-        const current = await requireStored(tx.raw, draftId, true)
-        const scopedTx = await authorizeTracker(tx, current, context, 'publish')
+      const result = await runReplayableTransaction(async (tx) => {
+        const current = await requireStored(tx.raw, draftId)
+        assertAuthorizedSnapshot(current, snapshot)
+        const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
         if (current.logRevision !== snapshot.logRevision) {
           throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
         }
@@ -354,7 +429,14 @@ export function createDraftLifecycle(
           context,
         })
         await clearDerivedChanges(tx.raw, draftId)
-        await deleteStoredDraft(tx.raw, draftId)
+        await deleteStoredCommands(tx.raw, draftId)
+        await deleteStoredTouchedTables(tx.raw, draftId)
+        const deleted = await deleteStoredDraftAtRevision(tx.raw, draftId, snapshot.logRevision)
+        if (!deleted) {
+          const latest = await readStoredDraft(tx.raw, draftId)
+          if (!latest) throw notFound(draftId)
+          throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
+        }
         draftWrites = new Set(
           touched.flatMap((table) => (table.invalidationTag ? [table.invalidationTag] : [])),
         )
@@ -369,16 +451,26 @@ export function createDraftLifecycle(
     async discard(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
+      const authorizationTracker = app.system.createTracked()
+      const authorized = await requireStored(authorizationTracker.raw, draftId)
+      await authorizeTracker(authorizationTracker, authorized, context, 'discard')
       let draftWrites = new Set<string>()
-      await app.system.createTracked().transaction(async (tx) => {
-        const stored = await requireStored(tx.raw, draftId, true)
-        await authorizeTracker(tx, stored, context, 'discard')
+      await runReplayableTransaction(async (tx) => {
+        const stored = await requireStored(tx.raw, draftId)
+        assertAuthorizedSnapshot(stored, authorized)
         const touched = await readStoredTouchedTables(tx.raw, draftId)
         await clearDerivedChanges(tx.raw, draftId)
-        await deleteStoredDraft(tx.raw, draftId)
+        await deleteStoredCommands(tx.raw, draftId)
+        await deleteStoredTouchedTables(tx.raw, draftId)
         draftWrites = new Set(
           touched.flatMap((table) => (table.invalidationTag ? [table.invalidationTag] : [])),
         )
+        const deleted = await deleteStoredDraftAtRevision(tx.raw, draftId, authorized.logRevision)
+        if (!deleted) {
+          const latest = await readStoredDraft(tx.raw, draftId)
+          if (!latest) throw notFound(draftId)
+          throw new Error(`draft lifecycle: draft "${draftId}" changed during discard; retry`)
+        }
       })
       if (draftWrites.size > 0) app.system.emit(draftWrites)
     },
@@ -390,32 +482,38 @@ export function createDraftLifecycle(
       }
       const context = operationOpts.context ?? {}
       let emitted = new Set<string>()
-      let report: ConflictReport = { staleBase: false, overlappingCells: [] }
-      await app.system.createTracked().transaction(async (tx) => {
-        const stored = await requireStored(tx.raw, draftId, true)
-        const scopedTx = await authorizeTracker(tx, stored, context, 'rebase')
+      const snapshotTracked = app.system.createTracked()
+      const snapshot = await requireStored(snapshotTracked.raw, draftId)
+      const snapshotScoped = await authorizeTracker(snapshotTracked, snapshot, context, 'rebase')
+      await assertStoredDraftIntegrity(snapshotScoped.raw, draftId)
+      const log = await readStoredCommands(snapshotScoped.raw, draftId)
+      const previousTouched = await readStoredTouchedTables(snapshotScoped.raw, draftId)
+      const currentVersion = await versionProbe.current()
+      const touchedCells = await enumerateTouchedCells(snapshotScoped.raw, draftId, previousTouched)
+      const report: ConflictReport = {
+        staleBase: versionProbe.isNewerThan(currentVersion, snapshot.baseVersion),
+        overlappingCells:
+          touchedCells.length > 0
+            ? await versionProbe.cellsWrittenSince(snapshot.baseVersion, touchedCells)
+            : [],
+      }
+      if (report.overlappingCells.length > 0) {
+        const accepted = operationOpts.acceptConflicts
+          ? await operationOpts.acceptConflicts(report)
+          : false
+        if (!accepted) {
+          throw new Error(`draft lifecycle: draft "${draftId}" has unresolved rebase conflicts`)
+        }
+      }
+      await runReplayableTransaction(async (tx) => {
+        const stored = await requireStored(tx.raw, draftId)
+        assertAuthorizedSnapshot(stored, snapshot)
+        const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
+        if (stored.logRevision !== snapshot.logRevision) {
+          throw new Error(`draft lifecycle: draft "${draftId}" changed during rebase; retry`)
+        }
         await assertStoredDraftIntegrity(tx.raw, draftId)
-        const log = await readStoredCommands(tx.raw, draftId)
-        const previousTouched = await readStoredTouchedTables(tx.raw, draftId)
-        const currentVersion = await versionProbe.current()
-        const touchedCells = await enumerateTouchedCells(tx.raw, draftId, previousTouched)
-        report = {
-          staleBase: versionProbe.isNewerThan(currentVersion, stored.baseVersion),
-          overlappingCells:
-            touchedCells.length > 0
-              ? await versionProbe.cellsWrittenSince(stored.baseVersion, touchedCells)
-              : [],
-        }
-        if (report.overlappingCells.length > 0) {
-          const accepted = operationOpts.acceptConflicts
-            ? await operationOpts.acceptConflicts(report)
-            : false
-          if (!accepted) {
-            throw new Error(`draft lifecycle: draft "${draftId}" has unresolved rebase conflicts`)
-          }
-        }
         await clearDerivedChanges(tx.raw, draftId)
-        await deleteStoredTouchedTables(tx.raw, draftId)
 
         const touchedTables = new Map<string, AnyTable>()
         const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
@@ -428,6 +526,7 @@ export function createDraftLifecycle(
           draftId,
           scopedTx.tenantId,
         )
+        await deleteStoredTouchedTables(tx.raw, draftId)
         await upsertStoredTouchedTables(tx.raw, draftId, rebuiltTouched)
         await validateGraph?.({
           phase: 'effective',
@@ -435,7 +534,12 @@ export function createDraftLifecycle(
           db: draftDb,
           context,
         })
-        await refreshStoredDraftIntegrity(tx.raw, draftId)
+        const confirmedVersion = await versionProbe.current()
+        if (!sameJsonValue(confirmedVersion, currentVersion)) {
+          throw new Error(
+            `draft lifecycle: canonical version changed during rebase; retry draft "${draftId}"`,
+          )
+        }
         await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
         emitted = new Set([
           ...previousTouched.flatMap((table) =>

@@ -1,4 +1,5 @@
-import { getTableName } from 'drizzle-orm'
+import { getTableColumns, getTableName, sql } from 'drizzle-orm'
+import { getTableConfig } from 'drizzle-orm/pg-core'
 import { tryGetTableCapabilities } from './schema'
 import type {
   AnyTable,
@@ -23,6 +24,59 @@ import { SelectBuilder } from './select-builder'
 import { DraftSelectBuilder } from './draft-select-builder'
 import { DraftInsertBuilder } from './draft-mutations'
 import { allocateRowRevision } from './row-revisions'
+import { mapColumnValue, normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
+
+async function materializeRevisionIdentity(
+  raw: DrizzleDb,
+  table: AnyTable,
+  row: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const config = getTableConfig(table)
+  const columns = getTableColumns(table) as Record<
+    string,
+    {
+      name: string
+      hasDefault: boolean
+      default?: unknown
+      getSQLType(): string
+    }
+  >
+  const pkColumnName = resolvePkColumnName(table, config)
+  const pkEntry = Object.entries(columns).find(([, column]) => column.name === pkColumnName)
+  if (!pkEntry) return row
+  const [pkProperty, pkColumn] = pkEntry
+  if (row[pkProperty] !== undefined && row[pkProperty] !== null) return row
+
+  const type = pkColumn.getSQLType().toLowerCase()
+  if (['serial', 'bigserial', 'smallserial'].includes(type)) {
+    const tableName = getTableName(table)
+    const quoteRegclassPart = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`
+    const tableIdentity = [config.schema, tableName]
+      .filter((part): part is string => part !== undefined)
+      .map(quoteRegclassPart)
+      .join('.')
+    const result = await raw.execute(sql`
+      SELECT nextval(pg_get_serial_sequence(${tableIdentity}, ${pkColumnName})) AS value
+    `)
+    const value = normalizeExecuteRows(result)[0]?.['value']
+    if (value === undefined || value === null) {
+      throw new Error(`Could not materialize generated primary key "${pkProperty}"`)
+    }
+    return { ...row, [pkProperty]: mapColumnValue(pkColumn, value) }
+  }
+
+  if (
+    pkColumn.hasDefault &&
+    pkColumn.default !== undefined &&
+    (pkColumn.default === null || typeof pkColumn.default !== 'object')
+  ) {
+    return { ...row, [pkProperty]: pkColumn.default }
+  }
+  if (type === 'uuid' && pkColumn.hasDefault) {
+    return { ...row, [pkProperty]: crypto.randomUUID() }
+  }
+  return row
+}
 
 export class InsertBuilder<T extends AnyTable> {
   private _table: T
@@ -52,8 +106,14 @@ export class InsertBuilder<T extends AnyTable> {
       ? await this._db.transaction(async (tx: DrizzleDb) => {
           const rowsWithRevisions = []
           for (const row of scopedRows) {
-            const token = await allocateRowRevision(tx, this._table, this._tenantScope, row)
-            rowsWithRevisions.push({ ...row, [revision]: token })
+            const materialized = await materializeRevisionIdentity(tx, this._table, row)
+            const token = await allocateRowRevision(
+              tx,
+              this._table,
+              this._tenantScope,
+              materialized,
+            )
+            rowsWithRevisions.push({ ...materialized, [revision]: token })
           }
           return tx.insert(this._table).values(rowsWithRevisions).returning()
         })

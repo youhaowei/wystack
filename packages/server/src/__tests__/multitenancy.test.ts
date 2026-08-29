@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, multiTenant, syncSchema, table, text, uuid } from '@wystack/db'
+import { defineSchema, int, multiTenant, syncSchema, table, text, uuid } from '@wystack/db'
 import { applyCommands } from '../apply-commands'
 import { createDraftLifecycle } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
@@ -13,17 +13,27 @@ const schema = defineSchema({
   catalog: table({ id: uuid.primaryKey(), name: text }),
   insights: tenancy.table({ id: uuid.primaryKey(), name: text }).draftable(),
 })
+const intTenancy = multiTenant({
+  key: { property: 'tenantId', column: 'tenant_id', type: int },
+})
+const intSchema = defineSchema({
+  integerInsights: intTenancy.table({ id: uuid.primaryKey(), name: text }).draftable(),
+})
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 let app: Awaited<ReturnType<typeof wy.build>>
+let client: PGlite
+let db: ReturnType<typeof drizzle>
 
 beforeEach(async () => {
-  const client = new PGlite()
+  client = new PGlite()
   await client.waitReady
-  const db = drizzle(client)
+  db = drizzle(client)
   await syncSchema(db, schema)
+  await syncSchema(db, intSchema)
   app = await wy.build({
     db,
+    tenancy,
     resolveTenant: async (context) => {
       const requested = context.requestedTenantId
       const allowed = context.allowedTenantIds
@@ -46,6 +56,10 @@ beforeEach(async () => {
         .mutation(async (ctx, args) => ctx.db.into(schema.catalog).insert(args)),
     },
   })
+})
+
+afterEach(async () => {
+  await client.close()
 })
 
 const alpha = { requestedTenantId: 'alpha', allowedTenantIds: ['alpha'] }
@@ -184,6 +198,48 @@ describe('server tenant resolution', () => {
     const betaRows = (await app.call('listInsights', {}, beta)).result as { name: string }[]
     expect(alphaRows.map((row) => row.name)).toEqual(['drafted'])
     expect(betaRows).toEqual([])
+  })
+
+  /** Opening under integer spelling `01` and continuing under `1` addresses the same tenant-owned draft. */
+  test('durable draft custody compares the tenant column canonical identity', async () => {
+    const integerApp = await wy.build({
+      db,
+      tenancy: intTenancy,
+      resolveTenant: (context) => context.requestedTenantId,
+      functions: {
+        addInsight: wy.procedure
+          .input({ id: uuid, name: text })
+          .mutation(async (ctx, args) => ctx.db.into(intSchema.integerInsights).insert(args)),
+      },
+    })
+    const lifecycle = createDraftLifecycle(integerApp)
+    const principal = { kind: 'user' as const, userId: 'same-owner' }
+    const opened = { requestedTenantId: '01', principal }
+    const canonical = { requestedTenantId: 1, principal }
+    const draftId = await lifecycle.open(0, { context: opened })
+
+    await lifecycle.append(
+      draftId,
+      [
+        {
+          path: 'addInsight',
+          args: { id: '00000000-0000-4000-8000-000000000099', name: 'canonical tenant' },
+        },
+      ],
+      { context: canonical },
+    )
+
+    expect(await lifecycle.getLog(draftId, { context: canonical })).toHaveLength(1)
+    await lifecycle.publish(draftId, undefined, { context: canonical })
+    expect(
+      await integerApp.system.createTracked().withTenant(1).from(intSchema.integerInsights).all(),
+    ).toEqual([
+      {
+        id: '00000000-0000-4000-8000-000000000099',
+        name: 'canonical tenant',
+        tenantId: 1,
+      },
+    ])
   })
 
   test('draft collaboration requires an explicit hook and never bypasses tenant scope', async () => {

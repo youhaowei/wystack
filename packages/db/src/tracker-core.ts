@@ -23,6 +23,7 @@ import type { DraftInsertBuilder } from './draft-mutations'
 import type { InsertBuilder } from './tracker-factory'
 import type { SystemManagedProperties } from './table'
 import { mapColumnValue, normalizeExecuteRows } from './tracker-codecs'
+import { canonicalizeIdentity } from './identity-codec'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle DB instance type varies by driver; no common typed interface
 export type DrizzleDb = any
@@ -299,62 +300,8 @@ export function encodeTypedKey(
   const type = draftCastType(column)
   const encoded = mapColumnValue(column, rawValue)
   const value = encoded instanceof Date ? encoded.toISOString() : encoded
-  if (type === 'uuid') {
-    const source = String(value)
-    const opensBrace = source.startsWith('{')
-    const closesBrace = source.endsWith('}')
-    if (opensBrace !== closesBrace) {
-      throw new Error(`Invalid UUID identity: ${formatIdentityValue(value)}`)
-    }
-    const unwrapped = opensBrace ? source.slice(1, -1) : source
-    const groups = unwrapped.split('-')
-    const validGroups = groups.every(
-      (group) => group.length > 0 && group.length % 4 === 0 && /^[0-9a-fA-F]+$/.test(group),
-    )
-    const digits = groups.join('')
-    if (!validGroups || digits.length !== 32) {
-      throw new Error(`Invalid UUID identity: ${formatIdentityValue(value)}`)
-    }
-    const canonical = [
-      digits.slice(0, 8),
-      digits.slice(8, 12),
-      digits.slice(12, 16),
-      digits.slice(16, 20),
-      digits.slice(20),
-    ]
-      .join('-')
-      .toLowerCase()
-    return { envelope: { type, value: canonical }, text: canonical }
-  }
-  if (type === 'integer' || type === 'bigint' || type === 'smallint') {
-    const match = /^[\t\n\v\f\r ]*([+-]?\d+)[\t\n\v\f\r ]*$/.exec(String(value))
-    if (!match) {
-      throw new Error(`Invalid ${type} identity: ${formatIdentityValue(value)}`)
-    }
-    const integer = BigInt(match[1])
-    const [minimum, maximum] =
-      type === 'smallint'
-        ? [-32_768n, 32_767n]
-        : type === 'integer'
-          ? [-2_147_483_648n, 2_147_483_647n]
-          : [-9_223_372_036_854_775_808n, 9_223_372_036_854_775_807n]
-    if (integer < minimum || integer > maximum) {
-      throw new Error(`Invalid ${type} identity: ${formatIdentityValue(value)}`)
-    }
-    const canonical = integer.toString()
-    const numeric = Number(canonical)
-    const envelopeValue = Number.isSafeInteger(numeric) ? numeric : canonical
-    return { envelope: { type, value: envelopeValue }, text: canonical }
-  }
-  if (type === 'text' || type === 'varchar') {
-    const text = String(value)
-    return { envelope: { type, value }, text }
-  }
-  throw new Error(`Draft identity columns must be scalar int, text, or uuid; received ${type}`)
-}
-
-function formatIdentityValue(value: unknown): string {
-  return typeof value === 'string' ? JSON.stringify(value) : String(value)
+  const canonical = canonicalizeIdentity(type, value)
+  return { envelope: { type, value: canonical.value }, text: canonical.text }
 }
 
 function isDraftJsonNull(value: unknown): value is DraftJsonNull {

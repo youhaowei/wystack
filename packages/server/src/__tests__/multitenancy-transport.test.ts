@@ -22,6 +22,7 @@ test('HTTP and WebSocket requests resolve tenant scope before procedure access',
   const observedReads: string[][] = []
   const app = await wy.build({
     db,
+    tenancy,
     resolveTenant(context) {
       const tenantId = context.tenantId
       if (tenantId !== 'alpha' && tenantId !== 'beta') throw new Error('tenant access denied')

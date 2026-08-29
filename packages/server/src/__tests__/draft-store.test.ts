@@ -1,11 +1,25 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { ensureDraftStorage } from '../draft-store'
 
+const openDatabases = new Set<PGlite>()
+
+function createTestDatabase(): PGlite {
+  const pg = new PGlite()
+  openDatabases.add(pg)
+  return pg
+}
+
+afterEach(async () => {
+  const databases = [...openDatabases]
+  openDatabases.clear()
+  await Promise.all(databases.map((pg) => pg.close()))
+})
+
 describe('draft storage migrations', () => {
   test('installs durable lifecycle tables and the whole-draft lookup index idempotently', async () => {
-    const pg = new PGlite()
+    const pg = createTestDatabase()
     const db = drizzle(pg)
 
     await Promise.all([ensureDraftStorage(db), ensureDraftStorage(db)])
@@ -30,8 +44,13 @@ describe('draft storage migrations', () => {
       `SELECT column_name, is_nullable FROM information_schema.columns
        WHERE table_name = 'wystack_drafts' AND column_name = 'integrity_hash'`,
     )
+    const draftForeignKeys = await db.execute(
+      `SELECT condeferrable, condeferred
+       FROM pg_catalog.pg_constraint
+       WHERE contype = 'f' AND confrelid = 'wystack_drafts'::regclass`,
+    )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((migration as any).rows[0].version).toBe(6)
+    expect((migration as any).rows[0].version).toBe(7)
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((tables as any).rows.map((row: { table_name: string }) => row.table_name)).toEqual([
       'wystack_draft_commands',
@@ -45,10 +64,21 @@ describe('draft storage migrations', () => {
     expect((integrityColumn as { rows: unknown[] }).rows).toEqual([
       { column_name: 'integrity_hash', is_nullable: 'NO' },
     ])
+    expect(
+      (draftForeignKeys as { rows: Array<Record<string, unknown>> }).rows.length,
+    ).toBeGreaterThan(2)
+    expect((draftForeignKeys as { rows: Array<Record<string, unknown>> }).rows).toEqual(
+      expect.arrayContaining([expect.objectContaining({ condeferrable: true, condeferred: true })]),
+    )
+    expect(
+      (draftForeignKeys as { rows: Array<Record<string, unknown>> }).rows.every(
+        (row) => row['condeferrable'] === true && row['condeferred'] === true,
+      ),
+    ).toBe(true)
   })
 
   test('upgrades v2 touched-table metadata without replacing durable rows', async () => {
-    const pg = new PGlite()
+    const pg = createTestDatabase()
     const db = drizzle(pg)
     await db.execute(`CREATE SCHEMA other_storage`)
     await db.execute(`CREATE TABLE other_storage.wystack_draft_tables (invalidation_tag TEXT)`)
@@ -163,7 +193,7 @@ describe('draft storage migrations', () => {
   })
 
   test('a v5 upgrade forces active revisioned drafts to rebase', async () => {
-    const pg = new PGlite()
+    const pg = createTestDatabase()
     const db = drizzle(pg)
     await ensureDraftStorage(db)
     await db.execute(`

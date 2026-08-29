@@ -1,6 +1,7 @@
-import { getTableColumns, getTableName, sql } from 'drizzle-orm'
-import type { SQL } from 'drizzle-orm'
+import { getTableColumns, getTableName, isSQLWrapper, sql } from 'drizzle-orm'
+import type { SQL, SQLChunk } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
+import type { AnyPgColumn } from 'drizzle-orm/pg-core'
 import { tryGetTableCapabilities } from './schema'
 import type {
   AnyTable,
@@ -28,53 +29,92 @@ import {
 } from './tracker-core'
 import { mapColumnValue, normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
 import { createDrizzleTracker } from './tracker-factory'
+import { compareRowRevisionRows, lockRowRevision } from './row-revisions'
 
-export async function writeDraftRow(
-  db: DrizzleDb,
-  tracker: { tablesWritten: Set<string> },
+type DraftWriteIntent = 'insert' | 'update' | 'delete'
+
+interface DraftWriteOptions {
+  pkValue: unknown
+  values: Record<string, unknown>
+  tombstone: boolean
+  intent: DraftWriteIntent
+}
+
+type DraftColumn = AnyPgColumn
+type DraftColumns = Record<string, DraftColumn>
+
+interface DraftRowTarget {
+  tableKey: string
+  baseRelation: string
+  columns: DraftColumns
+  pkColumnName: string
+  pkProperty: string
+  pkValue: unknown
+  rowKey: ReturnType<typeof encodeTypedKey>
+  tenantColumn?: DraftColumn
+  tenantValue?: unknown
+  tenantKey: ReturnType<typeof encodeTypedKey> | { envelope: null; text: '' }
+  revisionColumn?: DraftColumn
+}
+
+interface DraftField {
+  column: DraftColumn
+  sqlName: string
+  proposed: ReturnType<typeof encodeProposedDraftValue>
+  plannedRevision: boolean
+}
+
+function resolveDraftRowTarget(
   table: AnyTable,
-  draftId: string,
   tenantScope: TenantScope,
-  opts: {
-    pkValue: unknown
-    values: Record<string, unknown>
-    tombstone: boolean
-    intent: 'insert' | 'update' | 'delete'
-  },
-): Promise<Record<string, unknown>[]> {
+  pkInput: unknown,
+): DraftRowTarget {
   const tableName = getTableName(table)
   const config = getTableConfig(table)
-  const pkColName = resolvePkColumnName(table, config)
-  const schema = config.schema
-  const tableKey = schema ? `${schema}.${tableName}` : tableName
-  const baseRel = schema
-    ? `${quoteSqlIdentifier(schema)}.${quoteSqlIdentifier(tableName)}`
+  const pkColumnName = resolvePkColumnName(table, config)
+  const tableKey = config.schema ? `${config.schema}.${tableName}` : tableName
+  const baseRelation = config.schema
+    ? `${quoteSqlIdentifier(config.schema)}.${quoteSqlIdentifier(tableName)}`
     : quoteSqlIdentifier(tableName)
 
-  // Route the PK value through its column codec too, so a PK whose type has a
-  // non-identity codec binds identically to the canonical path. PKs are
-  // typically uuid/text/serial (identity codec → no-op), but routing rather than
-  // assuming keeps the write path codec-correct for any PK column type.
-  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-  const columns = getTableColumns(table) as Record<string, any>
-  const pkCol = Object.values(columns).find((c) => (c.name as string) === pkColName)
-  if (!pkCol) throw new Error(`Cannot resolve primary key column for "${tableKey}"`)
-  const pkValue = mapColumnValue(pkCol, opts.pkValue)
-  const rowKey = encodeTypedKey(pkCol, opts.pkValue)
+  const columns = getTableColumns(table) as DraftColumns
+  const pkEntry = Object.entries(columns).find(([, column]) => column.name === pkColumnName)
+  if (!pkEntry) throw new Error(`Cannot resolve primary key column for "${tableKey}"`)
+  const [pkProperty, pkColumn] = pkEntry
+
   const tenant = requireTenantScope(table, tenantScope)
   const tenantColumn = tenant ? requireColumn(columns, tenant.tenancy.property) : undefined
-  const tenantValue = tenantColumn ? mapColumnValue(tenantColumn, tenant?.tenantId) : undefined
-  const tenantKey = tenantColumn
-    ? encodeTypedKey(tenantColumn, tenant?.tenantId)
-    : { envelope: null, text: '' }
-  const revisionProperty = tryGetTableCapabilities(table)?.revisionProperty
-  const revisionColumn = revisionProperty ? requireColumn(columns, revisionProperty) : undefined
+  const revisionName = tryGetTableCapabilities(table)?.revisionProperty
 
-  const valueCols = Object.entries(opts.values).flatMap(([property, value]) => {
-    if (value === undefined || !Object.hasOwn(columns, property)) return []
-    const column = columns[property]
+  return {
+    tableKey,
+    baseRelation,
+    columns,
+    pkColumnName,
+    pkProperty,
+    // Route identity predicates through the same codec as canonical writes.
+    pkValue: mapColumnValue(pkColumn, pkInput),
+    rowKey: encodeTypedKey(pkColumn, pkInput),
+    tenantColumn,
+    tenantValue: tenantColumn ? mapColumnValue(tenantColumn, tenant?.tenantId) : undefined,
+    tenantKey: tenantColumn
+      ? encodeTypedKey(tenantColumn, tenant?.tenantId)
+      : { envelope: null, text: '' },
+    revisionColumn: revisionName ? requireColumn(columns, revisionName) : undefined,
+  }
+}
+
+function collectDraftFields(
+  target: DraftRowTarget,
+  values: Record<string, unknown>,
+  intent: DraftWriteIntent,
+): DraftField[] {
+  const fields = Object.entries(values).flatMap(([property, value]) => {
+    if (value === undefined || !Object.hasOwn(target.columns, property)) return []
+    const column = target.columns[property]
     const sqlName = column.name as string
-    if (sqlName === pkColName || sqlName === tenant?.tenancy.column) return []
+    if (sqlName === target.pkColumnName || sqlName === target.tenantColumn?.name) return []
+    if (intent === 'insert' && sqlName === target.revisionColumn?.name) return []
     return [
       {
         column,
@@ -84,46 +124,54 @@ export async function writeDraftRow(
       },
     ]
   })
-  if (opts.intent === 'insert' && revisionColumn) {
-    valueCols.push({
-      column: revisionColumn,
-      sqlName: revisionColumn.name as string,
-      proposed: encodeProposedDraftValue(revisionColumn, 1),
+
+  if (intent === 'insert' && target.revisionColumn) {
+    fields.push({
+      column: target.revisionColumn,
+      sqlName: target.revisionColumn.name as string,
+      proposed: encodeProposedDraftValue(target.revisionColumn, 1),
       plannedRevision: true,
     })
   }
 
-  const basePredicates: SQL[] = [
-    sql`${sql.raw(`${quoteSqlIdentifier(pkColName)} = `)}${sql.param(pkValue)}`,
+  return fields
+}
+
+function buildDraftBaseCte(target: DraftRowTarget, draftId: string): SQL {
+  const predicates: SQL[] = [
+    sql`${sql.raw(`${quoteSqlIdentifier(target.pkColumnName)} = `)}${sql.param(target.pkValue)}`,
   ]
-  if (tenant && tenantColumn) {
-    basePredicates.push(
-      sql`${sql.raw(`${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(tenantValue)}`,
+  if (target.tenantColumn) {
+    predicates.push(
+      sql`${sql.raw(`${quoteSqlIdentifier(target.tenantColumn.name)} = `)}${sql.param(
+        target.tenantValue,
+      )}`,
     )
   }
-  const revisionCte = revisionColumn
-    ? sql`${sql.raw(', revision_state AS (INSERT INTO wystack_row_revisions (table_key, tenant_key_text, row_key_text, revision) VALUES (')}${sql.param(
-        tableKey,
-      )}${sql.raw(', ')}${sql.param(tenantKey.text)}${sql.raw(', ')}${sql.param(
-        rowKey.text,
-      )}${sql.raw(
-        ', 0) ON CONFLICT (table_key, tenant_key_text, row_key_text) DO UPDATE SET revision = wystack_row_revisions.revision RETURNING revision)',
-      )}`
-    : sql.empty()
-  const existingChangeCte = sql`${sql.raw(
-    `, existing_change AS (SELECT "operation" FROM ${draftChangesRelation} WHERE "draft_id" = `,
-  )}${sql.param(draftId)}${sql.raw(' AND "table_key" = ')}${sql.param(tableKey)}${sql.raw(
-    ' AND "tenant_key_text" = ',
-  )}${sql.param(tenantKey.text)}${sql.raw(' AND "row_key_text" = ')}${sql.param(
-    rowKey.text,
-  )}${sql.raw(' FOR UPDATE)')}`
-  const baseCte = sql`${sql.raw(`WITH base AS (SELECT * FROM ${baseRel} WHERE `)}${sql.join(
-    basePredicates,
-    sql.raw(' AND '),
-  )}${sql.raw(' FOR UPDATE)')}${revisionCte}${existingChangeCte}${sql.raw(' ')}`
 
-  const basePresent = `b.${quoteSqlIdentifier(pkColName)} IS NOT NULL`
-  const fieldPairs = valueCols.flatMap(({ column, sqlName, proposed, plannedRevision }, index) => {
+  const revisionState = target.revisionColumn
+    ? sql`${sql.raw(', revision_state AS (SELECT revision FROM wystack_row_revisions WHERE table_key = ')}${sql.param(
+        target.tableKey,
+      )}${sql.raw(' AND tenant_key_text = ')}${sql.param(target.tenantKey.text)}${sql.raw(
+        ' AND row_key_text = ',
+      )}${sql.param(target.rowKey.text)}${sql.raw(')')}`
+    : sql.empty()
+  const existingChange = sql`${sql.raw(
+    `, existing_change AS (SELECT "operation" FROM ${draftChangesRelation} WHERE "draft_id" = `,
+  )}${sql.param(draftId)}${sql.raw(' AND "table_key" = ')}${sql.param(
+    target.tableKey,
+  )}${sql.raw(' AND "tenant_key_text" = ')}${sql.param(target.tenantKey.text)}${sql.raw(
+    ' AND "row_key_text" = ',
+  )}${sql.param(target.rowKey.text)}${sql.raw(' FOR UPDATE)')}`
+
+  return sql`${sql.raw(`WITH base AS (SELECT * FROM ${target.baseRelation} WHERE `)}${sql.join(
+    predicates,
+    sql.raw(' AND '),
+  )}${sql.raw(' FOR UPDATE)')}${revisionState}${existingChange}${sql.raw(' ')}`
+}
+
+function buildFieldsExpression(fields: DraftField[], basePresent: string): SQL {
+  const pairs = fields.map(({ column, sqlName, proposed, plannedRevision }) => {
     const kind = ['json', 'jsonb'].includes(draftCastType(column)) ? 'json' : 'value'
     const original =
       `CASE WHEN NOT (${basePresent}) THEN '{"kind":"absent"}'::jsonb ` +
@@ -136,55 +184,84 @@ export async function writeDraftRow(
             `ELSE COALESCE((SELECT revision FROM revision_state), 0) + 1 END))`,
         )
       : sql`${sql.param(JSON.stringify(proposed))}${sql.raw('::jsonb')}`
-    const separator = index === 0 ? '' : ', '
-    return [
-      sql`${sql.raw(
-        `${separator}${sqlLiteral(sqlName)}, jsonb_build_object('original', ${original}, 'value', `,
-      )}${proposedValue}${sql.raw(')')}`,
-    ]
-  })
-  const fieldsExpression = fieldPairs.length
-    ? sql`${sql.raw('jsonb_build_object(')}${sql.join(fieldPairs, sql.raw(''))}${sql.raw(')')}`
-    : sql.raw("'{}'::jsonb")
 
-  const baseRevision = revisionColumn
+    return sql`${sql.raw(`${sqlLiteral(sqlName)}, jsonb_build_object('original', ${original}, 'value', `)}${proposedValue}${sql.raw(
+      ')',
+    )}`
+  })
+
+  return pairs.length
+    ? sql`${sql.raw('jsonb_build_object(')}${sql.join(pairs, sql.raw(', '))}${sql.raw(')')}`
+    : sql.raw("'{}'::jsonb")
+}
+
+function buildDraftChangeValues(
+  target: DraftRowTarget,
+  draftId: string,
+  fields: DraftField[],
+  opts: DraftWriteOptions,
+): { basePresent: string; values: SQLChunk[] } {
+  const basePresent = `b.${quoteSqlIdentifier(target.pkColumnName)} IS NOT NULL`
+  const baseRevision = target.revisionColumn
     ? sql.raw(
-        `CASE WHEN ${basePresent} THEN to_jsonb(b.${quoteSqlIdentifier(revisionColumn.name as string)}) ` +
+        `CASE WHEN ${basePresent} THEN to_jsonb(b.${quoteSqlIdentifier(target.revisionColumn.name as string)}) ` +
           `ELSE (SELECT to_jsonb(revision) FROM revision_state) END`,
       )
     : sql.raw('NULL::jsonb')
-  const tenantJson = tenantColumn
-    ? sql`${sql.param(JSON.stringify(tenantKey.envelope))}${sql.raw('::jsonb')}`
+  const tenantJson = target.tenantColumn
+    ? sql`${sql.param(JSON.stringify(target.tenantKey.envelope))}${sql.raw('::jsonb')}`
     : sql.raw('NULL::jsonb')
   const operation = opts.tombstone ? 'delete' : opts.intent
-  const insertUniquenessGuard =
-    opts.intent === 'insert'
+  const fieldsExpression = buildFieldsExpression(fields, basePresent)
+
+  return {
+    basePresent,
+    values: [
+      sql.param(draftId),
+      sql.param(target.tableKey),
+      sql.param(target.tenantKey.text),
+      tenantJson,
+      sql.param(target.rowKey.text),
+      sql`${sql.param(JSON.stringify(target.rowKey.envelope))}${sql.raw('::jsonb')}`,
+      sql.param(operation),
+      sql.raw(basePresent),
+      baseRevision,
+      fieldsExpression,
+    ],
+  }
+}
+
+function buildDraftChangeInsert(
+  values: SQLChunk[],
+  intent: DraftWriteIntent,
+  basePresent: string,
+): SQL {
+  const insertAvailabilityGuard =
+    intent === 'insert'
       ? sql.raw(
           ` WHERE NOT (` +
             `EXISTS (SELECT 1 FROM existing_change WHERE "operation" <> 'delete') ` +
             `OR (NOT EXISTS (SELECT 1 FROM existing_change) AND ${basePresent}))`,
         )
       : sql.empty()
-  const conflictUpdateGuard =
-    opts.intent === 'insert'
-      ? sql.raw(` WHERE ${draftChangesRelation}."operation" = 'delete'`)
-      : sql.empty()
 
-  const query = sql`${baseCte}${sql.raw(
+  return sql`${sql.raw(
     `INSERT INTO ${draftChangesRelation} ` +
       `("draft_id", "table_key", "tenant_key_text", "tenant_key", "row_key_text", "row_key", ` +
       `"operation", "base_exists", "base_revision", "fields") SELECT `,
-  )}${sql.param(draftId)}${sql.raw(', ')}${sql.param(tableKey)}${sql.raw(', ')}${sql.param(
-    tenantKey.text,
-  )}${sql.raw(', ')}${tenantJson}${sql.raw(', ')}${sql.param(rowKey.text)}${sql.raw(
-    ', ',
-  )}${sql.param(JSON.stringify(rowKey.envelope))}${sql.raw('::jsonb, ')}${sql.param(
-    operation,
-  )}${sql.raw(`, ${basePresent}, `)}${baseRevision}${sql.raw(', ')}${fieldsExpression}${sql.raw(
-    ` FROM (SELECT 1) seed LEFT JOIN base b ON TRUE`,
-  )}${insertUniquenessGuard}${sql.raw(
-    ` ` +
-      `ON CONFLICT ("draft_id", "table_key", "tenant_key_text", "row_key_text") DO UPDATE SET ` +
+  )}${sql.join(values, sql.raw(', '))}${sql.raw(
+    ' FROM (SELECT 1) seed LEFT JOIN base b ON TRUE',
+  )}${insertAvailabilityGuard}`
+}
+
+function buildDraftChangeReconciliation(intent: DraftWriteIntent): SQL {
+  const restoreDeletedRowGuard =
+    intent === 'insert'
+      ? sql.raw(` WHERE ${draftChangesRelation}."operation" = 'delete'`)
+      : sql.empty()
+
+  return sql`${sql.raw(
+    `ON CONFLICT ("draft_id", "table_key", "tenant_key_text", "row_key_text") DO UPDATE SET ` +
       `"operation" = CASE ` +
       `WHEN EXCLUDED."operation" = 'delete' THEN 'delete' ` +
       `WHEN ${draftChangesRelation}."operation" = 'insert' THEN 'insert' ` +
@@ -195,13 +272,47 @@ export async function writeDraftRow(
       `THEN jsonb_set(${draftChangesRelation}."fields" -> entry.key, '{value}', entry.value -> 'value', true) ` +
       `ELSE entry.value END) FROM jsonb_each(EXCLUDED."fields") entry` +
       `), '{}'::jsonb)`,
-  )}${conflictUpdateGuard}${sql.raw(' RETURNING *')}`
+  )}${restoreDeletedRowGuard}`
+}
 
-  const result = await db.execute(query)
+function buildDraftWriteQuery(
+  target: DraftRowTarget,
+  draftId: string,
+  fields: DraftField[],
+  opts: DraftWriteOptions,
+): SQL {
+  const change = buildDraftChangeValues(target, draftId, fields, opts)
+  const insert = buildDraftChangeInsert(change.values, opts.intent, change.basePresent)
+  const reconcile = buildDraftChangeReconciliation(opts.intent)
+
+  return sql`${buildDraftBaseCte(target, draftId)}${insert}${sql.raw(' ')}${reconcile}${sql.raw(
+    ' RETURNING *',
+  )}`
+}
+
+export async function writeDraftRow(
+  db: DrizzleDb,
+  tracker: { tablesWritten: Set<string> },
+  table: AnyTable,
+  draftId: string,
+  tenantScope: TenantScope,
+  opts: DraftWriteOptions,
+): Promise<Record<string, unknown>[]> {
+  const target = resolveDraftRowTarget(table, tenantScope, opts.pkValue)
+
+  // Every revision-aware path takes the ledger row before the canonical row.
+  // Publish follows this order too; reversing it here lets a draft write and a
+  // publish deadlock while each holds one side of the pair.
+  if (target.revisionColumn) {
+    await lockRowRevision(db, table, tenantScope, { [target.pkProperty]: opts.pkValue })
+  }
+
+  const fields = collectDraftFields(target, opts.values, opts.intent)
+  const result = await db.execute(buildDraftWriteQuery(target, draftId, fields, opts))
   const rows = normalizeExecuteRows(result)
   if (opts.intent === 'insert' && rows.length === 0) {
     throw new Error(
-      `Draft insert cannot create "${tableKey}" row ${JSON.stringify(opts.pkValue)} because it already exists`,
+      `Draft insert cannot create "${target.tableKey}" row ${JSON.stringify(opts.pkValue)} because it already exists`,
     )
   }
   tracker.tablesWritten.add(draftTableTrackingTag(table, tenantScope, draftId))
@@ -209,8 +320,7 @@ export async function writeDraftRow(
 }
 
 function materializeDraftInsertDefaults(
-  // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
-  columns: Record<string, any>,
+  columns: DraftColumns,
   supplied: Record<string, unknown>,
   systemProperties: Set<string>,
 ): Record<string, unknown> {
@@ -223,11 +333,7 @@ function materializeDraftInsertDefaults(
           `Draft insert default for "${property}" is generated at execution time; resolve it into the command input so publish reuses the same value`,
         )
       }
-      if (
-        column.default !== null &&
-        typeof column.default === 'object' &&
-        typeof column.default.getSQL === 'function'
-      ) {
+      if (isSQLWrapper(column.default)) {
         throw new Error(
           `Draft insert default for "${property}" is generated by SQL; resolve it into the command input so publish reuses the same value`,
         )
@@ -284,19 +390,17 @@ export class DraftInsertBuilder<T extends AnyTable> {
     const rows = Array.isArray(values) ? values : [values]
     const config = getTableConfig(this._table)
     const pkColName = resolvePkColumnName(this._table, config)
-    // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
-    const columns = getTableColumns(this._table) as Record<string, any>
+    const columns = getTableColumns(this._table) as DraftColumns
     const pkPropKey = Object.keys(columns).find((k) => (columns[k].name as string) === pkColName)
 
     let committedTracker: DraftDrizzleTracker | undefined
     const out = await this._db.transaction(async (txDb: DrizzleDb) => {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
-      const inserted: Record<string, unknown>[] = []
-      for (const row of rows) {
+      const revision = revisionProperty(this._table)
+      const prepared = rows.map((row, index) => {
         const supplied = row as Record<string, unknown>
         assertRevisionInput(this._table, supplied)
-        const revision = revisionProperty(this._table)
         const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
         const r = materializeDraftInsertDefaults(
           columns,
@@ -315,21 +419,31 @@ export class DraftInsertBuilder<T extends AnyTable> {
               `Draft inserts require a client-minted PK so the derived row is addressable.`,
           )
         }
+        return { index, pkValue, row: r }
+      })
+      if (revision) {
+        prepared.sort((left, right) =>
+          compareRowRevisionRows(this._table, this._tenantScope, left.row, right.row),
+        )
+      }
+
+      const inserted: Array<Record<string, unknown> | undefined> = new Array(rows.length)
+      for (const item of prepared) {
         // Pass the full row as sparse values; writeDraftRow drops the PK column,
         // which is carried separately as the stable row identity.
         await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
-          pkValue,
-          values: r,
+          pkValue: item.pkValue,
+          values: item.row,
           tombstone: false,
           intent: 'insert',
         })
         const effective = await txDraft
           .from(this._table)
-          .where({ op: 'eq', column: pkPropKey ?? pkColName, value: pkValue })
+          .where({ op: 'eq', column: pkPropKey ?? pkColName, value: item.pkValue })
           .first()
-        if (effective) inserted.push(effective)
+        if (effective) inserted[item.index] = effective
       }
-      return inserted
+      return inserted.filter((row): row is Record<string, unknown> => row !== undefined)
     })
     if (committedTracker) {
       for (const tag of committedTracker.tablesRead) this._tracker.tablesRead.add(tag)

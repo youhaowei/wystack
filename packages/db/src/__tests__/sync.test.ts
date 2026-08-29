@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
@@ -19,6 +19,20 @@ const bytea = customType<{ data: Uint8Array; default: false }>({
   dataType() {
     return 'bytea'
   },
+})
+
+const openDatabases = new Set<PGlite>()
+
+function createTestDatabase(): PGlite {
+  const client = new PGlite()
+  openDatabases.add(client)
+  return client
+}
+
+afterEach(async () => {
+  const databases = [...openDatabases]
+  openDatabases.clear()
+  await Promise.all(databases.map((client) => client.close()))
 })
 
 describe('renderCreateTableIfNotExists', () => {
@@ -79,7 +93,7 @@ describe('syncSchema', () => {
         .table({ id: wyUuid.primaryKey(), description: wyText.nullable() })
         .draftable(),
     })
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
 
@@ -118,7 +132,7 @@ describe('syncSchema', () => {
       chartType: text('chart_type').notNull(),
     })
 
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
 
@@ -141,7 +155,7 @@ describe('syncSchema', () => {
       id: uuid('id').primaryKey().defaultRandom(),
       payload: jsonb('payload').notNull(),
     })
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
 
@@ -165,7 +179,7 @@ describe('syncSchema', () => {
       counter: integer('counter').notNull(),
     })
 
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
     await syncSchema(db, { parent, child })

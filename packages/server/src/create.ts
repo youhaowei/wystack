@@ -1,8 +1,22 @@
 /** Wires DB, functions, and reactive subscriptions into a running app. */
-import { createDrizzleTracker, createDb, ensureRowRevisionStorage } from '@wystack/db'
-import type { DbConfig, DrizzleTracker, DraftDrizzleTracker } from '@wystack/db'
+import { createDrizzleTracker, createDb } from '@wystack/db'
+import type {
+  DbConfig,
+  DrizzleTracker,
+  DraftDrizzleTracker,
+  MultiTenantDescriptor,
+  TenantKeyDefinition,
+} from '@wystack/db'
 import { evaluate, type Permission } from '@wystack/permissions'
-import type { FunctionDef, FunctionContext, DbInput, ProcedureDb } from './types'
+import {
+  procedureInsertMethods,
+  procedureSelectChainedMethods,
+  procedureSelectTerminalMethods,
+  type FunctionDef,
+  type FunctionContext,
+  type DbInput,
+  type ProcedureDb,
+} from './types'
 import { assertPermissionIds } from './permissions'
 import { createSubscriptionManager } from './subscriptions'
 import {
@@ -128,23 +142,20 @@ function toProcedureSelectBuilder(source: object): object {
     (method: string) =>
     (...args: unknown[]) =>
       toProcedureSelectBuilder(invokeBuilder(source, method, args) as object)
-  return Object.freeze({
-    select: chained('select'),
-    where: chained('where'),
-    orderBy: chained('orderBy'),
-    limit: chained('limit'),
-    all: (...args: unknown[]) => invokeBuilder(source, 'all', args),
-    first: (...args: unknown[]) => invokeBuilder(source, 'first', args),
-    update: (...args: unknown[]) => invokeBuilder(source, 'update', args),
-    delete: (...args: unknown[]) => invokeBuilder(source, 'delete', args),
-    toSql: (...args: unknown[]) => invokeBuilder(source, 'toSql', args),
-  })
+  const facade: Record<string, (...args: unknown[]) => unknown> = {}
+  for (const method of procedureSelectChainedMethods) facade[method] = chained(method)
+  for (const method of procedureSelectTerminalMethods) {
+    facade[method] = (...args: unknown[]) => invokeBuilder(source, method, args)
+  }
+  return Object.freeze(facade)
 }
 
 function toProcedureInsertBuilder(source: object): object {
-  return Object.freeze({
-    insert: (...args: unknown[]) => invokeBuilder(source, 'insert', args),
-  })
+  const facade: Record<string, (...args: unknown[]) => unknown> = {}
+  for (const method of procedureInsertMethods) {
+    facade[method] = (...args: unknown[]) => invokeBuilder(source, method, args)
+  }
+  return Object.freeze(facade)
 }
 
 function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
@@ -166,8 +177,12 @@ export async function buildWyStack(opts: {
   functions: Record<string, FunctionDef>
   permissions: unknown
   expectedPermissionIds?: readonly string[]
+  tenancy?: MultiTenantDescriptor<TenantKeyDefinition>
   resolveTenant?: (context: Record<string, unknown>) => unknown | Promise<unknown>
 }): Promise<WyStackApp> {
+  if ((opts.tenancy === undefined) !== (opts.resolveTenant === undefined)) {
+    throw new Error('buildWyStack requires tenancy and resolveTenant together')
+  }
   if (opts.expectedPermissionIds) {
     assertPermissionIds(opts.permissions, opts.expectedPermissionIds)
   }
@@ -182,8 +197,6 @@ export async function buildWyStack(opts: {
   // Resolve DB: either use createDb for config, or treat as raw Drizzle instance
   const dbConfig = resolveDbConfig(opts.db)
   const drizzleDb = dbConfig ? await createDb(dbConfig) : opts.db
-  await ensureRowRevisionStorage(drizzleDb)
-
   for (const [path, def] of Object.entries(opts.functions)) {
     def.path = path
     functions.set(path, def)
@@ -206,7 +219,13 @@ export async function buildWyStack(opts: {
     async scopeTracked(tracked: DrizzleTracker, context = {}) {
       if (!opts.resolveTenant) return tracked
       const tenantId = await opts.resolveTenant(context)
-      return tracked.withTenant(tenantId)
+      if (tenantId === null || tenantId === undefined) {
+        throw new Error('withTenant() requires a non-null trusted tenant ID')
+      }
+      const tenancy = opts.tenancy as MultiTenantDescriptor<TenantKeyDefinition> & {
+        canonicalize(value: unknown): unknown
+      }
+      return tracked.withTenant(tenancy.canonicalize(tenantId))
     },
 
     async runHandler(

@@ -25,9 +25,10 @@ import {
   withoutUndefined,
 } from './tracker-core'
 import { resolvePkColumnName } from './tracker-codecs'
-import { lockRowRevision, preserveRowRevision, rowRevisionSortKey } from './row-revisions'
+import { compareRowRevisionRows, lockRowRevision, preserveRowRevision } from './row-revisions'
+import type { TableSelectedRow } from './table'
 
-export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
+export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
   private _table: T
   private _db: DrizzleDb
   private _tracker: DrizzleTracker
@@ -90,14 +91,14 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
    * column is written. Narrowing tags to columns would be a different (finer)
    * invalidation model, not an optimization of this one.
    */
-  select<K extends keyof T['$inferSelect'] & string>(
+  select<K extends keyof TableSelectedRow<T> & string>(
     ...cols: [K, ...K[]]
-  ): SelectBuilder<T, Pick<T['$inferSelect'], K>> {
+  ): SelectBuilder<T, Pick<TableSelectedRow<T>, K>> {
     // The tuple type already forbids `select()` at compile time; this guards the
     // untyped-caller path, where an empty projection would silently lower to
     // `SELECT` with no columns.
     if (cols.length === 0) throw new Error('select() requires at least one column')
-    return this._with<Pick<T['$inferSelect'], K>>({ projection: cols })
+    return this._with<Pick<TableSelectedRow<T>, K>>({ projection: cols })
   }
 
   where(filters: FilterDescriptor | FilterDescriptor[]): SelectBuilder<T, TRow> {
@@ -300,9 +301,7 @@ export class SelectBuilder<T extends AnyTable, TRow = T['$inferSelect']> {
           if (conditions.length > 0) candidatesQuery = candidatesQuery.where(predicate)
           const candidates = (await candidatesQuery) as Record<string, unknown>[]
           candidates.sort((left, right) =>
-            rowRevisionSortKey(this._table, this._tenantScope, left).localeCompare(
-              rowRevisionSortKey(this._table, this._tenantScope, right),
-            ),
+            compareRowRevisionRows(this._table, this._tenantScope, left, right),
           )
           for (const row of candidates) {
             await lockRowRevision(tx, this._table, this._tenantScope, row)

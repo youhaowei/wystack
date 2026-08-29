@@ -27,12 +27,16 @@ describeWithPostgres('draft inserts — real PostgreSQL multi-connection concurr
     admin = postgres(postgresUrl!, { max: 1, onnotice: () => {} })
     await admin.unsafe(`CREATE SCHEMA "${namespace}"`)
 
-    firstClient = postgres(postgresUrl!, { max: 1, onnotice: () => {} })
-    secondClient = postgres(postgresUrl!, { max: 1, onnotice: () => {} })
-    await Promise.all([
-      firstClient.unsafe(`SET search_path TO "${namespace}"`),
-      secondClient.unsafe(`SET search_path TO "${namespace}"`),
-    ])
+    firstClient = postgres(postgresUrl!, {
+      max: 1,
+      onnotice: () => {},
+      connection: { search_path: namespace },
+    })
+    secondClient = postgres(postgresUrl!, {
+      max: 1,
+      onnotice: () => {},
+      connection: { search_path: namespace },
+    })
     await firstClient.unsafe(
       'CREATE TABLE draft_concurrent_items (id INTEGER PRIMARY KEY, title TEXT NOT NULL)',
     )

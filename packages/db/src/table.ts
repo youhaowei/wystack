@@ -1,11 +1,17 @@
 import { ColumnDef, uuid, type AnyColumnDef } from './dsl'
+import { canonicalizeIdentity } from './identity-codec'
 
 export type ColumnDefinitions = Record<string, AnyColumnDef>
 
 declare const systemManagedProperties: unique symbol
+declare const selectedRowType: unique symbol
 
 export interface CarriesSystemManagedProperties<TProperties extends string> {
   readonly [systemManagedProperties]: TProperties
+}
+
+export interface CarriesSelectedRow<TRow> {
+  readonly [selectedRowType]: TRow
 }
 
 /** Framework-owned property keys carried only through the type system. */
@@ -15,6 +21,17 @@ export type SystemManagedProperties<T> =
 /** Preserve framework-owned keys when a definition is compiled into a Drizzle table. */
 export type WithSystemManagedProperties<TTable, TDefinition> = TTable &
   CarriesSystemManagedProperties<SystemManagedProperties<TDefinition>>
+
+/** Exact selected-row shape carried alongside Drizzle's runtime table type. */
+export type WithSelectedRow<TTable, TRow> = TTable & CarriesSelectedRow<TRow>
+
+/** Prefer the WyStack row contract, falling back to native Drizzle tables. */
+export type TableSelectedRow<TTable> =
+  TTable extends CarriesSelectedRow<infer TRow>
+    ? TRow
+    : TTable extends { readonly $inferSelect: infer TRow }
+      ? TRow
+      : never
 
 export interface TenantKeyDefinition<
   TProperty extends string = string,
@@ -297,6 +314,7 @@ type WithTenantKey<
 
 export interface MultiTenantDescriptor<TKey extends TenantKeyDefinition> {
   readonly key: TKey
+  canonicalize(value: unknown): unknown
   table<TColumns extends ColumnDefinitions>(
     columns: TKey['property'] extends keyof TColumns ? never : TColumns,
   ): TableDefinition<WithTenantKey<TColumns, TKey>, false, TKey['property']>
@@ -331,6 +349,10 @@ export function multiTenant(
 
   return Object.freeze({
     key,
+    canonicalize(value: unknown) {
+      const sqlType = key.type.opts.type === 'int' ? 'integer' : key.type.opts.type
+      return canonicalizeIdentity(sqlType, value).value
+    },
     table<TColumns extends ColumnDefinitions>(columns: TColumns) {
       if (Object.hasOwn(columns, key.property)) {
         throw new Error(

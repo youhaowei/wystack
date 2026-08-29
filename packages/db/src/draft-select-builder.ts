@@ -48,8 +48,10 @@ import {
   resolvePkColumnName,
 } from './tracker-codecs'
 import { writeDraftRow } from './draft-mutations'
+import { compareRowRevisionRows } from './row-revisions'
+import type { TableSelectedRow } from './table'
 
-export class DraftSelectBuilder<T extends AnyTable> {
+export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
   private _table: T
   private _db: DrizzleDb
   private _draftId: string
@@ -77,8 +79,8 @@ export class DraftSelectBuilder<T extends AnyTable> {
 
   /** Copy carrying `patch`. See `SelectBuilder._with` for why no clause method
    *  assigns to `this`. */
-  private _with(patch: Partial<ReadClauses>): DraftSelectBuilder<T> {
-    return new DraftSelectBuilder<T>(
+  private _with<TNext = TRow>(patch: Partial<ReadClauses>): DraftSelectBuilder<T, TNext> {
+    return new DraftSelectBuilder<T, TNext>(
       this._table,
       this._db,
       this._draftId,
@@ -92,9 +94,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
   }
 
   /** Project effective rows by the same property-key contract as canonical reads. */
-  select<K extends keyof T['$inferSelect'] & string>(...cols: [K, ...K[]]): DraftSelectBuilder<T> {
+  select<K extends keyof TableSelectedRow<T> & string>(
+    ...cols: [K, ...K[]]
+  ): DraftSelectBuilder<T, Pick<TableSelectedRow<T>, K>> {
     if (cols.length === 0) throw new Error('select() requires at least one column')
-    return this._with({ projection: cols })
+    return this._with<Pick<TableSelectedRow<T>, K>>({ projection: cols })
   }
 
   where(filters: FilterDescriptor | FilterDescriptor[]): DraftSelectBuilder<T> {
@@ -144,7 +148,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * resulting effective rows. Read-only select/order/limit clauses are rejected
    * because a write cannot honor their return-shaping semantics.
    */
-  async update(values: TrackedUpdateValues<T>): Promise<Record<string, unknown>[]> {
+  async update(values: TrackedUpdateValues<T>): Promise<TableSelectedRow<T>[]> {
     assertNoReadClauses('update', this._clauses)
     assertDraftWriteScope(this._table, this._tenantScope)
     const patch = withoutUndefined(values as Record<string, unknown>)
@@ -166,6 +170,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
       const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
+      if (revisionProperty(this._table)) {
+        matches.sort((left, right) =>
+          compareRowRevisionRows(this._table, this._tenantScope, left, right),
+        )
+      }
       const updated: Record<string, unknown>[] = []
       for (const match of matches) {
         const pkValue = match[pkProperty]
@@ -202,7 +211,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * Filters have full effective-row parity with canonical deletes; every match
    * receives a delete marker in derived storage.
    */
-  async delete(): Promise<Record<string, unknown>[]> {
+  async delete(): Promise<TableSelectedRow<T>[]> {
     assertNoReadClauses('delete', this._clauses)
     assertDraftWriteScope(this._table, this._tenantScope)
     const columns = getTableColumns(this._table) as Record<string, { name: string }>
@@ -216,6 +225,11 @@ export class DraftSelectBuilder<T extends AnyTable> {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
       const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
+      if (revisionProperty(this._table)) {
+        matches.sort((left, right) =>
+          compareRowRevisionRows(this._table, this._tenantScope, left, right),
+        )
+      }
       for (const match of matches) {
         await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
           pkValue: match[pkProperty],
@@ -233,7 +247,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
     return rows
   }
 
-  async all(): Promise<Record<string, unknown>[]> {
+  async all(): Promise<TRow[]> {
     return this._coalescedRead()
   }
 
@@ -242,7 +256,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * without setting `_clauses.limitVal` — see `first()` for why that field must
    * mean only "the caller attached `limit()`".
    */
-  private async _coalescedRead(limitOverride?: number): Promise<Record<string, unknown>[]> {
+  private async _coalescedRead(limitOverride?: number): Promise<TRow[]> {
     // Record the base table read AND its virtual per-table draft tag. The rows
     // physically share one central relation, but invalidation remains scoped by
     // logical table/tenant/draft so unrelated drafts do not refetch.
@@ -271,7 +285,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
     // guarded with `typeof value === 'string'`, so it JSON.parses the
     // postgres-js string AND is a no-op on the already-parsed PGlite object — no
     // double-parse. Columns not in the schema are left untouched.
-    return rows.map((row) => decodeRowFromDriver(row, colEntries))
+    return rows.map((row) => decodeRowFromDriver(row, colEntries) as TRow)
   }
 
   /**
@@ -506,7 +520,7 @@ export class DraftSelectBuilder<T extends AnyTable> {
    * `LIMIT 1` is an override, not `_clauses.limitVal`, because the write guard
    * reserves that field for a limit explicitly attached by the caller.
    */
-  async first(): Promise<Record<string, unknown> | null> {
+  async first(): Promise<TRow | null> {
     const rows = await this._coalescedRead(1)
     return rows[0] ?? null
   }

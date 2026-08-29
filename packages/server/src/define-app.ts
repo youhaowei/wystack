@@ -1,5 +1,6 @@
 import { buildWyStack } from './create'
 import { authorize, createProcedure, requireAuth } from './functions'
+import type { MultiTenantDescriptor, TenantKeyDefinition } from '@wystack/db'
 import type { DbInput, FunctionContext, FunctionDef } from './types'
 
 export interface DefineAppOptions {
@@ -11,6 +12,8 @@ export interface BuildOptions {
   dialect?: 'postgres'
   functions: Record<string, FunctionDef>
   expectedPermissionIds?: readonly string[]
+  /** The descriptor that defines the database identity accepted by resolveTenant. */
+  tenancy?: MultiTenantDescriptor<TenantKeyDefinition>
   resolveTenant?: (context: Record<string, unknown>) => unknown | Promise<unknown>
 }
 

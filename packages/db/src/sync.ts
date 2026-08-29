@@ -5,6 +5,11 @@
  * raw `pgTable(...)`, then calls `syncSchema(db, schema)` at app boot to
  * materialize tables via `CREATE TABLE IF NOT EXISTS`.
  *
+ * When using `defineSchema`, pass its exact returned object. Generated framework
+ * relations are associated with that object by identity; copying or selecting a
+ * subset drops that metadata. Raw `pgTable` maps have no generated relations and
+ * may still be passed directly.
+ *
  * ── What it does ─────────────────────────────────────────────────────────
  * - Topologically orders tables by FK dependency (tables with no outgoing FKs
  *   first; tables referencing already-emitted targets next).

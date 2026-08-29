@@ -11,6 +11,7 @@ export interface Cell {
 export type Version = unknown
 
 export interface VersionProbe {
+  /** Read-only and replay-safe: rebase may call this again after a rolled-back transaction. */
   current(): Promise<Version>
   isNewerThan(current: Version, base: Version): boolean
   cellsWrittenSince(base: Version, cells: Cell[]): Promise<Cell[]>
@@ -70,6 +71,11 @@ export interface DraftLifecycleOptions {
    * than satisfying one.
    */
   authorizeGlobalDraft?: (request: GlobalDraftAuthorizationRequest) => boolean | Promise<boolean>
+  /**
+   * Validate using the supplied transaction-bound database view. This hook must
+   * be side-effect-free: PostgreSQL deadlock/serialization recovery may replay
+   * the framework-owned lifecycle transaction that invokes it.
+   */
   validateGraph?: (request: DraftGraphValidationRequest) => void | Promise<void>
 }
 

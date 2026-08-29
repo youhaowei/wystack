@@ -2,11 +2,15 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema } from '../schema'
-import { text, int, boolean } from '../dsl'
+import { text, int, boolean, uuid } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
-import { pgTable, text as pgText, integer, primaryKey } from 'drizzle-orm/pg-core'
+import { pgTable, text as pgText, integer } from 'drizzle-orm/pg-core'
 import { table } from '../table'
+import { draftChangesTableDdl } from './draft-storage.fixture'
+import { ensureRowRevisionStorage } from '../row-revisions'
+import { compareRowRevisionRows } from '../row-revisions'
+import { noTenantScope } from '../tracker-core'
 
 const schema = defineSchema({
   todos: table({
@@ -18,6 +22,20 @@ const schema = defineSchema({
     id: int.primaryKey(),
     label: text,
   }),
+  versioned_todos: table({
+    id: int.primaryKey(),
+    title: text,
+    revision: int,
+  }).revision('revision'),
+  versioned_uuid_todos: table({
+    id: uuid.primaryKey().defaultRandom(),
+    title: text,
+    revision: int,
+  }).revision('revision'),
+})
+
+const unicodeRevisionRows = pgTable('unicode_revision_rows', {
+  id: pgText('id').primaryKey(),
 })
 
 let pg: PGlite
@@ -35,6 +53,21 @@ beforeEach(async () => {
       done BOOLEAN NOT NULL
     )
   `)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS versioned_uuid_todos (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1
+    )
+  `)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS versioned_todos (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1
+    )
+  `)
+  await ensureRowRevisionStorage(db)
   await db.execute(`
     CREATE TABLE IF NOT EXISTS tags (
       id SERIAL PRIMARY KEY,
@@ -63,6 +96,19 @@ afterEach(async () => {
 })
 
 describe('DrizzleTracker', () => {
+  /** Lock keys use PostgreSQL C-collation byte order, including where UTF-16 ordering differs. */
+  test('revision lock ordering matches PostgreSQL C collation for non-ASCII identities', () => {
+    const rows = [{ id: '\u{10000}' }, { id: '\uE000' }]
+
+    rows.sort((left, right) =>
+      compareRowRevisionRows(unicodeRevisionRows, noTenantScope, left, right),
+    )
+
+    // UTF-16 code-unit ordering puts U+10000 first. UTF-8 byte ordering, like
+    // PostgreSQL COLLATE "C", puts U+E000 first.
+    expect(rows).toEqual([{ id: '\uE000' }, { id: '\u{10000}' }])
+  })
+
   test('insert records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'Test', done: false })
     expect(tracked.tablesWritten.has('todos')).toBe(true)
@@ -74,6 +120,39 @@ describe('DrizzleTracker', () => {
     expect(rows[0].title).toBe('Test')
     expect(rows[0].done).toBe(false)
     expect(rows[0].id).toBeGreaterThan(0)
+  })
+
+  /** A generated serial key is materialized once and becomes the identity of the same revision ledger row. */
+  test('revisioned inserts materialize generated primary keys before allocating ledger tokens', async () => {
+    const first = await tracked.into(schema.versioned_todos).insert({ title: 'first' })
+    const second = await tracked.into(schema.versioned_todos).insert({ title: 'second' })
+
+    expect(first).toEqual([{ id: 1, title: 'first', revision: 1 }])
+    expect(second).toEqual([{ id: 2, title: 'second', revision: 1 }])
+    const ledger = await db.execute(
+      `SELECT row_key_text, revision FROM wystack_row_revisions
+       WHERE table_key = 'versioned_todos' ORDER BY row_key_text`,
+    )
+    expect(ledger.rows).toEqual([
+      { row_key_text: '1', revision: 1 },
+      { row_key_text: '2', revision: 1 },
+    ])
+  })
+
+  /** A generated UUID is shared by the inserted row and its revision ledger entry, never generated twice. */
+  test('revisioned UUID defaults are materialized once for the ledger and inserted row', async () => {
+    const [inserted] = await tracked
+      .into(schema.versioned_uuid_todos)
+      .insert({ title: 'generated uuid' })
+
+    expect(inserted.id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+    const ledger = await db.execute(
+      `SELECT row_key_text FROM wystack_row_revisions
+       WHERE table_key = 'versioned_uuid_todos'`,
+    )
+    expect(ledger.rows).toEqual([{ row_key_text: inserted.id }])
   })
 
   test('a failed insert does not record tablesWritten', async () => {
@@ -311,19 +390,7 @@ const snakeTodos = pgTable('snake_todos', {
 /** The migration-managed relation used by every draftable table in this file. */
 const createDraftStorage = () =>
   tracked.raw.execute(`
-    CREATE TABLE IF NOT EXISTS wystack_draft_row_changes (
-      draft_id TEXT NOT NULL,
-      table_key TEXT NOT NULL,
-      tenant_key_text TEXT NOT NULL DEFAULT '',
-      tenant_key JSONB,
-      row_key_text TEXT NOT NULL,
-      row_key JSONB NOT NULL,
-      operation TEXT NOT NULL,
-      base_exists BOOLEAN NOT NULL,
-      base_revision JSONB,
-      fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-      PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text)
-    )
+    ${draftChangesTableDdl}
   `)
 
 /** Create the migration-managed snake-case fixture and optional draft storage. */
@@ -455,13 +522,16 @@ describe('SelectBuilder projection', () => {
     ).rejects.toThrow('Unknown column: nope')
   })
 
-  test('toSql() lowers the projection and stays in lockstep with all()', async () => {
-    const { sql: projected } = tracked.from(schema.todos).select('title').toSql()
-    const { sql: fullRow } = tracked.from(schema.todos).toSql()
+  /** Selecting one public property returns only that property on the canonical path. */
+  test('a canonical projection returns only the selected values', async () => {
+    await tracked.into(schema.todos).insert({ title: 'projected', done: true })
 
-    expect(projected).toContain('"title"')
-    expect(projected).not.toContain('"done"')
-    expect(fullRow).toContain('"done"')
+    const projected = await tracked.from(schema.todos).select('title').all()
+    const fullRows = await tracked.from(schema.todos).all()
+
+    expect(projected).toEqual([{ title: 'projected' }])
+    expect(Object.keys(projected[0] ?? {})).toEqual(['title'])
+    expect(fullRows).toEqual([{ id: 1, title: 'projected', done: true }])
   })
 })
 
@@ -824,61 +894,40 @@ describe('clause column resolution is total', () => {
   })
 })
 
-/**
- * A composite-PK table. `_pkColumn` cannot pin a single column here, so the
- * tiebreaker is OMITTED rather than guessed — this fixture is what keeps that
- * branch from being silently untested.
- */
-const compositeMembers = pgTable(
-  'composite_members',
-  {
-    orgId: integer('org_id').notNull(),
-    userId: integer('user_id').notNull(),
-    role: pgText('role').notNull(),
-  },
-  (t) => [primaryKey({ columns: [t.orgId, t.userId] })],
-)
-
 describe('canonical and draft reads agree on tied rows', () => {
-  // Asserted on the LOWERED SQL, not on returned row order. Rows inserted in PK
-  // order into a fresh heap come back in PK order regardless, so a row-order
-  // assertion stays green with the tiebreaker removed — it does not pin anything.
-  test('the canonical ORDER BY carries the primary key as a trailing term', () => {
-    const { sql } = tracked.from(schema.todos).orderBy('done').toSql()
-    expect(sql).toContain('order by "todos"."done" asc, "todos"."id" asc')
-  })
-
-  test('the tiebreaker is not duplicated when the named column IS the primary key', () => {
-    expect(tracked.from(schema.todos).orderBy('id').toSql().sql).toContain(
-      'order by "todos"."id" asc',
-    )
-    // `desc` proves the single term is the CALLER's, not a tiebreaker that
-    // happens to match: a duplicate would append a second, ascending `"id"`.
-    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).toContain(
-      'order by "todos"."id" desc',
-    )
-    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).not.toContain('asc')
-  })
-
-  test('the tiebreaker rides on the caller direction, not the reverse', () => {
-    // The PK term is always ascending — it exists to make the tie DETERMINISTIC,
-    // and the draft coalesce's `pkOrder` is ascending too. If one flipped with
-    // the caller's direction and the other did not, the two paths would disagree
-    // on exactly the reads this pairing exists to keep identical.
-    const { sql } = tracked.from(schema.todos).orderBy('done', 'desc').toSql()
-    expect(sql).toContain('order by "todos"."done" desc, "todos"."id" asc')
-  })
-
-  test('canonical and draft return tied rows in the same order', async () => {
+  /** Equal sort values produce the same primary-key order on canonical and draft reads. */
+  test('canonical and draft deterministically break ties by primary key', async () => {
     await createDraftStorage()
-    await tracked.into(schema.todos).insert({ title: 'x', done: true })
-    await tracked.into(schema.todos).insert({ title: 'y', done: true })
-    await tracked.into(schema.todos).insert({ title: 'z', done: true })
+    // Deliberately oppose heap order and primary-key order. This would expose a
+    // missing tiebreaker without asserting how the query is lowered to SQL.
+    await tracked.into(schema.todos).insert({ id: 30, title: 'thirty', done: true })
+    await tracked.into(schema.todos).insert({ id: 10, title: 'ten', done: true })
+    await tracked.into(schema.todos).insert({ id: 20, title: 'twenty', done: true })
 
-    const canonical = await tracked.from(schema.todos).orderBy('done').all()
-    const draft = await tracked.withDraft('d1').from(schema.todos).orderBy('done').all()
+    for (const direction of ['asc', 'desc'] as const) {
+      const canonical = await tracked.from(schema.todos).orderBy('done', direction).all()
+      const draft = await tracked
+        .withDraft('d1')
+        .from(schema.todos)
+        .orderBy('done', direction)
+        .all()
 
-    expect(draft.map((r) => r.id)).toEqual(canonical.map((r) => r.id))
+      expect(canonical.map((row) => row.id)).toEqual([10, 20, 30])
+      expect(draft).toEqual(canonical)
+    }
+  })
+
+  /** When the primary key is the requested sort column, descending order is not overwritten by a tiebreaker. */
+  test('ordering by the primary key respects the requested direction', async () => {
+    await tracked.into(schema.todos).insert({ id: 30, title: 'thirty', done: true })
+    await tracked.into(schema.todos).insert({ id: 10, title: 'ten', done: true })
+    await tracked.into(schema.todos).insert({ id: 20, title: 'twenty', done: true })
+
+    const ascending = await tracked.from(schema.todos).orderBy('id').all()
+    const descending = await tracked.from(schema.todos).orderBy('id', 'desc').all()
+
+    expect(ascending.map((row) => row.id)).toEqual([10, 20, 30])
+    expect(descending.map((row) => row.id)).toEqual([30, 20, 10])
   })
 
   test('limit(1) over a tie picks the same row on both paths', async () => {
@@ -907,15 +956,6 @@ describe('canonical and draft reads agree on tied rows', () => {
     const rows = await tracked.from(schema.todos).orderBy('title').all()
     expect(rows.map((r) => r.title)).toEqual(['a', 'b'])
     expect(rows.map((r) => r.id)).toEqual([2, 1])
-  })
-
-  test('a composite-PK table emits no tiebreaker rather than an arbitrary one', () => {
-    const { sql } = tracked.from(compositeMembers).orderBy('role').toSql()
-    // Scoped to the ORDER BY — the key's columns are of course in the SELECT
-    // list. No second term there: picking one half of a composite key would be
-    // arbitrary, and the draft coalesce cannot pin a single PK column either.
-    const orderBy = sql.slice(sql.indexOf('order by'))
-    expect(orderBy).toBe('order by "composite_members"."role" asc')
   })
 })
 
