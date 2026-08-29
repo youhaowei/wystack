@@ -131,6 +131,11 @@ function validateTableReferences(
           `Tenant-local reference "${definition.name}.${property}" cannot use ON DELETE SET NULL because the composite foreign key includes the required tenant key`,
         )
       }
+      if (target.capabilities.draftable && reference.onDelete === 'cascade') {
+        throw new Error(
+          `Reference "${definition.name}.${property}" cannot use ON DELETE CASCADE because draft deletes of "${reference.table}" cannot review or anchor untouched dependent rows`,
+        )
+      }
       continue
     }
 
@@ -139,6 +144,14 @@ function validateTableReferences(
     if (tenant && target?.capabilities.tenancy) {
       throw new Error(
         `Reference "${definition.name}.${property}" targets tenant-isolated table "${reference.table}"; use referencesWithinTenant()`,
+      )
+    }
+    if (
+      target?.capabilities.draftable &&
+      (reference.onDelete === 'cascade' || reference.onDelete === 'set null')
+    ) {
+      throw new Error(
+        `Reference "${definition.name}.${property}" cannot use ON DELETE ${reference.onDelete.toUpperCase()} because draft deletes of "${reference.table}" cannot review or anchor untouched dependent rows`,
       )
     }
   }

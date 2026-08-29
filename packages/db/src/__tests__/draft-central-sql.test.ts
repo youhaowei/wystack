@@ -130,6 +130,54 @@ afterEach(async () => {
 })
 
 describe('durable central draft overlay', () => {
+  test('writes explicit JSON null distinctly from SQL NULL through canonical builders', async () => {
+    await tracked.into(items).insert({
+      id: 5,
+      title: 'json null insert',
+      score: 50,
+      payload: jsonNull(),
+    })
+    await tracked.from(items).where(eq('id', 4)).update({ payload: jsonNull() })
+
+    const result = await db.execute(sql`
+      SELECT id, payload IS NULL AS is_sql_null, payload = 'null'::jsonb AS is_json_null
+      FROM draft_items
+      WHERE id IN (4, 5)
+      ORDER BY id
+    `)
+    expect(result.rows).toEqual([
+      { id: 4, is_sql_null: false, is_json_null: true },
+      { id: 5, is_sql_null: false, is_json_null: true },
+    ])
+  })
+
+  test('rejects jsonNull() in a non-JSON draft update even when no row matches', async () => {
+    const draft = tracked.withDraft('d-invalid-json-null-update')
+
+    await expect(
+      draft
+        .from(items)
+        .where(eq('id', 999))
+        .update({ title: jsonNull() as never }),
+    ).rejects.toThrow('jsonNull() can only be assigned to a json or jsonb column, not "title"')
+
+    expect(await enumerateDraftRowChanges(db, 'd-invalid-json-null-update')).toEqual([])
+  })
+
+  test('rejects jsonNull() in a non-JSON draft insert without recording a change', async () => {
+    const draft = tracked.withDraft('d-invalid-json-null-insert')
+
+    await expect(
+      draft.into(items).insert({
+        id: 5,
+        title: jsonNull() as never,
+        score: 50,
+      }),
+    ).rejects.toThrow('jsonNull() can only be assigned to a json or jsonb column, not "title"')
+
+    expect(await enumerateDraftRowChanges(db, 'd-invalid-json-null-insert')).toEqual([])
+  })
+
   test('keeps immutable first-touch original across A to B to C and distinguishes null states', async () => {
     const draft = tracked.withDraft('d-null')
 
@@ -180,9 +228,10 @@ describe('durable central draft overlay', () => {
 
     expect((await draft.from(items).all()).map((row) => row.id)).toEqual([1, 3, 4, 5])
     expect((await tracked.from(items).all()).map((row) => row.id)).toEqual([1, 2, 3, 4])
-    expect((await enumerateDraftRowChanges(db, 'd-ops')).map((change) => change.operation)).toEqual(
-      ['delete', 'insert'],
-    )
+    const changes = await enumerateDraftRowChanges(db, 'd-ops')
+    expect(changes.map((change) => change.operation)).toEqual(['delete', 'insert'])
+    expect(changes[0]?.fields['title']?.original).toEqual({ kind: 'value', value: 'banana' })
+    expect(changes[0]?.fields['note']?.original).toEqual({ kind: 'sql-null' })
   })
 
   test('unregistered Drizzle tables remain canonical and reject draft writes', async () => {

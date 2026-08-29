@@ -7,16 +7,14 @@ import {
 } from '@wystack/db'
 import { getTableColumns, getTableName, sql } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
+import { decodeJsonColumn, normalizeRows } from './draft-inspection'
 import type { StoredTouchedTable } from './draft-store'
-import {
-  DraftConflictError,
-  type Cell,
-  type DraftInspectionRow,
-  type DraftRowConflict,
-} from './draft-lifecycle-types'
+import { DraftConflictError, type Cell, type DraftRowConflict } from './draft-lifecycle-types'
 
-// oxlint-disable-next-line typescript/no-explicit-any -- mirrors polymorphic Drizzle tables
-type AnyTable = any
+export { inspectDraftRows } from './draft-inspection'
+export { applyReviewedChanges, assertReplayMatchesReviewedChanges } from './draft-publication'
+
+type AnyTable = Parameters<DrizzleTracker['from']>[0]
 
 function qualifiedTableKey(table: AnyTable): string {
   const name = getTableName(table)
@@ -89,42 +87,6 @@ function liveRevisionColumn(table: AnyTable): string | undefined {
 }
 
 /**
- * Wrap a canonical tracker so every table a replayed command touches is
- * captured, including through nested transactions and tenant rebinding. The
- * handles a handler receives are derived from the wrapped one, so recording
- * has to follow each derivation.
- */
-export function recordCanonicalTouchedTables(
-  tracker: DrizzleTracker,
-  touchedTables: Map<string, AnyTable>,
-): DrizzleTracker {
-  const record = (table: AnyTable) => touchedTables.set(qualifiedTableKey(table), table)
-  const wrap = (target: DrizzleTracker): DrizzleTracker =>
-    new Proxy(target, {
-      get(inner, property) {
-        if (property === 'from' || property === 'into') {
-          return (table: AnyTable) => {
-            record(table)
-            return inner[property](table)
-          }
-        }
-        if (property === 'withTenant') {
-          return (tenantId: unknown) => wrap(inner.withTenant(tenantId))
-        }
-        if (property === 'transaction') {
-          return <R>(
-            fn: (tx: DrizzleTracker) => Promise<R>,
-            opts?: Parameters<DrizzleTracker['transaction']>[1],
-          ) => inner.transaction((tx) => fn(wrap(tx)), opts)
-        }
-        const value = Reflect.get(inner, property, inner)
-        return typeof value === 'function' ? value.bind(inner) : value
-      },
-    })
-  return wrap(tracker)
-}
-
-/**
  * The stored descriptor is a snapshot of each touched table as it was at the
  * last append; the compare-and-swap in `assertDraftRowsUnchanged` can only
  * express what that snapshot knew. If the live schema has since added or
@@ -153,7 +115,11 @@ export async function assertStoredDescriptorsCurrent(
     )
     for (const row of rows) {
       const key = decodeJsonColumn(row['row_key']) as { value?: unknown }
-      conflicts.push({ table: tableIdentity, id: key.value, reason: 'revision' })
+      conflicts.push({
+        table: tableIdentity,
+        id: key.value,
+        reason: 'revision',
+      })
     }
   }
   if (conflicts.length > 0) throw new DraftConflictError(draftId, conflicts)
@@ -267,41 +233,22 @@ export async function enumerateTouchedCells(
     const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
     const rows = normalizeRows(
       await raw.execute(sql`
-        SELECT row_key FROM wystack_draft_row_changes
+        SELECT tenant_key, row_key FROM wystack_draft_row_changes
         WHERE draft_id = ${draftId} AND table_key = ${tableIdentity}
         ORDER BY tenant_key_text, row_key_text
       `),
     )
     for (const row of rows) {
-      const encoded = decodeJsonColumn(row['row_key']) as { value?: unknown }
-      cells.push({ table: tableIdentity, id: encoded?.value })
+      const rowKey = decodeJsonColumn(row['row_key']) as { value?: unknown }
+      const tenantKey = decodeJsonColumn(row['tenant_key']) as { value?: unknown } | null
+      cells.push({
+        table: tableIdentity,
+        id: rowKey?.value,
+        ...(tenantKey ? { tenantId: tenantKey.value } : {}),
+      })
     }
   }
   return cells
-}
-
-export async function inspectDraftRows(
-  raw: DrizzleTracker['raw'],
-  draftId: string,
-): Promise<DraftInspectionRow[]> {
-  const rows = normalizeRows(
-    await raw.execute(sql`
-      SELECT draft_id, table_key, tenant_key, row_key, operation,
-             base_exists, base_revision, fields
-      FROM wystack_draft_row_changes WHERE draft_id = ${draftId}
-      ORDER BY table_key, tenant_key_text, row_key_text
-    `),
-  )
-  return rows.map((row) => ({
-    draftId: String(row['draft_id']),
-    table: String(row['table_key']),
-    tenantKey: decodeJsonColumn(row['tenant_key']),
-    rowKey: decodeJsonColumn(row['row_key']),
-    operation: String(row['operation']) as DraftInspectionRow['operation'],
-    baseExists: Boolean(row['base_exists']),
-    baseRevision: decodeJsonColumn(row['base_revision']),
-    fields: decodeJsonColumn(row['fields']) as DraftInspectionRow['fields'],
-  }))
 }
 
 export async function clearDerivedChanges(
@@ -310,16 +257,4 @@ export async function clearDerivedChanges(
   draftId: string,
 ): Promise<void> {
   await raw.execute(sql`DELETE FROM wystack_draft_row_changes WHERE draft_id = ${draftId}`)
-}
-
-function decodeJsonColumn(value: unknown): unknown {
-  return typeof value === 'string' ? JSON.parse(value) : value
-}
-
-function normalizeRows(result: unknown): Record<string, unknown>[] {
-  if (Array.isArray(result)) return result as Record<string, unknown>[]
-  if (result && typeof result === 'object' && 'rows' in result) {
-    return (result as { rows: Record<string, unknown>[] }).rows
-  }
-  return []
 }

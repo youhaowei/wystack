@@ -211,10 +211,9 @@ const storageDdlV5 = [
       AND t.revision_column IS NOT NULL`),
 ]
 
-// The command log is publication authority while row changes and touched-table
-// metadata are its materialized read/review state. A deterministic fingerprint
-// makes accidental disagreement observable before a lifecycle operation can
-// bless, publish, or repair the inconsistent pair.
+// The command log and reviewed row changes are one integrity-bound record. The
+// log can reproduce intent while the materialized rows retain exact proposals
+// and anchors; publish requires the two representations to agree.
 const storageDdlV6 = [
   sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS integrity_hash TEXT`),
   sql`UPDATE wystack_drafts d

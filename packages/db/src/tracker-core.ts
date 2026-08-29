@@ -49,7 +49,7 @@ export type TrackedUpdateValues<T extends AnyTable> = Partial<TrackedInsertValue
 export const draftChangesRelation = '"wystack_draft_row_changes"'
 const draftJsonNullMarker = Symbol('wystack draft JSON null')
 
-/** Explicit JSON `null` for a json/jsonb draft field. Plain `null` remains SQL NULL. */
+/** Explicit JSON `null` for a tracked json/jsonb write. Plain `null` remains SQL NULL. */
 export interface DraftJsonNull {
   readonly [draftJsonNullMarker]: true
 }
@@ -310,10 +310,50 @@ function isDraftJsonNull(value: unknown): value is DraftJsonNull {
   )
 }
 
+function requireJsonColumn(
+  column: { name: string; getSQLType(): string },
+  property: string,
+): string {
+  const type = draftCastType(column)
+  if (type !== 'json' && type !== 'jsonb') {
+    throw new Error(`jsonNull() can only be assigned to a json or jsonb column, not "${property}"`)
+  }
+  return type
+}
+
+/** Reject explicit JSON-null markers before either tracked write path touches the database. */
+export function assertJsonNullInputs(table: AnyTable, values: Record<string, unknown>): void {
+  const columns = getTableColumns(table) as Record<string, { name: string; getSQLType(): string }>
+  for (const [property, value] of Object.entries(values)) {
+    if (!isDraftJsonNull(value)) continue
+    requireJsonColumn(requireColumn(columns, property), property)
+  }
+}
+
+/** Lower the explicit JSON-null marker before a canonical Drizzle write. */
+export function materializeJsonNulls(
+  table: AnyTable,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  assertJsonNullInputs(table, values)
+  const columns = getTableColumns(table) as Record<string, { name: string; getSQLType(): string }>
+  return Object.fromEntries(
+    Object.entries(values).map(([property, value]) => {
+      if (!isDraftJsonNull(value)) return [property, value]
+      const column = requireColumn(columns, property)
+      const type = draftCastType(column)
+      return [property, sql.raw(`'null'::${type}`)]
+    }),
+  )
+}
+
 // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
 export function encodeProposedDraftValue(column: any, value: unknown): DraftStoredValue {
   if (value === null) return { kind: 'sql-null' }
-  if (isDraftJsonNull(value)) return { kind: 'json', value: null }
+  if (isDraftJsonNull(value)) {
+    requireJsonColumn(column, String(column.name))
+    return { kind: 'json', value: null }
+  }
   const type = draftCastType(column)
   if (type === 'json' || type === 'jsonb') return { kind: 'json', value }
   if (type.endsWith('[]') && Array.isArray(value)) {

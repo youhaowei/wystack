@@ -17,6 +17,7 @@ import {
   assertTenantInput,
   drizzleOpMap,
   emptyClauses,
+  materializeJsonNulls,
   noTenantScope,
   requireColumn,
   requireTenantScope,
@@ -268,9 +269,10 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('update', this._clauses)
     assertTenantInput(this._table, values as Record<string, unknown>)
-    const patch = withoutUndefined(values as Record<string, unknown>)
-    assertRevisionInput(this._table, patch)
-    if (Object.keys(patch).length === 0) return []
+    const supplied = withoutUndefined(values as Record<string, unknown>)
+    assertRevisionInput(this._table, supplied)
+    if (Object.keys(supplied).length === 0) return []
+    const patch = materializeJsonNulls(this._table, supplied)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const revision = revisionProperty(this._table)

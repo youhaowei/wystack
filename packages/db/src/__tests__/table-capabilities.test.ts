@@ -564,6 +564,40 @@ describe('composable table capabilities', () => {
     })
   })
 
+  describe('draft delete safety', () => {
+    test('rejects delete actions that would mutate unreviewed dependent rows', () => {
+      expect(() =>
+        defineSchema({
+          parents: table({ id: uuid.primaryKey() }).draftable(),
+          children: table({
+            id: uuid.primaryKey(),
+            parentId: uuid.references('parents', 'id', 'cascade'),
+          }),
+        }),
+      ).toThrow('cannot review or anchor untouched dependent rows')
+
+      expect(() =>
+        defineSchema({
+          parents: table({ id: uuid.primaryKey() }).draftable(),
+          children: table({
+            id: uuid.primaryKey(),
+            parentId: uuid.nullable().references('parents', 'id', 'set null'),
+          }),
+        }),
+      ).toThrow('cannot review or anchor untouched dependent rows')
+
+      expect(() =>
+        defineSchema({
+          parents: table({ id: uuid.primaryKey() }).draftable(),
+          children: table({
+            id: uuid.primaryKey(),
+            parentId: uuid.references('parents', 'id', 'no action'),
+          }),
+        }),
+      ).not.toThrow()
+    })
+  })
+
   describe('tenant-local constraints', () => {
     /** Tenant-local uniqueness and references include tenant identity in their compiled constraints. */
     test('tenant-local uniqueness and references include the tenant key', () => {

@@ -22,6 +22,7 @@ import type {
 } from './tracker-core'
 import {
   assertDraftWriteScope,
+  assertJsonNullInputs,
   assertNoReadClauses,
   assertRevisionInput,
   assertTenantInput,
@@ -47,7 +48,7 @@ import {
   normalizeExecuteRows,
   resolvePkColumnName,
 } from './tracker-codecs'
-import { writeDraftRow } from './draft-mutations'
+import { lockDraftWriteCandidate, writeDraftRow } from './draft-mutations'
 import { compareRowRevisionRows } from './row-revisions'
 import type { TableSelectedRow } from './table'
 
@@ -137,6 +138,50 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
   }
 
   /**
+   * Match PostgreSQL's conditional write behavior across our two-statement
+   * lowering: identify candidates, lock them in a stable order, then evaluate
+   * the predicate again against the locked effective rows. A canonical update
+   * that wins before the lock therefore moves the row out of the draft write
+   * instead of silently changing the anchor underneath the original match.
+   */
+  private async _lockedWriteMatches(
+    txDb: DrizzleDb,
+    txDraft: DraftDrizzleTracker,
+    pkProperty: string,
+  ): Promise<Record<string, unknown>[]> {
+    const candidates = (await txDraft
+      .from(this._table)
+      .where(this._clauses.filters)
+      .all()) as Record<string, unknown>[]
+    candidates.sort((left, right) =>
+      compareRowRevisionRows(this._table, this._tenantScope, left, right),
+    )
+
+    for (const candidate of candidates) {
+      await lockDraftWriteCandidate(
+        txDb,
+        this._table,
+        this._draftId,
+        this._tenantScope,
+        candidate[pkProperty],
+      )
+    }
+
+    const lockedMatches: Record<string, unknown>[] = []
+    for (const candidate of candidates) {
+      const match = await txDraft
+        .from(this._table)
+        .where([
+          ...this._clauses.filters,
+          { op: 'eq', column: pkProperty, value: candidate[pkProperty] },
+        ])
+        .first()
+      if (match) lockedMatches.push(match as Record<string, unknown>)
+    }
+    return lockedMatches
+  }
+
+  /**
    * Sparse cell-edit: upsert one central change row and merge ONLY the fields
    * present in `values`, so a draft update of one field does not clobber another.
    * Mirrors the canonical
@@ -155,6 +200,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     assertTenantInput(this._table, patch)
     assertRevisionInput(this._table, patch)
     if (Object.keys(patch).length === 0) return []
+    assertJsonNullInputs(this._table, patch)
 
     const columns = getTableColumns(this._table) as Record<string, { name: string }>
     const pkSqlName = resolvePkColumnName(this._table, getTableConfig(this._table))
@@ -169,12 +215,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     const rows = await this._db.transaction(async (txDb: DrizzleDb) => {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
-      const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
-      if (revisionProperty(this._table)) {
-        matches.sort((left, right) =>
-          compareRowRevisionRows(this._table, this._tenantScope, left, right),
-        )
-      }
+      const matches = await this._lockedWriteMatches(txDb, txDraft, pkProperty)
       const updated: Record<string, unknown>[] = []
       for (const match of matches) {
         const pkValue = match[pkProperty]
@@ -224,16 +265,14 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     const rows = await this._db.transaction(async (txDb: DrizzleDb) => {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
-      const matches = await txDraft.from(this._table).where(this._clauses.filters).all()
-      if (revisionProperty(this._table)) {
-        matches.sort((left, right) =>
-          compareRowRevisionRows(this._table, this._tenantScope, left, right),
-        )
-      }
+      const matches = await this._lockedWriteMatches(txDb, txDraft, pkProperty)
       for (const match of matches) {
         await writeDraftRow(txDb, txDraft, this._table, this._draftId, this._tenantScope, {
           pkValue: match[pkProperty],
-          values: {},
+          // Preserve a full first-touch anchor for deletes. Revisioned tables
+          // already have row-level CAS; non-revisioned tables need the field
+          // originals so publish can detect a changed row before deleting it.
+          values: match,
           tombstone: true,
           intent: 'delete',
         })

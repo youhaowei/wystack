@@ -12,6 +12,7 @@ import type {
 } from './tracker-core'
 import {
   assertDraftWriteScope,
+  assertJsonNullInputs,
   assertRevisionInput,
   assertTenantInput,
   draftCastType,
@@ -137,7 +138,7 @@ function collectDraftFields(
   return fields
 }
 
-function buildDraftBaseCte(target: DraftRowTarget, draftId: string): SQL {
+function draftBasePredicates(target: DraftRowTarget): SQL[] {
   const predicates: SQL[] = [
     sql`${sql.raw(`${quoteSqlIdentifier(target.pkColumnName)} = `)}${sql.param(target.pkValue)}`,
   ]
@@ -148,7 +149,10 @@ function buildDraftBaseCte(target: DraftRowTarget, draftId: string): SQL {
       )}`,
     )
   }
+  return predicates
+}
 
+function buildDraftBaseCte(target: DraftRowTarget, draftId: string): SQL {
   const revisionState = target.revisionColumn
     ? sql`${sql.raw(', revision_state AS (SELECT revision FROM wystack_row_revisions WHERE table_key = ')}${sql.param(
         target.tableKey,
@@ -165,7 +169,7 @@ function buildDraftBaseCte(target: DraftRowTarget, draftId: string): SQL {
   )}${sql.param(target.rowKey.text)}${sql.raw(' FOR UPDATE)')}`
 
   return sql`${sql.raw(`WITH base AS (SELECT * FROM ${target.baseRelation} WHERE `)}${sql.join(
-    predicates,
+    draftBasePredicates(target),
     sql.raw(' AND '),
   )}${sql.raw(' FOR UPDATE)')}${revisionState}${existingChange}${sql.raw(' ')}`
 }
@@ -290,6 +294,40 @@ function buildDraftWriteQuery(
   )}`
 }
 
+/**
+ * Stabilize one row selected by a predicate write before that predicate is
+ * evaluated again. The lock order matches publish and `writeDraftRow`: durable
+ * revision identity, canonical row, then this draft's existing change row.
+ */
+export async function lockDraftWriteCandidate(
+  db: DrizzleDb,
+  table: AnyTable,
+  draftId: string,
+  tenantScope: TenantScope,
+  pkValue: unknown,
+): Promise<void> {
+  const target = resolveDraftRowTarget(table, tenantScope, pkValue)
+  if (target.revisionColumn) {
+    await lockRowRevision(db, table, tenantScope, { [target.pkProperty]: pkValue })
+  }
+
+  await db.execute(
+    sql`${sql.raw(`SELECT 1 FROM ${target.baseRelation} WHERE `)}${sql.join(
+      draftBasePredicates(target),
+      sql.raw(' AND '),
+    )}${sql.raw(' FOR UPDATE')}`,
+  )
+  await db.execute(
+    sql`${sql.raw(
+      `SELECT 1 FROM ${draftChangesRelation} WHERE "draft_id" = `,
+    )}${sql.param(draftId)}${sql.raw(' AND "table_key" = ')}${sql.param(
+      target.tableKey,
+    )}${sql.raw(' AND "tenant_key_text" = ')}${sql.param(target.tenantKey.text)}${sql.raw(
+      ' AND "row_key_text" = ',
+    )}${sql.param(target.rowKey.text)}${sql.raw(' FOR UPDATE')}`,
+  )
+}
+
 export async function writeDraftRow(
   db: DrizzleDb,
   tracker: { tablesWritten: Set<string> },
@@ -401,6 +439,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
       const prepared = rows.map((row, index) => {
         const supplied = row as Record<string, unknown>
         assertRevisionInput(this._table, supplied)
+        assertJsonNullInputs(this._table, supplied)
         const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
         const r = materializeDraftInsertDefaults(
           columns,

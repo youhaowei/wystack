@@ -14,40 +14,44 @@
 // drives append, chooses a conflict POLICY); this layer is the mechanism, a
 // sibling to `applyCommands`/`transaction` with the same "app conducts" posture.
 //
-// PUBLISH = REPLAY THE
-// ORDERED COMMAND LOG via `applyCommands(app, log, {commit})`, NOT "apply a
-// row-delta onto canonical." The command log is the publish unit because it
-// preserves INTENT GROUPING (e.g. an `add_to_dashboard` command merges into the
-// dashboard node — a row-delta cannot reconstruct that). Central row changes
-// are the READ overlay; the command log is the PUBLISH source. The
-// two are different artifacts with different jobs.
+// PUBLISH verifies that the ordered command log still materializes the reviewed
+// row changes, then applies those exact changes. The log resolves handler code
+// and table objects; the stored changes and their anchors remain authoritative.
 //
-// ATOMIC PUBLISH: `publish` adopts the `applyCommands` outer-tx seam
-// to wrap command-log replay + derived-state sweep in ONE transaction.
+// ATOMIC PUBLISH wraps verification + canonical changes + derived-state sweep
+// in ONE transaction.
 // This eliminates the crash window that previously existed between "canonical
 // committed" and "derived state cleared" — if either step fails, both roll back. The
 // draft stays live and publish is retryable. This is the wystack-internal adoption
 // of the primitive; an application's draft controller adopts separately
 // (the durable-log delete is the analogous bookkeeping step there).
 
-import type { DrizzleTracker } from '@wystack/db'
+import { createDrizzleTracker, type DrizzleTracker, type SelectBuilder } from '@wystack/db'
 import { isPrincipal } from '@wystack/identity'
+import { sql } from 'drizzle-orm'
+import type { CommandResult, CommitResult } from './apply-commands'
 import {
-  applyCommandsWithAuthorizedTx,
-  type CommandResult,
-  type CommitResult,
-} from './apply-commands'
-import { compactLog, snapshotCommand, snapshotJsonValue } from './draft-command-log'
+  compactLog,
+  snapshotCommand,
+  snapshotJsonValue,
+  type DraftCommand,
+} from './draft-command-log'
 export { compactLog } from './draft-command-log'
 export type { DraftCommand, ResolveHook } from './draft-command-log'
 import {
   type ConflictReport,
   type DraftAuthorizationRequest,
+  type DraftGraphReadBuilder,
+  type DraftGraphReadTracker,
   type DraftLifecycle,
   type DraftLifecycleOptions,
   type GlobalDraftAuthorizationRequest,
 } from './draft-lifecycle-types'
-export { DraftConflictError, DraftIntegrityError } from './draft-lifecycle-types'
+export {
+  DraftConflictError,
+  DraftIntegrityError,
+  DraftPublishDriftError,
+} from './draft-lifecycle-types'
 export type * from './draft-lifecycle-types'
 import type { WyStackApp } from './create'
 import {
@@ -68,18 +72,18 @@ import {
   type StoredDraft,
 } from './draft-store'
 import {
+  applyReviewedChanges,
   assertDraftRowsUnchanged,
+  assertReplayMatchesReviewedChanges,
   assertStoredDescriptorsCurrent,
   clearDerivedChanges,
   describeTouchedTables,
   enumerateTouchedCells,
   inspectDraftRows,
-  recordCanonicalTouchedTables,
   recordTouchedTables,
 } from './draft-review-state'
 
-// oxlint-disable-next-line typescript/no-explicit-any -- polymorphic Drizzle table metadata
-type AnyTable = any
+type AnyTable = Parameters<DrizzleTracker['from']>[0]
 
 const retryableTransactionCodes = new Set(['40P01', '40001'])
 const maxTransactionAttempts = 3
@@ -96,6 +100,12 @@ function transactionErrorCode(error: unknown): string | undefined {
   return undefined
 }
 
+async function lockDraftForPublication(raw: DrizzleTracker['raw'], draftId: string): Promise<void> {
+  await raw.execute(sql`
+    SELECT pg_advisory_xact_lock(hashtext('wystack publish'), hashtext(${draftId}))
+  `)
+}
+
 let draftCounter = 0
 function mintDraftId(): string {
   // Monotonic + random suffix: unique within a process without a uuid dep.
@@ -110,12 +120,59 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
 function stableJson(value: unknown): string {
   if (value === undefined) return 'undefined'
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (value instanceof Date) return `date:${JSON.stringify(value.toJSON())}`
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
   const record = value as Record<string, unknown>
   return `{${Object.keys(record)
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
     .join(',')}}`
+}
+
+type ValidationReadBuilder = {
+  select(...columns: string[]): ValidationReadBuilder
+  where(filters: Parameters<DraftGraphReadBuilder<AnyTable>['where']>[0]): ValidationReadBuilder
+  orderBy(column: string, direction?: 'asc' | 'desc'): ValidationReadBuilder
+  limit(count: number): ValidationReadBuilder
+  all(): Promise<unknown[]>
+  first(): Promise<unknown | null>
+  toSql(limitOverride?: number): ReturnType<DraftGraphReadBuilder<AnyTable>['toSql']>
+}
+type ValidationRow<TTable extends AnyTable> = Awaited<
+  ReturnType<SelectBuilder<TTable>['all']>
+>[number]
+
+/**
+ * Narrow a transaction-bound tracker to an object-capability that can only
+ * build reads. Wrapping each returned builder matters: omitting `into()` from
+ * the tracker alone would still leave `from(table).update()` available at
+ * runtime to JavaScript callers or code using a cast.
+ */
+function graphReadTracker(
+  db: DrizzleTracker | ReturnType<DrizzleTracker['withDraft']>,
+): DraftGraphReadTracker {
+  function wrapBuilder<TTable extends AnyTable, TRow = ValidationRow<TTable>>(
+    builder: ValidationReadBuilder,
+  ): DraftGraphReadBuilder<TTable, TRow> {
+    const readBuilder: DraftGraphReadBuilder<TTable, TRow> = {
+      select<K extends keyof ValidationRow<TTable> & string>(...columns: [K, ...K[]]) {
+        return wrapBuilder<TTable, Pick<ValidationRow<TTable>, K>>(builder.select(...columns))
+      },
+      where: (filters) => wrapBuilder<TTable, TRow>(builder.where(filters)),
+      orderBy: (column, direction) => wrapBuilder<TTable, TRow>(builder.orderBy(column, direction)),
+      limit: (count) => wrapBuilder<TTable, TRow>(builder.limit(count)),
+      all: () => builder.all() as Promise<TRow[]>,
+      first: () => builder.first() as Promise<TRow | null>,
+      toSql: (limitOverride) => builder.toSql(limitOverride),
+    }
+    return Object.freeze(readBuilder)
+  }
+
+  const readTracker: DraftGraphReadTracker = {
+    from: <TTable extends AnyTable>(table: TTable) =>
+      wrapBuilder<TTable>(db.from(table) as unknown as ValidationReadBuilder),
+  }
+  return Object.freeze(readTracker)
 }
 
 function defaultOwnerKey(context: Record<string, unknown>): unknown {
@@ -156,6 +213,23 @@ export function createDraftLifecycle(
       })
     }
     return storageInitialization
+  }
+
+  function assertDraftCommandIsInternal(command: DraftCommand): void {
+    if (app.functions.get(command.path)?.type === 'action') {
+      throw new Error(`Draft command ${command.path} cannot reference an action`)
+    }
+  }
+
+  async function runDraftCommand(
+    command: DraftCommand,
+    db: Parameters<WyStackApp['system']['runHandler']>[2],
+    context: Record<string, unknown>,
+  ): Promise<unknown> {
+    // The registry is mutable. Check immediately before dispatch so an earlier
+    // command cannot replace a later path with an Action during this batch.
+    assertDraftCommandIsInternal(command)
+    return app.system.runHandler(command.path, command.args, db, context)
   }
 
   async function ownerKey(context: Record<string, unknown>): Promise<unknown | undefined> {
@@ -320,10 +394,7 @@ export function createDraftLifecycle(
       await storageReady()
       const context = operationOpts.context ?? {}
       for (const command of commands) {
-        const definition = app.functions.get(command.path)
-        if (definition?.type === 'action') {
-          throw new Error(`Draft command ${command.path} cannot reference an action`)
-        }
+        assertDraftCommandIsInternal(command)
       }
       const authorizationTracker = app.system.createTracked()
       const authorized = await requireStored(authorizationTracker.raw, draftId)
@@ -342,16 +413,7 @@ export function createDraftLifecycle(
             const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
             const attemptResults: CommandResult[] = []
             for (const snapshot of commands) {
-              const definition = app.functions.get(snapshot.path)
-              if (definition?.type === 'action') {
-                throw new Error(`Draft command ${snapshot.path} cannot reference an action`)
-              }
-              const value = await app.system.runHandler(
-                snapshot.path,
-                snapshot.args,
-                draftDb,
-                context,
-              )
+              const value = await runDraftCommand(snapshot, draftDb, context)
               attemptResults.push({ id: snapshot.id, value })
             }
 
@@ -397,9 +459,16 @@ export function createDraftLifecycle(
       const boundLog = resolve
         ? (await resolve([...snapshotLog])).map((command) => snapshotCommand(command))
         : [...snapshotLog]
+      for (const command of boundLog) {
+        assertDraftCommandIsInternal(command)
+      }
 
       let draftWrites = new Set<string>()
       const result = await runReplayableTransaction(async (tx) => {
+        // Only publishers share this mutex. Append remains free to advance the
+        // draft while graph validation runs, and the final revision CAS then
+        // rejects this stale attempt without making a host callback hold locks.
+        await lockDraftForPublication(tx.raw, draftId)
         const current = await requireStored(tx.raw, draftId)
         assertAuthorizedSnapshot(current, snapshot)
         const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
@@ -412,20 +481,33 @@ export function createDraftLifecycle(
         await validateGraph?.({
           phase: 'effective',
           draftId,
-          db: scopedTx.withDraft(draftId),
+          db: graphReadTracker(scopedTx.withDraft(draftId)),
           context,
         })
+        const replayDraftId = `${draftId}:publish:${mintDraftId()}`
         const liveTables = new Map<string, AnyTable>()
-        const committed = (await applyCommandsWithAuthorizedTx(app, boundLog, {
-          mode: 'commit',
-          context,
-          tx: recordCanonicalTouchedTables(scopedTx, liveTables),
-        })) as CommitResult
+        const replayDb = recordTouchedTables(scopedTx.withDraft(replayDraftId), liveTables)
+        const results: CommandResult[] = []
+        for (const command of boundLog) {
+          const value = await runDraftCommand(command, replayDb, context)
+          results.push({ id: command.id, value })
+        }
         await assertStoredDescriptorsCurrent(tx.raw, draftId, touched, liveTables)
+        await assertReplayMatchesReviewedChanges(tx.raw, draftId, replayDraftId)
+        await clearDerivedChanges(tx.raw, replayDraftId)
+
+        const canonicalTx = scopeFromAuthorizedSnapshot(createDrizzleTracker(tx.raw), snapshot)
+        await applyReviewedChanges(canonicalTx, draftId, liveTables)
+        const committed: CommitResult = {
+          mode: 'commit',
+          commands: boundLog,
+          results,
+          tablesWritten: new Set(canonicalTx.tablesWritten),
+        }
         await validateGraph?.({
           phase: 'published',
           draftId,
-          db: scopedTx,
+          db: graphReadTracker(canonicalTx),
           context,
         })
         await clearDerivedChanges(tx.raw, draftId)
@@ -505,6 +587,15 @@ export function createDraftLifecycle(
           throw new Error(`draft lifecycle: draft "${draftId}" has unresolved rebase conflicts`)
         }
       }
+      // Reconfirm after every host callback, before opening the transaction.
+      // Once replay starts, its row locks and the stored-draft revision CAS are
+      // the database-local guard; no external probe runs while those locks are held.
+      const confirmedVersion = await versionProbe.current()
+      if (!sameJsonValue(confirmedVersion, currentVersion)) {
+        throw new Error(
+          `draft lifecycle: canonical version changed during rebase; retry "${draftId}"`,
+        )
+      }
       await runReplayableTransaction(async (tx) => {
         const stored = await requireStored(tx.raw, draftId)
         assertAuthorizedSnapshot(stored, snapshot)
@@ -518,7 +609,7 @@ export function createDraftLifecycle(
         const touchedTables = new Map<string, AnyTable>()
         const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
         for (const command of log) {
-          await app.system.runHandler(command.path, command.args, draftDb, context)
+          await runDraftCommand(command, draftDb, context)
         }
         const rebuiltTouched = describeTouchedTables(
           touchedTables,
@@ -531,15 +622,9 @@ export function createDraftLifecycle(
         await validateGraph?.({
           phase: 'effective',
           draftId,
-          db: draftDb,
+          db: graphReadTracker(draftDb),
           context,
         })
-        const confirmedVersion = await versionProbe.current()
-        if (!sameJsonValue(confirmedVersion, currentVersion)) {
-          throw new Error(
-            `draft lifecycle: canonical version changed during rebase; retry draft "${draftId}"`,
-          )
-        }
         await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
         emitted = new Set([
           ...previousTouched.flatMap((table) =>

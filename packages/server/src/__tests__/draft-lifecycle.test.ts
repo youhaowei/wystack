@@ -7,9 +7,8 @@
  *   1. append routes UNMODIFIED command handlers' writes into the draft overlay
  *      (the canonical table is untouched until publish).
  *   2. reads inside the draft see `canonical ⊕ draft`.
- *   3. PUBLISH = REPLAY THE COMMAND LOG (not a row-delta) via applyCommands —
- *      proven by a command whose effect is NOT reconstructible from the rows it
- *      wrote (intent grouping).
+ *   3. publish verifies replay against reviewed changes, then applies those
+ *      exact changes instead of re-evaluating intent against newer state.
  *   4. detectConflict is artifact-agnostic — it speaks (table,id,version) only,
  *      driven by an app-injected VersionProbe; it makes NO policy decision.
  *   5. the resolve(log) hook binds late-bound operands immediately before commit.
@@ -30,6 +29,7 @@ import {
   eq,
   draftInvalidationIdentity,
   ensureRowRevisionStorage,
+  jsonNull,
   multiTenant,
 } from '@wystack/db'
 import { registerTableCapabilities } from '../../../db/src/schema'
@@ -37,6 +37,7 @@ import {
   createDraftLifecycle as createProductionDraftLifecycle,
   DraftConflictError,
   DraftIntegrityError,
+  DraftPublishDriftError,
   type VersionProbe,
   type Cell,
   type Command,
@@ -66,6 +67,27 @@ const schema = defineSchema({
   // A "dashboard" with a jsonb-ish text column holding a comma-joined id list —
   // stands in for the intent-grouping case (add_to_dashboard merges into a node).
   dashboards: table({ id: int.primaryKey(), items: text }).draftable(),
+  documents: table({
+    id: int.primaryKey(),
+    payload: jsonb.nullable(),
+  }).draftable(),
+  aCodeParents: table({ id: int.primaryKey(), code: text.unique() }).draftable(),
+  zCodeChildren: table({
+    id: int.primaryKey(),
+    parentCode: text.references('aCodeParents', 'code'),
+  }).draftable(),
+  // Names intentionally sort child before parent; publish must follow the FK.
+  aChildren: table({ id: int.primaryKey(), parentId: int.references('zParents') }).draftable(),
+  zParents: table({ id: int.primaryKey(), name: text }).draftable(),
+  treeNodes: table({
+    id: int.primaryKey(),
+    parentId: int.nullable().references('treeNodes'),
+  }).draftable(),
+  aTimedChildren: table({
+    id: int.primaryKey(),
+    parentToken: timestamp.references('zTimedParents', 'token'),
+  }).draftable(),
+  zTimedParents: table({ id: int.primaryKey(), token: timestamp.unique() }).draftable(),
 })
 const appAccounts = pgSchema('app').table('accounts', {
   id: integer('id').primaryKey(),
@@ -110,6 +132,26 @@ beforeEach(async () => {
     `CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )
   await db.execute(`CREATE TABLE dashboards (id INTEGER PRIMARY KEY, items TEXT NOT NULL)`)
+  await db.execute(`CREATE TABLE documents (id INTEGER PRIMARY KEY, payload JSONB)`)
+  await db.execute(
+    `CREATE TABLE "aCodeParents" (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE)`,
+  )
+  await db.execute(
+    `CREATE TABLE "zCodeChildren" (id INTEGER PRIMARY KEY, "parentCode" TEXT NOT NULL REFERENCES "aCodeParents"(code))`,
+  )
+  await db.execute(`CREATE TABLE "zParents" (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+  await db.execute(
+    `CREATE TABLE "aChildren" (id INTEGER PRIMARY KEY, "parentId" INTEGER NOT NULL REFERENCES "zParents"(id))`,
+  )
+  await db.execute(
+    `CREATE TABLE "treeNodes" (id INTEGER PRIMARY KEY, "parentId" INTEGER REFERENCES "treeNodes"(id))`,
+  )
+  await db.execute(
+    `CREATE TABLE "zTimedParents" (id INTEGER PRIMARY KEY, token TIMESTAMP NOT NULL UNIQUE)`,
+  )
+  await db.execute(
+    `CREATE TABLE "aTimedChildren" (id INTEGER PRIMARY KEY, "parentToken" TIMESTAMP NOT NULL REFERENCES "zTimedParents"(token))`,
+  )
   await db.execute(
     `CREATE TABLE "versionedTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, revision INTEGER NOT NULL)`,
   )
@@ -121,6 +163,12 @@ beforeEach(async () => {
   await ensureRowRevisionStorage(db)
   await db.execute(`INSERT INTO todos (id,title,done) VALUES (1,'apple',false),(2,'banana',false)`)
   await db.execute(`INSERT INTO dashboards (id,items) VALUES (1,'a')`)
+  await db.execute(`INSERT INTO documents (id,payload) VALUES (1,'{}'::jsonb)`)
+  await db.execute(`INSERT INTO "aCodeParents" (id,code) VALUES (1,'old'),(2,'stable')`)
+  await db.execute(`INSERT INTO "zCodeChildren" (id,"parentCode") VALUES (1,'old')`)
+  await db.execute(`INSERT INTO "zParents" (id,name) VALUES (10,'existing')`)
+  await db.execute(`INSERT INTO "aChildren" (id,"parentId") VALUES (11,10)`)
+  await db.execute(`INSERT INTO "treeNodes" (id,"parentId") VALUES (10,NULL),(11,10)`)
   await db.execute(`INSERT INTO "versionedTodos" (id,title,revision) VALUES (1,'apple',1)`)
   await db.execute(
     `INSERT INTO "replaceableTodos" (id,title,note) VALUES (1,'original','old note')`,
@@ -202,6 +250,73 @@ beforeEach(async () => {
         .mutation(async (ctx, args) =>
           ctx.db.from(schema.todos).where(eq('id', args.id)).update({ title: args.title }),
         ),
+      finishOpenTodos: wy.procedure
+        .input({})
+        .mutation(async (ctx) =>
+          ctx.db.from(schema.todos).where(eq('done', false)).update({ done: true }),
+        ),
+      setDocumentPayload: wy.procedure
+        .input({ id: int, payload: jsonb })
+        .mutation(async (ctx, args) =>
+          ctx.db
+            .from(schema.documents)
+            .where(eq('id', args.id))
+            .update({
+              payload: args.payload === null ? jsonNull() : args.payload,
+            }),
+        ),
+      retargetAndRenameCode: wy.procedure
+        .input({ childId: int, parentId: int, nextParentCode: text, nextCode: text })
+        .mutation(async (ctx, args) => {
+          await ctx.db
+            .from(schema.aCodeParents)
+            .where(eq('id', args.parentId))
+            .update({ code: args.nextCode })
+          return ctx.db
+            .from(schema.zCodeChildren)
+            .where(eq('id', args.childId))
+            .update({ parentCode: args.nextParentCode })
+        }),
+      replaceCodeFamily: wy.procedure
+        .input({ childId: int, parentId: int, code: text })
+        .mutation(async (ctx, args) => {
+          await ctx.db.from(schema.zCodeChildren).where(eq('id', args.childId)).delete()
+          await ctx.db.from(schema.aCodeParents).where(eq('id', args.parentId)).delete()
+          await ctx.db.into(schema.aCodeParents).insert({ id: args.parentId, code: args.code })
+          return ctx.db
+            .into(schema.zCodeChildren)
+            .insert({ id: args.childId, parentCode: args.code })
+        }),
+      addFamily: wy.procedure.input({ parentId: int, childId: int }).mutation(async (ctx, args) => {
+        await ctx.db.into(schema.zParents).insert({ id: args.parentId, name: 'parent' })
+        return ctx.db.into(schema.aChildren).insert({ id: args.childId, parentId: args.parentId })
+      }),
+      removeFamily: wy.procedure
+        .input({ parentId: int, childId: int })
+        .mutation(async (ctx, args) => {
+          await ctx.db.from(schema.aChildren).where(eq('id', args.childId)).delete()
+          return ctx.db.from(schema.zParents).where(eq('id', args.parentId)).delete()
+        }),
+      addTreePair: wy.procedure
+        .input({ parentId: int, childId: int })
+        .mutation(async (ctx, args) => {
+          await ctx.db.into(schema.treeNodes).insert({ id: args.parentId, parentId: null })
+          return ctx.db.into(schema.treeNodes).insert({ id: args.childId, parentId: args.parentId })
+        }),
+      removeTreePair: wy.procedure
+        .input({ parentId: int, childId: int })
+        .mutation(async (ctx, args) => {
+          await ctx.db.from(schema.treeNodes).where(eq('id', args.childId)).delete()
+          return ctx.db.from(schema.treeNodes).where(eq('id', args.parentId)).delete()
+        }),
+      addTimedFamily: wy.procedure
+        .input({ parentId: int, childId: int, token: timestamp })
+        .mutation(async (ctx, args) => {
+          await ctx.db.into(schema.zTimedParents).insert({ id: args.parentId, token: args.token })
+          return ctx.db
+            .into(schema.aTimedChildren)
+            .insert({ id: args.childId, parentToken: args.token })
+        }),
       renameVersionedTodo: wy.procedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
@@ -220,10 +335,9 @@ beforeEach(async () => {
         .mutation(async (ctx, args) =>
           ctx.db.from(auditAccounts).where(eq('id', args.id)).update({ name: args.name }),
         ),
-      // INTENT-GROUPING handler: appends an item id to a dashboard's `items`
-      // list. The EFFECT (read-modify-write of a merged list) cannot be
-      // reconstructed from a row-delta — only replaying THIS command reproduces
-      // it. This is the proof that publish replays the LOG, not a row snapshot.
+      // A read-modify-write command makes drift observable: replay on a newer
+      // list produces a different proposal, so publish must preserve the draft
+      // and ask the application to resolve it.
       addToDashboard: wy.procedure
         .input({ dashboardId: int, item: text })
         .mutation(async (ctx, args) => {
@@ -254,7 +368,7 @@ function makeProbe(): VersionProbe & {
   let version = 0
   // `table\u0000id` -> the version at which canonical last wrote that cell
   const written = new Map<string, number>()
-  const key = (c: Cell) => `${c.table}\u0000${String(c.id)}`
+  const key = (c: Cell) => `${c.table}\u0000${String(c.tenantId)}\u0000${String(c.id)}`
   return {
     bump(cells) {
       version += 1
@@ -536,7 +650,42 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     ).rejects.toThrow('canonical version changed during rebase')
 
     expect(await lifecycle.getLog(draftId)).toHaveLength(1)
-    await expect(lifecycle.detectConflict(draftId)).resolves.toMatchObject({ staleBase: true })
+    await expect(lifecycle.detectConflict(draftId)).resolves.toMatchObject({
+      staleBase: true,
+    })
+  })
+
+  test('rebase distinguishes Date version tokens changed by conflict acceptance', async () => {
+    let current = new Date('2026-01-01T00:00:00.000Z')
+    const probe: VersionProbe = {
+      async current() {
+        return new Date(current)
+      },
+      isNewerThan(candidate, base) {
+        return (
+          new Date(candidate as string | number | Date).getTime() >
+          new Date(base as string | number | Date).getTime()
+        )
+      },
+      async cellsWrittenSince(_base, cells) {
+        return cells
+      },
+    }
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft-title' } }])
+    current = new Date('2026-01-01T00:00:01.000Z')
+
+    await expect(
+      lifecycle.rebase(draftId, {
+        acceptConflicts: () => {
+          current = new Date('2026-01-01T00:00:02.000Z')
+          return true
+        },
+      }),
+    ).rejects.toThrow('canonical version changed during rebase')
+
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
   })
 
   /** Persisted varchar(n) identities cast back to their canonical row during publish. */
@@ -639,7 +788,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     expect(byId[3]['title']).toBe('cherry')
   })
 
-  test('publish replays the log onto canonical atomically; overlay is torn down', async () => {
+  test('publish verifies intent and applies reviewed changes atomically', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     await lc.append(draftId, [
@@ -667,9 +816,9 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
   })
 
   test('atomic publish: derived-change sweep failure rolls back the canonical commit', async () => {
-    // Replay + derived sweep share ONE transaction. If the sweep fails
+    // Verification, reviewed writes, and the derived sweep share ONE transaction. If the sweep fails
     // (e.g. the central table is missing), the outer tx rolls back BOTH the
-    // canonical command replay AND the sweep — no "canonical committed but
+    // canonical reviewed changes AND the sweep — no "canonical committed but
     // derived changes still present" state. The draft stays live and publish is retryable.
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -681,7 +830,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     // publish must THROW (the outer tx rolled back), NOT silently succeed.
     await expect(lc.publish(draftId)).rejects.toThrow()
 
-    // Canonical MUST NOT have the row — the replay rolled back with the sweep.
+    // Canonical MUST NOT have the row — the reviewed write rolled back with the sweep.
     // Check both the count (fixture rows only) and that id=3 is absent.
     const { result: canonical } = await app.call('listTodos', {})
     expect(canonical as unknown[]).toHaveLength(2)
@@ -691,16 +840,9 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     expect(await lc.getLog(draftId)).toHaveLength(1)
   })
 
-  test('atomic publish: replay + sweep commit together — no crash window between them', async () => {
-    // Definition of done: exactly-once publish. Prove that replay and derived-change sweep
-    // are inseparable — if a failure occurs mid-transaction, canonical has ZERO
-    // replayed rows AND the derived changes are untouched. This models the crash-window
-    // scenario: any code that ran between a separate replay-tx and a separate
-    // sweep-tx would leave canonical committed but derived changes present.
-    //
-    // We simulate this by injecting a failure AFTER applyCommands but before
-    // the derived sweep — possible in the OLD two-tx design but not in the atomic
-    // one. With the outer-tx approach the only observable states are:
+  test('atomic publish: reviewed changes and sweep commit together', async () => {
+    // Exactly-once publish requires canonical changes and the derived sweep to
+    // be inseparable. With one outer transaction, the only observable states are:
     //   - tx committed → canonical has the row AND derived changes are swept
     //   - tx rolled back → canonical is clean AND derived changes remain
     // The "canonical committed but derived changes not swept" state cannot occur.
@@ -717,7 +859,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     expect(result.mode).toBe('commit')
     expect(result.tablesWritten.has('todos')).toBe(true)
 
-    // Canonical reflects the replay.
+    // Canonical reflects the reviewed change.
     const { result: canonical } = await app.call('listTodos', {})
     const byId = Object.fromEntries((canonical as { id: number }[]).map((r) => [r.id, r]))
     expect(byId[3]).toBeDefined()
@@ -729,7 +871,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
     // oxlint-disable-next-line typescript/no-explicit-any
     expect((overlay as any).rows).toHaveLength(0)
 
-    // Registry entry removed post-commit — a second publish throws, not double-replays.
+    // Registry entry removed post-commit — a second publish cannot apply twice.
     await expect(lc.publish(draftId)).rejects.toThrow('unknown draft')
   })
 
@@ -763,8 +905,8 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
   })
 })
 
-describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
-  test('an intent-grouping command (add_to_dashboard) reconstructs ONLY via replay', async () => {
+describe('draft lifecycle — reviewed changes are the publication authority', () => {
+  test('a newer read-modify-write result is reported as drift and preserves the draft', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
 
@@ -776,36 +918,236 @@ describe('draft lifecycle — publish REPLAYS THE LOG, not a row-delta', () => {
       { path: 'addToDashboard', args: { dashboardId: 1, item: 'y' } },
     ])
 
-    // CANONICAL ADVANCES OUT-OF-BAND before publish: a concurrent writer appends
-    // 'z' to the same dashboard. This is the discriminator — it makes the two
-    // publish strategies produce DIFFERENT results:
-    //   - LOG REPLAY: re-runs the commands' read-modify-write against the NEW
-    //     canonical 'a,z' → 'a,z,x' → 'a,z,x,y'.
-    //   - row-delta: would write the overlay's stale 'a,x,y' (the merges it
-    //     captured at append time), CLOBBERING the concurrent 'z'.
-    // Asserting 'a,z,x,y' is satisfiable ONLY by log replay.
+    // A concurrent writer changes the command's input after review. Publish
+    // must not silently replace the reviewed result with a new merge.
     await db.execute(`UPDATE dashboards SET items = 'a,z' WHERE id = 1`)
 
-    // The log is the publish unit — both commands present, in order.
+    // The ordered intent remains available for application review and repair.
     expect((await lc.getLog(draftId)).map((c) => c.path)).toEqual([
       'addToDashboard',
       'addToDashboard',
     ])
 
-    await lc.publish(draftId)
+    await expect(lc.publish(draftId)).rejects.toMatchObject({
+      differences: [{ table: 'dashboards', id: 1, reason: 'value' }],
+    })
 
     const res = await db.execute(`SELECT items FROM dashboards WHERE id = 1`)
     // oxlint-disable-next-line typescript/no-explicit-any
     const items = (res as any).rows[0].items as string
-    expect(items).toBe('a,z,x,y')
+    expect(items).toBe('a,z')
+    expect(await lc.getLog(draftId)).toHaveLength(2)
+  })
+
+  test('a changed reviewed field anchor is reported even when the proposal is unchanged', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameTodo', args: { id: 1, title: 'reviewed title' } },
+    ])
+
+    await db.execute(`UPDATE todos SET title = 'external title' WHERE id = 1`)
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      differences: [{ table: 'todos', id: 1, reason: 'anchor' }],
+    })
+    const { result } = await app.call('listTodos', {})
+    expect((result as { id: number; title: string }[]).find((row) => row.id === 1)?.title).toBe(
+      'external title',
+    )
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('a changed unrevisioned row is not deleted behind the reviewer', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'removeTodo', args: { id: 1 } }])
+
+    await db.execute(`UPDATE todos SET title = 'external title' WHERE id = 1`)
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      differences: [{ table: 'todos', id: 1, reason: 'anchor' }],
+    })
+    const { result } = await app.call('listTodos', {})
+    expect(result).toContainEqual({ id: 1, title: 'external title', done: false })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('a predicate phantom is reported instead of changing an unreviewed row', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'finishOpenTodos', args: {} }])
+
+    await app.call('addTodo', { id: 3, title: 'new canonical row' })
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      differences: [{ table: 'todos', id: 3, reason: 'target' }],
+    })
+    const { result } = await app.call('listTodos', {})
+    expect((result as { id: number; done: boolean }[]).find((row) => row.id === 3)?.done).toBe(
+      false,
+    )
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('a changed read dependency cannot alter the reviewed write output', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodoUsingSetting', args: { id: 3 } }])
+
+    await db.execute(`UPDATE settings SET prefix = 'new-setting' WHERE id = 1`)
+
+    await expect(lifecycle.publish(draftId)).rejects.toBeInstanceOf(DraftPublishDriftError)
+    const { result } = await app.call('listTodos', {})
+    expect((result as { id: number }[]).some((row) => row.id === 3)).toBe(false)
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
+  test('publishes a reviewed JSON null without converting it to SQL NULL', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'setDocumentPayload', args: { id: 1, payload: null } },
+    ])
+
+    await lifecycle.publish(draftId)
+
+    const result = await db.execute(
+      `SELECT payload IS NULL AS sql_null, payload = 'null'::jsonb AS json_null FROM documents WHERE id = 1`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((result as any).rows[0]).toEqual({
+      sql_null: false,
+      json_null: true,
+    })
+  })
+
+  test('orders parent and child changes for immediate foreign keys', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const insertDraft = await lifecycle.open(0)
+    await lifecycle.append(insertDraft, [
+      { path: 'addFamily', args: { parentId: 20, childId: 21 } },
+    ])
+
+    expect((await lifecycle.inspect(insertDraft)).map((row) => row.table)).toEqual([
+      'aChildren',
+      'zParents',
+    ])
+    await lifecycle.publish(insertDraft)
+    const inserted = await db.execute(
+      `SELECT c.id FROM "aChildren" c JOIN "zParents" p ON p.id = c."parentId" WHERE c.id = 21`,
+    )
+    expect((inserted as { rows: unknown[] }).rows).toHaveLength(1)
+
+    const deleteDraft = await lifecycle.open(0)
+    await lifecycle.append(deleteDraft, [
+      { path: 'removeFamily', args: { parentId: 10, childId: 11 } },
+    ])
+    await lifecycle.publish(deleteDraft)
+    const removed = await db.execute(
+      `SELECT (SELECT count(*) FROM "zParents" WHERE id = 10) AS parents,
+              (SELECT count(*) FROM "aChildren" WHERE id = 11) AS children`,
+    )
+    expect((removed as { rows: unknown[] }).rows[0]).toEqual({ parents: 0, children: 0 })
+  })
+
+  test('releases an old unique-key reference before updating its parent', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'retargetAndRenameCode',
+        args: {
+          childId: 1,
+          parentId: 1,
+          nextParentCode: 'stable',
+          nextCode: 'renamed',
+        },
+      },
+    ])
+
+    expect((await lifecycle.inspect(draftId)).map((row) => row.table)).toEqual([
+      'aCodeParents',
+      'zCodeChildren',
+    ])
+    await lifecycle.publish(draftId)
+
+    const result = await db.execute(
+      `SELECT p.code, c."parentCode" AS parent_code
+       FROM "aCodeParents" p CROSS JOIN "zCodeChildren" c
+       WHERE p.id = 1 AND c.id = 1`,
+    )
+    expect((result as { rows: unknown[] }).rows[0]).toEqual({
+      code: 'renamed',
+      parent_code: 'stable',
+    })
+  })
+
+  test('phases parent and child replacements around immediate foreign keys', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'replaceCodeFamily', args: { parentId: 1, childId: 1, code: 'old' } },
+    ])
+
+    expect((await lifecycle.inspect(draftId)).map((row) => row.operation)).toEqual([
+      'insert',
+      'insert',
+    ])
+    await lifecycle.publish(draftId)
+
+    const result = await db.execute(
+      `SELECT c.id FROM "zCodeChildren" c
+       JOIN "aCodeParents" p ON p.code = c."parentCode" WHERE c.id = 1`,
+    )
+    expect((result as { rows: unknown[] }).rows).toHaveLength(1)
+  })
+
+  test('orders self-referencing rows rather than relying on table order', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const insertDraft = await lifecycle.open(0)
+    await lifecycle.append(insertDraft, [
+      { path: 'addTreePair', args: { parentId: 21, childId: 20 } },
+    ])
+
+    expect((await lifecycle.inspect(insertDraft)).map((row) => row.rowKey)).toEqual([
+      { type: 'integer', value: 20 },
+      { type: 'integer', value: 21 },
+    ])
+    await lifecycle.publish(insertDraft)
+
+    const deleteDraft = await lifecycle.open(0)
+    await lifecycle.append(deleteDraft, [
+      { path: 'removeTreePair', args: { parentId: 10, childId: 11 } },
+    ])
+    await lifecycle.publish(deleteDraft)
+    const remaining = await db.execute(`SELECT id FROM "treeNodes" WHERE id IN (10, 11)`)
+    expect((remaining as { rows: unknown[] }).rows).toEqual([])
+  })
+
+  test('matches timestamp foreign keys by their canonical instant', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const token = new Date('2026-08-28T12:34:56.789Z')
+    await lifecycle.append(draftId, [
+      { path: 'addTimedFamily', args: { parentId: 1, childId: 2, token } },
+    ])
+
+    await lifecycle.publish(draftId)
+
+    const joined = await db.execute(
+      `SELECT c.id FROM "aTimedChildren" c
+       JOIN "zTimedParents" p ON p.token = c."parentToken" WHERE c.id = 2`,
+    )
+    expect((joined as { rows: unknown[] }).rows).toHaveLength(1)
   })
 
   test('a mid-log failure at publish rolls the whole batch back (atomic)', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
-    // Publish-time resolve injects a command that violates the NOT NULL title —
-    // proving the replay is one atomic applyCommands(commit).
+    // Publish-time resolve injects a command that violates the NOT NULL title.
+    // The failed verification replay rolls back before canonical apply.
     await expect(
       lc.publish(draftId, (logToBind) => [
         ...logToBind,
@@ -1046,7 +1388,10 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       .all()
     expect(effective).toEqual([{ id: 1, title: 'draft replacement', revision: 2 }])
 
-    await app.call('addVersionedTodo', { id: 1, title: 'concurrent replacement' })
+    await app.call('addVersionedTodo', {
+      id: 1,
+      title: 'concurrent replacement',
+    })
     await app.call('removeVersionedTodo', { id: 1 })
     await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
       conflicts: [{ table: 'versionedTodos', id: 1, reason: 'revision' }],
@@ -1084,27 +1429,59 @@ describe('draft lifecycle — row-local revision conflicts', () => {
       'apple',
     )
   })
+
+  test('graph validators receive a read-only database capability', async () => {
+    const phases: string[] = []
+    const lifecycle = createDraftLifecycle(app, {
+      async validateGraph({ phase, db: validationDb }) {
+        phases.push(phase)
+        expect(await validationDb.from(schema.todos).where(eq('id', 1)).first()).not.toBeNull()
+
+        const tracker = validationDb as unknown as Record<string, unknown>
+        expect(tracker['into']).toBeUndefined()
+        expect(tracker['raw']).toBeUndefined()
+        expect(tracker['transaction']).toBeUndefined()
+        expect(tracker['withDraft']).toBeUndefined()
+        expect(tracker['withTenant']).toBeUndefined()
+
+        const builder = validationDb.from(schema.todos) as unknown as Record<string, unknown>
+        expect(builder['update']).toBeUndefined()
+        expect(builder['delete']).toBeUndefined()
+      },
+    })
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'draft title' } }])
+
+    await lifecycle.publish(draftId)
+
+    expect(phases).toEqual(['effective', 'published'])
+    const { result } = await app.call('listTodos', {})
+    expect(result).toContainEqual(expect.objectContaining({ id: 1, title: 'draft title' }))
+  })
 })
 
-describe('draft lifecycle — resolve(log) binds late-bound operands pre-commit', () => {
-  test('the resolve hook rewrites the log immediately before commit', async () => {
+describe('draft lifecycle — resolve(log) cannot bypass reviewed changes', () => {
+  test('a resolved value that changes the reviewed result is reported as drift', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     // The appended command carries a PLACEHOLDER title; resolve binds it.
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: '<<late>>' } }])
 
     let sawLog: Command[] = []
-    await lc.publish(draftId, (logToBind) => {
-      sawLog = logToBind
-      return logToBind.map((c) =>
-        c.path === 'addTodo' ? { ...c, args: { ...(c.args as object), title: 'BOUND' } } : c,
-      )
-    })
+    await expect(
+      lc.publish(draftId, (logToBind) => {
+        sawLog = logToBind
+        return logToBind.map((c) =>
+          c.path === 'addTodo' ? { ...c, args: { ...(c.args as object), title: 'BOUND' } } : c,
+        )
+      }),
+    ).rejects.toBeInstanceOf(DraftPublishDriftError)
 
     expect(sawLog).toHaveLength(1) // hook saw the ordered log
     const res = await db.execute(`SELECT title FROM todos WHERE id = 3`)
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((res as any).rows[0].title).toBe('BOUND')
+    expect((res as any).rows).toHaveLength(0)
+    expect(await lc.getLog(draftId)).toHaveLength(1)
   })
 })
 
@@ -1278,7 +1655,10 @@ describe('draft lifecycle — a command that cannot be snapshotted', () => {
 
     const reopenedLifecycle = createDraftLifecycle(app)
     expect(await reopenedLifecycle.getLog(draftId)).toEqual([
-      { path: 'addTodoAt', args: { id: 3, createdAt: createdAt.toISOString() } },
+      {
+        path: 'addTodoAt',
+        args: { id: 3, createdAt: createdAt.toISOString() },
+      },
     ])
     await reopenedLifecycle.publish(draftId)
 
@@ -1372,6 +1752,46 @@ describe('draft lifecycle — command envelope ownership', () => {
     await expect(appending).rejects.toThrow('Draft command addTodo cannot reference an action')
     expect(await lc.getLog(draftId)).toEqual([])
   })
+
+  test('rechecks each publish command after an earlier handler swaps the registry', async () => {
+    const addTodo = app.functions.get('addTodo')
+    const renameTodo = app.functions.get('renameTodo')
+    const action = app.functions.get('externalAction')
+    if (!addTodo || addTodo.type !== 'mutation' || !renameTodo || !action) {
+      throw new Error('missing command definitions')
+    }
+    let addRuns = 0
+    let actionRuns = 0
+    app.functions.set('externalAction', {
+      ...action,
+      handler: async () => {
+        actionRuns += 1
+        return 'external'
+      },
+    })
+    app.functions.set('addTodo', {
+      ...addTodo,
+      handler: async (ctx, args) => {
+        addRuns += 1
+        const result = await addTodo.handler(ctx, args)
+        if (addRuns === 2) app.functions.set('renameTodo', app.functions.get('externalAction')!)
+        return result
+      },
+    })
+
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'addTodo', args: { id: 3, title: 'draft' } },
+      { path: 'renameTodo', args: { id: 1, title: 'reviewed' } },
+    ])
+
+    await expect(lifecycle.publish(draftId)).rejects.toThrow(
+      'Draft command renameTodo cannot reference an action',
+    )
+    expect(actionRuns).toBe(0)
+    expect(await lifecycle.getLog(draftId)).toHaveLength(2)
+  })
 })
 
 describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
@@ -1395,7 +1815,9 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
         handlerRuns += 1
         const result = await definition.handler(ctx, args)
         if (handlerRuns === 1) {
-          throw Object.assign(new Error('forced serialization rollback'), { code: '40001' })
+          throw Object.assign(new Error('forced serialization rollback'), {
+            code: '40001',
+          })
         }
         return result
       },
@@ -1522,7 +1944,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect((res as any).rows).toHaveLength(0)
   })
 
-  test('two concurrent publishes commit exactly once through row locking', async () => {
+  test('two concurrent publishes commit exactly once through the publication mutex', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addToDashboard', args: { dashboardId: 1, item: 'z' } }])
@@ -1545,7 +1967,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect((res as any).rows[0].items).toBe('a,z')
   })
 
-  test('a failed publish rolls back its row lock — append and discard work again', async () => {
+  test('a failed publish releases its publication mutex — append and discard work again', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])

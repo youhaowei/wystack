@@ -74,6 +74,8 @@ export type {
   GlobalDraftAuthorizationRequest,
   DraftOperationAction,
   DraftGraphValidationRequest,
+  DraftGraphReadBuilder,
+  DraftGraphReadTracker,
   DraftRowConflict,
   DraftInspectionRow,
   DraftInspectionValue,

@@ -1,10 +1,12 @@
-import type { DraftDrizzleTracker, DrizzleTracker } from '@wystack/db'
+import type { DrizzleTracker, FilterDescriptor, SelectBuilder } from '@wystack/db'
 import type { CommandResult, CommitResult } from './apply-commands'
 import type { DraftCommand, ResolveHook } from './draft-command-log'
 
 export interface Cell {
   table: string
   id: unknown
+  /** Present for tenant-isolated rows so equal primary keys remain distinct. */
+  tenantId?: unknown
 }
 
 /** Opaque canonical snapshot token whose ordering belongs to the application. */
@@ -47,6 +49,24 @@ export class DraftIntegrityError extends Error {
   }
 }
 
+export interface DraftPublishDrift {
+  table: string
+  id: unknown
+  tenantId?: unknown
+  reason: 'target' | 'value' | 'anchor'
+}
+
+/** The publish-time command result no longer matches the reviewed row changes. */
+export class DraftPublishDriftError extends Error {
+  readonly differences: DraftPublishDrift[]
+
+  constructor(draftId: string, differences: DraftPublishDrift[]) {
+    super(`draft lifecycle: draft "${draftId}" no longer matches its reviewed changes`)
+    this.name = 'DraftPublishDriftError'
+    this.differences = differences
+  }
+}
+
 export interface OpenOptions {
   context?: Record<string, unknown>
 }
@@ -72,17 +92,45 @@ export interface DraftLifecycleOptions {
    */
   authorizeGlobalDraft?: (request: GlobalDraftAuthorizationRequest) => boolean | Promise<boolean>
   /**
-   * Validate using the supplied transaction-bound database view. This hook must
-   * be side-effect-free: PostgreSQL deadlock/serialization recovery may replay
-   * the framework-owned lifecycle transaction that invokes it.
+   * Validate using the supplied transaction-bound read view. The view has no
+   * insert, update, delete, raw SQL, transaction, draft, or tenant-rebinding
+   * escape hatch. PostgreSQL deadlock/serialization recovery may replay the
+   * framework-owned lifecycle transaction that invokes this hook, so the hook
+   * itself must also avoid side effects outside the supplied view.
    */
   validateGraph?: (request: DraftGraphValidationRequest) => void | Promise<void>
+}
+
+type DraftGraphTable = Parameters<DrizzleTracker['from']>[0]
+type DraftGraphRow<TTable extends DraftGraphTable> = Awaited<
+  ReturnType<SelectBuilder<TTable>['all']>
+>[number]
+
+/** A query builder that can inspect rows but cannot mutate them. */
+export interface DraftGraphReadBuilder<
+  TTable extends DraftGraphTable,
+  TRow = DraftGraphRow<TTable>,
+> {
+  select<K extends keyof DraftGraphRow<TTable> & string>(
+    ...columns: [K, ...K[]]
+  ): DraftGraphReadBuilder<TTable, Pick<DraftGraphRow<TTable>, K>>
+  where(filters: FilterDescriptor | FilterDescriptor[]): DraftGraphReadBuilder<TTable, TRow>
+  orderBy(column: string, direction?: 'asc' | 'desc'): DraftGraphReadBuilder<TTable, TRow>
+  limit(count: number): DraftGraphReadBuilder<TTable, TRow>
+  all(): Promise<TRow[]>
+  first(): Promise<TRow | null>
+  toSql(limitOverride?: number): ReturnType<SelectBuilder<TTable, TRow>['toSql']>
+}
+
+/** Transaction-bound database capability exposed to graph validators. */
+export interface DraftGraphReadTracker {
+  from<TTable extends DraftGraphTable>(table: TTable): DraftGraphReadBuilder<TTable>
 }
 
 export interface DraftGraphValidationRequest {
   phase: 'effective' | 'published'
   draftId: string
-  db: DrizzleTracker | DraftDrizzleTracker
+  db: DraftGraphReadTracker
   context: Record<string, unknown>
 }
 
@@ -145,7 +193,7 @@ export interface DraftLifecycle {
     batch: DraftCommand[],
     opts?: DraftOperationOptions,
   ): Promise<CommandResult[]>
-  /** Replay the authoritative command log and sweep derived state in one transaction. */
+  /** Verify command replay, apply the reviewed row changes, and sweep derived state atomically. */
   publish(
     draftId: string,
     resolve?: ResolveHook,
