@@ -44,6 +44,7 @@ import {
   type DraftLifecycleOptions,
 } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
+import { applyReviewedChanges } from '../draft-review-state'
 import { refreshStoredDraftIntegrity } from '../draft-store'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
@@ -1371,6 +1372,30 @@ describe('draft lifecycle — row-local revision conflicts', () => {
     await lifecycle.publish(draftId)
     const { result: published } = await app.call('listVersionedTodos', {})
     expect(published).toEqual(effective)
+  })
+
+  test('reviewed publication fails closed when a schema change leaves no writable fields', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      { path: 'renameVersionedTodo', args: { id: 1, title: 'draft title' } },
+    ])
+
+    // Model a deployment that removed the only user-managed field after review.
+    // The reviewed revision still needs to advance, but replaying an empty patch
+    // cannot do that and must report drift instead of retrying forever.
+    const changedSchema = defineSchema({
+      versionedTodos: table({ id: int.primaryKey(), revision: int })
+        .revision('revision')
+        .draftable(),
+    })
+    const liveTables = new Map([['versionedTodos', changedSchema.versionedTodos]])
+
+    await expect(
+      applyReviewedChanges(app.system.createTracked(), draftId, liveTables),
+    ).rejects.toMatchObject({
+      differences: [{ table: 'versionedTodos', id: 1, reason: 'anchor' }],
+    })
   })
 
   test('an absent reused identity keeps its planned token unless the ledger changes', async () => {

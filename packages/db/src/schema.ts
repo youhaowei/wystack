@@ -145,9 +145,14 @@ function validateTableReferences(
       continue
     }
 
-    // A bare reference between tenant tables omits the tenant predicate and can
-    // cross scopes. References to a global lookup table remain valid.
-    if (tenant && target?.capabilities.tenancy) {
+    // A bare reference to a tenant table omits the tenant predicate, regardless
+    // of whether the source table is tenant-scoped. Global lookup targets remain valid.
+    if (target?.capabilities.tenancy) {
+      if (!tenant) {
+        throw new Error(
+          `Reference "${definition.name}.${property}" targets tenant-isolated table "${reference.table}"; make the source table tenant-isolated and use referencesWithinTenant()`,
+        )
+      }
       throw new Error(
         `Reference "${definition.name}.${property}" targets tenant-isolated table "${reference.table}"; use referencesWithinTenant()`,
       )

@@ -709,8 +709,8 @@ describe('composable table capabilities', () => {
       ).toThrow('cannot use ON DELETE SET NULL')
     })
 
-    /** Tenant tables must use tenant-qualified references to each other, while global lookups remain legal. */
-    test('a bare reference between tenant-isolated tables must be tenant-qualified', () => {
+    /** Every reference to a tenant table needs a tenant key; global lookup targets remain legal. */
+    test('a bare reference to a tenant-isolated table must be tenant-qualified', () => {
       const tenancy = multiTenant({
         key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
       })
@@ -720,6 +720,13 @@ describe('composable table capabilities', () => {
           tasks: tenancy.table({ id: uuid.primaryKey(), projectId: uuid.references('projects') }),
         }),
       ).toThrow('use referencesWithinTenant()')
+
+      expect(() =>
+        defineSchema({
+          projects: tenancy.table({ id: uuid.primaryKey() }),
+          auditEvents: table({ id: uuid.primaryKey(), projectId: uuid.references('projects') }),
+        }),
+      ).toThrow('make the source table tenant-isolated and use referencesWithinTenant()')
 
       // A plain lookup table has no tenant to cross, so a bare reference to it stays legal.
       const schema = defineSchema({

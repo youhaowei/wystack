@@ -361,7 +361,13 @@ async function advanceReviewedRevision(
     .from(change.table)
     .where(eq(change.pkProperty, change.pkValue))
     .first()
-  while (published && published[revision] < change.desiredRevision) {
+  let publishedRevision = published?.[revision]
+  while (
+    published &&
+    typeof publishedRevision === 'number' &&
+    publishedRevision < change.desiredRevision
+  ) {
+    const previousRevision = publishedRevision
     await tracker
       .from(change.table)
       .where(eq(change.pkProperty, change.pkValue))
@@ -370,8 +376,18 @@ async function advanceReviewedRevision(
       .from(change.table)
       .where(eq(change.pkProperty, change.pkValue))
       .first()
+    publishedRevision = published?.[revision]
+    if (
+      !published ||
+      typeof publishedRevision !== 'number' ||
+      publishedRevision <= previousRevision
+    ) {
+      throw new DraftPublishDriftError(draftId, [
+        { ...driftTarget(change.source), reason: 'anchor' },
+      ])
+    }
   }
-  if (!published || published[revision] !== change.desiredRevision) {
+  if (!published || publishedRevision !== change.desiredRevision) {
     throw new DraftPublishDriftError(draftId, [{ ...driftTarget(change.source), reason: 'anchor' }])
   }
 }
