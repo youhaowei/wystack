@@ -609,17 +609,19 @@ describe('composable table capabilities', () => {
         }),
       })
 
-      const accountConstraints = getTableConfig(schema.accounts).uniqueConstraints.map(
-        (constraint) => constraint.columns.map((column) => column.name),
+      const accountConfig = getTableConfig(schema.accounts)
+      const accountConstraints = accountConfig.uniqueConstraints.map((constraint) =>
+        constraint.columns.map((column) => column.name),
       )
       const postReference = getTableConfig(schema.posts).foreignKeys[0].reference()
 
-      expect(accountConstraints).toEqual(
-        expect.arrayContaining([
-          ['workspace_id', 'id'],
-          ['workspace_id', 'slug'],
-        ]),
-      )
+      expect(accountConfig.primaryKeys).toHaveLength(1)
+      expect(accountConfig.primaryKeys[0].columns.map((column) => column.name)).toEqual([
+        'workspace_id',
+        'id',
+      ])
+      expect(accountConfig.columns.find((column) => column.name === 'id')?.primary).toBe(false)
+      expect(accountConstraints).toContainEqual(['workspace_id', 'slug'])
       expect({
         localColumns: postReference.columns.map((column) => column.name),
         targetTable: getTableName(postReference.foreignTable),

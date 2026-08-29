@@ -51,11 +51,14 @@ export function decodeRowFromDriver(
  *   - table-level `primaryKey({...})`  → only visible in `config.primaryKeys`
  *   - no explicit PK                  → fall back to a column literally named `id`
  *
- * Composite PKs (2+ columns) are unsupported — the overlay join/upsert is
- * single-key — so we throw a clear error rather than silently keying on the
- * wrong column. Shared by the draft READ coalesce (`DraftSelectBuilder.all`)
- * and the draft WRITE path (`writeDraftRow` / `DraftSelectBuilder.update/delete`)
- * so both key on the identical column.
+ * Tenant tables are the one physical composite-key exception: defineSchema
+ * stores `(tenant key, logical scalar PK)` while the overlay already carries
+ * tenant identity independently. In that exact shape this returns the logical
+ * non-tenant column. Every other composite PK is unsupported — the overlay
+ * join/upsert is single-key — so we throw rather than silently mis-keying.
+ * Shared by the draft READ coalesce (`DraftSelectBuilder.all`) and the draft
+ * WRITE path (`writeDraftRow` / `DraftSelectBuilder.update/delete`) so both key
+ * on the identical logical column.
  */
 export function resolvePkColumnName(
   table: AnyTable,
@@ -67,6 +70,25 @@ export function resolvePkColumnName(
   if (config.primaryKeys.length > 0) {
     const pk = config.primaryKeys[0]
     if (pk.columns.length > 1) {
+      const tenancy = tryGetTableCapabilities(table)?.tenancy
+      const tenantColumn = tenancy
+        ? config.columns.find((column) => column.name === tenancy.column)
+        : undefined
+      const logicalColumnName = tryGetLogicalPrimaryKeyColumn(table)
+      const logicalColumn = logicalColumnName
+        ? config.columns.find((column) => column.name === logicalColumnName)
+        : undefined
+      const primaryColumnNames = pk.columns.map((column) => column.name)
+      if (
+        tenantColumn &&
+        logicalColumn &&
+        tenantColumn !== logicalColumn &&
+        pk.columns.length === 2 &&
+        primaryColumnNames.includes(tenantColumn.name) &&
+        primaryColumnNames.includes(logicalColumn.name)
+      ) {
+        return logicalColumn.name
+      }
       throw new Error(
         `draft overlay: table "${tableName}" has a composite primary key ` +
           `(${pk.columns.map((c) => c.name).join(', ')}). Composite PKs are not supported ` +
@@ -139,4 +161,5 @@ export function mapColumnValueFromDriver(col: any, value: unknown): unknown {
 
 import { getTableName } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
+import { tryGetLogicalPrimaryKeyColumn, tryGetTableCapabilities } from './schema'
 import type { AnyTable } from './tracker-core'

@@ -65,6 +65,7 @@ interface ReferenceContext {
 }
 
 const tableCapabilities = new WeakMap<object, Readonly<TableCapabilities>>()
+const logicalPrimaryKeyColumns = new WeakMap<object, string>()
 const generatedTables = new WeakMap<object, PgTable[]>()
 
 function normalizeTableDefinition(definition: unknown): {
@@ -182,8 +183,15 @@ function validateTableDefinition(
   }
 
   const primaryKeys = primaryKeyEntries(definition)
-  if (definition.capabilities.tenancy && primaryKeys.length !== 1) {
-    throw new Error(`Tenant-isolated table "${definition.name}" requires exactly one primary key`)
+  if (definition.capabilities.tenancy) {
+    if (primaryKeys.length !== 1) {
+      throw new Error(`Tenant-isolated table "${definition.name}" requires exactly one primary key`)
+    }
+    if (primaryKeys[0][0] === definition.capabilities.tenancy.property) {
+      throw new Error(
+        `Tenant-isolated table "${definition.name}" requires a logical primary key separate from the tenant key`,
+      )
+    }
   }
   if (definition.capabilities.draftable) {
     if (primaryKeys.length !== 1) {
@@ -232,6 +240,14 @@ export function tryGetTableCapabilities(table: object): TableCapabilities | unde
   return tableCapabilities.get(table)
 }
 
+/** Internal scalar row identity for compiled tenant tables. The physical SQL
+ * primary key also includes tenant scope, but draft storage carries that key in
+ * its own field and therefore resolves rows by this logical column.
+ */
+export function tryGetLogicalPrimaryKeyColumn(table: object): string | undefined {
+  return logicalPrimaryKeyColumns.get(table)
+}
+
 /** Internal registration seam for low-level SQL fixtures that exercise the
  * tracker against hand-authored Drizzle tables. It is intentionally absent
  * from the package barrel; application code opts in through `table(...).draftable()`.
@@ -251,6 +267,7 @@ function buildColumn(
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
   allTables: Record<string, any>,
   sqlName: string = name,
+  inlinePrimaryKey: boolean = true,
 ) {
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builder types vary per column type; no common base type
   let col: any
@@ -295,7 +312,7 @@ function buildColumn(
   // metadata (e.g. the draft coalesce primitive) — and the generated DDL would
   // omit PRIMARY KEY. Chaining `.primaryKey()` onto serial keeps its SQL type
   // (`serial`) while recording the primary-key constraint.
-  if (opts.isPrimaryKey) {
+  if (opts.isPrimaryKey && inlinePrimaryKey) {
     col = col.primaryKey()
   }
 
@@ -341,7 +358,17 @@ function compileColumns(definition: NormalizedTableDefinition, references?: Refe
       definition.capabilities.revisionProperty === property
         ? { ...column.opts, hasDefault: true, defaultValue: 1 }
         : column.opts
-    colDefs[property] = buildColumn(property, opts, references?.tables ?? {}, sqlName)
+    // A tenant table's declared PK is its logical row identity. Physically the
+    // database keys the row by (tenant, logical identity), so the logical column
+    // must not also emit a second, globally unique inline PRIMARY KEY.
+    const inlinePrimaryKey = !definition.capabilities.tenancy
+    colDefs[property] = buildColumn(
+      property,
+      opts,
+      references?.tables ?? {},
+      sqlName,
+      inlinePrimaryKey,
+    )
   }
   return colDefs
 }
@@ -355,10 +382,9 @@ function compileTable(definition: NormalizedTableDefinition, references?: Refere
 
   return pgTable(definition.name, colDefs, (current) => {
     const constraints: PgTableExtraConfigValue[] = [
-      unique(`${definition.name}_${tenant.column}_${current[primaryProperty].name}_unique`).on(
-        current[tenant.property],
-        current[primaryProperty],
-      ),
+      primaryKey({
+        columns: [current[tenant.property], current[primaryProperty]],
+      }),
     ]
 
     for (const [property, column] of Object.entries(definition.columns)) {
@@ -393,17 +419,29 @@ function hasReferences(definition: NormalizedTableDefinition): boolean {
 function compileSchema(schema: NormalizedSchema): CompiledSchema {
   const compiled: CompiledSchema = {}
 
+  const registerCompiledTable = (
+    definition: NormalizedTableDefinition,
+    // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
+    compiledTable: any,
+  ) => {
+    registerTableCapabilities(compiledTable, definition.capabilities)
+    const [primaryProperty] = primaryKeyEntries(definition)[0] ?? []
+    if (primaryProperty) {
+      logicalPrimaryKeyColumns.set(compiledTable, compiledTable[primaryProperty].name)
+    }
+  }
+
   // First compile every table without references so all targets exist.
   for (const definition of Object.values(schema)) {
     compiled[definition.name] = compileTable(definition)
-    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+    registerCompiledTable(definition, compiled[definition.name])
   }
 
   // Then rebuild only tables that declare references against the complete map.
   const references = { tables: compiled, definitions: schema }
   for (const definition of Object.values(schema).filter(hasReferences)) {
     compiled[definition.name] = compileTable(definition, references)
-    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+    registerCompiledTable(definition, compiled[definition.name])
   }
 
   return compiled
