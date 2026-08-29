@@ -32,6 +32,13 @@ describe('DSL column builders', () => {
     expect(col).not.toBe(text)
   })
 
+  test('.nullable() returns a new instance that accepts explicit nulls', () => {
+    const col = uuid.nullable()
+    expect(col.opts.isNullable).toBe(true)
+    expect(uuid.opts.isNullable).toBe(false)
+    expect(col).not.toBe(uuid)
+  })
+
   test('.default() returns new instance with default value', () => {
     const col = text.default('hello')
     expect(col.opts.hasDefault).toBe(true)

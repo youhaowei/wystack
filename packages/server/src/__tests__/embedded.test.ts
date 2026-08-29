@@ -13,18 +13,18 @@ import { Hono } from 'hono'
 import { upgradeWebSocket, websocket } from 'hono/bun'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { createRoutes } from '../routes'
 import { defineApp } from '../define-app'
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
-  items: {
+  items: table({
     id: int.primaryKey(),
     name: text,
     active: boolean,
-  },
+  }),
 })
 
 let server: ReturnType<typeof Bun.serve>

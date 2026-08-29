@@ -1,16 +1,16 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
+  }),
 })
 
 interface AppContext {
@@ -113,14 +113,101 @@ beforeEach(async () => {
       canWithThrowingCheck: wy.procedure
         .input({})
         .query(async (ctx) => ctx.can(throwingPermission)),
+      inspectDbSurface: wy.procedure.input({}).query(async (ctx) => {
+        const dbSurface = ctx.db as unknown as Record<string, unknown>
+        const selectSurface = ctx.db.from(schema.todos) as unknown as Record<string, unknown>
+        const chainedSurface = ctx.db.from(schema.todos).where(eq('id', 1)) as unknown as Record<
+          string,
+          unknown
+        >
+        const insertSurface = ctx.db.into(schema.todos) as unknown as Record<string, unknown>
+        return {
+          raw: 'raw' in dbSurface,
+          withTenant: 'withTenant' in dbSurface,
+          withDraft: 'withDraft' in dbSurface,
+          tablesRead: 'tablesRead' in dbSurface,
+          tablesWritten: 'tablesWritten' in dbSurface,
+          transaction: typeof dbSurface['transaction'] === 'function',
+          builderDb: '_db' in selectSurface,
+          builderTracker: '_tracker' in selectSurface,
+          chainedDb: '_db' in chainedSurface,
+          insertDb: '_db' in insertSurface,
+        }
+      }),
     },
   })
 })
 
 describe('defineApp().build()', () => {
+  /** Tenant-aware applications must provide both the trusted descriptor and its request resolver. */
+  test('requires tenancy and tenant resolution to be configured together', async () => {
+    const pg = createTestDatabase()
+    const isolatedDb = drizzle(pg)
+
+    await expect(
+      wy.build({
+        db: isolatedDb,
+        functions: {},
+        resolveTenant: () => 'tenant-1',
+      }),
+    ).rejects.toThrow('requires tenancy and resolveTenant together')
+    await expect(
+      wy.build({
+        db: isolatedDb,
+        functions: {},
+        tenancy: multiTenant({
+          key: { property: 'tenantId', column: 'tenant_id', type: text },
+        }),
+      }),
+    ).rejects.toThrow('requires tenancy and resolveTenant together')
+  })
+
+  /** Building an application performs no schema DDL, so a migrated runtime role needs only data access. */
+  test('does not require application runtime roles to execute framework DDL at startup', async () => {
+    const frameworkTables = await app.system.createTracked().raw.execute(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_name = 'wystack_row_revisions'`,
+    )
+
+    expect(frameworkTables.rows).toEqual([])
+  })
+
   test('registers functions', () => {
     expect(app.functions.has('listTodos')).toBe(true)
     expect(app.functions.has('addTodo')).toBe(true)
+  })
+
+  test('keeps privileged tracker custody behind one frozen system capability', () => {
+    const root = app as unknown as Record<string, unknown>
+
+    expect(root['createTracked']).toBeUndefined()
+    expect(root['runHandler']).toBeUndefined()
+    expect(root['scopeTracked']).toBeUndefined()
+    expect(root['emit']).toBeUndefined()
+    expect(Object.keys(app.system).sort()).toEqual([
+      'createTracked',
+      'emit',
+      'resolvesTenant',
+      'runHandler',
+      'scopeTracked',
+    ])
+    expect(Object.isFrozen(app.system)).toBe(true)
+  })
+
+  test('keeps raw SQL, scope changes, and tracking state out of procedure custody', async () => {
+    const { result } = await app.call('inspectDbSurface', {})
+    expect(result).toEqual({
+      raw: false,
+      withTenant: false,
+      withDraft: false,
+      tablesRead: false,
+      tablesWritten: false,
+      transaction: true,
+      builderDb: false,
+      builderTracker: false,
+      chainedDb: false,
+      insertDb: false,
+    })
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

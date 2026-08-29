@@ -5,6 +5,11 @@
  * raw `pgTable(...)`, then calls `syncSchema(db, schema)` at app boot to
  * materialize tables via `CREATE TABLE IF NOT EXISTS`.
  *
+ * When using `defineSchema`, pass its exact returned object. Generated framework
+ * relations are associated with that object by identity; copying or selecting a
+ * subset drops that metadata. Raw `pgTable` maps have no generated relations and
+ * may still be passed directly.
+ *
  * ── What it does ─────────────────────────────────────────────────────────
  * - Topologically orders tables by FK dependency (tables with no outgoing FKs
  *   first; tables referencing already-emitted targets next).
@@ -28,6 +33,7 @@
 import { sql } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { PgTable } from 'drizzle-orm/pg-core'
+import { getGeneratedTables } from './schema'
 
 /** Anything that can execute a Drizzle SQL object. Covers both the PGLite-backed
  *  drizzle instance and the future drizzle-tracker wrapper. */
@@ -37,7 +43,7 @@ export interface SyncTarget {
 }
 
 export async function syncSchema(db: SyncTarget, schema: Record<string, PgTable>): Promise<void> {
-  const tables = Object.values(schema)
+  const tables = [...Object.values(schema), ...getGeneratedTables(schema)]
   const ordered = sortByFkDeps(tables)
   for (const table of ordered) {
     const ddl = renderCreateTableIfNotExists(table)

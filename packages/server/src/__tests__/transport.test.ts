@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { buildAuthRequest } from '../routes'
@@ -9,11 +9,11 @@ import { defineApp } from '../define-app'
 import type { FunctionDef } from '../types'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
+  }),
 })
 
 function isAllowedUser(ctx: { principal?: unknown }): boolean {

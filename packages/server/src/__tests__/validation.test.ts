@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, uuid, timestamp, jsonb } from '@wystack/db'
 import { buildArgsSchema, ValidationError } from '../validation'
 import { defineApp } from '../define-app'
 import { PermissionDeniedError } from '../index'
@@ -66,6 +66,17 @@ describe('buildArgsSchema', () => {
     expect(schema.safeParse({ name: 42 }).success).toBe(false)
   })
 
+  test('distinguishes omitted, explicit null, and concrete nullable values', () => {
+    const schema = buildArgsSchema({ assigneeId: uuid.nullable().optional() })
+    const id = '550e8400-e29b-41d4-a716-446655440000'
+
+    expect(schema.safeParse({}).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: undefined }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: null }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: id }).success).toBe(true)
+    expect(schema.safeParse({ assigneeId: 'not-a-uuid' }).success).toBe(false)
+  })
+
   test('handles args with defaults as optional and applies default value', () => {
     const schema = buildArgsSchema({ limit: int.default(10) })
     expect(schema.safeParse({ limit: 5 }).success).toBe(true)
@@ -122,11 +133,11 @@ describe('buildArgsSchema', () => {
 
 describe('validation in call()', () => {
   const schema = defineSchema({
-    todos: {
+    todos: table({
       id: int.primaryKey(),
       title: text,
       done: boolean,
-    },
+    }),
   })
 
   let app: Awaited<ReturnType<typeof wy.build>>

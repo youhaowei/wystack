@@ -2,15 +2,16 @@ import { describe, test, expect } from 'bun:test'
 import { defineSchema } from '../schema'
 import { text, int, boolean, timestamp, uuid, jsonb } from '../dsl'
 import { getTableName, getTableColumns } from 'drizzle-orm'
+import { table } from '../table'
 
 describe('defineSchema', () => {
   test('produces a Drizzle pgTable for each table', () => {
     const schema = defineSchema({
-      todos: {
+      todos: table({
         id: int.primaryKey(),
         title: text,
         done: boolean,
-      },
+      }),
     })
 
     expect(schema.todos).toBeDefined()
@@ -19,12 +20,12 @@ describe('defineSchema', () => {
 
   test('maps column types correctly', () => {
     const schema = defineSchema({
-      items: {
+      items: table({
         id: int.primaryKey(),
         name: text,
         active: boolean,
         createdAt: timestamp,
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.items)
@@ -36,10 +37,10 @@ describe('defineSchema', () => {
 
   test('optional columns are nullable', () => {
     const schema = defineSchema({
-      items: {
+      items: table({
         id: int.primaryKey(),
         description: text.optional(),
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.items)
@@ -47,12 +48,29 @@ describe('defineSchema', () => {
     expect(cols.description.notNull).toBe(false)
   })
 
+  /**
+   * A nullable field accepts SQL NULL on stored rows but remains required in
+   * mutation input unless the caller separately marks it optional.
+   */
+  test('keeps an explicitly nullable field required in mutation input', () => {
+    const assigneeId = uuid.nullable()
+    const schema = defineSchema({
+      items: table({
+        id: int.primaryKey(),
+        assigneeId,
+      }),
+    })
+
+    expect(assigneeId.opts.isOptional).toBe(false)
+    expect(getTableColumns(schema.items).assigneeId.notNull).toBe(false)
+  })
+
   test('non-optional columns are notNull', () => {
     const schema = defineSchema({
-      items: {
+      items: table({
         id: int.primaryKey(),
         name: text,
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.items)
@@ -61,10 +79,10 @@ describe('defineSchema', () => {
 
   test('unique constraint is applied', () => {
     const schema = defineSchema({
-      users: {
+      users: table({
         id: int.primaryKey(),
         email: text.unique(),
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.users)
@@ -73,15 +91,15 @@ describe('defineSchema', () => {
 
   test('multiple tables can be defined', () => {
     const schema = defineSchema({
-      users: {
+      users: table({
         id: int.primaryKey(),
         name: text,
-      },
-      posts: {
+      }),
+      posts: table({
         id: int.primaryKey(),
         title: text,
         authorId: int,
-      },
+      }),
     })
 
     expect(getTableName(schema.users)).toBe('users')
@@ -90,10 +108,10 @@ describe('defineSchema', () => {
 
   test('uuid column with defaultRandom', () => {
     const schema = defineSchema({
-      items: {
+      items: table({
         id: uuid.primaryKey().defaultRandom(),
         name: text,
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.items)
@@ -103,10 +121,10 @@ describe('defineSchema', () => {
 
   test('timestamp with defaultNow', () => {
     const schema = defineSchema({
-      items: {
+      items: table({
         id: uuid.primaryKey().defaultRandom(),
         createdAt: timestamp.defaultNow(),
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.items)
@@ -115,10 +133,10 @@ describe('defineSchema', () => {
 
   test('text array column', () => {
     const schema = defineSchema({
-      settings: {
+      settings: table({
         id: uuid.primaryKey().defaultRandom(),
         tags: text.array().default([]),
-      },
+      }),
     })
 
     const cols = getTableColumns(schema.settings)
@@ -127,15 +145,15 @@ describe('defineSchema', () => {
 
   test('foreign key references', () => {
     const schema = defineSchema({
-      users: {
+      users: table({
         id: uuid.primaryKey().defaultRandom(),
         name: text,
-      },
-      posts: {
+      }),
+      posts: table({
         id: uuid.primaryKey().defaultRandom(),
         title: text,
         authorId: uuid.optional().references('users'),
-      },
+      }),
     })
 
     expect(getTableName(schema.users)).toBe('users')
@@ -146,7 +164,7 @@ describe('defineSchema', () => {
 
   test('WorkHub-like schema with uuid, refs, and defaults', () => {
     const schema = defineSchema({
-      users: {
+      users: table({
         id: uuid.primaryKey().defaultRandom(),
         orgId: text,
         clerkUserId: text.unique(),
@@ -154,8 +172,8 @@ describe('defineSchema', () => {
         email: text.optional(),
         createdAt: timestamp.defaultNow(),
         updatedAt: timestamp.defaultNow(),
-      },
-      people: {
+      }),
+      people: table({
         id: uuid.primaryKey().defaultRandom(),
         orgId: text,
         name: text,
@@ -163,8 +181,8 @@ describe('defineSchema', () => {
         createdById: uuid.optional().references('users'),
         createdAt: timestamp.defaultNow(),
         updatedAt: timestamp.defaultNow(),
-      },
-      activityLog: {
+      }),
+      activityLog: table({
         id: uuid.primaryKey().defaultRandom(),
         orgId: text,
         targetModel: text,
@@ -173,7 +191,7 @@ describe('defineSchema', () => {
         action: text,
         changes: jsonb.optional(),
         createdAt: timestamp.defaultNow(),
-      },
+      }),
     })
 
     expect(getTableName(schema.users)).toBe('users')

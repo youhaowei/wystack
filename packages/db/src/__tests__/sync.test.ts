@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
@@ -13,11 +13,26 @@ import {
 } from 'drizzle-orm/pg-core'
 
 import { renderCreateTableIfNotExists, syncSchema } from '../sync'
+import { defineSchema, multiTenant, text as wyText, uuid as wyUuid } from '../index'
 
 const bytea = customType<{ data: Uint8Array; default: false }>({
   dataType() {
     return 'bytea'
   },
+})
+
+const openDatabases = new Set<PGlite>()
+
+function createTestDatabase(): PGlite {
+  const client = new PGlite()
+  openDatabases.add(client)
+  return client
+}
+
+afterEach(async () => {
+  const databases = [...openDatabases]
+  openDatabases.clear()
+  await Promise.all(databases.map((client) => client.close()))
 })
 
 describe('renderCreateTableIfNotExists', () => {
@@ -69,6 +84,41 @@ describe('renderCreateTableIfNotExists', () => {
 })
 
 describe('syncSchema', () => {
+  test('creates one central draft relation for tenant-aware draft tables', async () => {
+    const tenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: wyUuid },
+    })
+    const schema = defineSchema({
+      insights: tenancy
+        .table({ id: wyUuid.primaryKey(), description: wyText.nullable() })
+        .draftable(),
+    })
+    const client = createTestDatabase()
+    await client.waitReady
+    const db = drizzle(client)
+
+    await syncSchema(db, schema)
+
+    const result = await client.query<{ column_name: string }>(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'wystack_draft_row_changes'
+      ORDER BY ordinal_position
+    `)
+    expect(result.rows.map((row) => row.column_name)).toEqual([
+      'draft_id',
+      'table_key',
+      'tenant_key_text',
+      'tenant_key',
+      'row_key_text',
+      'row_key',
+      'operation',
+      'base_exists',
+      'base_revision',
+      'fields',
+    ])
+  })
+
   test('creates all tables in dependency order', async () => {
     const insights = pgTable('insights', {
       id: uuid('id').primaryKey().defaultRandom(),
@@ -82,7 +132,7 @@ describe('syncSchema', () => {
       chartType: text('chart_type').notNull(),
     })
 
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
 
@@ -105,7 +155,7 @@ describe('syncSchema', () => {
       id: uuid('id').primaryKey().defaultRandom(),
       payload: jsonb('payload').notNull(),
     })
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
 
@@ -129,7 +179,7 @@ describe('syncSchema', () => {
       counter: integer('counter').notNull(),
     })
 
-    const client = new PGlite()
+    const client = createTestDatabase()
     await client.waitReady
     const db = drizzle(client)
     await syncSchema(db, { parent, child })

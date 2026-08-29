@@ -25,7 +25,7 @@
 // use. We assert those.
 
 import { describe, test, expect } from 'bun:test'
-import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { attachElectronTransport } from '../electron'
 import type { IpcMainEventLike, IpcMainLike, WebContentsLike } from '../electron'
 import { defineApp } from '../define-app'
@@ -40,7 +40,7 @@ const S2C = 'wystack:s2c'
 // ---------------------------------------------------------------------------
 
 const schema = defineSchema({
-  todos: { id: int.primaryKey(), title: text, done: boolean },
+  todos: table({ id: int.primaryKey(), title: text, done: boolean }),
 })
 
 async function makeApp() {

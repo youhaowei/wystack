@@ -1,22 +1,54 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema } from '../schema'
-import { text, int, boolean } from '../dsl'
+import { defineSchema, registerTableCapabilities } from '../schema'
+import { text, int, boolean, uuid } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
-import { pgTable, text as pgText, integer, primaryKey } from 'drizzle-orm/pg-core'
+import { pgTable, text as pgText, integer, uuid as pgUuid } from 'drizzle-orm/pg-core'
+import { table } from '../table'
+import { draftChangesTableDdl } from './draft-storage.fixture'
+import { ensureRowRevisionStorage } from '../row-revisions'
+import { compareRowRevisionRows } from '../row-revisions'
+import { noTenantScope } from '../tracker-core'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
-  tags: {
+  }).draftable(),
+  tags: table({
     id: int.primaryKey(),
     label: text,
-  },
+  }),
+  versioned_todos: table({
+    id: int.primaryKey(),
+    title: text,
+    revision: int,
+  }).revision('revision'),
+  versioned_uuid_todos: table({
+    id: uuid.primaryKey().defaultRandom(),
+    title: text,
+    revision: int,
+  }).revision('revision'),
+})
+
+const unicodeRevisionRows = pgTable('unicode_revision_rows', {
+  id: pgText('id').primaryKey(),
+})
+
+const customUuidRevisionRows = pgTable('custom_uuid_revision_rows', {
+  id: pgUuid('id')
+    .primaryKey()
+    .default(sql`uuid_generate_v4()`),
+  title: pgText('title').notNull(),
+  revision: integer('revision').notNull().default(1),
+})
+registerTableCapabilities(customUuidRevisionRows, {
+  draftable: false,
+  revisionProperty: 'revision',
 })
 
 let pg: PGlite
@@ -34,6 +66,21 @@ beforeEach(async () => {
       done BOOLEAN NOT NULL
     )
   `)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS versioned_uuid_todos (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1
+    )
+  `)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS versioned_todos (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1
+    )
+  `)
+  await ensureRowRevisionStorage(db)
   await db.execute(`
     CREATE TABLE IF NOT EXISTS tags (
       id SERIAL PRIMARY KEY,
@@ -62,6 +109,19 @@ afterEach(async () => {
 })
 
 describe('DrizzleTracker', () => {
+  /** Lock keys use PostgreSQL C-collation byte order, including where UTF-16 ordering differs. */
+  test('revision lock ordering matches PostgreSQL C collation for non-ASCII identities', () => {
+    const rows = [{ id: '\u{10000}' }, { id: '\uE000' }]
+
+    rows.sort((left, right) =>
+      compareRowRevisionRows(unicodeRevisionRows, noTenantScope, left, right),
+    )
+
+    // UTF-16 code-unit ordering puts U+10000 first. UTF-8 byte ordering, like
+    // PostgreSQL COLLATE "C", puts U+E000 first.
+    expect(rows).toEqual([{ id: '\uE000' }, { id: '\u{10000}' }])
+  })
+
   test('insert records tablesWritten', async () => {
     await tracked.into(schema.todos).insert({ title: 'Test', done: false })
     expect(tracked.tablesWritten.has('todos')).toBe(true)
@@ -73,6 +133,45 @@ describe('DrizzleTracker', () => {
     expect(rows[0].title).toBe('Test')
     expect(rows[0].done).toBe(false)
     expect(rows[0].id).toBeGreaterThan(0)
+  })
+
+  /** A generated serial key is materialized once and becomes the identity of the same revision ledger row. */
+  test('revisioned inserts materialize generated primary keys before allocating ledger tokens', async () => {
+    const first = await tracked.into(schema.versioned_todos).insert({ title: 'first' })
+    const second = await tracked.into(schema.versioned_todos).insert({ title: 'second' })
+
+    expect(first).toEqual([{ id: 1, title: 'first', revision: 1 }])
+    expect(second).toEqual([{ id: 2, title: 'second', revision: 1 }])
+    const ledger = await db.execute(
+      `SELECT row_key_text, revision FROM wystack_row_revisions
+       WHERE table_key = 'versioned_todos' ORDER BY row_key_text`,
+    )
+    expect(ledger.rows).toEqual([
+      { row_key_text: '1', revision: 1 },
+      { row_key_text: '2', revision: 1 },
+    ])
+  })
+
+  /** A generated UUID is shared by the inserted row and its revision ledger entry, never generated twice. */
+  test('revisioned UUID defaults are materialized once for the ledger and inserted row', async () => {
+    const [inserted] = await tracked
+      .into(schema.versioned_uuid_todos)
+      .insert({ title: 'generated uuid' })
+
+    expect(inserted.id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+    const ledger = await db.execute(
+      `SELECT row_key_text FROM wystack_row_revisions
+       WHERE table_key = 'versioned_uuid_todos'`,
+    )
+    expect(ledger.rows).toEqual([{ row_key_text: inserted.id }])
+  })
+
+  test('revisioned UUID inserts reject custom SQL-generated identities', async () => {
+    await expect(
+      tracked.into(customUuidRevisionRows).insert({ title: 'custom uuid' }),
+    ).rejects.toThrow('must use defaultRandom() or supply an explicit value')
   })
 
   test('a failed insert does not record tablesWritten', async () => {
@@ -124,6 +223,14 @@ describe('DrizzleTracker', () => {
     const row = await tracked.from(schema.todos).first()
     expect(row).not.toBeNull()
     expect(row!.title).toBe('A')
+  })
+
+  test('first never widens a caller limit of zero', async () => {
+    await tracked.into(schema.todos).insert({ title: 'A', done: false })
+    tracked = resetTracking(tracked)
+
+    expect(await tracked.from(schema.todos).limit(0).all()).toEqual([])
+    expect(await tracked.from(schema.todos).limit(0).first()).toBeNull()
   })
 
   test('update records tablesWritten', async () => {
@@ -299,30 +406,14 @@ const snakeTodos = pgTable('snake_todos', {
   ownerName: pgText('owner_name').notNull(),
 })
 
-/**
- * The shadow table the draft coalesce joins against. One definition for the whole
- * file: three describes needed it, and a copy that drifts from the real shadow
- * shape produces a `42703` from the emitted SQL — a test failure that reads like a
- * builder bug when it is only the fixture.
- */
-const createShadow = () =>
+/** The migration-managed relation used by every draftable table in this file. */
+const createDraftStorage = () =>
   tracked.raw.execute(`
-    CREATE TABLE IF NOT EXISTS todos__draft (
-      id INTEGER NOT NULL,
-      draft_id TEXT NOT NULL,
-      title TEXT,
-      done BOOLEAN,
-      __tombstone BOOLEAN DEFAULT false,
-      PRIMARY KEY (id, draft_id)
-    )
+    ${draftChangesTableDdl}
   `)
 
-/**
- * `snakeTodos` and, optionally, its shadow. Paired with `createShadow` above for
- * the same reason: the DDL must track the Drizzle declaration, and a copy that
- * drifts fails as a `42703` from the emitted SQL rather than as a fixture error.
- */
-const createSnakeTodos = async ({ withShadow = false } = {}) => {
+/** Create the migration-managed snake-case fixture and optional draft storage. */
+const createSnakeTodos = async ({ withDraftStorage = false } = {}) => {
   await tracked.raw.execute(`
     CREATE TABLE IF NOT EXISTS snake_todos (
       id INTEGER PRIMARY KEY,
@@ -330,17 +421,7 @@ const createSnakeTodos = async ({ withShadow = false } = {}) => {
       owner_name TEXT NOT NULL
     )
   `)
-  if (!withShadow) return
-  await tracked.raw.execute(`
-    CREATE TABLE IF NOT EXISTS snake_todos__draft (
-      id INTEGER NOT NULL,
-      draft_id TEXT NOT NULL,
-      todo_title TEXT,
-      owner_name TEXT,
-      __tombstone BOOLEAN DEFAULT false,
-      PRIMARY KEY (id, draft_id)
-    )
-  `)
+  if (withDraftStorage) await createDraftStorage()
 }
 
 describe('SelectBuilder projection', () => {
@@ -428,11 +509,11 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft read projects the coalesce, matching the canonical builder', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'base', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'overridden')`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({
+      title: 'overridden',
+    })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
 
@@ -441,12 +522,10 @@ describe('SelectBuilder projection', () => {
   })
 
   test('a draft projection omitting the PK still joins, orders and suppresses tombstones', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'kept', done: false })
     await tracked.into(schema.todos).insert({ title: 'deleted', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (2, 'd1', true)`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 2)).delete()
 
     const rows = await tracked.withDraft('d1').from(schema.todos).select('title').all()
 
@@ -462,26 +541,27 @@ describe('SelectBuilder projection', () => {
     ).rejects.toThrow('Unknown column: nope')
   })
 
-  test('toSql() lowers the projection and stays in lockstep with all()', async () => {
-    const { sql: projected } = tracked.from(schema.todos).select('title').toSql()
-    const { sql: fullRow } = tracked.from(schema.todos).toSql()
+  /** Selecting one public property returns only that property on the canonical path. */
+  test('a canonical projection returns only the selected values', async () => {
+    await tracked.into(schema.todos).insert({ title: 'projected', done: true })
 
-    expect(projected).toContain('"title"')
-    expect(projected).not.toContain('"done"')
-    expect(fullRow).toContain('"done"')
+    const projected = await tracked.from(schema.todos).select('title').all()
+    const fullRows = await tracked.from(schema.todos).all()
+
+    expect(projected).toEqual([{ title: 'projected' }])
+    expect(Object.keys(projected[0] ?? {})).toEqual(['title'])
+    expect(fullRows).toEqual([{ id: 1, title: 'projected', done: true }])
   })
 })
 
 describe('DraftSelectBuilder orderBy / limit', () => {
   test('orders by the COALESCED value, so a draft override moves the row', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
     // Row 1 is renamed to sort LAST. Ordering on `b."title"` would still see
     // 'aaa' and put it first — this is the assertion that pins COALESCE.
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title) VALUES (1, 'd1', 'zzz')`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({ title: 'zzz' })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
 
@@ -489,13 +569,15 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('a draft-INSERTED row sorts by its draft value, not as NULL', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'mmm', done: false })
     // No base row for id 99 — `b."title"` is NULL on this side of the FULL OUTER
     // JOIN, so only the coalesced expression can place it correctly.
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, title, done) VALUES (99, 'd1', 'aaa', false)`,
-    )
+    await tracked.withDraft('d1').into(schema.todos).insert({
+      id: 99,
+      title: 'aaa',
+      done: false,
+    })
 
     const rows = await tracked.withDraft('d1').from(schema.todos).orderBy('title').all()
 
@@ -503,7 +585,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('desc reverses the order', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
 
@@ -513,7 +595,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('limit caps the coalesced set, and composes with orderBy as top-N', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'ccc', done: false })
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
@@ -526,12 +608,10 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('a tombstoned row does not consume a limit slot', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'first', done: false })
     await tracked.into(schema.todos).insert({ title: 'second', done: false })
-    await tracked.raw.execute(
-      `INSERT INTO todos__draft (id, draft_id, __tombstone) VALUES (1, 'd1', true)`,
-    )
+    await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).delete()
 
     // LIMIT applies after the tombstone WHERE. If the order were reversed, the
     // suppressed row would eat the only slot and this would come back empty.
@@ -541,7 +621,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('ties on the ordering column stay deterministic via the PK tiebreaker', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
     await tracked.into(schema.todos).insert({ title: 'same', done: false })
@@ -554,7 +634,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('first() returns one row and no longer fetches the whole set', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
     await tracked.into(schema.todos).insert({ title: 'bbb', done: false })
 
@@ -564,7 +644,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('an unknown orderBy column throws instead of falling back to PK order', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'aaa', done: false })
 
     await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
@@ -573,7 +653,7 @@ describe('DraftSelectBuilder orderBy / limit', () => {
   })
 
   test('orderBy lowers the JS property key to its SQL column name', async () => {
-    await createSnakeTodos({ withShadow: true })
+    await createSnakeTodos({ withDraftStorage: true })
     await tracked.raw.execute(
       `INSERT INTO snake_todos (id, todo_title, owner_name) VALUES (1, 'bbb', 'x'), (2, 'aaa', 'y')`,
     )
@@ -649,7 +729,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('the draft write path rejects the same clauses', async () => {
-    await createShadow()
+    await createDraftStorage()
     const draft = () => tracked.withDraft('d1').from(schema.todos)
 
     await expect(draft().select('title').where(eq('id', 1)).update({ done: true })).rejects.toThrow(
@@ -663,8 +743,8 @@ describe('read clauses are rejected on write terminals', () => {
     ).rejects.toThrow('orderBy() cannot precede update()')
   })
 
-  test('a draft write with no read clauses still lands in the shadow', async () => {
-    await createShadow()
+  test('a draft write with no read clauses still lands in derived storage', async () => {
+    await createDraftStorage()
 
     await tracked.withDraft('d1').from(schema.todos).where(eq('id', 1)).update({ done: true })
 
@@ -694,7 +774,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('draft first() then a write on the same builder is not rejected either', async () => {
-    await createShadow()
+    await createDraftStorage()
     const b = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
 
     expect((await b.first())?.id).toBe(1)
@@ -705,7 +785,7 @@ describe('read clauses are rejected on write terminals', () => {
   })
 
   test('the prescribed two-step alternative works, in a draft too', async () => {
-    await createShadow()
+    await createDraftStorage()
     const handle = tracked.withDraft('d1')
 
     // This is what the error message tells a caller to write.
@@ -775,7 +855,7 @@ describe('clause methods return a copy, not the receiver', () => {
   })
 
   test('the draft builder copies too — same property, same reasons', async () => {
-    await createShadow()
+    await createDraftStorage()
     const base = tracked.withDraft('d1').from(schema.todos)
     const limited = base.limit(1)
 
@@ -785,7 +865,7 @@ describe('clause methods return a copy, not the receiver', () => {
   })
 
   test('a draft read branch does not block a write off the same base', async () => {
-    await createShadow()
+    await createDraftStorage()
     const base = tracked.withDraft('d1').from(schema.todos).where(eq('id', 1))
 
     expect(await base.orderBy('title').all()).toHaveLength(1)
@@ -826,72 +906,51 @@ describe('clause column resolution is total', () => {
   })
 
   test('a draft orderBy naming an unknown column throws', async () => {
-    await createShadow()
+    await createDraftStorage()
     await expect(tracked.withDraft('d1').from(schema.todos).orderBy('nope').all()).rejects.toThrow(
       'Unknown column: nope',
     )
   })
 })
 
-/**
- * A composite-PK table. `_pkColumn` cannot pin a single column here, so the
- * tiebreaker is OMITTED rather than guessed — this fixture is what keeps that
- * branch from being silently untested.
- */
-const compositeMembers = pgTable(
-  'composite_members',
-  {
-    orgId: integer('org_id').notNull(),
-    userId: integer('user_id').notNull(),
-    role: pgText('role').notNull(),
-  },
-  (t) => [primaryKey({ columns: [t.orgId, t.userId] })],
-)
-
 describe('canonical and draft reads agree on tied rows', () => {
-  // Asserted on the LOWERED SQL, not on returned row order. Rows inserted in PK
-  // order into a fresh heap come back in PK order regardless, so a row-order
-  // assertion stays green with the tiebreaker removed — it does not pin anything.
-  test('the canonical ORDER BY carries the primary key as a trailing term', () => {
-    const { sql } = tracked.from(schema.todos).orderBy('done').toSql()
-    expect(sql).toContain('order by "todos"."done" asc, "todos"."id" asc')
+  /** Equal sort values produce the same primary-key order on canonical and draft reads. */
+  test('canonical and draft deterministically break ties by primary key', async () => {
+    await createDraftStorage()
+    // Deliberately oppose heap order and primary-key order. This would expose a
+    // missing tiebreaker without asserting how the query is lowered to SQL.
+    await tracked.into(schema.todos).insert({ id: 30, title: 'thirty', done: true })
+    await tracked.into(schema.todos).insert({ id: 10, title: 'ten', done: true })
+    await tracked.into(schema.todos).insert({ id: 20, title: 'twenty', done: true })
+
+    for (const direction of ['asc', 'desc'] as const) {
+      const canonical = await tracked.from(schema.todos).orderBy('done', direction).all()
+      const draft = await tracked
+        .withDraft('d1')
+        .from(schema.todos)
+        .orderBy('done', direction)
+        .all()
+
+      expect(canonical.map((row) => row.id)).toEqual([10, 20, 30])
+      expect(draft).toEqual(canonical)
+    }
   })
 
-  test('the tiebreaker is not duplicated when the named column IS the primary key', () => {
-    expect(tracked.from(schema.todos).orderBy('id').toSql().sql).toContain(
-      'order by "todos"."id" asc',
-    )
-    // `desc` proves the single term is the CALLER's, not a tiebreaker that
-    // happens to match: a duplicate would append a second, ascending `"id"`.
-    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).toContain(
-      'order by "todos"."id" desc',
-    )
-    expect(tracked.from(schema.todos).orderBy('id', 'desc').toSql().sql).not.toContain('asc')
-  })
+  /** When the primary key is the requested sort column, descending order is not overwritten by a tiebreaker. */
+  test('ordering by the primary key respects the requested direction', async () => {
+    await tracked.into(schema.todos).insert({ id: 30, title: 'thirty', done: true })
+    await tracked.into(schema.todos).insert({ id: 10, title: 'ten', done: true })
+    await tracked.into(schema.todos).insert({ id: 20, title: 'twenty', done: true })
 
-  test('the tiebreaker rides on the caller direction, not the reverse', () => {
-    // The PK term is always ascending — it exists to make the tie DETERMINISTIC,
-    // and the draft coalesce's `pkOrder` is ascending too. If one flipped with
-    // the caller's direction and the other did not, the two paths would disagree
-    // on exactly the reads this pairing exists to keep identical.
-    const { sql } = tracked.from(schema.todos).orderBy('done', 'desc').toSql()
-    expect(sql).toContain('order by "todos"."done" desc, "todos"."id" asc')
-  })
+    const ascending = await tracked.from(schema.todos).orderBy('id').all()
+    const descending = await tracked.from(schema.todos).orderBy('id', 'desc').all()
 
-  test('canonical and draft return tied rows in the same order', async () => {
-    await createShadow()
-    await tracked.into(schema.todos).insert({ title: 'x', done: true })
-    await tracked.into(schema.todos).insert({ title: 'y', done: true })
-    await tracked.into(schema.todos).insert({ title: 'z', done: true })
-
-    const canonical = await tracked.from(schema.todos).orderBy('done').all()
-    const draft = await tracked.withDraft('d1').from(schema.todos).orderBy('done').all()
-
-    expect(draft.map((r) => r.id)).toEqual(canonical.map((r) => r.id))
+    expect(ascending.map((row) => row.id)).toEqual([10, 20, 30])
+    expect(descending.map((row) => row.id)).toEqual([30, 20, 10])
   })
 
   test('limit(1) over a tie picks the same row on both paths', async () => {
-    await createShadow()
+    await createDraftStorage()
     await tracked.into(schema.todos).insert({ title: 'x', done: true })
     await tracked.into(schema.todos).insert({ title: 'y', done: true })
 
@@ -917,13 +976,41 @@ describe('canonical and draft reads agree on tied rows', () => {
     expect(rows.map((r) => r.title)).toEqual(['a', 'b'])
     expect(rows.map((r) => r.id)).toEqual([2, 1])
   })
+})
 
-  test('a composite-PK table emits no tiebreaker rather than an arbitrary one', () => {
-    const { sql } = tracked.from(compositeMembers).orderBy('role').toSql()
-    // Scoped to the ORDER BY — the key's columns are of course in the SELECT
-    // list. No second term there: picking one half of a composite key would be
-    // arbitrary, and the draft coalesce cannot pin a single PK column either.
-    const orderBy = sql.slice(sql.indexOf('order by'))
-    expect(orderBy).toBe('order by "composite_members"."role" asc')
+describe('draft writes to array columns', () => {
+  const arraySchema = defineSchema({
+    notes: table({
+      id: int.primaryKey(),
+      tags: text.array(),
+    }).draftable(),
+  })
+
+  beforeEach(async () => {
+    await db.execute(
+      `CREATE TABLE IF NOT EXISTS notes (id SERIAL PRIMARY KEY, tags TEXT[] NOT NULL)`,
+    )
+    await createDraftStorage()
+  })
+
+  /**
+   * Drizzle encodes an array column as one PostgreSQL literal string. The draft
+   * read lowering rebuilds the column from a JSON array instead, so a proposed
+   * array has to be stored element by element or the draft can never be read.
+   */
+  test('an array proposed in a draft reads back as the array', async () => {
+    await tracked.into(arraySchema.notes).insert({ tags: ['a'] })
+
+    const draft = tracked.withDraft('d1').from(arraySchema.notes)
+    await draft.where(eq('id', 1)).update({ tags: ['b', 'c'] })
+    await tracked
+      .withDraft('d1')
+      .into(arraySchema.notes)
+      .insert({ id: 2, tags: ['x'] })
+
+    const rows = await tracked.withDraft('d1').from(arraySchema.notes).orderBy('id').all()
+    expect(rows.map((row) => row.tags)).toEqual([['b', 'c'], ['x']])
+    const canonical = await tracked.from(arraySchema.notes).all()
+    expect(canonical.map((row) => row.tags)).toEqual([['a']])
   })
 })

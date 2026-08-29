@@ -1,9 +1,9 @@
 /**
- * Tests for the bounded + compacted command log.
+ * Tests for conservative command-log compaction.
  *
  * `compactLog` collapses runs that share a `compactionKey` to NET EFFECT:
  *   - create then delete (same key)        → both removed (never existed)
- *   - create/update then update (same key) → the LATER kept
+ *   - update then update (same key)        → BOTH kept in replay order
  *   - delete of a CANONICAL row then create → BOTH kept, in order (a replace)
  *   - keyless commands                     → never compacted, order preserved
  *
@@ -31,34 +31,26 @@ describe('compactLog — net-effect collapse', () => {
     expect(compactLog(log)).toEqual([])
   })
 
-  test('update then update (same key) keeps the later, at the later position', () => {
+  test('two updates stay ordered because an opaque key cannot prove they are mergeable', () => {
     const log: DraftCommand[] = [
       { path: 'renameTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'update' },
       { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
     ]
     const out = compactLog(log)
-    expect(out).toHaveLength(1)
-    expect((out[0].args as { title: string }).title).toBe('b')
+    expect(out.map((command) => (command.args as { title: string }).title)).toEqual(['a', 'b'])
   })
 
-  test('survivor is emitted at the key LAST occurrence, not its first (replay order)', () => {
-    // Interleaved keys: X is edited, then Y, then X again. The X survivor must
-    // land at X's LAST position (after Y), because publish replays in order and
-    // the client-id invariant (a create precedes its referrer) rides on it.
-    // A first-occurrence emit would (wrongly) yield [X_v2, Y].
+  test('updates on interleaved keys keep their original replay order', () => {
     const log: DraftCommand[] = [
       { path: 'renameTodo', args: { id: 1, title: 'X1' }, compactionKey: 'todo:1', kind: 'update' },
       { path: 'renameTodo', args: { id: 2, title: 'Y' }, compactionKey: 'todo:2', kind: 'update' },
       { path: 'renameTodo', args: { id: 1, title: 'X2' }, compactionKey: 'todo:1', kind: 'update' },
     ]
     const out = compactLog(log)
-    expect(out.map((c) => (c.args as { title: string }).title)).toEqual(['Y', 'X2'])
+    expect(out.map((c) => (c.args as { title: string }).title)).toEqual(['X1', 'Y', 'X2'])
   })
 
-  test('a repeated command object reference is emitted at most once per surviving role', () => {
-    // compactLog is exported/public; a caller could hand it an array where the
-    // SAME object reference appears twice. Position-based (not identity-based)
-    // survivor tracking must still emit the key exactly once.
+  test('a repeated object reference still represents two ordered updates', () => {
     const dup: DraftCommand = {
       path: 'renameTodo',
       args: { id: 1, title: 'x' },
@@ -66,7 +58,7 @@ describe('compactLog — net-effect collapse', () => {
       kind: 'update',
     }
     const out = compactLog([dup, dup])
-    expect(out).toHaveLength(1)
+    expect(out).toEqual([dup, dup])
   })
 
   test('keyless commands are never compacted and keep their order', () => {
@@ -95,19 +87,26 @@ describe('compactLog — net-effect collapse', () => {
     expect(compactLog(log)).toEqual(log)
   })
 
-  test('create + update keeps BOTH (create then update) so publish inserts then edits', () => {
-    // A create followed by an update of the SAME key must NOT collapse to the
-    // update alone — that update would UPDATE a row that does not exist in
-    // canonical yet, silently dropping the created item. Keep the create + the
-    // last update, in order.
+  test('create followed by updates keeps every replay step', () => {
     const log: DraftCommand[] = [
       { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
       { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
       { path: 'renameTodo', args: { id: 1, title: 'c' }, compactionKey: 'todo:1', kind: 'update' },
     ]
     const out = compactLog(log)
-    expect(out.map((c) => c.kind)).toEqual(['create', 'update'])
-    expect((out[1].args as { title: string }).title).toBe('c') // last update wins
+    expect(out.map((c) => c.kind)).toEqual(['create', 'update', 'update'])
+  })
+
+  test('a later create supersedes earlier same-key draft history', () => {
+    const log: DraftCommand[] = [
+      { path: 'addTodo', args: { id: 1, title: 'a' }, compactionKey: 'todo:1', kind: 'create' },
+      { path: 'renameTodo', args: { id: 1, title: 'b' }, compactionKey: 'todo:1', kind: 'update' },
+      { path: 'addTodo', args: { id: 1, title: 'c' }, compactionKey: 'todo:1', kind: 'create' },
+    ]
+
+    const out = compactLog(log)
+
+    expect(out).toEqual([log[2]])
   })
 
   test('delete of a canonical row supersedes prior updates of the same key', () => {

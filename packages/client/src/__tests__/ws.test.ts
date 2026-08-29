@@ -1,16 +1,16 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
 import { createClient } from '../client'
 import { createWsManager } from '../ws'
 
 const schema = defineSchema({
-  todos: {
+  todos: table({
     id: int.primaryKey(),
     title: text,
     done: boolean,
-  },
+  }),
 })
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })

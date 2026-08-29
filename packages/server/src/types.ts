@@ -1,4 +1,13 @@
-import type { DrizzleTracker, AnyColumnDef, ColumnDef, InferColumn, DbConfig } from '@wystack/db'
+import type {
+  DrizzleTracker,
+  SelectBuilder,
+  InsertBuilder,
+  AnyColumnDef,
+  ColumnDef,
+  InferColumn,
+  DbConfig,
+  TransactionOptions,
+} from '@wystack/db'
 import type { Permission } from '@wystack/permissions'
 
 /** Replaces properties in T with the corresponding properties from U. */
@@ -21,9 +30,36 @@ export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
 // oxlint-disable-next-line typescript/no-explicit-any -- permissions remain contravariant over app-specific contexts
 export type Can = (permission: Permission<any>) => Promise<boolean>
 
+export const procedureSelectChainedMethods = ['select', 'where', 'orderBy', 'limit'] as const
+export const procedureSelectTerminalMethods = ['all', 'first', 'update', 'delete', 'toSql'] as const
+export const procedureInsertMethods = ['insert'] as const
+
+type ProcedureSelectMethod =
+  | (typeof procedureSelectChainedMethods)[number]
+  | (typeof procedureSelectTerminalMethods)[number]
+
+type ProcedureTable = Parameters<DrizzleTracker['from']>[0]
+
+export type ProcedureSelectBuilder<T extends ProcedureTable> = Pick<
+  SelectBuilder<T>,
+  ProcedureSelectMethod
+>
+export type ProcedureInsertBuilder<T extends ProcedureTable> = Pick<
+  InsertBuilder<T>,
+  (typeof procedureInsertMethods)[number]
+>
+
+/** Database surface available to application procedures. Tenant/draft binding,
+ * raw SQL, and tracking sets remain framework custody. */
+export interface ProcedureDb {
+  from<T extends ProcedureTable>(table: T): ProcedureSelectBuilder<T>
+  into<T extends ProcedureTable>(table: T): ProcedureInsertBuilder<T>
+  transaction<R>(fn: (tx: ProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+}
+
 /** Function context passed to every query/mutation/action handler. */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
-  db: DrizzleTracker
+  db: ProcedureDb
   can: Can
 }
 
@@ -36,7 +72,7 @@ export type FunctionContext<TAppContext extends object = Record<string, unknown>
 export type InferArg<C> = InferColumn<C>
 
 /** True when a ColumnDef carries the optional flag (`.optional()`). */
-type IsOptionalColumn<C> = C extends ColumnDef<unknown, infer Opt> ? Opt : false
+type IsOptionalColumn<C> = C extends ColumnDef<unknown, infer Opt, boolean> ? Opt : false
 
 /**
  * Maps a table of DSL columns to a procedure's arg object, honoring optionality
@@ -75,6 +111,9 @@ export interface ActionDef<
 }
 
 // A Mutation is the transaction-eligible database-write specialization of Action.
+// Mutation handlers may be replayed after a rolled-back transaction (including
+// draft append/rebase/publish and PostgreSQL deadlock/serialization recovery),
+// so external I/O belongs in an Action rather than a Mutation.
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
 export interface MutationDef<TArgs = any, TReturn = any> extends ActionDef<
   TArgs,
