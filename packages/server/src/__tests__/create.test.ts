@@ -134,6 +134,27 @@ beforeEach(async () => {
           insertDb: '_db' in insertSurface,
         }
       }),
+      inspectLegacyDbSurface: wy.legacyProcedure.input({}).query(async (ctx) => {
+        await ctx.db.raw.execute('SELECT 1')
+        ctx.db.tablesRead.add('legacy-manual-read')
+        const nested = await ctx.db.transaction(async (tx) => ({
+          raw: 'raw' in tx,
+          withTenant: 'withTenant' in tx,
+          withDraft: 'withDraft' in tx,
+          tablesRead: 'tablesRead' in tx,
+          tablesWritten: 'tablesWritten' in tx,
+        }))
+        const dbSurface = ctx.db as unknown as Record<string, unknown>
+        return {
+          raw: 'raw' in dbSurface,
+          withTenant: 'withTenant' in dbSurface,
+          withDraft: 'withDraft' in dbSurface,
+          tablesRead: 'tablesRead' in dbSurface,
+          tablesWritten: 'tablesWritten' in dbSurface,
+          transaction: typeof dbSurface['transaction'] === 'function',
+          nested,
+        }
+      }),
     },
   })
 })
@@ -208,6 +229,59 @@ describe('defineApp().build()', () => {
       chainedDb: false,
       insertDb: false,
     })
+  })
+
+  test('legacyProcedure restores tracked raw access without restoring scope custody', async () => {
+    const call = await app.call('inspectLegacyDbSurface', {})
+
+    expect(call.result).toEqual({
+      raw: true,
+      withTenant: false,
+      withDraft: false,
+      tablesRead: true,
+      tablesWritten: true,
+      transaction: true,
+      nested: {
+        raw: true,
+        withTenant: false,
+        withDraft: false,
+        tablesRead: true,
+        tablesWritten: true,
+      },
+    })
+    expect(call.tablesRead.has('legacy-manual-read')).toBe(true)
+  })
+
+  test('tenant-qualifies manual legacy invalidation tags', async () => {
+    const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
+    const tenancy = multiTenant({
+      key: { property: 'orgId', column: 'org_id', type: text },
+    })
+    const pg = createTestDatabase()
+    const tenantApp = await tenantWy.build({
+      db: drizzle(pg),
+      functions: {
+        legacyRead: tenantWy.legacyProcedure.input({}).query(async (ctx) => {
+          ctx.db.tablesRead.add('checklists')
+          return true
+        }),
+        legacyWrite: tenantWy.legacyProcedure.input({}).mutation(async (ctx) => {
+          ctx.db.tablesWritten.add('checklists')
+          return true
+        }),
+      },
+      tenancy,
+      resolveTenant: (context) => context.orgId,
+    })
+
+    const alphaRead = await tenantApp.call('legacyRead', {}, { orgId: 'alpha' })
+    const betaRead = await tenantApp.call('legacyRead', {}, { orgId: 'beta' })
+    const alphaWrite = await tenantApp.call('legacyWrite', {}, { orgId: 'alpha' })
+
+    expect([...alphaRead.tablesRead]).toEqual(['tenant:alpha:checklists'])
+    expect([...betaRead.tablesRead]).toEqual(['tenant:beta:checklists'])
+    expect([...alphaWrite.tablesWritten]).toEqual(['tenant:alpha:checklists'])
+    expect([...betaRead.tablesRead].some((tag) => alphaWrite.tablesWritten.has(tag))).toBe(false)
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

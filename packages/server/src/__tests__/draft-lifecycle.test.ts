@@ -16,6 +16,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgSchema, pgTable, text as pgText, varchar } from 'drizzle-orm/pg-core'
 import {
@@ -35,12 +36,18 @@ import {
 import { registerTableCapabilities } from '../../../db/src/schema'
 import {
   createDraftLifecycle as createProductionDraftLifecycle,
+  DEFAULT_OWNED_DRAFT_PAGE_SIZE,
+  MAX_DRAFT_SUMMARY_BYTES,
+  MAX_DRAFT_SUMMARY_DEPTH,
+  MAX_OWNED_DRAFT_PAGE_SIZE,
   DraftConflictError,
   DraftIntegrityError,
   DraftPublishDriftError,
   type VersionProbe,
   type Cell,
   type Command,
+  type DraftCommand,
+  type DraftSummary,
   type DraftLifecycleOptions,
 } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
@@ -356,6 +363,11 @@ beforeEach(async () => {
             .update({ items: next })
         }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      legacyAddTodo: wy.legacyProcedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
     },
   })
 })
@@ -415,7 +427,16 @@ describe('draft lifecycle — global authority and custody', () => {
     const privileged = createProductionDraftLifecycle(tenantAware, {
       authorizeGlobalDraft: () => true,
     })
-    await expect(privileged.open(0, { context: ownerContext })).resolves.toBeString()
+    const draftId = await privileged.open(0, {
+      context: ownerContext,
+      lookupKey: 'global:one',
+    })
+    await expect(
+      lifecycle.findOwnedByLookupKey('global:one', { context: ownerContext }),
+    ).rejects.toThrow(/privileged host context|trusted tenant ID/)
+    await expect(
+      privileged.findOwnedByLookupKey('global:one', { context: ownerContext }),
+    ).resolves.toMatchObject({ draftId })
   })
 
   test('apps without a tenant dimension open drafts without a global authorization hook', async () => {
@@ -716,12 +737,431 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(7)
+    expect((migration as any).rows[0].version).toBe(8)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
     expect((canonical as { id: number }[]).some((row) => row.id === 3)).toBe(true)
     await expect(restartedProcess.getLog(draftId)).rejects.toThrow('unknown draft')
+  })
+
+  test('opens a discoverable, materialized initial command batch in one operation', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const persistentCommand: DraftCommand = {
+      id: 'initial-command',
+      path: 'addTodo',
+      args: { id: 3, title: 'atomic cherry' },
+    }
+    const batch: DraftCommand[] = [
+      persistentCommand,
+      {
+        id: 'transient-create',
+        path: 'addTodo',
+        args: { id: 4, title: 'compacted away' },
+        compactionKey: 'todo:4',
+        kind: 'create',
+      },
+      {
+        id: 'transient-delete',
+        path: 'removeTodo',
+        args: { id: 4 },
+        compactionKey: 'todo:4',
+        kind: 'delete',
+      },
+    ]
+
+    const { draftId, results } = await lifecycle.openWithCommands(0, batch, {
+      lookupKey: 'artifact:atomic-success',
+      summary: { title: 'Atomic draft', commandCount: 1 },
+    })
+
+    expect(results.map((result) => result.id)).toEqual([
+      'initial-command',
+      'transient-create',
+      'transient-delete',
+    ])
+    expect(await lifecycle.getLog(draftId)).toEqual([persistentCommand])
+    expect(await lifecycle.inspect(draftId)).toContainEqual(
+      expect.objectContaining({ draftId, table: 'todos', operation: 'insert' }),
+    )
+    expect(await lifecycle.findOwnedByLookupKey('artifact:atomic-success')).toMatchObject({
+      draftId,
+      summary: { title: 'Atomic draft', commandCount: 1 },
+    })
+    const { result: canonical } = await app.call('listTodos', {})
+    expect(canonical as unknown[]).toHaveLength(2)
+    const effectiveRows = await app.system
+      .createTracked()
+      .withDraft(draftId)
+      .from(schema.todos)
+      .all()
+    expect(effectiveRows).toContainEqual(expect.objectContaining({ id: 3, title: 'atomic cherry' }))
+    expect(effectiveRows).not.toContainEqual(expect.objectContaining({ id: 4 }))
+
+    const restarted = createDraftLifecycle(app)
+    expect(await restarted.findOwnedByLookupKey('artifact:atomic-success')).toMatchObject({
+      draftId,
+      summary: { title: 'Atomic draft', commandCount: 1 },
+    })
+    await restarted.publish(draftId)
+    const { result: published } = await app.call('listTodos', {})
+    expect(published).toContainEqual(expect.objectContaining({ id: 3, title: 'atomic cherry' }))
+    expect(published).not.toContainEqual(expect.objectContaining({ id: 4 }))
+  })
+
+  test('rolls back atomic open before an empty draft can become discoverable', async () => {
+    const lifecycle = createDraftLifecycle(app)
+
+    await expect(
+      lifecycle.openWithCommands(
+        0,
+        [
+          { path: 'addTodo', args: { id: 3, title: 'must roll back' } },
+          { path: 'unknownInitialCommand', args: {} },
+        ],
+        {
+          lookupKey: 'artifact:atomic-failure',
+          summary: { title: 'Must not survive' },
+        },
+      ),
+    ).rejects.toThrow('Unknown function')
+    await expect(lifecycle.openWithCommands(0, [])).rejects.toThrow('non-empty batch')
+
+    expect(await lifecycle.findOwnedByLookupKey('artifact:atomic-failure')).toBeUndefined()
+    expect(await lifecycle.listOwned()).toEqual([])
+    const persisted = await db.execute(`SELECT
+      (SELECT count(*) FROM wystack_drafts) AS drafts,
+      (SELECT count(*) FROM wystack_draft_commands) AS commands,
+      (SELECT count(*) FROM wystack_draft_tables) AS tables,
+      (SELECT count(*) FROM wystack_draft_row_changes) AS changes`)
+    const row = (persisted as { rows: Array<Record<string, unknown>> }).rows[0]
+    expect({
+      drafts: Number(row?.['drafts']),
+      commands: Number(row?.['commands']),
+      tables: Number(row?.['tables']),
+      changes: Number(row?.['changes']),
+    }).toEqual({ drafts: 0, commands: 0, tables: 0, changes: 0 })
+  })
+
+  test('serializes concurrent owned lookup-key initialization to one draft and log', async () => {
+    const firstLifecycle = createDraftLifecycle(app)
+    const secondLifecycle = createDraftLifecycle(app)
+    const lookupKey = 'artifact:exclusive-open'
+
+    const [first, second] = await Promise.all([
+      firstLifecycle.getOrOpenWithCommands(
+        0,
+        [{ id: 'first', path: 'addTodo', args: { id: 3, title: 'first contender' } }],
+        { lookupKey, summary: { contender: 'first' } },
+      ),
+      secondLifecycle.getOrOpenWithCommands(
+        0,
+        [{ id: 'second', path: 'addTodo', args: { id: 4, title: 'second contender' } }],
+        { lookupKey, summary: { contender: 'second' } },
+      ),
+    ])
+
+    expect(first.draftId).toBe(second.draftId)
+    expect([first.created, second.created].sort()).toEqual([false, true])
+    expect([first.results.length, second.results.length].sort()).toEqual([0, 1])
+    const log = await firstLifecycle.getLog(first.draftId)
+    expect(log).toHaveLength(1)
+    expect(['first', 'second']).toContain(log[0]?.id)
+    expect(await firstLifecycle.inspect(first.draftId)).toHaveLength(1)
+    expect(await firstLifecycle.listOwned()).toHaveLength(1)
+    const persisted = await db.execute(sql`
+      SELECT
+        (SELECT count(*) FROM wystack_drafts WHERE lookup_key = ${lookupKey}) AS drafts,
+        (SELECT count(*) FROM wystack_draft_commands c
+          JOIN wystack_drafts d ON d.draft_id = c.draft_id
+          WHERE d.lookup_key = ${lookupKey}) AS commands
+    `)
+    const row = (persisted as { rows: Array<Record<string, unknown>> }).rows[0]
+    expect({ drafts: Number(row?.['drafts']), commands: Number(row?.['commands']) }).toEqual({
+      drafts: 1,
+      commands: 1,
+    })
+  })
+
+  test('lists stable created-order pages after lifecycle recreation', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    const aliceOldest = await lifecycle.open({ sequence: 1 }, { context: { owner: 'alice' } })
+    const bob = await lifecycle.open({ sequence: 2 }, { context: { owner: 'bob' } })
+    const aliceTieA = await lifecycle.open({ sequence: 3 }, { context: { owner: 'alice' } })
+    const aliceTieB = await lifecycle.open({ sequence: 4 }, { context: { owner: 'alice' } })
+    const aliceNewest = await lifecycle.open({ sequence: 5 }, { context: { owner: 'alice' } })
+
+    await db.execute(sql`UPDATE wystack_drafts SET created_at =
+      CASE draft_id
+        WHEN ${aliceOldest} THEN '2026-08-01T00:00:00.000Z'::timestamptz
+        WHEN ${bob} THEN '2026-08-02T00:00:00.000Z'::timestamptz
+        WHEN ${aliceTieA} THEN '2026-08-03T00:00:00.000Z'::timestamptz
+        WHEN ${aliceTieB} THEN '2026-08-03T00:00:00.000Z'::timestamptz
+        WHEN ${aliceNewest} THEN '2026-08-04T00:00:00.000Z'::timestamptz
+        ELSE updated_at
+      END`)
+
+    const restarted = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    const tieOrder = [aliceTieA, aliceTieB].sort().reverse()
+    const expectedIds = [aliceNewest, ...tieOrder, aliceOldest]
+    const firstPage = await restarted.listOwned({ context: { owner: 'alice' }, limit: 2 })
+    await restarted.append(
+      aliceOldest,
+      [{ path: 'addTodo', args: { id: 90, title: 'moves updated_at only' } }],
+      { context: { owner: 'alice' }, summary: { title: 'oldest changed' } },
+    )
+    const secondPage = await restarted.listOwned({
+      context: { owner: 'alice' },
+      limit: 2,
+      cursor: firstPage.at(-1)?.cursor,
+    })
+
+    expect([...firstPage, ...secondPage].map((draft) => draft.draftId)).toEqual(expectedIds)
+    expect(firstPage[0]).toMatchObject({
+      draftId: aliceNewest,
+      baseVersion: { sequence: 5 },
+      cursor: { draftId: aliceNewest },
+    })
+    expect(firstPage[0]?.cursor.createdAt).toBe(firstPage[0]?.createdAt)
+    expect(firstPage[0]?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+    expect(new Date(firstPage[0]?.createdAt ?? '').toISOString()).toBe('2026-08-04T00:00:00.000Z')
+    expect(secondPage.at(-1)).toMatchObject({
+      draftId: aliceOldest,
+      summary: { title: 'oldest changed' },
+    })
+    expect(new Set([...firstPage, ...secondPage].map((draft) => draft.draftId)).size).toBe(4)
+    expect(
+      (await restarted.listOwned({ context: { owner: 'bob' } })).map((draft) => draft.draftId),
+    ).toEqual([bob])
+  })
+
+  test('owned-draft listing has a default bound and rejects invalid or oversized pages', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    for (let sequence = 0; sequence <= DEFAULT_OWNED_DRAFT_PAGE_SIZE; sequence += 1) {
+      await lifecycle.open({ sequence }, { context: { owner: 'alice' } })
+    }
+
+    expect(await lifecycle.listOwned({ context: { owner: 'alice' } })).toHaveLength(
+      DEFAULT_OWNED_DRAFT_PAGE_SIZE,
+    )
+    await expect(
+      lifecycle.listOwned({
+        context: { owner: 'alice' },
+        limit: MAX_OWNED_DRAFT_PAGE_SIZE + 1,
+      }),
+    ).rejects.toThrow(`must not exceed ${MAX_OWNED_DRAFT_PAGE_SIZE}`)
+    for (const limit of [0, -1, 1.5, Number.NaN]) {
+      await expect(lifecycle.listOwned({ context: { owner: 'alice' }, limit })).rejects.toThrow(
+        'positive safe integer',
+      )
+    }
+    for (const createdAt of [
+      '0',
+      'not-a-timestamp',
+      '0000-01-01T00:00:00.000000Z',
+      '2026-08-04T00:00:00.000Z',
+      '2026-02-30T00:00:00.000000Z',
+      '2026-08-04T24:00:00.000000Z',
+      '2026-08-04T00:00:00.000000+00:00',
+    ]) {
+      await expect(
+        lifecycle.listOwned({
+          context: { owner: 'alice' },
+          cursor: { createdAt, draftId: 'draft_invalid' },
+        }),
+      ).rejects.toThrow('owned draft cursor is invalid')
+    }
+  })
+
+  test('persists snapshotted lookup metadata across append and lifecycle recreation', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    const initialSummary = { title: 'initial', nested: { sequence: 1 } }
+    const opening = lifecycle.open(0, {
+      context: { owner: 'alice' },
+      lookupKey: 'artifact:file-1',
+      summary: initialSummary,
+    })
+    initialSummary.title = 'mutated after open'
+    const draftId = await opening
+
+    const nextSummary = { title: 'after append', nested: { sequence: 2 } }
+    const appending = lifecycle.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 91, title: 'metadata' } }],
+      { context: { owner: 'alice' }, summary: nextSummary },
+    )
+    nextSummary.nested.sequence = 999
+    await appending
+
+    const restarted = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    expect(
+      await restarted.findOwnedByLookupKey('artifact:file-1', {
+        context: { owner: 'alice' },
+      }),
+    ).toMatchObject({
+      draftId,
+      lookupKey: 'artifact:file-1',
+      summary: { title: 'after append', nested: { sequence: 2 } },
+    })
+    expect(
+      await restarted.findOwnedByLookupKey('artifact:file-1', {
+        context: { owner: 'bob' },
+      }),
+    ).toBeUndefined()
+
+    await db.execute(`DROP TABLE wystack_draft_commands`)
+    const loglessRestart = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    expect(await loglessRestart.listOwned({ context: { owner: 'alice' } })).toMatchObject([
+      {
+        draftId,
+        lookupKey: 'artifact:file-1',
+        summary: { title: 'after append', nested: { sequence: 2 } },
+      },
+    ])
+    expect(
+      await loglessRestart.findOwnedByLookupKey('artifact:file-1', {
+        context: { owner: 'alice' },
+      }),
+    ).toMatchObject({ draftId })
+  })
+
+  test('summary replacement rolls back with a failed append and omission preserves it', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    const context = { owner: 'alice' }
+    const draftId = await lifecycle.open(0, {
+      context,
+      lookupKey: 'artifact:file-2',
+      summary: { state: 'initial' },
+    })
+
+    await expect(
+      lifecycle.append(
+        draftId,
+        [
+          { path: 'addTodo', args: { id: 92, title: 'rolled back' } },
+          { path: 'nope', args: {} },
+        ],
+        { context, summary: { state: 'must-not-commit' } },
+      ),
+    ).rejects.toThrow('Unknown function')
+    expect(await lifecycle.findOwnedByLookupKey('artifact:file-2', { context })).toMatchObject({
+      summary: { state: 'initial' },
+    })
+
+    await lifecycle.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 93, title: 'keeps summary' } }],
+      { context },
+    )
+    expect(await lifecycle.findOwnedByLookupKey('artifact:file-2', { context })).toMatchObject({
+      summary: { state: 'initial' },
+    })
+
+    await lifecycle.append(draftId, [], { context, summary: null })
+    expect(await lifecycle.findOwnedByLookupKey('artifact:file-2', { context })).toMatchObject({
+      summary: null,
+    })
+  })
+
+  test('lookup keys enforce their UTF-8 byte bound before opening a draft', async () => {
+    const lifecycle = createProductionDraftLifecycle(app, {
+      resolveOwner: (context) => context['owner'],
+      authorizeGlobalDraft: () => true,
+    })
+    await expect(
+      lifecycle.open(0, {
+        context: { owner: 'alice' },
+        lookupKey: '界'.repeat(171),
+      }),
+    ).rejects.toThrow('512 UTF-8 bytes')
+    await expect(
+      lifecycle.findOwnedByLookupKey('', { context: { owner: 'alice' } }),
+    ).rejects.toThrow('non-empty text')
+    expect(await lifecycle.listOwned({ context: { owner: 'alice' } })).toEqual([])
+  })
+
+  test('bounds discovery summaries by their serialized UTF-8 size at every open ingress', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const exactLimit = 'x'.repeat(MAX_DRAFT_SUMMARY_BYTES - 2)
+    const acceptedId = await lifecycle.open(0, {
+      lookupKey: 'summary:exact-limit',
+      summary: exactLimit,
+    })
+
+    await expect(
+      lifecycle.open(0, { summary: 'x'.repeat(MAX_DRAFT_SUMMARY_BYTES - 1) }),
+    ).rejects.toThrow(`${MAX_DRAFT_SUMMARY_BYTES} serialized UTF-8 bytes`)
+    await expect(lifecycle.open(0, { summary: 'x'.repeat(1024 * 1024) })).rejects.toThrow(
+      `${MAX_DRAFT_SUMMARY_BYTES} serialized UTF-8 bytes`,
+    )
+    await expect(
+      lifecycle.openWithCommands(
+        0,
+        [{ path: 'addTodo', args: { id: 3, title: 'must not materialize' } }],
+        {
+          lookupKey: 'summary:oversized-atomic',
+          summary: 'x'.repeat(MAX_DRAFT_SUMMARY_BYTES - 1),
+        },
+      ),
+    ).rejects.toThrow(`${MAX_DRAFT_SUMMARY_BYTES} serialized UTF-8 bytes`)
+
+    expect(await lifecycle.findOwnedByLookupKey('summary:exact-limit')).toMatchObject({
+      draftId: acceptedId,
+      summary: exactLimit,
+    })
+    expect(await lifecycle.findOwnedByLookupKey('summary:oversized-atomic')).toBeUndefined()
+    expect((await lifecycle.listOwned()).map((draft) => draft.draftId)).toEqual([acceptedId])
+  })
+
+  test('rejects over-deep summary replacements before append or fork writes', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const sourceId = await lifecycle.open(0, {
+      lookupKey: 'summary:depth-source',
+      summary: { state: 'initial' },
+    })
+    let exactDepth: DraftSummary = 'leaf'
+    for (let depth = 0; depth < MAX_DRAFT_SUMMARY_DEPTH; depth += 1) {
+      exactDepth = { child: exactDepth }
+    }
+    const exactDepthId = await lifecycle.open(0, { summary: exactDepth })
+    const overDepth: DraftSummary = { child: exactDepth }
+
+    await expect(lifecycle.append(sourceId, [], { summary: overDepth })).rejects.toThrow(
+      `${MAX_DRAFT_SUMMARY_DEPTH} nested containers`,
+    )
+    await expect(
+      lifecycle.forkAndDiscard(sourceId, 1, (commands) => ({
+        commands,
+        summary: overDepth,
+      })),
+    ).rejects.toThrow(`${MAX_DRAFT_SUMMARY_DEPTH} nested containers`)
+
+    expect(await lifecycle.findOwnedByLookupKey('summary:depth-source')).toMatchObject({
+      draftId: sourceId,
+      summary: { state: 'initial' },
+    })
+    expect((await lifecycle.listOwned()).map((draft) => draft.draftId)).toContain(exactDepthId)
   })
 
   test('default custody follows stable principal identity, not mutable profile fields', async () => {
@@ -1753,6 +2193,16 @@ describe('draft lifecycle — command envelope ownership', () => {
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
+  test('rejects a legacy procedure before it can execute against the draft tracker', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(
+      lc.append(draftId, [{ path: 'legacyAddTodo', args: { id: 3, title: 'cherry' } }]),
+    ).rejects.toThrow('Draft command legacyAddTodo cannot reference a legacy procedure')
+    expect(await lc.getLog(draftId)).toEqual([])
+  })
+
   test('snapshots a mutable batch before validation and queued execution', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -1949,6 +2399,92 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect(ids).toEqual([1, 2, 3, 4])
   })
 
+  test('an append during fork resolution preserves the source draft and loses no command', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0, {
+      lookupKey: 'artifact:fork-race',
+      summary: { commandCount: 0 },
+    })
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      summary: { commandCount: 1 },
+    })
+
+    const releaseResolve = deferred()
+    const enteredResolve = deferred()
+    const replacing = lc.forkAndDiscard(draftId, 1, async (snapshotLog, metadata) => {
+      expect(metadata).toMatchObject({
+        lookupKey: 'artifact:fork-race',
+        summary: { commandCount: 1 },
+      })
+      enteredResolve.release()
+      await releaseResolve.gate
+      return { commands: snapshotLog, summary: { commandCount: snapshotLog.length } }
+    })
+
+    await enteredResolve.gate
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }], {
+      summary: { commandCount: 2 },
+    })
+    releaseResolve.release()
+
+    await expect(replacing).rejects.toThrow('changed during replacement')
+    expect(await lc.getLog(draftId)).toHaveLength(2)
+    expect(await lc.findOwnedByLookupKey('artifact:fork-race')).toMatchObject({
+      draftId,
+      summary: { commandCount: 2 },
+    })
+    const stored = await db.execute(`SELECT draft_id FROM wystack_drafts`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((stored as any).rows.map((row: { draft_id: string }) => row.draft_id)).toEqual([draftId])
+
+    await lc.publish(draftId)
+    const { result: canonical } = await app.call('listTodos', {})
+    const ids = (canonical as { id: number }[]).map((row) => row.id).sort()
+    expect(ids).toEqual([1, 2, 3, 4])
+  })
+
+  test('fork and discard swaps effective state atomically', async () => {
+    const lc = createDraftLifecycle(app)
+    const sourceId = await lc.open(0, {
+      lookupKey: 'artifact:fork-success',
+      summary: { commandCount: 0 },
+    })
+    await lc.append(sourceId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      summary: { commandCount: 1 },
+    })
+
+    const replacementId = await lc.forkAndDiscard(sourceId, 1, (snapshotLog, metadata) => {
+      expect(metadata).toMatchObject({
+        lookupKey: 'artifact:fork-success',
+        summary: { commandCount: 1 },
+      })
+      return {
+        commands: [...snapshotLog, { path: 'addTodo', args: { id: 4, title: 'date' } }],
+        summary: { commandCount: 2 },
+      }
+    })
+
+    await expect(lc.getLog(sourceId)).rejects.toThrow('unknown draft')
+    expect(await lc.getLog(replacementId)).toHaveLength(2)
+    expect(await lc.findOwnedByLookupKey('artifact:fork-success')).toMatchObject({
+      draftId: replacementId,
+      lookupKey: 'artifact:fork-success',
+      summary: { commandCount: 2 },
+    })
+
+    const backwardCompatibleId = await lc.forkAndDiscard(replacementId, 2, (snapshotLog) => [
+      ...snapshotLog,
+    ])
+    expect(await lc.findOwnedByLookupKey('artifact:fork-success')).toMatchObject({
+      draftId: backwardCompatibleId,
+      summary: { commandCount: 2 },
+    })
+    await lc.publish(backwardCompatibleId)
+    const { result: canonical } = await app.call('listTodos', {})
+    const ids = (canonical as { id: number }[]).map((row) => row.id).sort()
+    expect(ids).toEqual([1, 2, 3, 4])
+  })
+
   test('discard during publish resolution wins atomically and invalidates the stale publish', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -2017,14 +2553,22 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
 
-    const a = lc.append(draftId, [
-      { path: 'addTodo', args: { id: 3, title: 'c1' } },
-      { path: 'addTodo', args: { id: 4, title: 'c2' } },
-    ])
-    const b = lc.append(draftId, [
-      { path: 'addTodo', args: { id: 5, title: 'c3' } },
-      { path: 'addTodo', args: { id: 6, title: 'c4' } },
-    ])
+    const a = lc.append(
+      draftId,
+      [
+        { path: 'addTodo', args: { id: 3, title: 'c1' } },
+        { path: 'addTodo', args: { id: 4, title: 'c2' } },
+      ],
+      { summary: { last: 'c2' } },
+    )
+    const b = lc.append(
+      draftId,
+      [
+        { path: 'addTodo', args: { id: 5, title: 'c3' } },
+        { path: 'addTodo', args: { id: 6, title: 'c4' } },
+      ],
+      { summary: { last: 'c4' } },
+    )
     await Promise.all([a, b])
 
     expect((await lc.getLog(draftId)).map((c) => (c.args as { title: string }).title)).toEqual([
@@ -2033,6 +2577,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
       'c3',
       'c4',
     ])
+    expect((await lc.listOwned())[0]).toMatchObject({ summary: { last: 'c4' } })
   })
 
   test('concurrent append and discard cannot leave an orphaned overlay', async () => {

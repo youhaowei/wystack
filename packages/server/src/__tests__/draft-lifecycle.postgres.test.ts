@@ -237,6 +237,43 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     ).toEqual([[], []])
   })
 
+  test('exclusive owned lookup initialization serializes across separate connections', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const lookupKey = 'postgres-proof:exclusive-open'
+    const [firstResult, secondResult] = await Promise.all([
+      first.getOrOpenWithCommands(
+        0,
+        [{ id: 'first', path: 'addTodo', args: { id: 20_001, title: 'first contender' } }],
+        { context: privilegedContext, lookupKey },
+      ),
+      second.getOrOpenWithCommands(
+        0,
+        [{ id: 'second', path: 'addTodo', args: { id: 20_002, title: 'second contender' } }],
+        { context: privilegedContext, lookupKey },
+      ),
+    ])
+
+    expect(firstResult.draftId).toBe(secondResult.draftId)
+    expect([firstResult.created, secondResult.created].sort()).toEqual([false, true])
+    expect([firstResult.results.length, secondResult.results.length].sort()).toEqual([0, 1])
+    expect(await first.getLog(firstResult.draftId, { context: privilegedContext })).toHaveLength(1)
+    expect(await second.inspect(secondResult.draftId, { context: privilegedContext })).toHaveLength(
+      1,
+    )
+    const [counts] = await firstClient<{ drafts: string; commands: string }[]>`
+      SELECT
+        (SELECT count(*) FROM wystack_drafts WHERE lookup_key = ${lookupKey}) AS drafts,
+        (SELECT count(*) FROM wystack_draft_commands c
+          JOIN wystack_drafts d ON d.draft_id = c.draft_id
+          WHERE d.lookup_key = ${lookupKey}) AS commands
+    `
+    expect({ drafts: Number(counts?.drafts), commands: Number(counts?.commands) }).toEqual({
+      drafts: 1,
+      commands: 1,
+    })
+  })
+
   test('publishes immediate foreign keys in dependency order', async () => {
     const draft = lifecycle(firstApp)
     const familyDraft = await draft.open(0, { context: privilegedContext })

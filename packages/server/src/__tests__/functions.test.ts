@@ -9,6 +9,7 @@ describe('procedure builder', () => {
   test('creates a QueryDef with correct type', () => {
     const q = wy.procedure.input({ type: text.optional() }).query(async (_ctx, _args) => [])
     expect(q.type).toBe('query')
+    expect(q.databaseAccess).toBe('native')
     expect(q.path).toBe('')
     expect(q.args.type).toBeDefined()
   })
@@ -36,6 +37,19 @@ describe('procedure builder', () => {
     expect(action.type).toBe('action')
     await expect(action.handler({}, { prompt: 'run' })).resolves.toBe('middleware:run')
     await expect(action.handler({}, { prompt: 123 } as never)).rejects.toThrow('Validation failed')
+  })
+
+  test('legacyProcedure preserves middleware and input inference while branding the definition', async () => {
+    const definition = wy.legacyProcedure
+      .use(({ next }) => next({ source: 'legacy-middleware' }))
+      .input({ id: int })
+      .query(async (ctx, args) => ({ source: ctx.source, id: args.id }))
+
+    expect(definition.databaseAccess).toBe('legacy-raw')
+    await expect(definition.handler({}, { id: 7 })).resolves.toEqual({
+      source: 'legacy-middleware',
+      id: 7,
+    })
   })
 
   test('composes minimal middleware patches with Overwrite', async () => {

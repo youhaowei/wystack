@@ -9,6 +9,7 @@ import {
   type ActionDef,
   type MutationDef,
   type Overwrite,
+  type ProcedureDatabaseAccess,
   type QueryDef,
   type StageOk,
 } from './types'
@@ -59,6 +60,7 @@ function isStageOk(value: unknown): value is StageOk<unknown> {
 
 function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
   type: 'query' | 'mutation' | 'action',
+  databaseAccess: ProcedureDatabaseAccess,
   args: TArgSchema,
   middleware: readonly AnyMiddleware[],
   handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
@@ -70,6 +72,7 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
 
   return {
     type,
+    databaseAccess,
     path: '',
     args,
     // Keep the stored context deliberately broad: client inference only needs
@@ -100,7 +103,9 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
   }
 }
 
-export function createProcedure<TContext>(): ProcedureBuilder<TContext> {
+export function createProcedure<TContext>(
+  databaseAccess: ProcedureDatabaseAccess = 'native',
+): ProcedureBuilder<TContext> {
   function createBuilder<TCurrentContext, TArgSchema extends Record<string, AnyColumnDef>>(
     middleware: readonly AnyMiddleware[],
     args: TArgSchema,
@@ -124,7 +129,7 @@ export function createProcedure<TContext>(): ProcedureBuilder<TContext> {
       query<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('query', args, middleware, handler) as QueryDef<
+        return terminal('query', databaseAccess, args, middleware, handler) as QueryDef<
           InferArgs<TArgSchema>,
           TReturn
         >
@@ -132,7 +137,7 @@ export function createProcedure<TContext>(): ProcedureBuilder<TContext> {
       mutation<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('mutation', args, middleware, handler) as MutationDef<
+        return terminal('mutation', databaseAccess, args, middleware, handler) as MutationDef<
           InferArgs<TArgSchema>,
           TReturn
         >
@@ -140,7 +145,7 @@ export function createProcedure<TContext>(): ProcedureBuilder<TContext> {
       action<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('action', args, middleware, handler) as ActionDef<
+        return terminal('action', databaseAccess, args, middleware, handler) as ActionDef<
           InferArgs<TArgSchema>,
           TReturn
         >

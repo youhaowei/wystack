@@ -68,6 +68,11 @@ beforeEach(async () => {
         throw new Error('command boom')
       }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      legacyAddTodo: wy.legacyProcedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
     },
   })
 })
@@ -77,6 +82,17 @@ describe('applyCommands — commit mode', () => {
     await expect(
       applyCommands(app, [{ path: 'externalAction', args: {} }], { mode: 'commit' }),
     ).rejects.toThrow('Command externalAction cannot reference an action')
+  })
+
+  test('rejects a legacy procedure before opening the command transaction', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'legacyAddTodo', args: { id: 1, title: 'A' } }], {
+        mode: 'commit',
+      }),
+    ).rejects.toThrow('Command legacyAddTodo cannot reference a legacy procedure')
+
+    const { result } = await app.call('listTodos', {})
+    expect(result).toEqual([])
   })
 
   test('rejects a path replaced with an Action after upfront validation', async () => {

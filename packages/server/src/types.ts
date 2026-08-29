@@ -49,7 +49,7 @@ export type ProcedureInsertBuilder<T extends ProcedureTable> = Pick<
   (typeof procedureInsertMethods)[number]
 >
 
-/** Database surface available to application procedures. Tenant/draft binding,
+/** Database surface available to native application procedures. Tenant/draft binding,
  * raw SQL, and tracking sets remain framework custody. */
 export interface ProcedureDb {
   from<T extends ProcedureTable>(table: T): ProcedureSelectBuilder<T>
@@ -57,11 +57,36 @@ export interface ProcedureDb {
   transaction<R>(fn: (tx: ProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
+/**
+ * Compatibility-only database surface for procedures that have not yet moved
+ * onto WyStack's tracked query DSL.
+ *
+ * The raw connection and tracking sets are deliberately available only through
+ * `defineApp().legacyProcedure`. Tenant and draft scope-changing capabilities
+ * remain framework custody even on this migration surface.
+ */
+export interface LegacyProcedureDb extends ProcedureDb {
+  readonly raw: DrizzleTracker['raw']
+  readonly tablesRead: Set<string>
+  readonly tablesWritten: Set<string>
+  transaction<R>(fn: (tx: LegacyProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+}
+
 /** Function context passed to every query/mutation/action handler. */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
   db: ProcedureDb
   can: Can
 }
+
+/** Context passed only to handlers built with `defineApp().legacyProcedure`. */
+export type LegacyFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  TAppContext & {
+    db: LegacyProcedureDb
+    can: Can
+  }
+
+/** Runtime marker controlling which database facade a registered handler receives. */
+export type ProcedureDatabaseAccess = 'native' | 'legacy-raw'
 
 /**
  * Maps a DSL ColumnDef to its TypeScript arg type, honoring optionality:
@@ -90,6 +115,7 @@ export type InferArgs<T extends Record<string, AnyColumnDef>> = {
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
 export interface QueryDef<TArgs = any, TReturn = any> {
   type: 'query'
+  databaseAccess: ProcedureDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
@@ -104,6 +130,7 @@ export interface ActionDef<
   TType extends 'action' | 'mutation' = 'action',
 > {
   type: TType
+  databaseAccess: ProcedureDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape

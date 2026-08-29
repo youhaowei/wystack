@@ -238,6 +238,9 @@ async function executeCommands(
     if (definition?.type === 'action') {
       throw new Error(`Command ${command.path} cannot reference an action`)
     }
+    if (definition?.databaseAccess === 'legacy-raw') {
+      throw new Error(`Command ${command.path} cannot reference a legacy procedure`)
+    }
   }
 
   if (mode === 'commit') {
@@ -367,6 +370,9 @@ async function applyAll(
     const definition = app.functions.get(cmd.path)
     if (definition?.type === 'action') {
       throw new Error(`Command ${cmd.path} cannot reference an action`)
+    }
+    if (definition?.databaseAccess === 'legacy-raw') {
+      throw new Error(`Command ${cmd.path} cannot reference a legacy procedure`)
     }
     const value = await app.system.runHandler(cmd.path, cmd.args, tx, context)
     // Echo the command's opaque correlation id onto its result; the engine

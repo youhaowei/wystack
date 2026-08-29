@@ -1,7 +1,16 @@
 import { withFrameworkBootstrapLock } from '@wystack/db'
 import { sql, type SQL } from 'drizzle-orm'
 import type { DraftCommand } from './draft-command-log'
-import { DraftIntegrityError, type Version } from './draft-lifecycle-types'
+import {
+  DEFAULT_OWNED_DRAFT_PAGE_SIZE,
+  MAX_DRAFT_LOOKUP_KEY_BYTES,
+  MAX_OWNED_DRAFT_PAGE_SIZE,
+  DraftIntegrityError,
+  type DraftSummary,
+  type OwnedDraftCursor,
+  type Version,
+} from './draft-lifecycle-types'
+import { snapshotDraftSummary } from './draft-summary'
 
 // oxlint-disable-next-line typescript/no-explicit-any -- the server supports multiple Drizzle Postgres drivers
 type RawDb = any
@@ -12,6 +21,27 @@ export interface StoredDraft {
   logRevision: number
   tenantId: unknown | undefined
   ownerKey: unknown
+  lookupKey: string | undefined
+  summary: DraftSummary | undefined
+}
+
+export interface StoredDraftSummary {
+  draftId: string
+  baseVersion: Version
+  createdAt: string
+  updatedAt: string
+  lookupKey: string | undefined
+  summary: DraftSummary | undefined
+  cursor: OwnedDraftCursor
+}
+
+export interface ListStoredDraftsForOwnerOptions {
+  limit?: number
+  cursor?: OwnedDraftCursor
+}
+
+export interface StoredDraftMetadataUpdate {
+  summary?: DraftSummary
 }
 
 export interface StoredTouchedTable {
@@ -67,7 +97,7 @@ function draftIntegrityExpression(draftId: SQL): SQL {
   )::text)`
 }
 
-const draftStorageVersion = 7
+const draftStorageVersion = 8
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -245,6 +275,46 @@ const storageDdlV7 = [
     END $$`),
 ]
 
+// Custody values are arbitrary JSON and may be much larger than PostgreSQL's
+// btree entry limit. Index fixed-size immutable hashes, then retain the exact
+// JSONB predicates in every query as collision rechecks. created_at is the
+// immutable keyset; updated_at remains display metadata only.
+const storageDdlV8 = [
+  sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS lookup_key TEXT`),
+  sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS summary JSONB`),
+  sql.raw(`UPDATE wystack_drafts
+    SET summary = '{"present":false}'::jsonb
+    WHERE summary IS NULL`),
+  sql.raw(`ALTER TABLE wystack_drafts ALTER COLUMN summary SET NOT NULL`),
+  sql.raw(`ALTER TABLE wystack_drafts ALTER COLUMN summary
+    SET DEFAULT '{"present":false}'::jsonb`),
+  sql.raw(`DO $$
+    BEGIN
+      ALTER TABLE wystack_drafts
+        ADD CONSTRAINT wystack_drafts_lookup_key_size_check
+        CHECK (
+          lookup_key IS NULL OR
+          octet_length(lookup_key) BETWEEN 1 AND ${MAX_DRAFT_LOOKUP_KEY_BYTES}
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$`),
+  sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_created_idx
+    ON wystack_drafts (
+      jsonb_hash_extended(tenant_scope, 0),
+      jsonb_hash_extended(owner_key, 0),
+      created_at DESC,
+      draft_id DESC
+    )`),
+  sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_lookup_idx
+    ON wystack_drafts (
+      jsonb_hash_extended(tenant_scope, 0),
+      jsonb_hash_extended(owner_key, 0),
+      lookup_key,
+      created_at DESC,
+      draft_id DESC
+    ) WHERE lookup_key IS NOT NULL`),
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await withFrameworkBootstrapLock(raw, async (tx: RawDb) => {
     await tx.execute(migrationTableDdl)
@@ -290,6 +360,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     if (installedVersion < 7) {
       for (const statement of storageDdlV7) await tx.execute(statement)
     }
+    if (installedVersion < 8) {
+      for (const statement of storageDdlV8) await tx.execute(statement)
+    }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
       SET version = ${draftStorageVersion}, applied_at = CURRENT_TIMESTAMP
@@ -305,13 +378,19 @@ export async function insertStoredDraft(
   const baseVersion = encodeEnvelope(draft.baseVersion, 'base version')
   const tenantScope = encodeEnvelope(draft.tenantId, 'tenant scope')
   const ownerKey = encodeEnvelope(draft.ownerKey, 'owner key')
+  const lookupKey =
+    draft.lookupKey === undefined ? undefined : validateDraftLookupKey(draft.lookupKey)
+  const summarySnapshot =
+    draft.summary === undefined ? undefined : snapshotDraftSummary(draft.summary)
+  const summary = encodeEnvelope(summarySnapshot, 'draft summary')
   const integrityHash = draftIntegrityExpression(sql`${draft.draftId}`)
   await raw.execute(sql`
     INSERT INTO wystack_drafts
-      (draft_id, base_version, tenant_scope, owner_key, log_revision, integrity_hash)
+      (draft_id, base_version, tenant_scope, owner_key, lookup_key, summary,
+       log_revision, integrity_hash)
     VALUES
-      (${draft.draftId}, ${baseVersion}::jsonb, ${tenantScope}::jsonb, ${ownerKey}::jsonb, 0,
-       ${integrityHash})
+      (${draft.draftId}, ${baseVersion}::jsonb, ${tenantScope}::jsonb, ${ownerKey}::jsonb,
+       ${lookupKey ?? null}, ${summary}::jsonb, 0, ${integrityHash})
   `)
 }
 
@@ -321,7 +400,7 @@ export async function readStoredDraft(
 ): Promise<StoredDraft | undefined> {
   const rows = normalizeRows(
     await raw.execute(sql`
-      SELECT draft_id, base_version, tenant_scope, owner_key, log_revision
+      SELECT draft_id, base_version, tenant_scope, owner_key, lookup_key, summary, log_revision
       FROM wystack_drafts
       WHERE draft_id = ${draftId}
     `),
@@ -334,7 +413,196 @@ export async function readStoredDraft(
     logRevision: Number(row['log_revision']),
     tenantId: decodeEnvelope(row['tenant_scope']),
     ownerKey: decodeEnvelope(row['owner_key']),
+    lookupKey: row['lookup_key'] == null ? undefined : String(row['lookup_key']),
+    summary: decodeEnvelope(row['summary']) as DraftSummary | undefined,
   }
+}
+
+export async function listStoredDraftsForOwner(
+  raw: RawDb,
+  tenantId: unknown,
+  ownerKey: unknown,
+  opts: ListStoredDraftsForOwnerOptions = {},
+): Promise<StoredDraftSummary[]> {
+  const limit = normalizeOwnedDraftPageSize(opts.limit)
+  const cursor = normalizeOwnedDraftCursor(opts.cursor)
+  const tenantScope = encodeEnvelope(tenantId, 'tenant scope')
+  const encodedOwnerKey = encodeEnvelope(ownerKey, 'owner key')
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      SELECT draft_id, base_version, lookup_key, summary,
+             to_char(
+               created_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+             ) AS created_at_cursor,
+             to_char(
+               updated_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+             ) AS updated_at_display
+      FROM wystack_drafts
+      WHERE jsonb_hash_extended(tenant_scope, 0) =
+              jsonb_hash_extended(${tenantScope}::jsonb, 0)
+        AND jsonb_hash_extended(owner_key, 0) =
+              jsonb_hash_extended(${encodedOwnerKey}::jsonb, 0)
+        AND tenant_scope = ${tenantScope}::jsonb
+        AND owner_key = ${encodedOwnerKey}::jsonb
+        ${
+          cursor
+            ? sql`AND (created_at, draft_id) <
+                (${cursor.createdAt}::timestamptz, ${cursor.draftId})`
+            : sql``
+        }
+      ORDER BY created_at DESC, draft_id DESC
+      LIMIT ${limit}
+    `),
+  )
+  return rows.map(storedDraftSummaryFromRow)
+}
+
+export async function findStoredDraftForOwnerByLookupKey(
+  raw: RawDb,
+  tenantId: unknown,
+  ownerKey: unknown,
+  lookupKey: string,
+): Promise<StoredDraftSummary | undefined> {
+  const normalizedLookupKey = validateDraftLookupKey(lookupKey)
+  const tenantScope = encodeEnvelope(tenantId, 'tenant scope')
+  const encodedOwnerKey = encodeEnvelope(ownerKey, 'owner key')
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      SELECT draft_id, base_version, lookup_key, summary,
+             to_char(
+               created_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+             ) AS created_at_cursor,
+             to_char(
+               updated_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+             ) AS updated_at_display
+      FROM wystack_drafts
+      WHERE jsonb_hash_extended(tenant_scope, 0) =
+              jsonb_hash_extended(${tenantScope}::jsonb, 0)
+        AND jsonb_hash_extended(owner_key, 0) =
+              jsonb_hash_extended(${encodedOwnerKey}::jsonb, 0)
+        AND tenant_scope = ${tenantScope}::jsonb
+        AND owner_key = ${encodedOwnerKey}::jsonb
+        AND lookup_key = ${normalizedLookupKey}
+      ORDER BY created_at DESC, draft_id DESC
+      LIMIT 1
+    `),
+  )
+  return rows[0] ? storedDraftSummaryFromRow(rows[0]) : undefined
+}
+
+/**
+ * Serialize owned lookup-key initializers across connections. Hash collisions
+ * only add contention: callers must still perform the exact JSONB custody query
+ * after acquiring this transaction-scoped lock.
+ */
+export async function lockStoredDraftLookup(
+  raw: RawDb,
+  tenantId: unknown,
+  ownerKey: unknown,
+  lookupKey: string,
+): Promise<void> {
+  const normalizedLookupKey = validateDraftLookupKey(lookupKey)
+  const tenantScope = encodeEnvelope(tenantId, 'tenant scope')
+  const encodedOwnerKey = encodeEnvelope(ownerKey, 'owner key')
+  await raw.execute(sql`
+    SELECT pg_advisory_xact_lock(
+      hashtext('wystack owned draft lookup'),
+      hashtext(
+        jsonb_hash_extended(${tenantScope}::jsonb, 0)::text || ':' ||
+        jsonb_hash_extended(${encodedOwnerKey}::jsonb, 0)::text || ':' ||
+        ${normalizedLookupKey}
+      )
+    )
+  `)
+}
+
+function storedDraftSummaryFromRow(row: Record<string, unknown>): StoredDraftSummary {
+  const draftId = String(row['draft_id'])
+  const createdAt = String(row['created_at_cursor'])
+  return {
+    draftId,
+    baseVersion: decodeEnvelope(row['base_version']),
+    createdAt,
+    updatedAt: String(row['updated_at_display']),
+    lookupKey: row['lookup_key'] == null ? undefined : String(row['lookup_key']),
+    summary: decodeEnvelope(row['summary']) as DraftSummary | undefined,
+    cursor: { createdAt, draftId },
+  }
+}
+
+function normalizeOwnedDraftPageSize(limit: number | undefined): number {
+  const resolved = limit ?? DEFAULT_OWNED_DRAFT_PAGE_SIZE
+  if (!Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new Error('draft lifecycle: owned draft page size must be a positive safe integer')
+  }
+  if (resolved > MAX_OWNED_DRAFT_PAGE_SIZE) {
+    throw new Error(
+      `draft lifecycle: owned draft page size must not exceed ${MAX_OWNED_DRAFT_PAGE_SIZE}`,
+    )
+  }
+  return resolved
+}
+
+function normalizeOwnedDraftCursor(cursor: OwnedDraftCursor | undefined): OwnedDraftCursor | null {
+  if (cursor === undefined) return null
+  if (
+    !cursor ||
+    typeof cursor !== 'object' ||
+    typeof cursor.createdAt !== 'string' ||
+    !isOwnedDraftCursorTimestamp(cursor.createdAt) ||
+    typeof cursor.draftId !== 'string' ||
+    cursor.draftId.length === 0
+  ) {
+    throw new Error('draft lifecycle: owned draft cursor is invalid')
+  }
+  return cursor
+}
+
+const ownedDraftCursorTimestampPattern =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/
+
+function isOwnedDraftCursorTimestamp(value: string): boolean {
+  const match = ownedDraftCursorTimestampPattern.exec(value)
+  if (!match) return false
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, microseconds] = match
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  const second = Number(secondText)
+  const millisecond = Number(microseconds?.slice(0, 3))
+  // PostgreSQL has no year zero, so the storage emitter can never produce it.
+  if (year === 0) return false
+  const timestamp = new Date(0)
+  timestamp.setUTCFullYear(year, month - 1, day)
+  timestamp.setUTCHours(hour, minute, second, millisecond)
+  return (
+    timestamp.getUTCFullYear() === year &&
+    timestamp.getUTCMonth() === month - 1 &&
+    timestamp.getUTCDate() === day &&
+    timestamp.getUTCHours() === hour &&
+    timestamp.getUTCMinutes() === minute &&
+    timestamp.getUTCSeconds() === second &&
+    timestamp.getUTCMilliseconds() === millisecond
+  )
+}
+
+export function validateDraftLookupKey(lookupKey: string): string {
+  if (typeof lookupKey !== 'string' || lookupKey.length === 0 || lookupKey.includes('\0')) {
+    throw new Error('draft lifecycle: lookup key must be non-empty text without NUL bytes')
+  }
+  const byteLength = new TextEncoder().encode(lookupKey).byteLength
+  if (byteLength > MAX_DRAFT_LOOKUP_KEY_BYTES) {
+    throw new Error(
+      `draft lifecycle: lookup key must not exceed ${MAX_DRAFT_LOOKUP_KEY_BYTES} UTF-8 bytes`,
+    )
+  }
+  return lookupKey
 }
 
 export async function readStoredCommands(raw: RawDb, draftId: string): Promise<DraftCommand[]> {
@@ -402,13 +670,19 @@ export async function refreshStoredDraftIntegrityAndAdvance(
   raw: RawDb,
   draftId: string,
   expectedRevision: number,
+  metadata: StoredDraftMetadataUpdate = {},
 ): Promise<void> {
+  const replacesSummary = Object.hasOwn(metadata, 'summary')
+  const summary = replacesSummary
+    ? encodeEnvelope(snapshotDraftSummary(metadata.summary), 'draft summary')
+    : undefined
   const rows = normalizeRows(
     await raw.execute(sql`
       UPDATE wystack_drafts d
       SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))},
           log_revision = log_revision + 1,
           updated_at = CURRENT_TIMESTAMP
+          ${replacesSummary ? sql`, summary = ${summary}::jsonb` : sql``}
       WHERE d.draft_id = ${draftId} AND d.log_revision = ${expectedRevision}
       RETURNING log_revision
     `),

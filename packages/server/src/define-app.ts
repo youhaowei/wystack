@@ -1,7 +1,7 @@
 import { buildWyStack } from './create'
 import { authorize, createProcedure, requireAuth } from './functions'
 import type { MultiTenantDescriptor, TenantKeyDefinition } from '@wystack/db'
-import type { DbInput, FunctionContext, FunctionDef } from './types'
+import type { DbInput, FunctionContext, FunctionDef, LegacyFunctionContext } from './types'
 
 export interface DefineAppOptions {
   permissions: unknown
@@ -22,6 +22,12 @@ export function defineApp<TAppContext extends object = Record<string, unknown>>(
 ) {
   return {
     procedure: createProcedure<FunctionContext<TAppContext>>(),
+    /**
+     * Explicit migration surface for existing handlers that still require raw
+     * Drizzle queries and manual reactive tracking. Legacy procedures cannot be
+     * recorded or replayed as commands; new code should use `procedure`.
+     */
+    legacyProcedure: createProcedure<LegacyFunctionContext<TAppContext>>('legacy-raw'),
     authorize,
     requireAuth,
     build(buildOptions: BuildOptions) {
