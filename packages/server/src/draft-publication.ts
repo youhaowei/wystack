@@ -14,6 +14,7 @@ import {
   type DraftInspectionValue,
   type DraftPublishDrift,
 } from './draft-lifecycle-types'
+import { stableJson } from './stable-json'
 
 type AnyTable = Parameters<DrizzleTracker['from']>[0]
 
@@ -22,18 +23,6 @@ function encodedIdentityValue(identity: unknown): unknown {
     throw new Error('draft lifecycle: malformed stored row identity')
   }
   return (identity as { value: unknown }).value
-}
-
-function stableJson(value: unknown): string {
-  if (value === undefined) return 'undefined'
-  if (value === null || typeof value !== 'object') return JSON.stringify(value)
-  if (value instanceof Date) return JSON.stringify(value.toISOString())
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
-  const record = value as Record<string, unknown>
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
-    .join(',')}}`
 }
 
 function changeTarget(row: DraftInspectionRow): string {

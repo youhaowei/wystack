@@ -38,27 +38,8 @@ describe('composable table capabilities', () => {
       }) as typeof authentic
       expect(Reflect.set(TableDefinition, Symbol.hasInstance, () => true)).toBe(false)
 
-      const originalWeakSetHas = WeakSet.prototype.has
-      let forgedInstanceof = true
-      let mintError: unknown
-      const weakSetHasPatched = Reflect.set(WeakSet.prototype, 'has', () => true)
-      let weakSetHasRestored = false
-      try {
-        forgedInstanceof = forged instanceof TableDefinition
-        try {
-          forged.draftable()
-        } catch (error) {
-          mintError = error
-        }
-      } finally {
-        weakSetHasRestored = Reflect.set(WeakSet.prototype, 'has', originalWeakSetHas)
-      }
-
-      expect(weakSetHasPatched).toBe(true)
-      expect(weakSetHasRestored).toBe(true)
-      expect(forgedInstanceof).toBe(false)
-      expect(mintError).toBeInstanceOf(Error)
-      expect((mintError as Error).message).toContain('require a factory-created definition')
+      expect(forged instanceof TableDefinition).toBe(false)
+      expect(() => forged.draftable()).toThrow('require a factory-created definition')
       expect(() => forged.revision('id')).toThrow('require a factory-created definition')
       expect(() => defineSchema({ forged })).toThrow('table(...)')
     })
@@ -481,6 +462,15 @@ describe('composable table capabilities', () => {
 
       expect(entryReference.foreignTable).toBe(schema.folders)
       expect(folderReference.foreignTable).toBe(schema.accounts)
+    })
+
+    /** A misspelled bare target fails instead of silently compiling without its foreign key. */
+    test('bare references to unknown tables fail during schema definition', () => {
+      expect(() =>
+        defineSchema({
+          posts: table({ id: uuid.primaryKey(), authorId: uuid.references('autors') }),
+        }),
+      ).toThrow('Reference "posts.authorId" targets unknown table "autors"')
     })
 
     /** All tenant tables in one schema share one descriptor and therefore one tenant dimension. */

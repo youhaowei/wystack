@@ -5,6 +5,14 @@ import type { AnyTable, DrizzleDb, TenantScope } from './tracker-core'
 import { normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
 import { withFrameworkBootstrapLock } from './framework-storage'
 
+const utf8Encoder = new TextEncoder()
+
+export interface RowRevisionSortKey {
+  tableKey: Uint8Array
+  tenantKey: Uint8Array
+  rowKey: Uint8Array
+}
+
 export const rowRevisionStorageDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_row_revisions (
   table_key TEXT NOT NULL,
   tenant_key_text TEXT NOT NULL DEFAULT '',
@@ -46,16 +54,38 @@ function revisionIdentity(table: AnyTable, tenantScope: TenantScope, row: Record
   }
 }
 
-function compareUtf8Text(left: string, right: string): number {
-  const encoder = new TextEncoder()
-  const leftBytes = encoder.encode(left)
-  const rightBytes = encoder.encode(right)
+function compareUtf8Bytes(leftBytes: Uint8Array, rightBytes: Uint8Array): number {
   const length = Math.min(leftBytes.length, rightBytes.length)
   for (let index = 0; index < length; index += 1) {
     const difference = leftBytes[index]! - rightBytes[index]!
     if (difference !== 0) return difference
   }
   return leftBytes.length - rightBytes.length
+}
+
+/** Precompute the PostgreSQL C-collation identity used by hot lock-order sorts. */
+export function rowRevisionSortKey(
+  table: AnyTable,
+  tenantScope: TenantScope,
+  row: Record<string, unknown>,
+): RowRevisionSortKey {
+  const identity = revisionIdentity(table, tenantScope, row)
+  return {
+    tableKey: utf8Encoder.encode(identity.tableKey),
+    tenantKey: utf8Encoder.encode(identity.tenantKey),
+    rowKey: utf8Encoder.encode(identity.rowKey),
+  }
+}
+
+export function compareRowRevisionSortKeys(
+  left: RowRevisionSortKey,
+  right: RowRevisionSortKey,
+): number {
+  for (const property of ['tableKey', 'tenantKey', 'rowKey'] as const) {
+    const comparison = compareUtf8Bytes(left[property], right[property])
+    if (comparison !== 0) return comparison
+  }
+  return 0
 }
 
 /** Match PostgreSQL's explicit `COLLATE "C"` revision-ledger lock order. */
@@ -65,13 +95,10 @@ export function compareRowRevisionRows(
   left: Record<string, unknown>,
   right: Record<string, unknown>,
 ): number {
-  const leftIdentity = revisionIdentity(table, tenantScope, left)
-  const rightIdentity = revisionIdentity(table, tenantScope, right)
-  for (const property of ['tableKey', 'tenantKey', 'rowKey'] as const) {
-    const comparison = compareUtf8Text(leftIdentity[property], rightIdentity[property])
-    if (comparison !== 0) return comparison
-  }
-  return 0
+  return compareRowRevisionSortKeys(
+    rowRevisionSortKey(table, tenantScope, left),
+    rowRevisionSortKey(table, tenantScope, right),
+  )
 }
 
 /** Establish and row-lock an identity, including one never inserted before. */

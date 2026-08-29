@@ -30,7 +30,7 @@ import {
 } from './tracker-core'
 import { mapColumnValue, normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
 import { createDrizzleTracker } from './tracker-factory'
-import { compareRowRevisionRows, lockRowRevision } from './row-revisions'
+import { compareRowRevisionSortKeys, lockRowRevision, rowRevisionSortKey } from './row-revisions'
 
 type DraftWriteIntent = 'insert' | 'update' | 'delete'
 
@@ -458,13 +458,14 @@ export class DraftInsertBuilder<T extends AnyTable> {
               `Draft inserts require a client-minted PK so the derived row is addressable.`,
           )
         }
-        return { index, pkValue, row: r }
+        return {
+          index,
+          pkValue,
+          row: r,
+          sortKey: rowRevisionSortKey(this._table, this._tenantScope, r),
+        }
       })
-      if (revision) {
-        prepared.sort((left, right) =>
-          compareRowRevisionRows(this._table, this._tenantScope, left.row, right.row),
-        )
-      }
+      prepared.sort((left, right) => compareRowRevisionSortKeys(left.sortKey, right.sortKey))
 
       const inserted: Array<Record<string, unknown> | undefined> = new Array(rows.length)
       for (const item of prepared) {

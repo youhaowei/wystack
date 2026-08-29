@@ -1,4 +1,4 @@
-import { getTableColumns, getTableName, sql } from 'drizzle-orm'
+import { getTableColumns, getTableName, SQL, sql, StringChunk } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import { tryGetTableCapabilities } from './schema'
 import type {
@@ -26,6 +26,16 @@ import { DraftSelectBuilder } from './draft-select-builder'
 import { DraftInsertBuilder } from './draft-mutations'
 import { allocateRowRevision } from './row-revisions'
 import { mapColumnValue, normalizeExecuteRows, resolvePkColumnName } from './tracker-codecs'
+
+function isStandardRandomUuidDefault(value: unknown): boolean {
+  if (!(value instanceof SQL) || value.queryChunks.length !== 1) return false
+  const [chunk] = value.queryChunks
+  return (
+    chunk instanceof StringChunk &&
+    chunk.value.length === 1 &&
+    chunk.value[0] === 'gen_random_uuid()'
+  )
+}
 
 async function materializeRevisionIdentity(
   raw: DrizzleDb,
@@ -73,8 +83,13 @@ async function materializeRevisionIdentity(
   ) {
     return { ...row, [pkProperty]: pkColumn.default }
   }
-  if (type === 'uuid' && pkColumn.hasDefault) {
+  if (type === 'uuid' && isStandardRandomUuidDefault(pkColumn.default)) {
     return { ...row, [pkProperty]: crypto.randomUUID() }
+  }
+  if (type === 'uuid' && pkColumn.hasDefault) {
+    throw new Error(
+      `Revisioned UUID primary key "${pkProperty}" must use defaultRandom() or supply an explicit value; custom generated defaults cannot be materialized safely`,
+    )
   }
   return row
 }

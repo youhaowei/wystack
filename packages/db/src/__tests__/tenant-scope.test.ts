@@ -40,7 +40,7 @@ const intTenantSchema = defineSchema({
 })
 
 let tracked: ReturnType<typeof createDrizzleTracker>
-let client: PGlite
+let client: PGlite | undefined
 
 beforeEach(async () => {
   client = new PGlite()
@@ -53,7 +53,8 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  await client.close()
+  await client?.close()
+  client = undefined
 })
 
 describe('tenant-scoped database access', () => {

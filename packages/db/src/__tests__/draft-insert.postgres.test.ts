@@ -59,6 +59,9 @@ describeWithPostgres('draft inserts — real PostgreSQL multi-connection concurr
       CREATE FUNCTION block_competing_draft_inserts() RETURNS trigger
       LANGUAGE plpgsql AS $$
       BEGIN
+        PERFORM pg_advisory_xact_lock(
+          hashtextextended('${advisoryKey}:row:' || NEW.row_key_text, 0)
+        );
         PERFORM pg_advisory_xact_lock(hashtextextended('${advisoryKey}', 0));
         RETURN NEW;
       END
@@ -135,5 +138,48 @@ describeWithPostgres('draft inserts — real PostgreSQL multi-connection concurr
     expect(changes).toHaveLength(1)
     expect(changes[0]?.operation).toBe('insert')
     expect(['first', 'second']).toContain(changes[0]?.title)
+  })
+
+  test('opposing unrevisioned batches lock draft identities in the same order', async () => {
+    await admin`SELECT pg_advisory_lock(hashtextextended(${advisoryKey}, 0))`
+    const first = createDrizzleTracker(drizzle(firstClient)).withDraft('batch-draft')
+    const second = createDrizzleTracker(drizzle(secondClient)).withDraft('batch-draft')
+    const outcomesPromise = Promise.allSettled([
+      first.into(concurrentItems).insert([
+        { id: 10, title: 'first-10' },
+        { id: 20, title: 'first-20' },
+      ]),
+      second.into(concurrentItems).insert([
+        { id: 20, title: 'second-20' },
+        { id: 10, title: 'second-10' },
+      ]),
+    ])
+
+    let barrierFailure: unknown
+    try {
+      await waitUntilBothWritersReachTheInsert()
+    } catch (error) {
+      barrierFailure = error
+    } finally {
+      await admin`SELECT pg_advisory_unlock(hashtextextended(${advisoryKey}, 0))`
+    }
+
+    const outcomes = await outcomesPromise
+    if (barrierFailure) throw barrierFailure
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    const rejected = outcomes.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected',
+    )
+    expect(rejected).toHaveLength(1)
+    expect(String(rejected[0]?.reason)).toContain('because it already exists')
+    expect(String(rejected[0]?.reason).toLowerCase()).not.toContain('deadlock')
+
+    const changes = await firstClient<{ row_key_text: string }[]>`
+      SELECT row_key_text
+      FROM wystack_draft_row_changes
+      WHERE draft_id = 'batch-draft'
+      ORDER BY row_key_text::integer
+    `
+    expect([...changes]).toEqual([{ row_key_text: '10' }, { row_key_text: '20' }])
   })
 })

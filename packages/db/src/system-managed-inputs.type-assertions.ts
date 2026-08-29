@@ -8,10 +8,10 @@
  *
  * A call without `@ts-expect-error` must compile. A prohibited call has an
  * adjacent `@ts-expect-error`; `tsc --noEmit` fails if that call ever becomes
- * legal. The final function separately proves that returned rows expose managed
- * fields with their domain types and reject an invented property.
+ * legal. The final functions separately prove returned row shapes, including
+ * projection narrowing after chained draft read clauses.
  */
-import { defineSchema, int, multiTenant, table, text, uuid } from './index'
+import { defineSchema, eq, int, multiTenant, table, text, uuid } from './index'
 import type { DrizzleTracker } from './tracker-core'
 
 const workspaces = multiTenant({
@@ -114,12 +114,33 @@ async function returnedRowsExposeManagedFields() {
   void row.definitelyNotAColumn
 }
 
+/** Read-shaping clauses after select() retain the projected row type. */
+async function draftProjectionStaysNarrow() {
+  const row = await tracked
+    .withTenant('alpha')
+    .withDraft('draft-1')
+    .from(schema.draftProjects)
+    .select('name')
+    .where(eq('name', 'drafted'))
+    .orderBy('name')
+    .limit(1)
+    .first()
+  if (!row) return
+
+  const name: string = row.name
+  void name
+
+  // @ts-expect-error — projection excludes columns that were not selected
+  void row.id
+}
+
 // Keep the compile-time contracts reachable to the compiler without executing them.
 void [
   applicationFieldsRemainWritable,
   tenantIdentityCannotBeWritten,
   revisionTokensCannotBeWritten,
   returnedRowsExposeManagedFields,
+  draftProjectionStaysNarrow,
 ]
 
 export type __SystemManagedInputContract = true

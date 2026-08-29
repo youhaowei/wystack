@@ -1,11 +1,12 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
-import { defineSchema } from '../schema'
+import { defineSchema, registerTableCapabilities } from '../schema'
 import { text, int, boolean, uuid } from '../dsl'
 import { eq } from '../operators'
 import { createDrizzleTracker, resetTracking } from '../drizzle-tracker'
-import { pgTable, text as pgText, integer } from 'drizzle-orm/pg-core'
+import { pgTable, text as pgText, integer, uuid as pgUuid } from 'drizzle-orm/pg-core'
 import { table } from '../table'
 import { draftChangesTableDdl } from './draft-storage.fixture'
 import { ensureRowRevisionStorage } from '../row-revisions'
@@ -36,6 +37,18 @@ const schema = defineSchema({
 
 const unicodeRevisionRows = pgTable('unicode_revision_rows', {
   id: pgText('id').primaryKey(),
+})
+
+const customUuidRevisionRows = pgTable('custom_uuid_revision_rows', {
+  id: pgUuid('id')
+    .primaryKey()
+    .default(sql`uuid_generate_v4()`),
+  title: pgText('title').notNull(),
+  revision: integer('revision').notNull().default(1),
+})
+registerTableCapabilities(customUuidRevisionRows, {
+  draftable: false,
+  revisionProperty: 'revision',
 })
 
 let pg: PGlite
@@ -153,6 +166,12 @@ describe('DrizzleTracker', () => {
        WHERE table_key = 'versioned_uuid_todos'`,
     )
     expect(ledger.rows).toEqual([{ row_key_text: inserted.id }])
+  })
+
+  test('revisioned UUID inserts reject custom SQL-generated identities', async () => {
+    await expect(
+      tracked.into(customUuidRevisionRows).insert({ title: 'custom uuid' }),
+    ).rejects.toThrow('must use defaultRandom() or supply an explicit value')
   })
 
   test('a failed insert does not record tablesWritten', async () => {

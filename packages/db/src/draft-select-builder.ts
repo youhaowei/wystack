@@ -102,7 +102,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     return this._with<Pick<TableSelectedRow<T>, K>>({ projection: cols })
   }
 
-  where(filters: FilterDescriptor | FilterDescriptor[]): DraftSelectBuilder<T> {
+  where(filters: FilterDescriptor | FilterDescriptor[]): DraftSelectBuilder<T, TRow> {
     const toAdd = Array.isArray(filters) ? filters : [filters]
     return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
@@ -120,7 +120,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
    * so without it two rows equal on `col` could come back in a different order
    * run to run — and differently from the canonical read of the same table.
    */
-  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): DraftSelectBuilder<T> {
+  orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): DraftSelectBuilder<T, TRow> {
     if (col === '') throw new Error('orderBy() requires a column name')
     return this._with({ orderByCol: col, orderDir: dir })
   }
@@ -130,7 +130,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
    * above always ends in the primary key, so the capped set is a well-defined
    * prefix rather than an arbitrary sample of the join output.
    */
-  limit(n: number): DraftSelectBuilder<T> {
+  limit(n: number): DraftSelectBuilder<T, TRow> {
     if (!Number.isInteger(n) || n < 0) {
       throw new Error(`limit() requires a non-negative integer — got ${n}`)
     }

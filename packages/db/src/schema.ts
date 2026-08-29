@@ -102,7 +102,13 @@ function validateTableReferences(
   for (const [property, column] of Object.entries(definition.columns)) {
     const reference = column.opts.ref
     if (!reference) continue
-    const target = schema[reference.table]
+    const target = Object.hasOwn(schema, reference.table) ? schema[reference.table] : undefined
+
+    if (!reference.withinTenant && !target) {
+      throw new Error(
+        `Reference "${definition.name}.${property}" targets unknown table "${reference.table}"`,
+      )
+    }
 
     if (reference.withinTenant) {
       if (!tenant) {
