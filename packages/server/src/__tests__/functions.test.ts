@@ -39,7 +39,7 @@ describe('procedure builder', () => {
     await expect(action.handler({}, { prompt: 123 } as never)).rejects.toThrow('Validation failed')
   })
 
-  test('legacyProcedure preserves middleware and input inference while branding the definition', async () => {
+  test('legacyProcedure preserves middleware and input validation while branding the definition', async () => {
     const definition = wy.legacyProcedure
       .use(({ next }) => next({ source: 'legacy-middleware' }))
       .input({ id: int })
@@ -50,6 +50,9 @@ describe('procedure builder', () => {
       source: 'legacy-middleware',
       id: 7,
     })
+    await expect(definition.handler({}, { id: 'invalid' } as never)).rejects.toThrow(
+      'Validation failed',
+    )
   })
 
   test('composes minimal middleware patches with Overwrite', async () => {

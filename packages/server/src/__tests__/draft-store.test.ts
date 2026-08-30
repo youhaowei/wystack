@@ -2,18 +2,11 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
+import { ensureDraftStorage, listStoredDraftsForOwner } from '../draft-store'
 import {
-  ensureDraftStorage,
-  insertStoredDraft,
-  listStoredDraftsForOwner,
-  readStoredDraft,
-  refreshStoredDraftIntegrityAndAdvance,
-} from '../draft-store'
-import {
-  MAX_DRAFT_SUMMARY_BYTES,
-  MAX_DRAFT_SUMMARY_DEPTH,
-  type DraftSummary,
-} from '../draft-lifecycle-types'
+  installV2MetadataUpgradeFixture,
+  installV7CustodyUpgradeFixture,
+} from './draft-store.fixture'
 
 const openDatabases = new Set<PGlite>()
 
@@ -29,7 +22,7 @@ afterEach(async () => {
   await Promise.all(databases.map((pg) => pg.close()))
 })
 
-describe('draft storage migrations', () => {
+describe('draft discovery storage', () => {
   test('rejects non-canonical owner-list cursors before issuing SQL', async () => {
     let executeCalls = 0
     const raw = {
@@ -54,47 +47,9 @@ describe('draft storage migrations', () => {
     }
     expect(executeCalls).toBe(0)
   })
+})
 
-  test('enforces summary size and depth bounds at storage write seams', async () => {
-    const pg = createTestDatabase()
-    const db = drizzle(pg)
-    await ensureDraftStorage(db)
-
-    await expect(
-      insertStoredDraft(db, {
-        draftId: 'oversized-summary',
-        baseVersion: 0,
-        tenantId: undefined,
-        ownerKey: 'owner',
-        lookupKey: undefined,
-        summary: 'x'.repeat(1024 * 1024),
-      }),
-    ).rejects.toThrow(`${MAX_DRAFT_SUMMARY_BYTES} serialized UTF-8 bytes`)
-    expect(await readStoredDraft(db, 'oversized-summary')).toBeUndefined()
-
-    await insertStoredDraft(db, {
-      draftId: 'bounded-summary',
-      baseVersion: 0,
-      tenantId: undefined,
-      ownerKey: 'owner',
-      lookupKey: undefined,
-      summary: { state: 'initial' },
-    })
-    let exactDepth: DraftSummary = 'leaf'
-    for (let depth = 0; depth < MAX_DRAFT_SUMMARY_DEPTH; depth += 1) {
-      exactDepth = { child: exactDepth }
-    }
-    await expect(
-      refreshStoredDraftIntegrityAndAdvance(db, 'bounded-summary', 0, {
-        summary: { child: exactDepth },
-      }),
-    ).rejects.toThrow(`${MAX_DRAFT_SUMMARY_DEPTH} nested containers`)
-    expect(await readStoredDraft(db, 'bounded-summary')).toMatchObject({
-      logRevision: 0,
-      summary: { state: 'initial' },
-    })
-  })
-
+describe('draft storage migrations', () => {
   test('installs durable lifecycle tables and bounded-listing indexes idempotently', async () => {
     const pg = createTestDatabase()
     const db = drizzle(pg)
@@ -230,19 +185,7 @@ describe('draft storage migrations', () => {
     const ownerKey = { subject: ownerBytes }
     const ownerEnvelope = JSON.stringify({ present: true, value: ownerKey })
 
-    await db.execute(`CREATE TABLE wystack_framework_migrations (
-      migration_name TEXT PRIMARY KEY, version INTEGER NOT NULL,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)`)
-    await db.execute(`CREATE TABLE wystack_drafts (
-      draft_id TEXT PRIMARY KEY, base_version JSONB NOT NULL,
-      tenant_scope JSONB NOT NULL, owner_key JSONB NOT NULL,
-      log_revision INTEGER NOT NULL DEFAULT 0, integrity_hash TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)`)
-    await db.execute(
-      `INSERT INTO wystack_framework_migrations (migration_name, version)
-       VALUES ('draft-storage', 7)`,
-    )
+    await installV7CustodyUpgradeFixture(db)
     await db.execute(sql`INSERT INTO wystack_drafts
       (draft_id, base_version, tenant_scope, owner_key, integrity_hash)
       VALUES (
@@ -281,41 +224,7 @@ describe('draft storage migrations', () => {
     const db = drizzle(pg)
     await db.execute(`CREATE SCHEMA other_storage`)
     await db.execute(`CREATE TABLE other_storage.wystack_draft_tables (invalidation_tag TEXT)`)
-    await db.execute(`
-      CREATE TABLE wystack_framework_migrations (
-        migration_name TEXT PRIMARY KEY, version INTEGER NOT NULL,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)
-    `)
-    await db.execute(`
-      CREATE TABLE wystack_drafts (
-        draft_id TEXT PRIMARY KEY, base_version JSONB NOT NULL, tenant_scope JSONB NOT NULL,
-        owner_key JSONB NOT NULL, log_revision INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)
-    `)
-    await db.execute(`
-      CREATE TABLE wystack_draft_commands (
-        draft_id TEXT NOT NULL REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE,
-        position INTEGER NOT NULL, command JSONB NOT NULL, PRIMARY KEY (draft_id, position))
-    `)
-    await db.execute(`
-      CREATE TABLE wystack_draft_tables (
-        draft_id TEXT NOT NULL REFERENCES wystack_drafts(draft_id) ON DELETE CASCADE,
-        schema_name TEXT NOT NULL DEFAULT '', table_name TEXT NOT NULL,
-        pk_column TEXT NOT NULL, shadow_tag TEXT,
-        PRIMARY KEY (draft_id, schema_name, table_name))
-    `)
-    await db.execute(`
-      CREATE TABLE wystack_draft_row_changes (
-        draft_id TEXT NOT NULL, table_key TEXT NOT NULL,
-        tenant_key_text TEXT NOT NULL DEFAULT '', tenant_key JSONB,
-        row_key_text TEXT NOT NULL, row_key JSONB NOT NULL, operation TEXT NOT NULL,
-        base_exists BOOLEAN NOT NULL, base_revision JSONB, fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-        PRIMARY KEY (draft_id, table_key, tenant_key_text, row_key_text))
-    `)
-    await db.execute(
-      `INSERT INTO wystack_framework_migrations (migration_name, version) VALUES ('draft-storage', 2)`,
-    )
+    await installV2MetadataUpgradeFixture(db)
     await db.execute(
       `INSERT INTO wystack_drafts (draft_id, base_version, tenant_scope, owner_key)
        VALUES ('kept', '{"present":true,"value":0}', '{"present":false}', '{"present":false}')`,

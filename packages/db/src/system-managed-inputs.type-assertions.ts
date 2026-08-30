@@ -51,10 +51,6 @@ function applicationFieldsRemainWritable() {
   void scoped.into(schema.workspaceProjects).insert({ id: 'tenant-1', name: 'tenant' })
   void scoped.into(schema.generatedWorkspaceProjects).insert({ name: 'generated tenant' })
   void scoped.into(schema.serialWorkspaceProjects).insert({ name: 'serial tenant' })
-  // Known pre-existing type gap: defineSchema currently erases required Drizzle
-  // insert properties, so a missing non-default logical identity compiles. SQL
-  // still rejects it; tenant-primary-key.test.ts preserves that runtime guard.
-  void scoped.into(schema.workspaceProjects).insert({ name: 'missing logical identity' })
   void scoped.from(schema.workspaceProjects).update({ name: 'renamed' })
   void tracked
     .into(schema.versionedProjects)

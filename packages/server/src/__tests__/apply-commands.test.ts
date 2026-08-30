@@ -84,7 +84,7 @@ describe('applyCommands — commit mode', () => {
     ).rejects.toThrow('Command externalAction cannot reference an action')
   })
 
-  test('rejects a legacy procedure before opening the command transaction', async () => {
+  test('rejects a legacy procedure without executing its handler', async () => {
     await expect(
       applyCommands(app, [{ path: 'legacyAddTodo', args: { id: 1, title: 'A' } }], {
         mode: 'commit',

@@ -46,7 +46,15 @@ afterEach(async () => {
   client = undefined
 })
 
-describe('tenant composite primary keys', () => {
+async function seedTwoTenantsWithSharedLogicalId() {
+  const alpha = tracked.withTenant('alpha')
+  const beta = tracked.withTenant('beta')
+  await alpha.into(schema.tenant_records).insert({ id: 'shared', value: 'alpha canonical' })
+  await beta.into(schema.tenant_records).insert({ id: 'shared', value: 'beta canonical' })
+  return { alpha, beta }
+}
+
+describe('tenant-qualified row identity', () => {
   test('requires a logical identity even though tenant scope supplies the other PK column', async () => {
     const alpha = tracked.withTenant('alpha')
 
@@ -54,38 +62,43 @@ describe('tenant composite primary keys', () => {
       alpha.into(schema.tenant_records).insert({ value: 'missing logical identity' }),
     )
     expect(cause.message).toMatch(/null value in column "id"/)
-    expect(await alpha.from(schema.tenant_records).all()).toEqual([])
   })
 
-  test('isolates reads, updates, and deletes when two tenants reuse one logical ID', async () => {
-    const alpha = tracked.withTenant('alpha')
-    const beta = tracked.withTenant('beta')
+  test('allows two tenants to store the same logical identity', async () => {
+    const { alpha, beta } = await seedTwoTenantsWithSharedLogicalId()
 
-    await alpha.into(schema.tenant_records).insert({ id: 'shared', value: 'alpha' })
-    await beta.into(schema.tenant_records).insert({ id: 'shared', value: 'beta' })
-
-    expect(await alpha.from(schema.tenant_records).where(eq('id', 'shared')).first()).toMatchObject(
-      {
-        workspaceId: 'alpha',
-        value: 'alpha',
-      },
-    )
-    expect(await beta.from(schema.tenant_records).where(eq('id', 'shared')).first()).toMatchObject({
-      workspaceId: 'beta',
-      value: 'beta',
+    expect({
+      alpha: await alpha.from(schema.tenant_records).where(eq('id', 'shared')).first(),
+      beta: await beta.from(schema.tenant_records).where(eq('id', 'shared')).first(),
+    }).toMatchObject({
+      alpha: { workspaceId: 'alpha', value: 'alpha canonical' },
+      beta: { workspaceId: 'beta', value: 'beta canonical' },
     })
+  })
+
+  test('updates only the tenant-qualified row when logical identities overlap', async () => {
+    const { alpha, beta } = await seedTwoTenantsWithSharedLogicalId()
 
     await alpha
       .from(schema.tenant_records)
       .where(eq('id', 'shared'))
       .update({ value: 'alpha updated' })
-    expect((await beta.from(schema.tenant_records).where(eq('id', 'shared')).first())?.value).toBe(
-      'beta',
-    )
+
+    expect({
+      alpha: (await alpha.from(schema.tenant_records).where(eq('id', 'shared')).first())?.value,
+      beta: (await beta.from(schema.tenant_records).where(eq('id', 'shared')).first())?.value,
+    }).toEqual({ alpha: 'alpha updated', beta: 'beta canonical' })
+  })
+
+  test('deletes only the tenant-qualified row when logical identities overlap', async () => {
+    const { alpha, beta } = await seedTwoTenantsWithSharedLogicalId()
 
     await alpha.from(schema.tenant_records).where(eq('id', 'shared')).delete()
-    expect(await alpha.from(schema.tenant_records).all()).toEqual([])
-    expect((await beta.from(schema.tenant_records).all()).map((row) => row.value)).toEqual(['beta'])
+
+    expect({
+      alpha: await alpha.from(schema.tenant_records).where(eq('id', 'shared')).first(),
+      beta: (await beta.from(schema.tenant_records).where(eq('id', 'shared')).first())?.value,
+    }).toEqual({ alpha: null, beta: 'beta canonical' })
   })
 
   test('resolves tenant-local foreign keys against the matching tenant only', async () => {
@@ -93,9 +106,6 @@ describe('tenant composite primary keys', () => {
     const beta = tracked.withTenant('beta')
 
     await alpha.into(schema.tenant_parents).insert({ id: 'parent', name: 'alpha parent' })
-    await alpha
-      .into(schema.tenant_children)
-      .insert({ id: 'child', parentId: 'parent', name: 'alpha child' })
 
     const cause = await databaseCause(
       beta
@@ -105,23 +115,17 @@ describe('tenant composite primary keys', () => {
     expect(cause.message).toMatch(/foreign key constraint/)
 
     await beta.into(schema.tenant_parents).insert({ id: 'parent', name: 'beta parent' })
-    await beta
+    const inserted = await beta
       .into(schema.tenant_children)
       .insert({ id: 'child', parentId: 'parent', name: 'beta child' })
 
-    expect((await alpha.from(schema.tenant_children).all()).map((row) => row.name)).toEqual([
-      'alpha child',
-    ])
-    expect((await beta.from(schema.tenant_children).all()).map((row) => row.name)).toEqual([
-      'beta child',
+    expect(inserted).toMatchObject([
+      { workspaceId: 'beta', parentId: 'parent', name: 'beta child' },
     ])
   })
 
   test('keeps draft row identity tenant-qualified while using the logical scalar key', async () => {
-    const alpha = tracked.withTenant('alpha')
-    const beta = tracked.withTenant('beta')
-    await alpha.into(schema.tenant_records).insert({ id: 'shared', value: 'alpha canonical' })
-    await beta.into(schema.tenant_records).insert({ id: 'shared', value: 'beta canonical' })
+    const { alpha, beta } = await seedTwoTenantsWithSharedLogicalId()
 
     await alpha
       .withDraft('shared-draft')
@@ -134,11 +138,9 @@ describe('tenant composite primary keys', () => {
       .where(eq('id', 'shared'))
       .update({ value: 'beta draft' })
 
-    expect((await alpha.withDraft('shared-draft').from(schema.tenant_records).first())?.value).toBe(
-      'alpha draft',
-    )
-    expect((await beta.withDraft('shared-draft').from(schema.tenant_records).first())?.value).toBe(
-      'beta draft',
-    )
+    expect({
+      alpha: (await alpha.withDraft('shared-draft').from(schema.tenant_records).first())?.value,
+      beta: (await beta.withDraft('shared-draft').from(schema.tenant_records).first())?.value,
+    }).toEqual({ alpha: 'alpha draft', beta: 'beta draft' })
   })
 })

@@ -589,6 +589,28 @@ describe('composable table capabilities', () => {
   })
 
   describe('tenant-local constraints', () => {
+    /** Physical row identity includes tenant scope while preserving the declared key as a logical column. */
+    test('tenant tables compile tenant scope and logical identity as one primary key', () => {
+      const tenancy = multiTenant({
+        key: {
+          property: 'workspaceId',
+          column: 'workspace_id',
+          type: uuid,
+        },
+      })
+      const schema = defineSchema({
+        accounts: tenancy.table({ id: uuid.primaryKey(), slug: text }),
+      })
+
+      const config = getTableConfig(schema.accounts)
+      expect(config.primaryKeys).toHaveLength(1)
+      expect(config.primaryKeys[0].columns.map((column) => column.name)).toEqual([
+        'workspace_id',
+        'id',
+      ])
+      expect(config.columns.find((column) => column.name === 'id')?.primary).toBe(false)
+    })
+
     /** Tenant-local uniqueness and references include tenant identity in their compiled constraints. */
     test('tenant-local uniqueness and references include the tenant key', () => {
       const tenancy = multiTenant({
@@ -609,18 +631,11 @@ describe('composable table capabilities', () => {
         }),
       })
 
-      const accountConfig = getTableConfig(schema.accounts)
-      const accountConstraints = accountConfig.uniqueConstraints.map((constraint) =>
-        constraint.columns.map((column) => column.name),
+      const accountConstraints = getTableConfig(schema.accounts).uniqueConstraints.map(
+        (constraint) => constraint.columns.map((column) => column.name),
       )
       const postReference = getTableConfig(schema.posts).foreignKeys[0].reference()
 
-      expect(accountConfig.primaryKeys).toHaveLength(1)
-      expect(accountConfig.primaryKeys[0].columns.map((column) => column.name)).toEqual([
-        'workspace_id',
-        'id',
-      ])
-      expect(accountConfig.columns.find((column) => column.name === 'id')?.primary).toBe(false)
       expect(accountConstraints).toContainEqual(['workspace_id', 'slug'])
       expect({
         localColumns: postReference.columns.map((column) => column.name),

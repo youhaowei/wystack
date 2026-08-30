@@ -95,9 +95,11 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
               .into(schema.treeNodes)
               .insert({ id: args.childId, parentId: args.parentId })
           }),
-        addTodo: wy.procedure
-          .input({ id: int, title: text })
-          .mutation(async (ctx, args) => ctx.db.into(schema.todos).insert(args)),
+        addTodo: wy.procedure.input({ id: int, title: text }).mutation(async (ctx, args) => {
+          const barrier = ctx['initialCommandBarrier']
+          if (typeof barrier === 'function') await barrier()
+          return ctx.db.into(schema.todos).insert(args)
+        }),
         addToDashboard: wy.procedure.input({ id: int, item: text }).mutation(async (ctx, args) => {
           const current = (await ctx.db.from(schema.dashboards).first()) as {
             id: number
@@ -152,6 +154,30 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     return createDraftLifecycle(app, {
       authorizeGlobalDraft: ({ context }) => context.mayManageGlobalDrafts === true,
     })
+  }
+
+  async function waitForConnectionLock(
+    applicationName: string,
+    failureMessage: string,
+    lockType?: string,
+  ): Promise<void> {
+    const deadline = Date.now() + 2_000
+    while (true) {
+      const [lock] = await admin<{ locktype: string }[]>`
+        SELECT l.locktype
+        FROM pg_locks l
+        JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE a.application_name = ${applicationName}
+          AND NOT l.granted
+          AND (${lockType ?? null}::text IS NULL OR l.locktype = ${lockType ?? null})
+        LIMIT 1
+      `
+      if (lock) return
+      if (Date.now() >= deadline) {
+        throw new Error(failureMessage)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
   }
 
   beforeAll(async () => {
@@ -237,30 +263,63 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     ).toEqual([[], []])
   })
 
-  test('exclusive owned lookup initialization serializes across separate connections', async () => {
+  test('exclusive owned lookup initialization serializes contenders across connections', async () => {
     const first = lifecycle(firstApp)
     const second = lifecycle(secondApp)
     const lookupKey = 'postgres-proof:exclusive-open'
-    const [firstResult, secondResult] = await Promise.all([
-      first.getOrOpenWithCommands(
-        0,
-        [{ id: 'first', path: 'addTodo', args: { id: 20_001, title: 'first contender' } }],
-        { context: privilegedContext, lookupKey },
-      ),
-      second.getOrOpenWithCommands(
-        0,
-        [{ id: 'second', path: 'addTodo', args: { id: 20_002, title: 'second contender' } }],
-        { context: privilegedContext, lookupKey },
-      ),
-    ])
+    let commandStarted!: () => void
+    const firstCommandStarted = new Promise<void>((resolve) => {
+      commandStarted = resolve
+    })
+    let releaseFirst!: () => void
+    const firstMayCommit = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const firstResultPromise = first.getOrOpenWithCommands(
+      0,
+      [{ id: 'first', path: 'addTodo', args: { id: 20_001, title: 'first contender' } }],
+      {
+        context: {
+          ...privilegedContext,
+          initialCommandBarrier: async () => {
+            commandStarted()
+            await firstMayCommit
+          },
+        },
+        lookupKey,
+      },
+    )
+    await firstCommandStarted
+    const secondResultPromise = second.getOrOpenWithCommands(
+      0,
+      [{ id: 'second', path: 'addTodo', args: { id: 20_002, title: 'second contender' } }],
+      { context: privilegedContext, lookupKey },
+    )
+
+    let lockWaitError: unknown
+    try {
+      await waitForConnectionLock(
+        `${namespace}_second`,
+        'second initializer did not wait on the owned-lookup advisory lock',
+        'advisory',
+      )
+    } catch (error) {
+      lockWaitError = error
+    } finally {
+      releaseFirst()
+    }
+    const [firstResult, secondResult] = await Promise.all([firstResultPromise, secondResultPromise])
+    if (lockWaitError) throw lockWaitError
 
     expect(firstResult.draftId).toBe(secondResult.draftId)
-    expect([firstResult.created, secondResult.created].sort()).toEqual([false, true])
-    expect([firstResult.results.length, secondResult.results.length].sort()).toEqual([0, 1])
-    expect(await first.getLog(firstResult.draftId, { context: privilegedContext })).toHaveLength(1)
-    expect(await second.inspect(secondResult.draftId, { context: privilegedContext })).toHaveLength(
-      1,
-    )
+    expect({
+      created: firstResult.created,
+      resultIds: firstResult.results.map(({ id }) => id),
+    }).toEqual({ created: true, resultIds: ['first'] })
+    expect({ created: secondResult.created, results: secondResult.results }).toEqual({
+      created: false,
+      results: [],
+    })
     const [counts] = await firstClient<{ drafts: string; commands: string }[]>`
       SELECT
         (SELECT count(*) FROM wystack_drafts WHERE lookup_key = ${lookupKey}) AS drafts,
@@ -519,19 +578,10 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     const publishing = second.publish(publishDraft, undefined, {
       context: privilegedContext,
     })
-    const waitDeadline = Date.now() + 2_000
-    while (true) {
-      const [activity] = await admin<{ wait_event_type: string | null }[]>`
-        SELECT wait_event_type
-        FROM pg_stat_activity
-        WHERE application_name = ${`${namespace}_second`}
-      `
-      if (activity?.wait_event_type === 'Lock') break
-      if (Date.now() >= waitDeadline) {
-        throw new Error('publish did not block on the append-held zeta row')
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await waitForConnectionLock(
+      `${namespace}_second`,
+      'publish did not block on the append-held zeta row',
+    )
     release()
 
     await expect(Promise.all([appending, publishing])).resolves.toHaveLength(2)
