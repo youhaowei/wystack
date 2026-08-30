@@ -29,6 +29,15 @@ const unsafeSchema = defineSchema({
   unsafe_migration_parents: tenancy.table({ id: text.primaryKey(), name: text }),
 })
 
+const currentDependencySchema = defineSchema({
+  current_dependency_parents: tenancy.table({ id: text.primaryKey(), name: text }),
+})
+
+const atomicShapeSchema = defineSchema({
+  a_atomic_legacy_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+  z_atomic_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+})
+
 const openDatabases = new Set<PGlite>()
 
 function createTestDatabase(): PGlite {
@@ -175,6 +184,103 @@ describe('migrateTenantPrimaryKeys', () => {
       GROUP BY relation.relname
     `)
     expect(primaryKey.rows).toEqual([{ columns: 'id' }])
+  })
+
+  test('rejects global-ID foreign keys on an already-composite primary key', async () => {
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE current_dependency_parents (
+        workspace_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        CONSTRAINT current_dependency_parents_pkey PRIMARY KEY (workspace_id, id),
+        CONSTRAINT current_dependency_parents_id_unique UNIQUE (id)
+      );
+      CREATE TABLE current_dependency_children (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        parent_id TEXT NOT NULL,
+        CONSTRAINT current_dependency_children_parent_fk
+          FOREIGN KEY (parent_id) REFERENCES current_dependency_parents (id)
+      );
+      INSERT INTO current_dependency_parents VALUES ('alpha', 'shared', 'alpha parent');
+      INSERT INTO current_dependency_children VALUES ('beta', 'beta child', 'shared');
+    `)
+
+    await expect(
+      migrateTenantPrimaryKeys(drizzle(client), currentDependencySchema),
+    ).rejects.toThrow(
+      /current_dependency_children\.current_dependency_children_parent_fk.*include "workspace_id"/,
+    )
+
+    const crossTenantReference = await client.query<{ workspace_id: string; parent_id: string }>(`
+      SELECT workspace_id, parent_id FROM current_dependency_children
+    `)
+    expect(crossTenantReference.rows).toEqual([{ workspace_id: 'beta', parent_id: 'shared' }])
+  })
+
+  test('rejects standalone global uniqueness atomically before accepting current shape', async () => {
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE a_atomic_legacy_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        CONSTRAINT a_atomic_legacy_accounts_workspace_id_id_unique UNIQUE (workspace_id, id)
+      );
+      CREATE TABLE z_atomic_current_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        CONSTRAINT z_atomic_current_accounts_pkey PRIMARY KEY (workspace_id, id),
+        CONSTRAINT z_atomic_current_accounts_id_unique UNIQUE (id)
+      );
+      INSERT INTO a_atomic_legacy_accounts VALUES ('alpha', 'shared', 'legacy alpha');
+      INSERT INTO z_atomic_current_accounts VALUES ('alpha', 'shared', 'current alpha');
+    `)
+    const db = drizzle(client)
+
+    await expect(migrateTenantPrimaryKeys(db, atomicShapeSchema)).rejects.toThrow(
+      /constraint "z_atomic_current_accounts_id_unique".*supported current shape.*no standalone UNIQUE \(id\)/,
+    )
+
+    // The valid legacy table sorts before the invalid current table. Its
+    // unchanged key proves preflight failure cannot partially contract a schema.
+    const primaryBeforeCleanup = await client.query<{ columns: string }>(`
+      SELECT string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
+      FROM pg_constraint AS constraint_record
+      JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
+      JOIN LATERAL unnest(constraint_record.conkey)
+        WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+      JOIN pg_attribute AS attribute
+        ON attribute.attrelid = relation.oid
+       AND attribute.attnum = key_column.attribute_number
+      WHERE constraint_record.contype = 'p'
+        AND relation.relname = 'a_atomic_legacy_accounts'
+      GROUP BY relation.relname
+    `)
+    expect(primaryBeforeCleanup.rows).toEqual([{ columns: 'id' }])
+
+    await client.exec(`
+      ALTER TABLE z_atomic_current_accounts
+        DROP CONSTRAINT z_atomic_current_accounts_id_unique
+    `)
+    expect(await migrateTenantPrimaryKeys(db, atomicShapeSchema)).toEqual({
+      migrated: ['a_atomic_legacy_accounts'],
+      alreadyCurrent: ['z_atomic_current_accounts'],
+    })
+
+    await client.exec(`
+      INSERT INTO a_atomic_legacy_accounts VALUES ('beta', 'shared', 'legacy beta');
+      INSERT INTO z_atomic_current_accounts VALUES ('beta', 'shared', 'current beta');
+    `)
+    const rowCounts = await client.query<{ legacy: number; current: number }>(`
+      SELECT (SELECT count(*)::integer FROM a_atomic_legacy_accounts) AS legacy,
+             (SELECT count(*)::integer FROM z_atomic_current_accounts) AS current
+    `)
+    expect(rowCounts.rows).toEqual([{ legacy: 2, current: 2 }])
   })
 
   test('rejects a compatibility model that has not declared the target primary key', async () => {

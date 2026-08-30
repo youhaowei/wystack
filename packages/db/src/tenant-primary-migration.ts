@@ -28,6 +28,11 @@ interface PrimaryKeyRow extends Record<string, unknown> {
   column_names: string
 }
 
+interface GlobalIdentityUniqueness {
+  kind: 'constraint' | 'index'
+  name: string
+}
+
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`
 }
@@ -190,6 +195,50 @@ async function globalIdentityDependents(
   )
 }
 
+async function globalIdentityUniqueness(
+  tx: MigrationTransaction,
+  identity: TenantIdentity,
+): Promise<GlobalIdentityUniqueness[]> {
+  const result = await tx.execute(sql`
+    SELECT CASE WHEN unique_constraint.oid IS NULL THEN 'index' ELSE 'constraint' END
+             AS object_kind,
+           COALESCE(unique_constraint.conname, index_relation.relname) AS object_name,
+           string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS column_names
+    FROM pg_index AS index_record
+    JOIN pg_class AS relation ON relation.oid = index_record.indrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_class AS index_relation ON index_relation.oid = index_record.indexrelid
+    LEFT JOIN pg_constraint AS unique_constraint
+      ON unique_constraint.conindid = index_record.indexrelid
+     AND unique_constraint.contype = 'u'
+    JOIN LATERAL unnest(index_record.indkey)
+      WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+    JOIN pg_attribute AS attribute
+      ON attribute.attrelid = relation.oid
+     AND attribute.attnum = key_column.attribute_number
+    WHERE namespace.nspname = current_schema()
+      AND relation.relname = ${identity.tableName}
+      AND index_record.indisunique
+      AND NOT index_record.indisprimary
+      AND index_record.indisvalid
+      AND index_record.indisready
+      AND index_record.indislive
+      AND index_record.indpred IS NULL
+      AND index_record.indexprs IS NULL
+    GROUP BY index_record.indexrelid,
+             index_relation.relname,
+             unique_constraint.oid,
+             unique_constraint.conname
+    HAVING string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) =
+      ${identity.logicalColumn}
+    ORDER BY COALESCE(unique_constraint.conname, index_relation.relname)
+  `)
+  return normalizeExecuteRows(result).map((row) => ({
+    kind: row['object_kind'] === 'constraint' ? 'constraint' : 'index',
+    name: String(row['object_name']),
+  }))
+}
+
 /**
  * Contract the v0.2 global-primary compatibility shape into tenant-qualified
  * physical identity. This is deliberately separate from syncSchema(): callers
@@ -203,10 +252,12 @@ async function globalIdentityDependents(
  * Tenant-qualified foreign keys remain backed by the retained UNIQUE index.
  * A foreign key that still references only the global logical ID blocks the
  * migration with its exact constraint name; callers must expand that relation
- * to include tenant identity before retrying. The supplied Drizzle schema must
- * already model the target composite primary key; the temporary adopted
- * `global-primary-compatibility` model is rejected so code and storage cannot
- * silently disagree after the contract step.
+ * to include tenant identity before retrying. An already-composite table is
+ * current only when no standalone unique logical-ID constraint or index still
+ * enforces global identity. The supplied Drizzle schema must already model the
+ * target composite primary key; the temporary adopted `global-primary-compatibility`
+ * model is rejected so code and storage cannot silently disagree after the
+ * contract step.
  */
 export async function migrateTenantPrimaryKeys(
   db: TenantPrimaryKeyMigrationTarget,
@@ -225,7 +276,25 @@ export async function migrateTenantPrimaryKeys(
       }
       const currentPrimary = await primaryKey(tx, identity)
       const desiredColumns = `${identity.tenantColumn},${identity.logicalColumn}`
+      const dependents = await globalIdentityDependents(tx, identity)
+      if (dependents.length > 0) {
+        throw new Error(
+          `Tenant-primary migration cannot finalize "${identity.tableName}" while foreign keys ` +
+            `still reference only "${identity.logicalColumn}": ${dependents.join(', ')}. ` +
+            `Expand each foreign key to include "${identity.tenantColumn}" first`,
+        )
+      }
       if (currentPrimary.column_names === desiredColumns) {
+        const globalUniqueness = await globalIdentityUniqueness(tx, identity)
+        if (globalUniqueness.length > 0) {
+          const evidence = globalUniqueness.map(({ kind, name }) => `${kind} "${name}"`).join(', ')
+          throw new Error(
+            `Tenant-primary migration rejects unsupported current shape on ` +
+              `"${identity.tableName}": ${evidence} still enforces global identity ` +
+              `(${identity.logicalColumn}). The supported current shape is PRIMARY KEY ` +
+              `(${desiredColumns}) with no standalone UNIQUE (${identity.logicalColumn})`,
+          )
+        }
         alreadyCurrent.push(identity.tableName)
         continue
       }
@@ -239,14 +308,6 @@ export async function migrateTenantPrimaryKeys(
         throw new Error(
           `Tenant-primary migration requires a non-partial unique index on ` +
             `"${identity.tableName}" (${desiredColumns}) before dropping the global primary key`,
-        )
-      }
-      const dependents = await globalIdentityDependents(tx, identity)
-      if (dependents.length > 0) {
-        throw new Error(
-          `Tenant-primary migration cannot upgrade "${identity.tableName}" while foreign keys ` +
-            `still reference only "${identity.logicalColumn}": ${dependents.join(', ')}. ` +
-            `Expand each foreign key to include "${identity.tenantColumn}" first`,
         )
       }
       plans.push({
