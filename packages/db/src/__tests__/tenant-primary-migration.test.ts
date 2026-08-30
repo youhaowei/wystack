@@ -42,6 +42,30 @@ const includedExpandSchema = defineSchema({
   included_expand_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
 })
 
+const expressionShapeSchema = defineSchema({
+  a_expression_legacy_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+  z_expression_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+})
+
+const currentExpressionIndexCases = [
+  {
+    suffix: 'identity',
+    definition: `(((id || '')))`,
+  },
+  {
+    suffix: 'identity_include',
+    definition: `(((id || ''))) INCLUDE (id)`,
+  },
+  {
+    suffix: 'identity_multikey',
+    definition: `(((id || '')), ((length(id))))`,
+  },
+  {
+    suffix: 'encoded_tenant',
+    definition: `(((workspace_id || ':' || id)))`,
+  },
+] as const
+
 const residualLegacyIndexCases = [
   {
     contract: 'a standalone logical-ID index',
@@ -293,7 +317,7 @@ describe('migrateTenantPrimaryKeys', () => {
     const db = drizzle(client)
 
     await expect(migrateTenantPrimaryKeys(db, atomicShapeSchema)).rejects.toThrow(
-      /constraint "z_atomic_current_accounts_id_unique".*supported legacy and current shapes.*no standalone UNIQUE \(id\)/,
+      /constraint "z_atomic_current_accounts_id_unique".*standalone UNIQUE \(id\).*\(workspace_id\) is a direct key attribute/,
     )
 
     // The valid legacy table sorts before the invalid current table. Its
@@ -333,6 +357,90 @@ describe('migrateTenantPrimaryKeys', () => {
     expect(rowCounts.rows).toEqual([{ legacy: 2, current: 2 }])
   })
 
+  test('rejects expression-derived global identity across legacy and current shapes', async () => {
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE a_expression_legacy_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        CONSTRAINT a_expression_legacy_accounts_workspace_id_id_unique
+          UNIQUE (workspace_id, id)
+      );
+      CREATE TABLE z_expression_current_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        CONSTRAINT z_expression_current_accounts_pkey PRIMARY KEY (workspace_id, id)
+      );
+      CREATE UNIQUE INDEX a_expression_legacy_name_unique_idx
+        ON a_expression_legacy_accounts ((lower(name))) INCLUDE (id);
+      CREATE UNIQUE INDEX a_expression_legacy_id_name_unique_idx
+        ON a_expression_legacy_accounts (id, name);
+      CREATE UNIQUE INDEX z_expression_current_name_partial_idx
+        ON z_expression_current_accounts ((lower(name)))
+        WHERE name <> 'excluded';
+      CREATE UNIQUE INDEX z_expression_current_tenant_id_expression_idx
+        ON z_expression_current_accounts (workspace_id, ((id || '')));
+      INSERT INTO a_expression_legacy_accounts VALUES ('alpha', 'shared', 'legacy alpha');
+      INSERT INTO z_expression_current_accounts VALUES ('alpha', 'shared', 'current alpha');
+    `)
+    const db = drizzle(client)
+
+    for (const example of currentExpressionIndexCases) {
+      const indexName = `z_expression_current_${example.suffix}_idx`
+      await client.exec(`
+        CREATE UNIQUE INDEX ${indexName}
+          ON z_expression_current_accounts ${example.definition}
+      `)
+      const error = await databaseCause(migrateTenantPrimaryKeys(db, expressionShapeSchema))
+      expect(error.message).toContain(`index "${indexName}"`)
+      expect(error.message).toContain('(workspace_id) is a direct key attribute')
+      await client.exec(`DROP INDEX ${indexName}`)
+    }
+
+    // The legacy table sorts first. Its global key remaining in place proves
+    // the later current-shape rejection happens before any ALTER statement.
+    const legacyPrimaryBeforeCleanup = await client.query<{ columns: string }>(`
+      SELECT string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
+      FROM pg_constraint AS constraint_record
+      JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
+      JOIN LATERAL unnest(constraint_record.conkey)
+        WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+      JOIN pg_attribute AS attribute
+        ON attribute.attrelid = relation.oid
+       AND attribute.attnum = key_column.attribute_number
+      WHERE constraint_record.contype = 'p'
+        AND relation.relname = 'a_expression_legacy_accounts'
+      GROUP BY relation.relname
+    `)
+    expect(legacyPrimaryBeforeCleanup.rows).toEqual([{ columns: 'id' }])
+
+    await client.exec(`
+      CREATE UNIQUE INDEX a_expression_legacy_id_partial_idx
+        ON a_expression_legacy_accounts (((id || ''))) INCLUDE (name)
+        WHERE name <> 'excluded';
+    `)
+    await expect(migrateTenantPrimaryKeys(db, expressionShapeSchema)).rejects.toThrow(
+      /index "a_expression_legacy_id_partial_idx".*\(workspace_id\) is a direct key attribute/,
+    )
+
+    await client.exec(`DROP INDEX a_expression_legacy_id_partial_idx`)
+    expect(await migrateTenantPrimaryKeys(db, expressionShapeSchema)).toEqual({
+      migrated: ['a_expression_legacy_accounts'],
+      alreadyCurrent: ['z_expression_current_accounts'],
+    })
+    await client.exec(`
+      INSERT INTO a_expression_legacy_accounts VALUES ('beta', 'shared', 'legacy beta');
+      INSERT INTO z_expression_current_accounts VALUES ('beta', 'shared', 'current beta');
+    `)
+    expect(await migrateTenantPrimaryKeys(db, expressionShapeSchema)).toEqual({
+      migrated: [],
+      alreadyCurrent: ['a_expression_legacy_accounts', 'z_expression_current_accounts'],
+    })
+  })
+
   for (const example of residualLegacyIndexCases) {
     test(`rejects ${example.contract} before migrating a legacy primary key`, async () => {
       const validTable = `a_${example.suffix}_legacy_accounts`
@@ -367,7 +475,7 @@ describe('migrateTenantPrimaryKeys', () => {
       const error = await databaseCause(migrateTenantPrimaryKeys(db, legacySchema))
       expect(error.message).toContain(`index "${residualIndex}"`)
       expect(error.message).toContain(
-        'supported legacy and current shapes have no standalone UNIQUE (id)',
+        'standalone UNIQUE (id) nor an expression-bearing UNIQUE index with a residual (id) dependency',
       )
 
       // The valid table sorts first. Both keys remaining global proves the

@@ -60,12 +60,17 @@ plus a unique `(tenant, logical ID)` index. It is atomic and idempotent. It keep
 the tenant-qualified unique index so existing composite foreign keys remain
 valid, and fails with the exact blocker when a foreign key still references only
 the old global ID. Before migrating a legacy table or accepting a composite key
-as current, it rejects by name every standalone unique constraint or index that
-still enforces a global logical ID. This includes partial indexes and indexes
-with non-key `INCLUDE` columns. The passed Drizzle schema must already declare
-the target composite primary key; an adopted `global-primary-compatibility`
-model is rejected so application metadata cannot keep claiming the retired
-shape. All other schema evolution remains application-owned.
+as current, it rejects by name every unique constraint or index that can retain
+global logical identity. Direct, partial, and `INCLUDE` indexes are covered. An
+expression-bearing unique index that depends on the logical ID outside a
+non-key `INCLUDE` payload is accepted only when the tenant column is a direct
+key attribute. PostgreSQL dependency rows do not distinguish key expressions
+from predicates, so this deliberately rejects encoded tenant expressions and
+other ambiguous expression indexes; use an explicit tenant key instead. The
+passed Drizzle schema must already declare the target composite primary key; an
+adopted `global-primary-compatibility` model is rejected so application metadata
+cannot keep claiming the retired shape. All other schema evolution remains
+application-owned.
 
 ## Server functions
 

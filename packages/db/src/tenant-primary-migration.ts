@@ -200,39 +200,91 @@ async function globalIdentityUniqueness(
   tx: MigrationTransaction,
   identity: TenantIdentity,
 ): Promise<GlobalIdentityUniqueness[]> {
+  // pg_depend attaches key expressions, predicates, and INCLUDE columns to the
+  // index object. Discount known logical-ID INCLUDE occurrences, then fail
+  // closed on any remaining dependency unless tenant identity is a direct key.
   const result = await tx.execute(sql`
-    SELECT CASE WHEN unique_constraint.oid IS NULL THEN 'index' ELSE 'constraint' END
-             AS object_kind,
-           COALESCE(unique_constraint.conname, index_relation.relname) AS object_name,
-           string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS column_names
-    FROM pg_index AS index_record
-    JOIN pg_class AS relation ON relation.oid = index_record.indrelid
-    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    JOIN pg_class AS index_relation ON index_relation.oid = index_record.indexrelid
-    LEFT JOIN pg_constraint AS unique_constraint
-      ON unique_constraint.conindid = index_record.indexrelid
-     AND unique_constraint.contype = 'u'
-    JOIN LATERAL unnest(index_record.indkey)
-      WITH ORDINALITY AS key_column(attribute_number, ordinality)
-      ON key_column.ordinality <= index_record.indnkeyatts
-    JOIN pg_attribute AS attribute
-      ON attribute.attrelid = relation.oid
-     AND attribute.attnum = key_column.attribute_number
-    WHERE namespace.nspname = current_schema()
-      AND relation.relname = ${identity.tableName}
-      AND index_record.indisunique
-      AND NOT index_record.indisprimary
-      AND index_record.indisvalid
-      AND index_record.indisready
-      AND index_record.indislive
-      AND index_record.indexprs IS NULL
-    GROUP BY index_record.indexrelid,
-             index_relation.relname,
-             unique_constraint.oid,
-             unique_constraint.conname
-    HAVING string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) =
-      ${identity.logicalColumn}
-    ORDER BY COALESCE(unique_constraint.conname, index_relation.relname)
+    WITH candidate_indexes AS (
+      SELECT index_record.indexrelid,
+             index_record.indrelid,
+             index_record.indkey,
+             index_record.indnkeyatts,
+             index_record.indexprs,
+             logical_attribute.attnum AS logical_attribute_number,
+             tenant_attribute.attnum AS tenant_attribute_number,
+             CASE WHEN unique_constraint.oid IS NULL THEN 'index' ELSE 'constraint' END
+               AS object_kind,
+             COALESCE(unique_constraint.conname, index_relation.relname) AS object_name
+      FROM pg_index AS index_record
+      JOIN pg_class AS relation ON relation.oid = index_record.indrelid
+      JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      JOIN pg_class AS index_relation ON index_relation.oid = index_record.indexrelid
+      JOIN pg_attribute AS logical_attribute
+        ON logical_attribute.attrelid = relation.oid
+       AND logical_attribute.attname = ${identity.logicalColumn}
+       AND logical_attribute.attnum > 0
+       AND NOT logical_attribute.attisdropped
+      JOIN pg_attribute AS tenant_attribute
+        ON tenant_attribute.attrelid = relation.oid
+       AND tenant_attribute.attname = ${identity.tenantColumn}
+       AND tenant_attribute.attnum > 0
+       AND NOT tenant_attribute.attisdropped
+      LEFT JOIN pg_constraint AS unique_constraint
+        ON unique_constraint.conindid = index_record.indexrelid
+       AND unique_constraint.contype = 'u'
+      WHERE namespace.nspname = current_schema()
+        AND relation.relname = ${identity.tableName}
+        AND index_record.indisunique
+        AND NOT index_record.indisprimary
+        AND index_record.indisvalid
+        AND index_record.indisready
+        AND index_record.indislive
+    ),
+    direct_global_identity AS (
+      SELECT candidate.object_kind, candidate.object_name
+      FROM candidate_indexes AS candidate
+      JOIN LATERAL unnest(candidate.indkey)
+        WITH ORDINALITY AS key_column(attribute_number, ordinality)
+        ON key_column.ordinality <= candidate.indnkeyatts
+      WHERE candidate.indexprs IS NULL
+      GROUP BY candidate.indexrelid,
+               candidate.object_kind,
+               candidate.object_name,
+               candidate.logical_attribute_number
+      HAVING count(*) = 1
+         AND min(key_column.attribute_number) = candidate.logical_attribute_number
+    ),
+    expression_global_identity AS (
+      SELECT candidate.object_kind, candidate.object_name
+      FROM candidate_indexes AS candidate
+      WHERE candidate.indexprs IS NOT NULL
+        AND (
+          SELECT count(*)
+          FROM pg_depend AS dependency
+          WHERE dependency.classid = 'pg_class'::regclass
+            AND dependency.objid = candidate.indexrelid
+            AND dependency.refclassid = 'pg_class'::regclass
+            AND dependency.refobjid = candidate.indrelid
+            AND dependency.refobjsubid = candidate.logical_attribute_number
+        ) > (
+          SELECT count(*)
+          FROM unnest(candidate.indkey)
+            WITH ORDINALITY AS included_column(attribute_number, ordinality)
+          WHERE included_column.ordinality > candidate.indnkeyatts
+            AND included_column.attribute_number = candidate.logical_attribute_number
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(candidate.indkey)
+            WITH ORDINALITY AS key_column(attribute_number, ordinality)
+          WHERE key_column.ordinality <= candidate.indnkeyatts
+            AND key_column.attribute_number = candidate.tenant_attribute_number
+        )
+    )
+    SELECT object_kind, object_name FROM direct_global_identity
+    UNION
+    SELECT object_kind, object_name FROM expression_global_identity
+    ORDER BY object_name
   `)
   return normalizeExecuteRows(result).map((row) => ({
     kind: row['object_kind'] === 'constraint' ? 'constraint' : 'index',
@@ -254,11 +306,12 @@ async function globalIdentityUniqueness(
  * A foreign key that still references only the global logical ID blocks the
  * migration with its exact constraint name; callers must expand that relation
  * to include tenant identity before retrying. Neither a legacy nor an
- * already-composite table is accepted while a standalone unique logical-ID
- * constraint or index still enforces global identity. The supplied Drizzle
- * schema must already model the target composite primary key; the temporary
- * adopted `global-primary-compatibility` model is rejected so code and storage
- * cannot silently disagree after the contract step.
+ * already-composite table is accepted while standalone logical-ID uniqueness
+ * or an expression-bearing unique index with a residual logical-ID dependency
+ * lacks a direct tenant key. The supplied Drizzle schema must already model the
+ * target composite primary key; the temporary adopted `global-primary-compatibility`
+ * model is rejected so code and storage cannot silently disagree after the
+ * contract step.
  */
 export async function migrateTenantPrimaryKeys(
   db: TenantPrimaryKeyMigrationTarget,
@@ -291,8 +344,10 @@ export async function migrateTenantPrimaryKeys(
         throw new Error(
           `Tenant-primary migration rejects unsupported identity shape on ` +
             `"${identity.tableName}": ${evidence} still enforces global identity ` +
-            `(${identity.logicalColumn}). The supported legacy and current shapes have ` +
-            `no standalone UNIQUE (${identity.logicalColumn})`,
+            `(${identity.logicalColumn}). The supported legacy and current shapes allow ` +
+            `neither standalone UNIQUE (${identity.logicalColumn}) nor an expression-bearing ` +
+            `UNIQUE index with a residual (${identity.logicalColumn}) dependency unless ` +
+            `(${identity.tenantColumn}) is a direct key attribute`,
         )
       }
       if (currentPrimary.column_names === desiredColumns) {
