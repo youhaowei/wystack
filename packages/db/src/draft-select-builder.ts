@@ -11,7 +11,7 @@ import type { Query, SQL } from 'drizzle-orm'
  */
 export type DraftReadPlan = 'point' | 'bounded' | 'overlay'
 import { getTableConfig } from 'drizzle-orm/pg-core'
-import type { FilterDescriptor } from './operators'
+import type { ComparisonFilterDescriptor, FilterDescriptor } from './operators'
 import type {
   AnyTable,
   DraftDrizzleTracker,
@@ -51,6 +51,55 @@ import {
 import { lockDraftWriteCandidate, writeDraftRow } from './draft-mutations'
 import { compareRowRevisionRows } from './row-revisions'
 import type { TableSelectedRow } from './table'
+
+const draftSqlOperators = {
+  eq: '=',
+  ne: '<>',
+  gt: '>',
+  gte: '>=',
+  lt: '<',
+  lte: '<=',
+} as const
+
+/**
+ * Lower a predicate against either effective draft expressions or canonical
+ * candidate columns. Keeping both paths on this one recursive lowering is what
+ * makes candidate pruning and the final overlay agree for nested predicates.
+ */
+function lowerPredicate(
+  filter: FilterDescriptor,
+  // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+  columns: Record<string, any>,
+  // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous Drizzle columns
+  expression: (column: any) => string,
+): SQL {
+  if ('filters' in filter) {
+    if (filter.filters.length === 0) {
+      throw new Error(`${filter.op}() requires at least one predicate`)
+    }
+    const children = filter.filters.map((child) => lowerPredicate(child, columns, expression))
+    const separator = filter.op === 'and' ? ' AND ' : ' OR '
+    return sql`${sql.raw('(')}${sql.join(children, sql.raw(separator))}${sql.raw(')')}`
+  }
+
+  const column = requireColumn(columns, filter.column)
+  const columnSql = expression(column)
+  if (!('value' in filter) && !('values' in filter)) {
+    return sql.raw(`(${columnSql} ${filter.op === 'isNull' ? 'IS NULL' : 'IS NOT NULL'})`)
+  }
+  if ('values' in filter) {
+    if (filter.values.length === 0) {
+      return sql.raw(filter.op === 'in' ? '(FALSE)' : '(TRUE)')
+    }
+    const values = filter.values.map((value) => sql.param(mapColumnValue(column, value)))
+    return sql`${sql.raw(
+      `(${columnSql} ${filter.op === 'in' ? 'IN' : 'NOT IN'} (`,
+    )}${sql.join(values, sql.raw(', '))}${sql.raw('))')}`
+  }
+  return sql`${sql.raw(`(${columnSql} ${draftSqlOperators[filter.op]} `)}${sql.param(
+    mapColumnValue(column, filter.value),
+  )}${sql.raw(')')}`
+}
 
 export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
   private _table: T
@@ -412,7 +461,8 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     // native PK index; the small side hits the central composite key instead of
     // scanning the entire draft and filtering a COALESCE after the join.
     const pkFilter = this._clauses.filters.find(
-      (filter) => filter.op === 'eq' && filter.column === pkProperty,
+      (filter): filter is ComparisonFilterDescriptor =>
+        filter.op === 'eq' && 'column' in filter && filter.column === pkProperty,
     )
     const pointKey = pkFilter ? encodeTypedKey(pkColumn, pkFilter.value) : undefined
 
@@ -458,21 +508,12 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
         ? this._clauses.limitVal
         : Math.min(limitOverride, this._clauses.limitVal ?? limitOverride)
     const limit = limitVal === undefined ? sql.raw('') : sql`${sql.raw(' LIMIT ')}${limitVal}`
-    const sqlOperators = {
-      eq: '=',
-      ne: '<>',
-      gt: '>',
-      gte: '>=',
-      lt: '<',
-      lte: '<=',
-    } as const
-    const filterFragments = this._clauses.filters.map((filter) => {
-      const column = requireColumn(columns, filter.column)
-      return sql`${sql.raw(
-        ` AND ${effectiveExpression(column)} ${sqlOperators[filter.op]} `,
-      )}${sql.param(mapColumnValue(column, filter.value))}`
-    })
-    const filterPredicate = sql.join(filterFragments, sql.raw(''))
+    const effectiveFilters = this._clauses.filters.map((filter) =>
+      lowerPredicate(filter, columns, effectiveExpression),
+    )
+    const filterPredicate = effectiveFilters.length
+      ? sql`${sql.raw(' AND ')}${sql.join(effectiveFilters, sql.raw(' AND '))}`
+      : sql.raw('')
 
     // A filtered effective query can start from canonical matches; a limited
     // one can reduce those matches further. If this table has M draft changes,
@@ -495,11 +536,12 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
         )
       }
       for (const filter of this._clauses.filters) {
-        const column = requireColumn(columns, filter.column)
         candidatePredicates.push(
-          sql`${sql.raw(
-            `c.${quoteSqlIdentifier(column.name)} ${sqlOperators[filter.op]} `,
-          )}${sql.param(mapColumnValue(column, filter.value))}`,
+          lowerPredicate(
+            filter,
+            columns,
+            (column) => `c.${quoteSqlIdentifier(column.name as string)}`,
+          ),
         )
       }
       const candidateWhere = candidatePredicates.length
