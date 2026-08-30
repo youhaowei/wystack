@@ -44,7 +44,13 @@
 
 import type { DrizzleTracker } from '@wystack/db'
 import type { WyStackApp } from './create'
-import type { FunctionDef } from './types'
+import type { FunctionDef, ProcedureDatabaseAccess } from './types'
+
+const nonNativeProcedureLabels = {
+  'read-model-raw': 'a read-model procedure',
+  'integration-raw': 'an integration procedure',
+  'legacy-raw': 'a legacy procedure',
+} satisfies Record<Exclude<ProcedureDatabaseAccess, 'native'>, string>
 
 /**
  * Enforce the registry capability boundary shared by direct batches and the
@@ -59,11 +65,13 @@ export function assertReplayableCommand(
   if (!definition) {
     throw new Error(`${label} ${path} references an unknown function`)
   }
+  if (definition.databaseAccess !== 'native') {
+    throw new Error(
+      `${label} ${path} cannot reference ${nonNativeProcedureLabels[definition.databaseAccess]}`,
+    )
+  }
   if (definition.type === 'action') {
     throw new Error(`${label} ${path} cannot reference an action`)
-  }
-  if (definition.databaseAccess === 'legacy-raw') {
-    throw new Error(`${label} ${path} cannot reference a legacy procedure`)
   }
   if (definition.type === 'query') {
     throw new Error(

@@ -402,6 +402,14 @@ beforeEach(async () => {
             .update({ items: next })
         }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      rawTodoReadModel: wy.readModel
+        .input({})
+        .query(async (ctx) => ctx.db.from(schema.todos).all()),
+      rawTodoIntegration: wy.integration
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
       legacyAddTodo: wy.legacyProcedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
@@ -2115,15 +2123,36 @@ describe('draft lifecycle — command envelope ownership', () => {
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
-  test('rejects a legacy procedure before it can execute against the draft tracker', async () => {
-    const lc = createDraftLifecycle(app)
-    const draftId = await lc.open(0)
+  for (const boundary of [
+    {
+      name: 'a read model',
+      path: 'rawTodoReadModel',
+      args: {},
+      error: 'Draft command rawTodoReadModel cannot reference a read-model procedure',
+    },
+    {
+      name: 'an integration',
+      path: 'rawTodoIntegration',
+      args: { id: 3, title: 'cherry' },
+      error: 'Draft command rawTodoIntegration cannot reference an integration procedure',
+    },
+    {
+      name: 'a legacy procedure',
+      path: 'legacyAddTodo',
+      args: { id: 3, title: 'cherry' },
+      error: 'Draft command legacyAddTodo cannot reference a legacy procedure',
+    },
+  ]) {
+    test(`rejects ${boundary.name} before draft execution`, async () => {
+      const lc = createDraftLifecycle(app)
+      const draftId = await lc.open(0)
 
-    await expect(
-      lc.append(draftId, [{ path: 'legacyAddTodo', args: { id: 3, title: 'cherry' } }]),
-    ).rejects.toThrow('Draft command legacyAddTodo cannot reference a legacy procedure')
-    expect(await lc.getLog(draftId)).toEqual([])
-  })
+      await expect(
+        lc.append(draftId, [{ path: boundary.path, args: boundary.args }]),
+      ).rejects.toThrow(boundary.error)
+      expect(await lc.getLog(draftId)).toEqual([])
+    })
+  }
 
   test('rejects a canonical-only mutation before it can change the draft', async () => {
     const lc = createDraftLifecycle(app)

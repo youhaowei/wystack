@@ -41,6 +41,15 @@ beforeEach(async () => {
     )
   `)
 
+  const readModelTodos = wy.readModel
+    .input({})
+    .query(async (ctx) => ctx.db.from(schema.todos).all())
+  const integrationAddTodo = wy.integration
+    .input({ id: int, title: text })
+    .mutation(async (ctx, args) =>
+      ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+    )
+
   app = await wy.build({
     db,
     functions: {
@@ -74,6 +83,9 @@ beforeEach(async () => {
         throw new Error('command boom')
       }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      readModelTodos,
+      integrationAddTodo,
+      forgedIntegrationCommand: { ...integrationAddTodo, draftReplayable: true },
       legacyAddTodo: wy.legacyProcedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
@@ -90,16 +102,35 @@ describe('applyCommands — commit mode', () => {
     ).rejects.toThrow('Command externalAction cannot reference an action')
   })
 
-  test('rejects a legacy procedure without executing its handler', async () => {
-    await expect(
-      applyCommands(app, [{ path: 'legacyAddTodo', args: { id: 1, title: 'A' } }], {
-        mode: 'commit',
-      }),
-    ).rejects.toThrow('Command legacyAddTodo cannot reference a legacy procedure')
+  for (const boundary of [
+    {
+      name: 'read model',
+      path: 'readModelTodos',
+      args: {},
+      error: 'Command readModelTodos cannot reference a read-model procedure',
+    },
+    {
+      name: 'integration with a forged replay flag',
+      path: 'forgedIntegrationCommand',
+      args: { id: 1, title: 'A' },
+      error: 'Command forgedIntegrationCommand cannot reference an integration procedure',
+    },
+    {
+      name: 'legacy procedure',
+      path: 'legacyAddTodo',
+      args: { id: 1, title: 'A' },
+      error: 'Command legacyAddTodo cannot reference a legacy procedure',
+    },
+  ]) {
+    test(`rejects the non-native ${boundary.name} during preflight`, async () => {
+      await expect(
+        applyCommands(app, [{ path: boundary.path, args: boundary.args }], { mode: 'commit' }),
+      ).rejects.toThrow(boundary.error)
 
-    const { result } = await app.call('listTodos', {})
-    expect(result).toEqual([])
-  })
+      const { result } = await app.call('listTodos', {})
+      expect(result).toEqual([])
+    })
+  }
 
   test('rejects a query that was not explicitly declared as a command', async () => {
     await expect(
@@ -123,6 +154,7 @@ describe('applyCommands — commit mode', () => {
         'canonicalOnlyTodo',
         'Command addTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
       ],
+      ['forgedIntegrationCommand', 'Command addTodo cannot reference an integration procedure'],
     ] as const
 
     for (const [replacement, error] of replacements) {
@@ -148,6 +180,13 @@ describe('applyCommands — commit mode', () => {
 
     const { result } = await app.call('listTodos', {})
     expect(result).toEqual([{ id: 1, title: 'canonical', done: false }])
+  })
+
+  test('keeps integration mutations canonically callable', async () => {
+    await app.call('integrationAddTodo', { id: 1, title: 'imported' })
+
+    const { result } = await app.call('listTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'imported', done: false }])
   })
 
   test('applies all commands atomically and persists them', async () => {

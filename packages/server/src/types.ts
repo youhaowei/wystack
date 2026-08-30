@@ -67,19 +67,23 @@ export type CommandDb = Pick<ProcedureDb, 'from' | 'into'>
 export type CommandContext<TContext> = Overwrite<TContext, { db: CommandDb }>
 
 /**
- * Compatibility-only database surface for procedures that have not yet moved
- * onto WyStack's tracked query DSL.
+ * Raw database surface for app-owned SQL boundaries.
  *
- * The raw connection and tracking sets are deliberately available only through
- * `defineApp().legacyProcedure`. Tenant and draft scope-changing capabilities
- * remain framework custody even on this migration surface.
+ * The raw connection and manual tracking sets support joins, aggregates, and
+ * bulk workflows that the native DSL cannot yet express. Trusted tenant
+ * resolution and tag qualification remain framework-owned, but raw SQL tenant
+ * predicates are application-owned. Tenant and draft scope-changing methods
+ * remain framework custody on every raw boundary.
  */
-export interface LegacyProcedureDb extends ProcedureDb {
+export interface RawProcedureDb extends ProcedureDb {
   readonly raw: DrizzleTracker['raw']
   readonly tablesRead: Set<string>
   readonly tablesWritten: Set<string>
-  transaction<R>(fn: (tx: LegacyProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+  transaction<R>(fn: (tx: RawProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
+
+/** Backward-compatible name for the raw legacy migration facade. */
+export type LegacyProcedureDb = RawProcedureDb
 
 /**
  * Base context for query, mutation, and action handlers. The command terminal
@@ -90,15 +94,27 @@ export type FunctionContext<TAppContext extends object = Record<string, unknown>
   can: Can
 }
 
-/** Context passed only to handlers built with `defineApp().legacyProcedure`. */
-export type LegacyFunctionContext<TAppContext extends object = Record<string, unknown>> =
+/** Context shared by explicit raw boundaries after any configured tenant resolution. */
+export type RawFunctionContext<TAppContext extends object = Record<string, unknown>> =
   TAppContext & {
-    db: LegacyProcedureDb
+    db: RawProcedureDb
     can: Can
   }
 
+/** Context passed only to handlers built with `defineApp().readModel`. */
+export type ReadModelFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
+/** Context passed only to handlers built with `defineApp().integration`. */
+export type IntegrationFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
+/** Backward-compatible context for `defineApp().legacyProcedure`. */
+export type LegacyFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
 /** Runtime marker controlling which database facade a registered handler receives. */
-export type ProcedureDatabaseAccess = 'native' | 'legacy-raw'
+export type ProcedureDatabaseAccess = 'native' | 'read-model-raw' | 'integration-raw' | 'legacy-raw'
 
 /**
  * Maps a DSL ColumnDef to its TypeScript arg type, honoring optionality:
@@ -124,10 +140,15 @@ export type InferArgs<T extends Record<string, AnyColumnDef>> = {
   [K in keyof T as IsOptionalColumn<T[K]> extends true ? K : never]?: InferArg<T[K]>
 }
 
-// oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export interface QueryDef<TArgs = any, TReturn = any> {
+export interface QueryDef<
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TArgs = any,
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TReturn = any,
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
+> {
   type: 'query'
-  databaseAccess: ProcedureDatabaseAccess
+  databaseAccess: TDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
@@ -140,9 +161,10 @@ export interface ActionDef<
   // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
   TReturn = any,
   TType extends 'action' | 'mutation' = 'action',
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
 > {
   type: TType
-  databaseAccess: ProcedureDatabaseAccess
+  databaseAccess: TDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
@@ -159,14 +181,15 @@ export interface MutationDef<
   // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
   TReturn = any,
   TDraftReplayable extends boolean = boolean,
-> extends ActionDef<TArgs, TReturn, 'mutation'> {
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
+> extends ActionDef<TArgs, TReturn, 'mutation', TDatabaseAccess> {
   /** Capability attestation consumed by applyCommands and the draft lifecycle. */
   draftReplayable: TDraftReplayable
 }
 
 /** A mutation whose author explicitly attested it is safe for ordered draft replay. */
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export type CommandDef<TArgs = any, TReturn = any> = MutationDef<TArgs, TReturn, true>
+export type CommandDef<TArgs = any, TReturn = any> = MutationDef<TArgs, TReturn, true, 'native'>
 
 export type FunctionDef = QueryDef | MutationDef | ActionDef
 

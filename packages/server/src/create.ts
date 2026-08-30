@@ -14,8 +14,8 @@ import {
   procedureSelectTerminalMethods,
   type FunctionDef,
   type FunctionContext,
-  type LegacyFunctionContext,
-  type LegacyProcedureDb,
+  type RawFunctionContext,
+  type RawProcedureDb,
   type DbInput,
   type ProcedureDb,
 } from './types'
@@ -46,11 +46,12 @@ export interface WyStackSystem {
   emit: (tablesWritten: Set<string>) => void
   /**
    * Run one registered function's handler using a SUPPLIED DrizzleTracker instead
-   * of a fresh per-call one. The handler receives a `ProcedureDb`, not the tracker
-   * itself. This is the seam `applyCommands` uses to dispatch every command in a
-   * batch through one native transaction and one merged Tag-set. Native
-   * handlers receive `ProcedureDb`; explicitly branded legacy handlers receive
-   * `LegacyProcedureDb` for plain RPC compatibility and are rejected by every
+   * of a fresh per-call one. The handler receives a database facade, not the
+   * tracker itself. This is the seam `applyCommands` uses to dispatch every
+   * command in a batch through one native transaction and one merged Tag-set.
+   * Native handlers receive the restricted facade (commands are typed to its
+   * transaction-free `CommandDb` subset); explicitly branded raw boundaries
+   * receive `RawProcedureDb` for canonical dispatch and are rejected by every
    * command/draft entry point before replay.
    *
    * Validation runs inside the composed handler after middleware exactly as in
@@ -67,10 +68,10 @@ export interface WyStackSystem {
    * `tracked` may also be a `DraftDrizzleTracker` (a `base.withDraft(draftId)` handle):
    * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
    * command handler's writes (`ctx.db.into/update/delete`) into the durable
-   * draft overlay. `runHandler` converts either tracker to the same restricted
-   * `ProcedureDb` surface (`from`, `into`, and `transaction`), so the substitution
-   * is transparent to native handlers while raw SQL, scope changes, and tracking
-   * sets remain framework custody.
+   * draft overlay. `runHandler` converts either tracker to the same native
+   * `from`/`into` surface, so the substitution is transparent to command
+   * handlers while raw SQL, scope changes, and tracking sets remain framework
+   * custody.
    */
   runHandler: (
     path: string,
@@ -187,6 +188,15 @@ function mappedTrackingSet(target: Set<string>, qualify: (tag: string) => string
           return facade
         }
       }
+      if (property === 'forEach') {
+        return (
+          callback: (value: string, key: string, set: Set<string>) => void,
+          thisArg?: unknown,
+        ) =>
+          source.forEach((value, key) => {
+            callback.call(thisArg, value, key, facade)
+          })
+      }
       if (property === 'has') return (tag: string) => source.has(qualify(tag))
       if (property === 'delete') return (tag: string) => source.delete(qualify(tag))
       const value = Reflect.get(source, property, source)
@@ -196,22 +206,22 @@ function mappedTrackingSet(target: Set<string>, qualify: (tag: string) => string
   return facade
 }
 
-function toLegacyProcedureDb(
+function toRawProcedureDb(
   tracked: DrizzleTracker | DraftDrizzleTracker,
   qualifyTag: (tag: string) => string,
-): LegacyProcedureDb {
+): RawProcedureDb {
   return Object.freeze({
     raw: tracked.raw,
     tablesRead: mappedTrackingSet(tracked.tablesRead, qualifyTag),
     tablesWritten: mappedTrackingSet(tracked.tablesWritten, qualifyTag),
     from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
-      toProcedureSelectBuilder(tracked.from(table))) as LegacyProcedureDb['from'],
+      toProcedureSelectBuilder(tracked.from(table))) as RawProcedureDb['from'],
     into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
-      toProcedureInsertBuilder(tracked.into(table))) as LegacyProcedureDb['into'],
+      toProcedureInsertBuilder(tracked.into(table))) as RawProcedureDb['into'],
     transaction: async <R>(
-      fn: (tx: LegacyProcedureDb) => Promise<R>,
-      opts?: Parameters<LegacyProcedureDb['transaction']>[1],
-    ) => tracked.transaction((tx) => fn(toLegacyProcedureDb(tx, qualifyTag)), opts),
+      fn: (tx: RawProcedureDb) => Promise<R>,
+      opts?: Parameters<RawProcedureDb['transaction']>[1],
+    ) => tracked.transaction((tx) => fn(toRawProcedureDb(tx, qualifyTag)), opts),
   })
 }
 
@@ -238,7 +248,7 @@ export async function buildWyStack(opts: {
   // their own — see the WyStackApp.invalidationSource contract.
   const invalidation = createDispatchInvalidationSource()
 
-  function qualifyLegacyTag(tracked: DrizzleTracker | DraftDrizzleTracker, tag: string): string {
+  function qualifyRawTag(tracked: DrizzleTracker | DraftDrizzleTracker, tag: string): string {
     const tenantId = 'tenantId' in tracked ? tracked.tenantId : undefined
     if (tenantId === undefined || !opts.tenancy) return tag
     const tenantKey = encodeURIComponent(String(opts.tenancy.canonicalize(tenantId)))
@@ -291,14 +301,13 @@ export async function buildWyStack(opts: {
       // draft tracker implements transaction() as a fail-loud nested-transaction
       // guard because lifecycle append/publish own the outer boundaries. Raw SQL
       // and scope-changing methods are unavailable in both type and runtime.
-      // Existing handlers may opt into the deliberately branded legacy facade,
-      // which restores raw Drizzle + manual Tag tracking without restoring
-      // withTenant()/withDraft() custody.
+      // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
+      // without restoring withTenant()/withDraft() custody.
       const db =
-        fn.databaseAccess === 'legacy-raw'
-          ? toLegacyProcedureDb(tracked, (tag) => qualifyLegacyTag(tracked, tag))
+        fn.databaseAccess !== 'native'
+          ? toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
           : toProcedureDb(tracked)
-      const ctx = { ...context, db } as FunctionContext | LegacyFunctionContext
+      const ctx = { ...context, db } as FunctionContext | RawFunctionContext
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
       return fn.handler(ctx, args)

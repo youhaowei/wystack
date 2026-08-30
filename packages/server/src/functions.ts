@@ -20,6 +20,36 @@ import { buildArgsSchema, ValidationError } from './validation'
 // oxlint-disable-next-line typescript/no-explicit-any -- middleware stages deliberately change context shape
 type AnyMiddleware = MiddlewareFn<any, any>
 
+type QueryTerminal<
+  TContext,
+  TArgSchema extends Record<string, AnyColumnDef>,
+  TDatabaseAccess extends ProcedureDatabaseAccess,
+> = TDatabaseAccess extends 'native' | 'read-model-raw' | 'legacy-raw'
+  ? <TReturn>(
+      handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
+    ) => QueryDef<InferArgs<TArgSchema>, TReturn, TDatabaseAccess>
+  : never
+
+type MutationTerminal<
+  TContext,
+  TArgSchema extends Record<string, AnyColumnDef>,
+  TDatabaseAccess extends ProcedureDatabaseAccess,
+> = TDatabaseAccess extends 'native' | 'integration-raw' | 'legacy-raw'
+  ? <TReturn>(
+      handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
+    ) => MutationDef<InferArgs<TArgSchema>, TReturn, false, TDatabaseAccess>
+  : never
+
+type ActionTerminal<
+  TContext,
+  TArgSchema extends Record<string, AnyColumnDef>,
+  TDatabaseAccess extends ProcedureDatabaseAccess,
+> = TDatabaseAccess extends 'native' | 'legacy-raw'
+  ? <TReturn>(
+      handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
+    ) => ActionDef<InferArgs<TArgSchema>, TReturn, 'action', TDatabaseAccess>
+  : never
+
 export interface ProcedureBuilder<
   TContext,
   TArgSchema extends Record<string, AnyColumnDef> = Record<never, never>,
@@ -34,12 +64,8 @@ export interface ProcedureBuilder<
   input<TNextArgSchema extends Record<string, AnyColumnDef>>(
     schema: TNextArgSchema,
   ): ProcedureBuilder<TContext, TNextArgSchema, TDatabaseAccess>
-  query<TReturn>(
-    handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
-  ): QueryDef<InferArgs<TArgSchema>, TReturn>
-  mutation<TReturn>(
-    handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
-  ): MutationDef<InferArgs<TArgSchema>, TReturn, false>
+  query: QueryTerminal<TContext, TArgSchema, TDatabaseAccess>
+  mutation: MutationTerminal<TContext, TArgSchema, TDatabaseAccess>
   /**
    * Attest that a native, DB-only handler is safe for ordered draft replay.
    * WyStack restricts the DB surface but cannot inspect captured side effects.
@@ -49,9 +75,7 @@ export interface ProcedureBuilder<
         handler: (ctx: CommandContext<TContext>, args: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) => CommandDef<InferArgs<TArgSchema>, TReturn>
     : never
-  action<TReturn>(
-    handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
-  ): ActionDef<InferArgs<TArgSchema>, TReturn>
+  action: ActionTerminal<TContext, TArgSchema, TDatabaseAccess>
 }
 
 function stageOk<P>(patch?: P): StageOk<P> {
@@ -70,17 +94,22 @@ function isStageOk(value: unknown): value is StageOk<unknown> {
   )
 }
 
-function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
+function terminal<
+  TContext,
+  TArgSchema extends Record<string, AnyColumnDef>,
+  TReturn,
+  TDatabaseAccess extends ProcedureDatabaseAccess,
+>(
   type: 'query' | 'mutation' | 'action',
-  databaseAccess: ProcedureDatabaseAccess,
+  databaseAccess: TDatabaseAccess,
   draftReplayable: boolean,
   args: TArgSchema,
   middleware: readonly AnyMiddleware[],
   handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
 ):
-  | QueryDef<InferArgs<TArgSchema>, TReturn>
-  | MutationDef<InferArgs<TArgSchema>, TReturn>
-  | ActionDef<InferArgs<TArgSchema>, TReturn> {
+  | QueryDef<InferArgs<TArgSchema>, TReturn, TDatabaseAccess>
+  | MutationDef<InferArgs<TArgSchema>, TReturn, boolean, TDatabaseAccess>
+  | ActionDef<InferArgs<TArgSchema>, TReturn, 'action', TDatabaseAccess> {
   const argsSchema = buildArgsSchema(args)
 
   const definition = {
@@ -126,6 +155,12 @@ export function createProcedure<TContext>(
   databaseAccess: 'legacy-raw',
 ): ProcedureBuilder<TContext, Record<never, never>, 'legacy-raw'>
 export function createProcedure<TContext>(
+  databaseAccess: 'read-model-raw',
+): ProcedureBuilder<TContext, Record<never, never>, 'read-model-raw'>
+export function createProcedure<TContext>(
+  databaseAccess: 'integration-raw',
+): ProcedureBuilder<TContext, Record<never, never>, 'integration-raw'>
+export function createProcedure<TContext>(
   databaseAccess: ProcedureDatabaseAccess = 'native',
 ): ProcedureBuilder<TContext, Record<never, never>, ProcedureDatabaseAccess> {
   function createBuilder<
@@ -159,30 +194,41 @@ export function createProcedure<TContext>(
           currentDatabaseAccess,
         )
       },
-      query<TReturn>(
-        handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
-      ) {
-        return terminal(
-          'query',
-          currentDatabaseAccess,
-          false,
-          args,
-          middleware,
-          handler,
-        ) as QueryDef<InferArgs<TArgSchema>, TReturn>
-      },
-      mutation<TReturn>(
-        handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
-      ) {
-        return terminal(
-          'mutation',
-          currentDatabaseAccess,
-          false,
-          args,
-          middleware,
-          handler,
-        ) as MutationDef<InferArgs<TArgSchema>, TReturn, false>
-      },
+      query: (currentDatabaseAccess === 'native' ||
+      currentDatabaseAccess === 'read-model-raw' ||
+      currentDatabaseAccess === 'legacy-raw'
+        ? <TReturn>(
+            handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
+          ) =>
+            terminal('query', currentDatabaseAccess, false, args, middleware, handler) as QueryDef<
+              InferArgs<TArgSchema>,
+              TReturn,
+              TCurrentDatabaseAccess
+            >
+        : undefined) as ProcedureBuilder<
+        TCurrentContext,
+        TArgSchema,
+        TCurrentDatabaseAccess
+      >['query'],
+      mutation: (currentDatabaseAccess === 'native' ||
+      currentDatabaseAccess === 'integration-raw' ||
+      currentDatabaseAccess === 'legacy-raw'
+        ? <TReturn>(
+            handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
+          ) =>
+            terminal(
+              'mutation',
+              currentDatabaseAccess,
+              false,
+              args,
+              middleware,
+              handler,
+            ) as MutationDef<InferArgs<TArgSchema>, TReturn, false, TCurrentDatabaseAccess>
+        : undefined) as ProcedureBuilder<
+        TCurrentContext,
+        TArgSchema,
+        TCurrentDatabaseAccess
+      >['mutation'],
       command: (currentDatabaseAccess === 'native'
         ? <TReturn>(
             handler: (
@@ -203,18 +249,23 @@ export function createProcedure<TContext>(
         TArgSchema,
         TCurrentDatabaseAccess
       >['command'],
-      action<TReturn>(
-        handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
-      ) {
-        return terminal(
-          'action',
-          currentDatabaseAccess,
-          false,
-          args,
-          middleware,
-          handler,
-        ) as ActionDef<InferArgs<TArgSchema>, TReturn>
-      },
+      action: (currentDatabaseAccess === 'native' || currentDatabaseAccess === 'legacy-raw'
+        ? <TReturn>(
+            handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
+          ) =>
+            terminal(
+              'action',
+              currentDatabaseAccess,
+              false,
+              args,
+              middleware,
+              handler,
+            ) as ActionDef<InferArgs<TArgSchema>, TReturn, 'action', TCurrentDatabaseAccess>
+        : undefined) as ProcedureBuilder<
+        TCurrentContext,
+        TArgSchema,
+        TCurrentDatabaseAccess
+      >['action'],
     }
   }
 

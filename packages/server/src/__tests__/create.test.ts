@@ -3,7 +3,12 @@ import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
-import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
+import {
+  assertPermissionIds,
+  defineApp,
+  PermissionDeniedError,
+  type RawProcedureDb,
+} from '../index'
 
 const schema = defineSchema({
   todos: table({
@@ -56,6 +61,44 @@ function createTestDatabase(): PGlite {
   const pg = new PGlite()
   openDatabases.add(pg)
   return pg
+}
+
+async function inspectRawDbSurface(db: RawProcedureDb, readTag: string) {
+  await db.raw.execute('SELECT 1')
+  db.tablesRead.add(readTag)
+  const nested = await db.transaction(async (tx) => ({
+    raw: 'raw' in tx,
+    withTenant: 'withTenant' in tx,
+    withDraft: 'withDraft' in tx,
+    tablesRead: 'tablesRead' in tx,
+    tablesWritten: 'tablesWritten' in tx,
+  }))
+  const dbSurface = db as unknown as Record<string, unknown>
+  return {
+    raw: 'raw' in dbSurface,
+    withTenant: 'withTenant' in dbSurface,
+    withDraft: 'withDraft' in dbSurface,
+    tablesRead: 'tablesRead' in dbSurface,
+    tablesWritten: 'tablesWritten' in dbSurface,
+    transaction: typeof dbSurface['transaction'] === 'function',
+    nested,
+  }
+}
+
+const expectedRawDbSurface = {
+  raw: true,
+  withTenant: false,
+  withDraft: false,
+  tablesRead: true,
+  tablesWritten: true,
+  transaction: true,
+  nested: {
+    raw: true,
+    withTenant: false,
+    withDraft: false,
+    tablesRead: true,
+    tablesWritten: true,
+  },
 }
 
 afterEach(async () => {
@@ -134,27 +177,15 @@ beforeEach(async () => {
           insertDb: '_db' in insertSurface,
         }
       }),
-      inspectLegacyDbSurface: wy.legacyProcedure.input({}).query(async (ctx) => {
-        await ctx.db.raw.execute('SELECT 1')
-        ctx.db.tablesRead.add('legacy-manual-read')
-        const nested = await ctx.db.transaction(async (tx) => ({
-          raw: 'raw' in tx,
-          withTenant: 'withTenant' in tx,
-          withDraft: 'withDraft' in tx,
-          tablesRead: 'tablesRead' in tx,
-          tablesWritten: 'tablesWritten' in tx,
-        }))
-        const dbSurface = ctx.db as unknown as Record<string, unknown>
-        return {
-          raw: 'raw' in dbSurface,
-          withTenant: 'withTenant' in dbSurface,
-          withDraft: 'withDraft' in dbSurface,
-          tablesRead: 'tablesRead' in dbSurface,
-          tablesWritten: 'tablesWritten' in dbSurface,
-          transaction: typeof dbSurface['transaction'] === 'function',
-          nested,
-        }
-      }),
+      inspectReadModelDbSurface: wy.readModel
+        .input({})
+        .query(async (ctx) => inspectRawDbSurface(ctx.db, 'read-model-manual-read')),
+      inspectIntegrationDbSurface: wy.integration
+        .input({})
+        .mutation(async (ctx) => inspectRawDbSurface(ctx.db, 'integration-manual-read')),
+      inspectLegacyDbSurface: wy.legacyProcedure
+        .input({})
+        .query(async (ctx) => inspectRawDbSurface(ctx.db, 'legacy-manual-read')),
     },
   })
 })
@@ -231,28 +262,34 @@ describe('defineApp().build()', () => {
     })
   })
 
+  for (const boundary of [
+    {
+      name: 'readModel',
+      path: 'inspectReadModelDbSurface',
+      readTag: 'read-model-manual-read',
+    },
+    {
+      name: 'integration',
+      path: 'inspectIntegrationDbSurface',
+      readTag: 'integration-manual-read',
+    },
+  ]) {
+    test(`${boundary.name} exposes tracked raw access without scope custody`, async () => {
+      const call = await app.call(boundary.path, {})
+
+      expect(call.result).toEqual(expectedRawDbSurface)
+      expect(call.tablesRead.has(boundary.readTag)).toBe(true)
+    })
+  }
+
   test('legacyProcedure restores tracked raw access without restoring scope custody', async () => {
     const call = await app.call('inspectLegacyDbSurface', {})
 
-    expect(call.result).toEqual({
-      raw: true,
-      withTenant: false,
-      withDraft: false,
-      tablesRead: true,
-      tablesWritten: true,
-      transaction: true,
-      nested: {
-        raw: true,
-        withTenant: false,
-        withDraft: false,
-        tablesRead: true,
-        tablesWritten: true,
-      },
-    })
+    expect(call.result).toEqual(expectedRawDbSurface)
     expect(call.tablesRead.has('legacy-manual-read')).toBe(true)
   })
 
-  test('tenant-qualifies manual legacy invalidation tags', async () => {
+  test('tenant-qualifies manual invalidation tags on every raw boundary', async () => {
     const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
     const tenancy = multiTenant({
       key: { property: 'orgId', column: 'org_id', type: text },
@@ -261,6 +298,15 @@ describe('defineApp().build()', () => {
     const tenantApp = await tenantWy.build({
       db: drizzle(pg),
       functions: {
+        readModelRead: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.tablesRead.add('seed')
+          ctx.db.tablesRead.forEach((_value, _key, tracked) => tracked.add('checklists'))
+          return true
+        }),
+        integrationWrite: tenantWy.integration.input({}).mutation(async (ctx) => {
+          ctx.db.tablesWritten.add('checklists')
+          return true
+        }),
         legacyRead: tenantWy.legacyProcedure.input({}).query(async (ctx) => {
           ctx.db.tablesRead.add('checklists')
           return true
@@ -274,10 +320,16 @@ describe('defineApp().build()', () => {
       resolveTenant: (context) => context.orgId,
     })
 
+    const alphaReadModel = await tenantApp.call('readModelRead', {}, { orgId: 'alpha' })
+    const betaReadModel = await tenantApp.call('readModelRead', {}, { orgId: 'beta' })
+    const alphaIntegration = await tenantApp.call('integrationWrite', {}, { orgId: 'alpha' })
     const alphaRead = await tenantApp.call('legacyRead', {}, { orgId: 'alpha' })
     const betaRead = await tenantApp.call('legacyRead', {}, { orgId: 'beta' })
     const alphaWrite = await tenantApp.call('legacyWrite', {}, { orgId: 'alpha' })
 
+    expect([...alphaReadModel.tablesRead]).toEqual(['tenant:alpha:seed', 'tenant:alpha:checklists'])
+    expect([...betaReadModel.tablesRead]).toEqual(['tenant:beta:seed', 'tenant:beta:checklists'])
+    expect([...alphaIntegration.tablesWritten]).toEqual(['tenant:alpha:checklists'])
     expect([...alphaRead.tablesRead]).toEqual(['tenant:alpha:checklists'])
     expect([...betaRead.tablesRead]).toEqual(['tenant:beta:checklists'])
     expect([...alphaWrite.tablesWritten]).toEqual(['tenant:alpha:checklists'])
