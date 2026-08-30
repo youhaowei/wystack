@@ -14,6 +14,7 @@ const schema = defineSchema({
 const failClosedSchema = defineSchema({
   a_real_legacy_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
   z_real_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+  zz_real_index_legacy_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
 })
 
 describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
@@ -56,6 +57,16 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
         CONSTRAINT z_real_current_children_parent_fk
           FOREIGN KEY (parent_id) REFERENCES z_real_current_accounts (id)
       );
+      CREATE TABLE zz_real_index_legacy_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        CONSTRAINT zz_real_index_legacy_accounts_workspace_id_id_unique
+          UNIQUE (workspace_id, id)
+      );
+      CREATE UNIQUE INDEX zz_real_index_legacy_accounts_id_unique_idx
+        ON zz_real_index_legacy_accounts (id) INCLUDE (name)
+        WHERE name <> 'excluded';
     `)
   })
 
@@ -99,12 +110,13 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
     expect(identity).toEqual({ columns: 'workspace_id,id', rows: 2 })
   })
 
-  test('fails closed on composite keys with global identity remnants', async () => {
+  test('fails closed on global identity remnants before legacy or current acceptance', async () => {
     const db = drizzle(client)
     await client.unsafe(`
       INSERT INTO a_real_legacy_accounts VALUES ('alpha', 'shared', 'legacy alpha');
       INSERT INTO z_real_current_accounts VALUES ('alpha', 'shared', 'current alpha');
       INSERT INTO z_real_current_children VALUES ('beta', 'beta child', 'shared');
+      INSERT INTO zz_real_index_legacy_accounts VALUES ('alpha', 'shared', 'index alpha');
     `)
 
     await expect(migrateTenantPrimaryKeys(db, failClosedSchema)).rejects.toThrow(
@@ -119,8 +131,17 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
       /constraint "z_real_current_accounts_id_unique".*no standalone UNIQUE \(id\)/,
     )
 
-    const [legacyIdentityBeforeCleanup] = await client<{ columns: string }[]>`
-      SELECT string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
+    await client.unsafe(`
+      ALTER TABLE z_real_current_accounts
+        DROP CONSTRAINT z_real_current_accounts_id_unique
+    `)
+    await expect(migrateTenantPrimaryKeys(db, failClosedSchema)).rejects.toThrow(
+      /index "zz_real_index_legacy_accounts_id_unique_idx".*no standalone UNIQUE \(id\)/,
+    )
+
+    const legacyIdentitiesBeforeCleanup = await client<{ table_name: string; columns: string }[]>`
+      SELECT relation.relname AS table_name,
+             string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
       FROM pg_constraint AS constraint_record
       JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
       JOIN LATERAL unnest(constraint_record.conkey)
@@ -129,28 +150,33 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
         ON attribute.attrelid = relation.oid
        AND attribute.attnum = key_column.attribute_number
       WHERE constraint_record.contype = 'p'
-        AND relation.relname = 'a_real_legacy_accounts'
+        AND relation.relname IN ('a_real_legacy_accounts', 'zz_real_index_legacy_accounts')
       GROUP BY relation.relname
+      ORDER BY relation.relname
     `
-    expect(legacyIdentityBeforeCleanup).toEqual({ columns: 'id' })
+    expect([...legacyIdentitiesBeforeCleanup]).toEqual([
+      { table_name: 'a_real_legacy_accounts', columns: 'id' },
+      { table_name: 'zz_real_index_legacy_accounts', columns: 'id' },
+    ])
 
     await client.unsafe(`
-      ALTER TABLE z_real_current_accounts
-        DROP CONSTRAINT z_real_current_accounts_id_unique
+      DROP INDEX zz_real_index_legacy_accounts_id_unique_idx
     `)
     expect(await migrateTenantPrimaryKeys(db, failClosedSchema)).toEqual({
-      migrated: ['a_real_legacy_accounts'],
+      migrated: ['a_real_legacy_accounts', 'zz_real_index_legacy_accounts'],
       alreadyCurrent: ['z_real_current_accounts'],
     })
 
     await client.unsafe(`
       INSERT INTO a_real_legacy_accounts VALUES ('beta', 'shared', 'legacy beta');
       INSERT INTO z_real_current_accounts VALUES ('beta', 'shared', 'current beta');
+      INSERT INTO zz_real_index_legacy_accounts VALUES ('beta', 'shared', 'index beta');
     `)
-    const [rows] = await client<{ legacy: number; current: number }[]>`
+    const [rows] = await client<{ legacy: number; current: number; indexed: number }[]>`
       SELECT (SELECT count(*)::integer FROM a_real_legacy_accounts) AS legacy,
-             (SELECT count(*)::integer FROM z_real_current_accounts) AS current
+             (SELECT count(*)::integer FROM z_real_current_accounts) AS current,
+             (SELECT count(*)::integer FROM zz_real_index_legacy_accounts) AS indexed
     `
-    expect(rows).toEqual({ legacy: 2, current: 2 })
+    expect(rows).toEqual({ legacy: 2, current: 2, indexed: 2 })
   })
 })

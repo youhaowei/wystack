@@ -38,6 +38,28 @@ const atomicShapeSchema = defineSchema({
   z_atomic_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
 })
 
+const includedExpandSchema = defineSchema({
+  included_expand_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+})
+
+const residualLegacyIndexCases = [
+  {
+    contract: 'a standalone logical-ID index',
+    suffix: 'plain',
+    indexDefinition: '(id)',
+  },
+  {
+    contract: 'a logical-ID index with INCLUDE columns',
+    suffix: 'include',
+    indexDefinition: '(id) INCLUDE (name)',
+  },
+  {
+    contract: 'a partial logical-ID index',
+    suffix: 'partial',
+    indexDefinition: `(id) WHERE name <> 'excluded'`,
+  },
+] as const
+
 const openDatabases = new Set<PGlite>()
 
 function createTestDatabase(): PGlite {
@@ -146,6 +168,34 @@ describe('migrateTenantPrimaryKeys', () => {
     })
   })
 
+  test('accepts a tenant-qualified expand index with non-key INCLUDE columns', async () => {
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE included_expand_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX included_expand_accounts_workspace_id_id_unique
+        ON included_expand_accounts (workspace_id, id) INCLUDE (name);
+      INSERT INTO included_expand_accounts VALUES ('alpha', 'shared', 'alpha');
+    `)
+    const db = drizzle(client)
+
+    expect(await migrateTenantPrimaryKeys(db, includedExpandSchema)).toEqual({
+      migrated: ['included_expand_accounts'],
+      alreadyCurrent: [],
+    })
+    await client.exec(`
+      INSERT INTO included_expand_accounts VALUES ('beta', 'shared', 'beta')
+    `)
+    const rows = await client.query<{ count: number }>(`
+      SELECT count(*)::integer AS count FROM included_expand_accounts
+    `)
+    expect(rows.rows).toEqual([{ count: 2 }])
+  })
+
   test('names global-ID foreign keys and leaves the legacy primary key untouched', async () => {
     const client = createTestDatabase()
     await client.waitReady
@@ -243,7 +293,7 @@ describe('migrateTenantPrimaryKeys', () => {
     const db = drizzle(client)
 
     await expect(migrateTenantPrimaryKeys(db, atomicShapeSchema)).rejects.toThrow(
-      /constraint "z_atomic_current_accounts_id_unique".*supported current shape.*no standalone UNIQUE \(id\)/,
+      /constraint "z_atomic_current_accounts_id_unique".*supported legacy and current shapes.*no standalone UNIQUE \(id\)/,
     )
 
     // The valid legacy table sorts before the invalid current table. Its
@@ -282,6 +332,84 @@ describe('migrateTenantPrimaryKeys', () => {
     `)
     expect(rowCounts.rows).toEqual([{ legacy: 2, current: 2 }])
   })
+
+  for (const example of residualLegacyIndexCases) {
+    test(`rejects ${example.contract} before migrating a legacy primary key`, async () => {
+      const validTable = `a_${example.suffix}_legacy_accounts`
+      const residualTable = `z_${example.suffix}_legacy_accounts`
+      const residualIndex = `${residualTable}_id_unique_idx`
+      const legacySchema = defineSchema({
+        [validTable]: tenancy.table({ id: text.primaryKey(), name: text }),
+        [residualTable]: tenancy.table({ id: text.primaryKey(), name: text }),
+      })
+      const client = createTestDatabase()
+      await client.waitReady
+      await client.exec(`
+        CREATE TABLE ${validTable} (
+          workspace_id TEXT NOT NULL,
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          CONSTRAINT ${validTable}_workspace_id_id_unique UNIQUE (workspace_id, id)
+        );
+        CREATE TABLE ${residualTable} (
+          workspace_id TEXT NOT NULL,
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          CONSTRAINT ${residualTable}_workspace_id_id_unique UNIQUE (workspace_id, id)
+        );
+        CREATE UNIQUE INDEX ${residualIndex}
+          ON ${residualTable} ${example.indexDefinition};
+        INSERT INTO ${validTable} VALUES ('alpha', 'shared', 'valid alpha');
+        INSERT INTO ${residualTable} VALUES ('alpha', 'shared', 'residual alpha');
+      `)
+      const db = drizzle(client)
+
+      const error = await databaseCause(migrateTenantPrimaryKeys(db, legacySchema))
+      expect(error.message).toContain(`index "${residualIndex}"`)
+      expect(error.message).toContain(
+        'supported legacy and current shapes have no standalone UNIQUE (id)',
+      )
+
+      // The valid table sorts first. Both keys remaining global proves the
+      // later preflight rejection cannot partially mutate an earlier plan.
+      const primaryKeysBeforeCleanup = await client.query<{
+        table_name: string
+        columns: string
+      }>(`
+        SELECT relation.relname AS table_name,
+               string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
+        FROM pg_constraint AS constraint_record
+        JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
+        JOIN LATERAL unnest(constraint_record.conkey)
+          WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = relation.oid
+         AND attribute.attnum = key_column.attribute_number
+        WHERE constraint_record.contype = 'p'
+          AND relation.relname IN ('${validTable}', '${residualTable}')
+        GROUP BY relation.relname
+        ORDER BY relation.relname
+      `)
+      expect(primaryKeysBeforeCleanup.rows).toEqual([
+        { table_name: validTable, columns: 'id' },
+        { table_name: residualTable, columns: 'id' },
+      ])
+
+      await client.exec(`DROP INDEX ${residualIndex}`)
+      expect(await migrateTenantPrimaryKeys(db, legacySchema)).toEqual({
+        migrated: [validTable, residualTable],
+        alreadyCurrent: [],
+      })
+      await client.exec(`
+        INSERT INTO ${validTable} VALUES ('beta', 'shared', 'valid beta');
+        INSERT INTO ${residualTable} VALUES ('beta', 'shared', 'residual beta');
+      `)
+      expect(await migrateTenantPrimaryKeys(db, legacySchema)).toEqual({
+        migrated: [],
+        alreadyCurrent: [validTable, residualTable],
+      })
+    })
+  }
 
   test('rejects a compatibility model that has not declared the target primary key', async () => {
     const records = pgTable(

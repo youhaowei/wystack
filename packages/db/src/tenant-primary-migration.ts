@@ -147,7 +147,8 @@ async function hasTenantUniqueIndex(
     JOIN pg_class AS relation ON relation.oid = index_record.indrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
     JOIN LATERAL unnest(index_record.indkey)
-      WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+      WITH ORDINALITY AS key_column(attribute_number, ordinality)
+      ON key_column.ordinality <= index_record.indnkeyatts
     JOIN pg_attribute AS attribute
       ON attribute.attrelid = relation.oid
      AND attribute.attnum = key_column.attribute_number
@@ -212,7 +213,8 @@ async function globalIdentityUniqueness(
       ON unique_constraint.conindid = index_record.indexrelid
      AND unique_constraint.contype = 'u'
     JOIN LATERAL unnest(index_record.indkey)
-      WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+      WITH ORDINALITY AS key_column(attribute_number, ordinality)
+      ON key_column.ordinality <= index_record.indnkeyatts
     JOIN pg_attribute AS attribute
       ON attribute.attrelid = relation.oid
      AND attribute.attnum = key_column.attribute_number
@@ -223,7 +225,6 @@ async function globalIdentityUniqueness(
       AND index_record.indisvalid
       AND index_record.indisready
       AND index_record.indislive
-      AND index_record.indpred IS NULL
       AND index_record.indexprs IS NULL
     GROUP BY index_record.indexrelid,
              index_relation.relname,
@@ -252,12 +253,12 @@ async function globalIdentityUniqueness(
  * Tenant-qualified foreign keys remain backed by the retained UNIQUE index.
  * A foreign key that still references only the global logical ID blocks the
  * migration with its exact constraint name; callers must expand that relation
- * to include tenant identity before retrying. An already-composite table is
- * current only when no standalone unique logical-ID constraint or index still
- * enforces global identity. The supplied Drizzle schema must already model the
- * target composite primary key; the temporary adopted `global-primary-compatibility`
- * model is rejected so code and storage cannot silently disagree after the
- * contract step.
+ * to include tenant identity before retrying. Neither a legacy nor an
+ * already-composite table is accepted while a standalone unique logical-ID
+ * constraint or index still enforces global identity. The supplied Drizzle
+ * schema must already model the target composite primary key; the temporary
+ * adopted `global-primary-compatibility` model is rejected so code and storage
+ * cannot silently disagree after the contract step.
  */
 export async function migrateTenantPrimaryKeys(
   db: TenantPrimaryKeyMigrationTarget,
@@ -284,17 +285,17 @@ export async function migrateTenantPrimaryKeys(
             `Expand each foreign key to include "${identity.tenantColumn}" first`,
         )
       }
+      const globalUniqueness = await globalIdentityUniqueness(tx, identity)
+      if (globalUniqueness.length > 0) {
+        const evidence = globalUniqueness.map(({ kind, name }) => `${kind} "${name}"`).join(', ')
+        throw new Error(
+          `Tenant-primary migration rejects unsupported identity shape on ` +
+            `"${identity.tableName}": ${evidence} still enforces global identity ` +
+            `(${identity.logicalColumn}). The supported legacy and current shapes have ` +
+            `no standalone UNIQUE (${identity.logicalColumn})`,
+        )
+      }
       if (currentPrimary.column_names === desiredColumns) {
-        const globalUniqueness = await globalIdentityUniqueness(tx, identity)
-        if (globalUniqueness.length > 0) {
-          const evidence = globalUniqueness.map(({ kind, name }) => `${kind} "${name}"`).join(', ')
-          throw new Error(
-            `Tenant-primary migration rejects unsupported current shape on ` +
-              `"${identity.tableName}": ${evidence} still enforces global identity ` +
-              `(${identity.logicalColumn}). The supported current shape is PRIMARY KEY ` +
-              `(${desiredColumns}) with no standalone UNIQUE (${identity.logicalColumn})`,
-          )
-        }
         alreadyCurrent.push(identity.tableName)
         continue
       }

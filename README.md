@@ -59,13 +59,13 @@ The migration accepts only the known expand shape: a global logical primary key
 plus a unique `(tenant, logical ID)` index. It is atomic and idempotent. It keeps
 the tenant-qualified unique index so existing composite foreign keys remain
 valid, and fails with the exact blocker when a foreign key still references only
-the old global ID. An already-composite table is accepted as current only when
-no standalone unique constraint or index still enforces a global logical ID;
-those remnants are rejected by name rather than silently preserving global
-identity. The passed Drizzle schema must already declare the target composite
-primary key; an adopted `global-primary-compatibility` model is rejected so
-application metadata cannot keep claiming the retired shape. All other schema
-evolution remains application-owned.
+the old global ID. Before migrating a legacy table or accepting a composite key
+as current, it rejects by name every standalone unique constraint or index that
+still enforces a global logical ID. This includes partial indexes and indexes
+with non-key `INCLUDE` columns. The passed Drizzle schema must already declare
+the target composite primary key; an adopted `global-primary-compatibility`
+model is rejected so application metadata cannot keep claiming the retired
+shape. All other schema evolution remains application-owned.
 
 ## Server functions
 

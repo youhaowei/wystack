@@ -144,6 +144,14 @@ describe('adoptSchema', () => {
       first: { logicalPrimaryKey: 'id' as const, softDeleteProperty: 'deletedAt' as const },
       second: { logicalPrimaryKey: 'id' as const },
     },
+    {
+      contract: 'identity mode',
+      first: { logicalPrimaryKey: 'id' as const, identity: 'tenant-primary' as const },
+      second: {
+        logicalPrimaryKey: 'id' as const,
+        identity: 'global-primary-compatibility' as const,
+      },
+    },
   ]
 
   for (const [index, example] of duplicateConfigurationCases.entries()) {
