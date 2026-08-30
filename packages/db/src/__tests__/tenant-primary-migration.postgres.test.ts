@@ -20,6 +20,9 @@ const expressionSchema = defineSchema({
   a_real_expression_legacy_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
   z_real_expression_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
 })
+const notReadySchema = defineSchema({
+  real_not_ready_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+})
 
 describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
   const namespace = `wystack_tenant_primary_${process.pid}_${Date.now()}`
@@ -69,8 +72,10 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
           UNIQUE (workspace_id, id)
       );
       CREATE UNIQUE INDEX zz_real_index_legacy_accounts_id_unique_idx
-        ON zz_real_index_legacy_accounts (id) INCLUDE (name)
+        ON zz_real_index_legacy_accounts (id, id) INCLUDE (name)
         WHERE name <> 'excluded';
+      CREATE UNIQUE INDEX zz_real_index_legacy_accounts_id_name_unique_idx
+        ON zz_real_index_legacy_accounts (id, name);
       CREATE TABLE a_real_expression_legacy_accounts (
         workspace_id TEXT NOT NULL,
         id TEXT PRIMARY KEY,
@@ -82,17 +87,30 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
         workspace_id TEXT NOT NULL,
         id TEXT NOT NULL,
         name TEXT NOT NULL,
+        id_copy TEXT GENERATED ALWAYS AS (id) STORED,
         CONSTRAINT z_real_expression_current_accounts_pkey PRIMARY KEY (workspace_id, id)
       );
+      CREATE FUNCTION real_whole_row_account_id(account z_real_expression_current_accounts)
+        RETURNS TEXT LANGUAGE SQL IMMUTABLE AS 'SELECT account.id';
       CREATE UNIQUE INDEX a_real_expression_legacy_name_unique_idx
         ON a_real_expression_legacy_accounts ((lower(name))) INCLUDE (id);
       CREATE UNIQUE INDEX z_real_expression_current_name_partial_idx
-        ON z_real_expression_current_accounts ((lower(name)))
+        ON z_real_expression_current_accounts (workspace_id, (lower(name)))
         WHERE name <> 'excluded';
       CREATE UNIQUE INDEX z_real_expression_current_tenant_id_idx
         ON z_real_expression_current_accounts (workspace_id, ((id || '')));
+      CREATE UNIQUE INDEX z_real_expression_current_tenant_generated_idx
+        ON z_real_expression_current_accounts (workspace_id, id_copy);
       CREATE UNIQUE INDEX z_real_expression_current_id_idx
         ON z_real_expression_current_accounts (((id || ''))) INCLUDE (id);
+      CREATE TABLE real_not_ready_current_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        CONSTRAINT real_not_ready_current_accounts_pkey PRIMARY KEY (workspace_id, id)
+      );
+      CREATE UNIQUE INDEX real_not_ready_current_accounts_id_unique_idx
+        ON real_not_ready_current_accounts (id, id);
     `)
   })
 
@@ -136,17 +154,45 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
     expect(identity).toEqual({ columns: 'workspace_id,id', rows: 2 })
   })
 
-  test('fails closed on expression-derived global identity without rejecting safe controls', async () => {
+  test('fails closed on catalog-derived global identity without rejecting safe controls', async () => {
     const db = drizzle(client)
     await client.unsafe(`
       INSERT INTO a_real_expression_legacy_accounts
         VALUES ('alpha', 'shared', 'legacy alpha');
-      INSERT INTO z_real_expression_current_accounts
+      INSERT INTO z_real_expression_current_accounts (workspace_id, id, name)
         VALUES ('alpha', 'shared', 'current alpha');
     `)
 
     await expect(migrateTenantPrimaryKeys(db, expressionSchema)).rejects.toThrow(
-      /index "z_real_expression_current_id_idx".*\(workspace_id\) is a direct key attribute/,
+      /index "z_real_expression_current_id_idx".*direct \(workspace_id\) key attribute/,
+    )
+
+    await client.unsafe(`
+      DROP INDEX z_real_expression_current_id_idx;
+      CREATE UNIQUE INDEX z_real_expression_current_whole_row_idx
+        ON z_real_expression_current_accounts
+        ((real_whole_row_account_id(z_real_expression_current_accounts.*)));
+    `)
+    await expect(migrateTenantPrimaryKeys(db, expressionSchema)).rejects.toThrow(
+      /index "z_real_expression_current_whole_row_idx".*relation-level expression dependency/,
+    )
+
+    await client.unsafe(`
+      DROP INDEX z_real_expression_current_whole_row_idx;
+      CREATE UNIQUE INDEX z_real_expression_current_generated_idx
+        ON z_real_expression_current_accounts (id_copy);
+    `)
+    await expect(migrateTenantPrimaryKeys(db, expressionSchema)).rejects.toThrow(
+      /index "z_real_expression_current_generated_idx".*\(id\)-derived generated column/,
+    )
+
+    await client.unsafe(`
+      DROP INDEX z_real_expression_current_generated_idx;
+      CREATE UNIQUE INDEX z_real_expression_current_generated_expression_idx
+        ON z_real_expression_current_accounts ((lower(id_copy)));
+    `)
+    await expect(migrateTenantPrimaryKeys(db, expressionSchema)).rejects.toThrow(
+      /index "z_real_expression_current_generated_expression_idx".*generated-column.*expression dependency/,
     )
 
     const [legacyIdentityBeforeCleanup] = await client<{ columns: string }[]>`
@@ -165,13 +211,13 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
     expect(legacyIdentityBeforeCleanup).toEqual({ columns: 'id' })
 
     await client.unsafe(`
-      DROP INDEX z_real_expression_current_id_idx;
+      DROP INDEX z_real_expression_current_generated_expression_idx;
       CREATE UNIQUE INDEX a_real_expression_legacy_id_partial_idx
         ON a_real_expression_legacy_accounts (((id || ''))) INCLUDE (name)
         WHERE name <> 'excluded';
     `)
     await expect(migrateTenantPrimaryKeys(db, expressionSchema)).rejects.toThrow(
-      /index "a_real_expression_legacy_id_partial_idx".*\(workspace_id\) is a direct key attribute/,
+      /index "a_real_expression_legacy_id_partial_idx".*direct \(workspace_id\) key attribute/,
     )
 
     await client.unsafe(`DROP INDEX a_real_expression_legacy_id_partial_idx`)
@@ -182,7 +228,7 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
     await client.unsafe(`
       INSERT INTO a_real_expression_legacy_accounts
         VALUES ('beta', 'shared', 'legacy beta');
-      INSERT INTO z_real_expression_current_accounts
+      INSERT INTO z_real_expression_current_accounts (workspace_id, id, name)
         VALUES ('beta', 'shared', 'current beta');
     `)
     expect(await migrateTenantPrimaryKeys(db, expressionSchema)).toEqual({
@@ -194,6 +240,36 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
              (SELECT count(*)::integer FROM z_real_expression_current_accounts) AS current
     `
     expect(rows).toEqual({ legacy: 2, current: 2 })
+  })
+
+  test('ignores a not-ready unique index only after it stops enforcing writes', async () => {
+    const db = drizzle(client)
+    await client.unsafe(`
+      INSERT INTO real_not_ready_current_accounts VALUES ('alpha', 'shared', 'alpha');
+      UPDATE pg_index
+      SET indisvalid = FALSE, indisready = FALSE
+      WHERE indexrelid = 'real_not_ready_current_accounts_id_unique_idx'::regclass;
+    `)
+    const [state] = await client<
+      {
+        indisvalid: boolean
+        indisready: boolean
+        indislive: boolean
+      }[]
+    >`
+      SELECT indisvalid, indisready, indislive
+      FROM pg_index
+      WHERE indexrelid = 'real_not_ready_current_accounts_id_unique_idx'::regclass
+    `
+    expect(state).toEqual({ indisvalid: false, indisready: false, indislive: true })
+
+    await client.unsafe(`
+      INSERT INTO real_not_ready_current_accounts VALUES ('beta', 'shared', 'beta')
+    `)
+    expect(await migrateTenantPrimaryKeys(db, notReadySchema)).toEqual({
+      migrated: [],
+      alreadyCurrent: ['real_not_ready_current_accounts'],
+    })
   })
 
   test('fails closed on global identity remnants before legacy or current acceptance', async () => {
@@ -214,7 +290,7 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
         DROP CONSTRAINT z_real_current_children_parent_fk
     `)
     await expect(migrateTenantPrimaryKeys(db, failClosedSchema)).rejects.toThrow(
-      /constraint "z_real_current_accounts_id_unique".*\(workspace_id\) is a direct key attribute/,
+      /constraint "z_real_current_accounts_id_unique".*direct \(workspace_id\) key attribute/,
     )
 
     await client.unsafe(`
@@ -222,7 +298,7 @@ describeWithPostgres('tenant-primary migration — real PostgreSQL', () => {
         DROP CONSTRAINT z_real_current_accounts_id_unique
     `)
     await expect(migrateTenantPrimaryKeys(db, failClosedSchema)).rejects.toThrow(
-      /index "zz_real_index_legacy_accounts_id_unique_idx".*\(workspace_id\) is a direct key attribute/,
+      /index "zz_real_index_legacy_accounts_id_unique_idx".*direct \(workspace_id\) key attribute/,
     )
 
     const legacyIdentitiesBeforeCleanup = await client<{ table_name: string; columns: string }[]>`

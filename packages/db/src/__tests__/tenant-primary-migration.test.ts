@@ -47,7 +47,11 @@ const expressionShapeSchema = defineSchema({
   z_expression_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
 })
 
-const currentExpressionIndexCases = [
+const invalidReadySchema = defineSchema({
+  invalid_ready_current_accounts: tenancy.table({ id: text.primaryKey(), name: text }),
+})
+
+const currentIdentityIndexCases = [
   {
     suffix: 'identity',
     definition: `(((id || '')))`,
@@ -64,6 +68,18 @@ const currentExpressionIndexCases = [
     suffix: 'encoded_tenant',
     definition: `(((workspace_id || ':' || id)))`,
   },
+  {
+    suffix: 'whole_row',
+    definition: '((whole_row_account_id(z_expression_current_accounts.*)))',
+  },
+  {
+    suffix: 'generated_identity',
+    definition: '(id_copy)',
+  },
+  {
+    suffix: 'generated_identity_expression',
+    definition: '((lower(id_copy)))',
+  },
 ] as const
 
 const residualLegacyIndexCases = [
@@ -71,16 +87,25 @@ const residualLegacyIndexCases = [
     contract: 'a standalone logical-ID index',
     suffix: 'plain',
     indexDefinition: '(id)',
+    mixedIndexDefinition: null,
   },
   {
     contract: 'a logical-ID index with INCLUDE columns',
     suffix: 'include',
     indexDefinition: '(id) INCLUDE (name)',
+    mixedIndexDefinition: null,
   },
   {
     contract: 'a partial logical-ID index',
     suffix: 'partial',
     indexDefinition: `(id) WHERE name <> 'excluded'`,
+    mixedIndexDefinition: null,
+  },
+  {
+    contract: 'repeated logical-ID key slots',
+    suffix: 'repeated',
+    indexDefinition: '(id, id)',
+    mixedIndexDefinition: '(id, name)',
   },
 ] as const
 
@@ -317,7 +342,7 @@ describe('migrateTenantPrimaryKeys', () => {
     const db = drizzle(client)
 
     await expect(migrateTenantPrimaryKeys(db, atomicShapeSchema)).rejects.toThrow(
-      /constraint "z_atomic_current_accounts_id_unique".*standalone UNIQUE \(id\).*\(workspace_id\) is a direct key attribute/,
+      /constraint "z_atomic_current_accounts_id_unique".*direct UNIQUE key made only of \(id\) slots.*direct \(workspace_id\) key attribute/,
     )
 
     // The valid legacy table sorts before the invalid current table. Its
@@ -357,7 +382,7 @@ describe('migrateTenantPrimaryKeys', () => {
     expect(rowCounts.rows).toEqual([{ legacy: 2, current: 2 }])
   })
 
-  test('rejects expression-derived global identity across legacy and current shapes', async () => {
+  test('rejects catalog-derived global identity across legacy and current shapes', async () => {
     const client = createTestDatabase()
     await client.waitReady
     await client.exec(`
@@ -372,23 +397,29 @@ describe('migrateTenantPrimaryKeys', () => {
         workspace_id TEXT NOT NULL,
         id TEXT NOT NULL,
         name TEXT NOT NULL,
+        id_copy TEXT GENERATED ALWAYS AS (id) STORED,
         CONSTRAINT z_expression_current_accounts_pkey PRIMARY KEY (workspace_id, id)
       );
+      CREATE FUNCTION whole_row_account_id(account z_expression_current_accounts)
+        RETURNS TEXT LANGUAGE SQL IMMUTABLE AS 'SELECT account.id';
       CREATE UNIQUE INDEX a_expression_legacy_name_unique_idx
         ON a_expression_legacy_accounts ((lower(name))) INCLUDE (id);
       CREATE UNIQUE INDEX a_expression_legacy_id_name_unique_idx
         ON a_expression_legacy_accounts (id, name);
       CREATE UNIQUE INDEX z_expression_current_name_partial_idx
-        ON z_expression_current_accounts ((lower(name)))
+        ON z_expression_current_accounts (workspace_id, (lower(name)))
         WHERE name <> 'excluded';
       CREATE UNIQUE INDEX z_expression_current_tenant_id_expression_idx
         ON z_expression_current_accounts (workspace_id, ((id || '')));
+      CREATE UNIQUE INDEX z_expression_current_tenant_generated_idx
+        ON z_expression_current_accounts (workspace_id, id_copy);
       INSERT INTO a_expression_legacy_accounts VALUES ('alpha', 'shared', 'legacy alpha');
-      INSERT INTO z_expression_current_accounts VALUES ('alpha', 'shared', 'current alpha');
+      INSERT INTO z_expression_current_accounts (workspace_id, id, name)
+        VALUES ('alpha', 'shared', 'current alpha');
     `)
     const db = drizzle(client)
 
-    for (const example of currentExpressionIndexCases) {
+    for (const example of currentIdentityIndexCases) {
       const indexName = `z_expression_current_${example.suffix}_idx`
       await client.exec(`
         CREATE UNIQUE INDEX ${indexName}
@@ -396,7 +427,7 @@ describe('migrateTenantPrimaryKeys', () => {
       `)
       const error = await databaseCause(migrateTenantPrimaryKeys(db, expressionShapeSchema))
       expect(error.message).toContain(`index "${indexName}"`)
-      expect(error.message).toContain('(workspace_id) is a direct key attribute')
+      expect(error.message).toContain('direct (workspace_id) key attribute')
       await client.exec(`DROP INDEX ${indexName}`)
     }
 
@@ -423,7 +454,7 @@ describe('migrateTenantPrimaryKeys', () => {
         WHERE name <> 'excluded';
     `)
     await expect(migrateTenantPrimaryKeys(db, expressionShapeSchema)).rejects.toThrow(
-      /index "a_expression_legacy_id_partial_idx".*\(workspace_id\) is a direct key attribute/,
+      /index "a_expression_legacy_id_partial_idx".*direct \(workspace_id\) key attribute/,
     )
 
     await client.exec(`DROP INDEX a_expression_legacy_id_partial_idx`)
@@ -433,7 +464,8 @@ describe('migrateTenantPrimaryKeys', () => {
     })
     await client.exec(`
       INSERT INTO a_expression_legacy_accounts VALUES ('beta', 'shared', 'legacy beta');
-      INSERT INTO z_expression_current_accounts VALUES ('beta', 'shared', 'current beta');
+      INSERT INTO z_expression_current_accounts (workspace_id, id, name)
+        VALUES ('beta', 'shared', 'current beta');
     `)
     expect(await migrateTenantPrimaryKeys(db, expressionShapeSchema)).toEqual({
       migrated: [],
@@ -467,6 +499,12 @@ describe('migrateTenantPrimaryKeys', () => {
         );
         CREATE UNIQUE INDEX ${residualIndex}
           ON ${residualTable} ${example.indexDefinition};
+        ${
+          example.mixedIndexDefinition
+            ? `CREATE UNIQUE INDEX ${residualTable}_mixed_unique_idx
+                 ON ${residualTable} ${example.mixedIndexDefinition};`
+            : ''
+        }
         INSERT INTO ${validTable} VALUES ('alpha', 'shared', 'valid alpha');
         INSERT INTO ${residualTable} VALUES ('alpha', 'shared', 'residual alpha');
       `)
@@ -474,9 +512,7 @@ describe('migrateTenantPrimaryKeys', () => {
 
       const error = await databaseCause(migrateTenantPrimaryKeys(db, legacySchema))
       expect(error.message).toContain(`index "${residualIndex}"`)
-      expect(error.message).toContain(
-        'standalone UNIQUE (id) nor an expression-bearing UNIQUE index with a residual (id) dependency',
-      )
+      expect(error.message).toContain('direct UNIQUE key made only of (id) slots')
 
       // The valid table sorts first. Both keys remaining global proves the
       // later preflight rejection cannot partially mutate an earlier plan.
@@ -518,6 +554,44 @@ describe('migrateTenantPrimaryKeys', () => {
       })
     })
   }
+
+  test('rejects an invalid-but-ready unique index that still enforces writes', async () => {
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE invalid_ready_current_accounts (
+        workspace_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        CONSTRAINT invalid_ready_current_accounts_pkey PRIMARY KEY (workspace_id, id)
+      );
+      CREATE UNIQUE INDEX invalid_ready_current_accounts_id_unique_idx
+        ON invalid_ready_current_accounts (id, id);
+      INSERT INTO invalid_ready_current_accounts VALUES ('alpha', 'shared', 'alpha');
+      UPDATE pg_index
+      SET indisvalid = FALSE
+      WHERE indexrelid = 'invalid_ready_current_accounts_id_unique_idx'::regclass;
+    `)
+    const state = await client.query<{
+      indisvalid: boolean
+      indisready: boolean
+      indislive: boolean
+    }>(`
+      SELECT indisvalid, indisready, indislive
+      FROM pg_index
+      WHERE indexrelid = 'invalid_ready_current_accounts_id_unique_idx'::regclass
+    `)
+    expect(state.rows).toEqual([{ indisvalid: false, indisready: true, indislive: true }])
+
+    await expect(
+      client.exec(`
+        INSERT INTO invalid_ready_current_accounts VALUES ('beta', 'shared', 'beta')
+      `),
+    ).rejects.toThrow(/invalid_ready_current_accounts_id_unique_idx|unique/i)
+    await expect(migrateTenantPrimaryKeys(drizzle(client), invalidReadySchema)).rejects.toThrow(
+      /index "invalid_ready_current_accounts_id_unique_idx".*direct UNIQUE key made only of \(id\) slots/,
+    )
+  })
 
   test('rejects a compatibility model that has not declared the target primary key', async () => {
     const records = pgTable(

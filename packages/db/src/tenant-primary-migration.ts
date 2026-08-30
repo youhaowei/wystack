@@ -202,7 +202,8 @@ async function globalIdentityUniqueness(
 ): Promise<GlobalIdentityUniqueness[]> {
   // pg_depend attaches key expressions, predicates, and INCLUDE columns to the
   // index object. Discount known logical-ID INCLUDE occurrences, then fail
-  // closed on any remaining dependency unless tenant identity is a direct key.
+  // closed on a remaining logical-ID or whole-relation dependency unless tenant
+  // identity is a direct key.
   const result = await tx.execute(sql`
     WITH candidate_indexes AS (
       SELECT index_record.indexrelid,
@@ -236,42 +237,104 @@ async function globalIdentityUniqueness(
         AND relation.relname = ${identity.tableName}
         AND index_record.indisunique
         AND NOT index_record.indisprimary
-        AND index_record.indisvalid
         AND index_record.indisready
         AND index_record.indislive
+    ),
+    generated_identity_attributes AS (
+      SELECT DISTINCT candidate.indrelid,
+             generated_attribute.attnum AS attribute_number
+      FROM candidate_indexes AS candidate
+      JOIN pg_attribute AS generated_attribute
+        ON generated_attribute.attrelid = candidate.indrelid
+       AND generated_attribute.attgenerated <> ''
+       AND generated_attribute.attnum > 0
+       AND NOT generated_attribute.attisdropped
+      JOIN pg_attrdef AS generated_definition
+        ON generated_definition.adrelid = generated_attribute.attrelid
+       AND generated_definition.adnum = generated_attribute.attnum
+      WHERE EXISTS (
+        SELECT 1
+        FROM pg_depend AS dependency
+        WHERE dependency.classid = 'pg_attrdef'::regclass
+          AND dependency.objid = generated_definition.oid
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.refobjid = candidate.indrelid
+          AND dependency.refobjsubid IN (0, candidate.logical_attribute_number)
+      )
+    ),
+    identity_derived_attributes AS (
+      SELECT DISTINCT indrelid, logical_attribute_number AS attribute_number
+      FROM candidate_indexes
+      UNION
+      SELECT indrelid, attribute_number
+      FROM generated_identity_attributes
     ),
     direct_global_identity AS (
       SELECT candidate.object_kind, candidate.object_name
       FROM candidate_indexes AS candidate
-      JOIN LATERAL unnest(candidate.indkey)
-        WITH ORDINALITY AS key_column(attribute_number, ordinality)
-        ON key_column.ordinality <= candidate.indnkeyatts
       WHERE candidate.indexprs IS NULL
-      GROUP BY candidate.indexrelid,
-               candidate.object_kind,
-               candidate.object_name,
-               candidate.logical_attribute_number
-      HAVING count(*) = 1
-         AND min(key_column.attribute_number) = candidate.logical_attribute_number
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM unnest(candidate.indkey)
+              WITH ORDINALITY AS key_column(attribute_number, ordinality)
+            WHERE key_column.ordinality <= candidate.indnkeyatts
+              AND key_column.attribute_number <> candidate.logical_attribute_number
+          )
+          OR (
+            EXISTS (
+              SELECT 1
+              FROM unnest(candidate.indkey)
+                WITH ORDINALITY AS key_column(attribute_number, ordinality)
+              JOIN generated_identity_attributes AS generated_attribute
+                ON generated_attribute.indrelid = candidate.indrelid
+               AND generated_attribute.attribute_number = key_column.attribute_number
+              WHERE key_column.ordinality <= candidate.indnkeyatts
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM unnest(candidate.indkey)
+                WITH ORDINALITY AS key_column(attribute_number, ordinality)
+              WHERE key_column.ordinality <= candidate.indnkeyatts
+                AND key_column.attribute_number = candidate.tenant_attribute_number
+            )
+          )
+        )
     ),
     expression_global_identity AS (
       SELECT candidate.object_kind, candidate.object_name
       FROM candidate_indexes AS candidate
       WHERE candidate.indexprs IS NOT NULL
         AND (
-          SELECT count(*)
-          FROM pg_depend AS dependency
-          WHERE dependency.classid = 'pg_class'::regclass
-            AND dependency.objid = candidate.indexrelid
-            AND dependency.refclassid = 'pg_class'::regclass
-            AND dependency.refobjid = candidate.indrelid
-            AND dependency.refobjsubid = candidate.logical_attribute_number
-        ) > (
-          SELECT count(*)
-          FROM unnest(candidate.indkey)
-            WITH ORDINALITY AS included_column(attribute_number, ordinality)
-          WHERE included_column.ordinality > candidate.indnkeyatts
-            AND included_column.attribute_number = candidate.logical_attribute_number
+          EXISTS (
+            SELECT 1
+            FROM identity_derived_attributes AS derived_attribute
+            WHERE derived_attribute.indrelid = candidate.indrelid
+              AND (
+                SELECT count(*)
+                FROM pg_depend AS dependency
+                WHERE dependency.classid = 'pg_class'::regclass
+                  AND dependency.objid = candidate.indexrelid
+                  AND dependency.refclassid = 'pg_class'::regclass
+                  AND dependency.refobjid = candidate.indrelid
+                  AND dependency.refobjsubid = derived_attribute.attribute_number
+              ) > (
+                SELECT count(*)
+                FROM unnest(candidate.indkey)
+                  WITH ORDINALITY AS included_column(attribute_number, ordinality)
+                WHERE included_column.ordinality > candidate.indnkeyatts
+                  AND included_column.attribute_number = derived_attribute.attribute_number
+              )
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM pg_depend AS dependency
+            WHERE dependency.classid = 'pg_class'::regclass
+              AND dependency.objid = candidate.indexrelid
+              AND dependency.refclassid = 'pg_class'::regclass
+              AND dependency.refobjid = candidate.indrelid
+              AND dependency.refobjsubid = 0
+          )
         )
         AND NOT EXISTS (
           SELECT 1
@@ -305,11 +368,12 @@ async function globalIdentityUniqueness(
  * Tenant-qualified foreign keys remain backed by the retained UNIQUE index.
  * A foreign key that still references only the global logical ID blocks the
  * migration with its exact constraint name; callers must expand that relation
- * to include tenant identity before retrying. Neither a legacy nor an
- * already-composite table is accepted while standalone logical-ID uniqueness
- * or an expression-bearing unique index with a residual logical-ID dependency
- * lacks a direct tenant key. The supplied Drizzle schema must already model the
- * target composite primary key; the temporary adopted `global-primary-compatibility`
+ * to include tenant identity before retrying. The catalog preflight inspects
+ * ready/live unique indexes, including direct keys, expressions, whole-row
+ * dependencies, and generated-column lineage. Ambiguous derived identity must
+ * have a direct tenant key. This does not prove arbitrary trigger or custom
+ * runtime behavior. The supplied Drizzle schema must already model the target
+ * composite primary key; the temporary adopted `global-primary-compatibility`
  * model is rejected so code and storage cannot silently disagree after the
  * contract step.
  */
@@ -344,10 +408,11 @@ export async function migrateTenantPrimaryKeys(
         throw new Error(
           `Tenant-primary migration rejects unsupported identity shape on ` +
             `"${identity.tableName}": ${evidence} still enforces global identity ` +
-            `(${identity.logicalColumn}). The supported legacy and current shapes allow ` +
-            `neither standalone UNIQUE (${identity.logicalColumn}) nor an expression-bearing ` +
-            `UNIQUE index with a residual (${identity.logicalColumn}) dependency unless ` +
-            `(${identity.tenantColumn}) is a direct key attribute`,
+            `(${identity.logicalColumn}). The supported legacy and current shapes allow neither ` +
+            `a direct UNIQUE key made only of (${identity.logicalColumn}) slots nor, without a ` +
+            `direct (${identity.tenantColumn}) key attribute, a UNIQUE key that uses an ` +
+            `(${identity.logicalColumn})-derived generated column or has a residual ` +
+            `(${identity.logicalColumn}), generated-column, or relation-level expression dependency`,
         )
       }
       if (currentPrimary.column_names === desiredColumns) {

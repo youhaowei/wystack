@@ -60,16 +60,22 @@ plus a unique `(tenant, logical ID)` index. It is atomic and idempotent. It keep
 the tenant-qualified unique index so existing composite foreign keys remain
 valid, and fails with the exact blocker when a foreign key still references only
 the old global ID. Before migrating a legacy table or accepting a composite key
-as current, it rejects by name every unique constraint or index that can retain
-global logical identity. Direct, partial, and `INCLUDE` indexes are covered. An
-expression-bearing unique index that depends on the logical ID outside a
-non-key `INCLUDE` payload is accepted only when the tenant column is a direct
-key attribute. PostgreSQL dependency rows do not distinguish key expressions
-from predicates, so this deliberately rejects encoded tenant expressions and
-other ambiguous expression indexes; use an explicit tenant key instead. The
-passed Drizzle schema must already declare the target composite primary key; an
-adopted `global-primary-compatibility` model is rejected so application metadata
-cannot keep claiming the retired shape. All other schema evolution remains
+as current, it preflights every ready/live unique index that can still enforce
+writes, even when the planner marks that index invalid. It rejects direct keys
+made only of logical-ID slots and follows catalog dependencies through partial,
+expression, `INCLUDE`, whole-row, and generated-column shapes. Derived or
+ambiguous identity is accepted only when the tenant column is a direct key
+attribute; encoded tenant expressions do not qualify. Indexes that never became
+ready are ignored because they do not enforce writes.
+
+This is a structural PostgreSQL-catalog guarantee, not semantic proof over
+arbitrary triggers or custom runtime behavior. PostgreSQL dependency rows do not
+fully separate key expressions from predicates, so the migration deliberately
+fails closed on ambiguous catalog shapes and reports the exact blocking object.
+Use an explicit tenant key or remove the blocker intentionally. The passed
+Drizzle schema must already declare the target composite primary key; an adopted
+`global-primary-compatibility` model is rejected so application metadata cannot
+keep claiming the retired shape. All other schema evolution remains
 application-owned.
 
 ## Server functions
