@@ -320,6 +320,17 @@ export interface MultiTenantDescriptor<TKey extends TenantKeyDefinition> {
   ): TableDefinition<WithTenantKey<TColumns, TKey>, false, TKey['property']>
 }
 
+const tenantCapabilities = new WeakMap<object, TenantCapability>()
+
+/** Internal bridge used by schema compilers and validated Drizzle adoption. */
+export function getTenantCapability(
+  descriptor: MultiTenantDescriptor<TenantKeyDefinition>,
+): TenantCapability {
+  const capability = tenantCapabilities.get(descriptor)
+  if (!capability) throw new Error('Unknown multiTenant descriptor')
+  return capability
+}
+
 const defaultTenantKey = {
   property: 'tenantId',
   column: 'tenant_id',
@@ -347,7 +358,7 @@ export function multiTenant(
   }
   const descriptorId = Symbol('multiTenant descriptor')
 
-  return Object.freeze({
+  const descriptor = Object.freeze({
     key,
     canonicalize(value: unknown) {
       const sqlType = key.type.opts.type === 'int' ? 'integer' : key.type.opts.type
@@ -374,4 +385,12 @@ export function multiTenant(
       })
     },
   })
+  tenantCapabilities.set(
+    descriptor,
+    Object.freeze({
+      ...key,
+      descriptorId,
+    }),
+  )
+  return descriptor
 }
