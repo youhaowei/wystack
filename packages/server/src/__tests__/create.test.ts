@@ -1,9 +1,15 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq, multiTenant, syncSchema } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
-import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
+import {
+  assertPermissionIds,
+  defineApp,
+  PermissionDeniedError,
+  type FunctionDef,
+  type RawProcedureDb,
+} from '../index'
 
 const schema = defineSchema({
   todos: table({
@@ -56,6 +62,52 @@ function createTestDatabase(): PGlite {
   const pg = new PGlite()
   openDatabases.add(pg)
   return pg
+}
+
+async function inspectRawDbSurface(db: RawProcedureDb, readTag: string) {
+  await db.raw.execute('SELECT 1')
+  db.tablesRead.add(readTag)
+  const nested = await db.transaction(async (tx) => ({
+    raw: 'raw' in tx,
+    withTenant: 'withTenant' in tx,
+    withDraft: 'withDraft' in tx,
+    tablesRead: 'tablesRead' in tx,
+    tablesWritten: 'tablesWritten' in tx,
+    trackGlobalRead: 'trackGlobalRead' in tx,
+    trackGlobalWrite: 'trackGlobalWrite' in tx,
+  }))
+  const dbSurface = db as unknown as Record<string, unknown>
+  return {
+    raw: 'raw' in dbSurface,
+    withTenant: 'withTenant' in dbSurface,
+    withDraft: 'withDraft' in dbSurface,
+    tablesRead: 'tablesRead' in dbSurface,
+    tablesWritten: 'tablesWritten' in dbSurface,
+    transaction: typeof dbSurface['transaction'] === 'function',
+    trackGlobalRead: typeof dbSurface['trackGlobalRead'] === 'function',
+    trackGlobalWrite: typeof dbSurface['trackGlobalWrite'] === 'function',
+    nested,
+  }
+}
+
+const expectedRawDbSurface = {
+  raw: true,
+  withTenant: false,
+  withDraft: false,
+  tablesRead: true,
+  tablesWritten: true,
+  transaction: true,
+  trackGlobalRead: true,
+  trackGlobalWrite: true,
+  nested: {
+    raw: true,
+    withTenant: false,
+    withDraft: false,
+    tablesRead: true,
+    tablesWritten: true,
+    trackGlobalRead: true,
+    trackGlobalWrite: true,
+  },
 }
 
 afterEach(async () => {
@@ -134,6 +186,15 @@ beforeEach(async () => {
           insertDb: '_db' in insertSurface,
         }
       }),
+      inspectReadModelDbSurface: wy.readModel
+        .input({})
+        .query(async (ctx) => inspectRawDbSurface(ctx.db, 'read-model-manual-read')),
+      inspectIntegrationDbSurface: wy.integration
+        .input({})
+        .mutation(async (ctx) => inspectRawDbSurface(ctx.db, 'integration-manual-read')),
+      inspectLegacyDbSurface: wy.legacyProcedure
+        .input({})
+        .query(async (ctx) => inspectRawDbSurface(ctx.db, 'legacy-manual-read')),
     },
   })
 })
@@ -208,6 +269,167 @@ describe('defineApp().build()', () => {
       chainedDb: false,
       insertDb: false,
     })
+  })
+
+  for (const boundary of [
+    {
+      name: 'readModel',
+      path: 'inspectReadModelDbSurface',
+      readTag: 'read-model-manual-read',
+    },
+    {
+      name: 'integration',
+      path: 'inspectIntegrationDbSurface',
+      readTag: 'integration-manual-read',
+    },
+  ]) {
+    test(`${boundary.name} exposes tracked raw access without scope custody`, async () => {
+      const call = await app.call(boundary.path, {})
+
+      expect(call.result).toEqual(expectedRawDbSurface)
+      expect(call.tablesRead.has(boundary.readTag)).toBe(true)
+    })
+  }
+
+  test('legacyProcedure restores tracked raw access without restoring scope custody', async () => {
+    const call = await app.call('inspectLegacyDbSurface', {})
+
+    expect(call.result).toEqual(expectedRawDbSurface)
+    expect(call.tablesRead.has('legacy-manual-read')).toBe(true)
+  })
+
+  for (const forgedAccess of [
+    { contract: 'missing', omit: true, value: undefined },
+    { contract: 'invalid', omit: false, value: 'implicit-raw' },
+  ] as const) {
+    test(`fails closed for a forged definition with ${forgedAccess.contract} databaseAccess`, async () => {
+      const path = `forged-${forgedAccess.contract}-database-access`
+      let handlerRan = false
+      const baseDefinition = {
+        type: 'query' as const,
+        path,
+        args: {},
+        handler: async () => {
+          handlerRan = true
+          return true
+        },
+      }
+      const definition = (forgedAccess.omit
+        ? baseDefinition
+        : { ...baseDefinition, databaseAccess: forgedAccess.value }) as unknown as FunctionDef
+      app.functions.set(path, definition)
+
+      await expect(app.call(path, {})).rejects.toThrow(
+        `Function "${path}" has unsupported databaseAccess`,
+      )
+      expect(handlerRan).toBe(false)
+    })
+  }
+
+  test('tenant-qualifies manual invalidation tags on every raw boundary', async () => {
+    const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
+    const tenancy = multiTenant({
+      key: { property: 'orgId', column: 'org_id', type: text },
+    })
+    const pg = createTestDatabase()
+    const tenantApp = await tenantWy.build({
+      db: drizzle(pg),
+      functions: {
+        readModelRead: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.tablesRead.add('seed')
+          let addedThroughCallbackFacade = false
+          ctx.db.tablesRead.forEach((_value, _key, tracked) => {
+            if (addedThroughCallbackFacade) return
+            addedThroughCallbackFacade = true
+            tracked.add('checklists')
+          })
+          return true
+        }),
+        integrationWrite: tenantWy.integration.input({}).mutation(async (ctx) => {
+          ctx.db.tablesWritten.add('checklists')
+          return true
+        }),
+        legacyRead: tenantWy.legacyProcedure.input({}).query(async (ctx) => {
+          ctx.db.tablesRead.add('checklists')
+          return true
+        }),
+        legacyWrite: tenantWy.legacyProcedure.input({}).mutation(async (ctx) => {
+          ctx.db.tablesWritten.add('checklists')
+          return true
+        }),
+      },
+      tenancy,
+      resolveTenant: (context) => context.orgId,
+    })
+
+    const alphaReadModel = await tenantApp.call('readModelRead', {}, { orgId: 'alpha' })
+    const betaReadModel = await tenantApp.call('readModelRead', {}, { orgId: 'beta' })
+    const alphaIntegration = await tenantApp.call('integrationWrite', {}, { orgId: 'alpha' })
+    const alphaRead = await tenantApp.call('legacyRead', {}, { orgId: 'alpha' })
+    const betaRead = await tenantApp.call('legacyRead', {}, { orgId: 'beta' })
+    const alphaWrite = await tenantApp.call('legacyWrite', {}, { orgId: 'alpha' })
+
+    expect([...alphaReadModel.tablesRead]).toEqual(['tenant:alpha:seed', 'tenant:alpha:checklists'])
+    expect([...betaReadModel.tablesRead]).toEqual(['tenant:beta:seed', 'tenant:beta:checklists'])
+    expect([...alphaIntegration.tablesWritten]).toEqual(['tenant:alpha:checklists'])
+    expect([...alphaRead.tablesRead]).toEqual(['tenant:alpha:checklists'])
+    expect([...betaRead.tablesRead]).toEqual(['tenant:beta:checklists'])
+    expect([...alphaWrite.tablesWritten]).toEqual(['tenant:alpha:checklists'])
+    expect([...betaRead.tablesRead].some((tag) => alphaWrite.tablesWritten.has(tag))).toBe(false)
+  })
+
+  test('raw handlers can track a global table from a tenant-scoped dispatch', async () => {
+    const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
+    const tenancy = multiTenant({
+      key: { property: 'orgId', column: 'org_id', type: text },
+    })
+    const mixedSchema = defineSchema({
+      catalog: table({ id: int.primaryKey(), value: text }),
+    })
+    const pg = createTestDatabase()
+    const db = drizzle(pg)
+    await syncSchema(db, mixedSchema)
+    const tenantApp = await tenantWy.build({
+      db,
+      functions: {
+        readCatalog: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.trackGlobalRead('catalog')
+          return ctx.db.raw.execute('SELECT id FROM catalog')
+        }),
+        writeCatalogRaw: tenantWy.integration.input({}).mutation(async (ctx) => {
+          await ctx.db.transaction(async (tx) => {
+            tx.trackGlobalWrite('catalog')
+          })
+        }),
+        spoofTenantRead: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.trackGlobalRead('tenant:beta:notes')
+        }),
+        spoofDraftWrite: tenantWy.integration.input({}).mutation(async (ctx) => {
+          ctx.db.trackGlobalWrite('draft:other:notes')
+        }),
+        writeCatalog: tenantWy.procedure.input({ id: int }).command(async (ctx, args) => {
+          await ctx.db.into(mixedSchema.catalog).insert({ id: args.id, value: 'global' })
+        }),
+      },
+      tenancy,
+      resolveTenant: (context) => context.orgId,
+    })
+
+    const read = await tenantApp.call('readCatalog', {}, { orgId: 'alpha' })
+    const write = await tenantApp.call('writeCatalog', { id: 1 }, { orgId: 'alpha' })
+    const rawWrite = await tenantApp.call('writeCatalogRaw', {}, { orgId: 'alpha' })
+
+    expect(read.tablesRead).toEqual(new Set(['catalog']))
+    expect(write.tablesWritten).toEqual(new Set(['catalog']))
+    expect(rawWrite.tablesWritten).toEqual(new Set(['catalog']))
+    expect([...read.tablesRead].some((tag) => write.tablesWritten.has(tag))).toBe(true)
+    expect([...read.tablesRead].some((tag) => rawWrite.tablesWritten.has(tag))).toBe(true)
+    await expect(tenantApp.call('spoofTenantRead', {}, { orgId: 'alpha' })).rejects.toThrow(
+      'uses a reserved tenant or draft identity prefix',
+    )
+    await expect(tenantApp.call('spoofDraftWrite', {}, { orgId: 'alpha' })).rejects.toThrow(
+      'uses a reserved tenant or draft identity prefix',
+    )
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

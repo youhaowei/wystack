@@ -1,5 +1,18 @@
-import { and, asc, desc, eq as drizzleEq, getTableColumns, sql } from 'drizzle-orm'
-import type { Query } from 'drizzle-orm'
+import {
+  and as drizzleAnd,
+  asc,
+  desc,
+  eq as drizzleEq,
+  getTableColumns,
+  getTableName,
+  inArray as drizzleInArray,
+  isNotNull as drizzleIsNotNull,
+  isNull as drizzleIsNull,
+  notInArray as drizzleNotInArray,
+  or as drizzleOr,
+  sql,
+} from 'drizzle-orm'
+import type { Query, SQL } from 'drizzle-orm'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 import type { FilterDescriptor } from './operators'
 import type {
@@ -14,14 +27,18 @@ import type {
 import {
   assertNoReadClauses,
   assertRevisionInput,
+  assertSoftDeleteInput,
   assertTenantInput,
+  assertValidSoftDeleteTimestamp,
   drizzleOpMap,
   emptyClauses,
   materializeJsonNulls,
   noTenantScope,
   requireColumn,
+  requireSoftDeleteProperty,
   requireTenantScope,
   revisionProperty,
+  softDeleteProperty,
   tableTrackingTag,
   withoutUndefined,
 } from './tracker-core'
@@ -107,6 +124,18 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
 
+  /** Include both active and soft-deleted rows in this builder's scope. */
+  includeDeleted(): SelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'include' })
+  }
+
+  /** Restrict this builder to soft-deleted rows. */
+  onlyDeleted(): SelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'only' })
+  }
+
   orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): SelectBuilder<T, TRow> {
     // Rejected here rather than at lowering time, for the same reason `select()`
     // rejects an empty column list: the lowering used to gate on truthiness, so
@@ -134,8 +163,8 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
 
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
   private _buildConditions(columns: Record<string, any>) {
-    const conditions = this._clauses.filters.map((f) =>
-      drizzleOpMap[f.op](requireColumn(columns, f.column), f.value),
+    const conditions = this._clauses.filters.map((filter) =>
+      this._buildFilterCondition(columns, filter),
     )
     const tenant = requireTenantScope(this._table, this._tenantScope)
     if (tenant) {
@@ -143,7 +172,39 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
         drizzleEq(requireColumn(columns, tenant.tenancy.property), tenant.tenantId),
       )
     }
+    const deletedProperty = softDeleteProperty(this._table)
+    if (deletedProperty && this._clauses.softDeleteScope !== 'include') {
+      const deletedColumn = requireColumn(columns, deletedProperty)
+      conditions.unshift(
+        this._clauses.softDeleteScope === 'only'
+          ? drizzleIsNotNull(deletedColumn)
+          : drizzleIsNull(deletedColumn),
+      )
+    }
     return conditions
+  }
+
+  /** Lower one recursively composed public predicate through Drizzle. */
+  // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
+  private _buildFilterCondition(columns: Record<string, any>, filter: FilterDescriptor): SQL {
+    if ('filters' in filter) {
+      if (filter.filters.length === 0) {
+        throw new Error(`${filter.op}() requires at least one predicate`)
+      }
+      const conditions = filter.filters.map((child) => this._buildFilterCondition(columns, child))
+      return (filter.op === 'and' ? drizzleAnd(...conditions) : drizzleOr(...conditions)) as SQL
+    }
+
+    const column = requireColumn(columns, filter.column)
+    if ('values' in filter) {
+      return filter.op === 'in'
+        ? drizzleInArray(column, [...filter.values])
+        : drizzleNotInArray(column, [...filter.values])
+    }
+    if (!('value' in filter)) {
+      return filter.op === 'isNull' ? drizzleIsNull(column) : drizzleIsNotNull(column)
+    }
+    return drizzleOpMap[filter.op](column, filter.value)
   }
 
   /**
@@ -180,7 +241,7 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
       : this._db.select().from(this._table)
     const conditions = this._buildConditions(columns)
     if (conditions.length > 0) {
-      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
+      q = q.where(conditions.length === 1 ? conditions[0] : drizzleAnd(...conditions))
     }
     if (this._clauses.orderByCol !== undefined) {
       const col = requireColumn(columns, this._clauses.orderByCol)
@@ -266,11 +327,16 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
   }
 
   async update(values: TrackedUpdateValues<T>) {
+    return this._update(values, false)
+  }
+
+  private async _update(values: TrackedUpdateValues<T>, allowSoftDeleteInput: boolean) {
     if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('update', this._clauses)
     assertTenantInput(this._table, values as Record<string, unknown>)
     const supplied = withoutUndefined(values as Record<string, unknown>)
     assertRevisionInput(this._table, supplied)
+    if (!allowSoftDeleteInput) assertSoftDeleteInput(this._table, supplied)
     if (Object.keys(supplied).length === 0) return []
     const patch = materializeJsonNulls(this._table, supplied)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -282,20 +348,43 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     let q = this._db.update(this._table).set(valuesWithRevision)
     const conditions = this._buildConditions(columns)
     if (conditions.length > 0) {
-      q = q.where(conditions.length === 1 ? conditions[0] : and(...conditions))
+      q = q.where(conditions.length === 1 ? conditions[0] : drizzleAnd(...conditions))
     }
     const rows = await q.returning()
     this._tracker.tablesWritten.add(tableTrackingTag(this._table, this._tenantScope))
     return rows
   }
 
+  /**
+   * Logically remove matching rows at the explicit instant supplied by the
+   * caller. Requiring the value keeps replayable commands deterministic.
+   */
+  async softDelete(at: Date) {
+    const property = requireSoftDeleteProperty(this._table)
+    assertValidSoftDeleteTimestamp(at)
+    return this._update({ [property]: new Date(at.getTime()) } as TrackedUpdateValues<T>, true)
+  }
+
+  /** Restore matching rows by clearing their framework-owned tombstone. */
+  async restore() {
+    const property = requireSoftDeleteProperty(this._table)
+    const scoped = this._with({ softDeleteScope: 'only' })
+    return scoped._update({ [property]: null } as TrackedUpdateValues<T>, true)
+  }
+
   async delete() {
     if (this._writeError) throw new Error(this._writeError)
+    const deletedProperty = softDeleteProperty(this._table)
+    if (deletedProperty) {
+      throw new Error(
+        `Table "${getTableName(this._table)}" uses soft deletion; physical delete() is unavailable. Use softDelete(at).`,
+      )
+    }
     assertNoReadClauses('delete', this._clauses)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>
     const conditions = this._buildConditions(columns)
-    const predicate = conditions.length === 1 ? conditions[0] : and(...conditions)
+    const predicate = conditions.length === 1 ? conditions[0] : drizzleAnd(...conditions)
     const revision = revisionProperty(this._table)
     const rows = revision
       ? await this._db.transaction(async (tx: DrizzleDb) => {

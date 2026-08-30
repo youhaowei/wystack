@@ -2,6 +2,7 @@
 // SQL-agnostic database layer with schema DSL, tracked queries, and change detection
 
 export {
+  adoptSchema,
   defineSchema,
   getGeneratedTables,
   getTableCapabilities,
@@ -16,12 +17,27 @@ export {
   jsonNull,
   publishedInvalidationIdentity,
   draftInvalidationIdentity,
+  softDeleteProperty,
 } from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
+export { migrateTenantPrimaryKeys } from './tenant-primary-migration'
 export { ensureRowRevisionStorage } from './row-revisions'
 export { withFrameworkBootstrapLock } from './framework-storage'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
-export { eq, ne, gt, gte, lt, lte } from './operators'
+export {
+  and,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  ne,
+  notInArray,
+  or,
+} from './operators'
 
 export type {
   AnyColumnDef,
@@ -37,8 +53,24 @@ export type {
   TableCapabilities,
   TenantKeyDefinition,
 } from './table'
-export type { FilterOp, FilterDescriptor } from './operators'
+export type { AdoptedTableConfig } from './schema'
+export type {
+  ComparisonFilterDescriptor,
+  ComparisonFilterOp,
+  FilterDescriptor,
+  FilterOp,
+  LogicalFilterDescriptor,
+  LogicalFilterOp,
+  MembershipFilterDescriptor,
+  MembershipFilterOp,
+  NullFilterDescriptor,
+  NullFilterOp,
+} from './operators'
 export type { SyncTarget } from './sync'
+export type {
+  TenantPrimaryKeyMigrationResult,
+  TenantPrimaryKeyMigrationTarget,
+} from './tenant-primary-migration'
 export type {
   DrizzleTracker,
   DraftDrizzleTracker,

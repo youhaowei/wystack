@@ -14,11 +14,17 @@ import {
   unique,
   foreignKey,
 } from 'drizzle-orm/pg-core'
-import type { PgTable, PgTableExtraConfigValue } from 'drizzle-orm/pg-core'
+import { getTableColumns, getTableName } from 'drizzle-orm'
+import { getTableConfig } from 'drizzle-orm/pg-core'
+import type { PgTable, PgTableExtraConfigValue, PgTableWithColumns } from 'drizzle-orm/pg-core'
 import type { AnyColumnDef, ColumnDef, ColumnDefOptions } from './dsl'
 import {
   TableDefinition,
+  getTenantCapability,
+  type CarriesSystemManagedProperties,
+  type MultiTenantDescriptor,
   type TableCapabilities,
+  type TenantKeyDefinition,
   type WithSelectedRow,
   type WithSystemManagedProperties,
 } from './table'
@@ -65,7 +71,19 @@ interface ReferenceContext {
 }
 
 const tableCapabilities = new WeakMap<object, Readonly<TableCapabilities>>()
+const logicalPrimaryKeyColumns = new WeakMap<object, string>()
 const generatedTables = new WeakMap<object, PgTable[]>()
+
+interface AdoptedRegistration {
+  capabilities: Readonly<TableCapabilities>
+  identity: 'tenant-primary' | 'global-primary-compatibility'
+  logicalPrimaryKeyProperty: string
+  logicalPrimaryKeyColumn: string
+}
+
+// Intentionally strong: cross-call adoption validates one module-lifetime table
+// graph, so later foreign-key checks must retain prior Drizzle table objects.
+const adoptedRegistrations = new Map<AnyPgTable, AdoptedRegistration>()
 
 function normalizeTableDefinition(definition: unknown): {
   columns: ColumnMap
@@ -182,8 +200,15 @@ function validateTableDefinition(
   }
 
   const primaryKeys = primaryKeyEntries(definition)
-  if (definition.capabilities.tenancy && primaryKeys.length !== 1) {
-    throw new Error(`Tenant-isolated table "${definition.name}" requires exactly one primary key`)
+  if (definition.capabilities.tenancy) {
+    if (primaryKeys.length !== 1) {
+      throw new Error(`Tenant-isolated table "${definition.name}" requires exactly one primary key`)
+    }
+    if (primaryKeys[0][0] === definition.capabilities.tenancy.property) {
+      throw new Error(
+        `Tenant-isolated table "${definition.name}" requires a logical primary key separate from the tenant key`,
+      )
+    }
   }
   if (definition.capabilities.draftable) {
     if (primaryKeys.length !== 1) {
@@ -202,13 +227,14 @@ function validateTableDefinition(
   validateTableReferences(definition, schema)
 }
 
-function validateSchema(schema: NormalizedSchema): void {
-  const reservedTable = Object.keys(schema).find((tableName) => tableName.startsWith('wystack_'))
-  if (reservedTable) {
-    throw new Error(
-      `Table name "${reservedTable}" uses the reserved "wystack_" framework namespace`,
-    )
+function assertApplicationTableName(tableName: string): void {
+  if (tableName.startsWith('wystack_')) {
+    throw new Error(`Table name "${tableName}" uses the reserved "wystack_" framework namespace`)
   }
+}
+
+function validateSchema(schema: NormalizedSchema): void {
+  for (const tableName of Object.keys(schema)) assertApplicationTableName(tableName)
 
   const tenancyDescriptors = new Set(
     Object.values(schema)
@@ -232,6 +258,14 @@ export function tryGetTableCapabilities(table: object): TableCapabilities | unde
   return tableCapabilities.get(table)
 }
 
+/** Internal scalar row identity for compiled tenant tables. The physical SQL
+ * primary key also includes tenant scope, but draft storage carries that key in
+ * its own field and therefore resolves rows by this logical column.
+ */
+export function tryGetLogicalPrimaryKeyColumn(table: object): string | undefined {
+  return logicalPrimaryKeyColumns.get(table)
+}
+
 /** Internal registration seam for low-level SQL fixtures that exercise the
  * tracker against hand-authored Drizzle tables. It is intentionally absent
  * from the package barrel; application code opts in through `table(...).draftable()`.
@@ -251,6 +285,7 @@ function buildColumn(
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle pgTable objects need dynamic column access for foreign key references
   allTables: Record<string, any>,
   sqlName: string = name,
+  inlinePrimaryKey: boolean = true,
 ) {
   // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column builder types vary per column type; no common base type
   let col: any
@@ -295,7 +330,7 @@ function buildColumn(
   // metadata (e.g. the draft coalesce primitive) — and the generated DDL would
   // omit PRIMARY KEY. Chaining `.primaryKey()` onto serial keeps its SQL type
   // (`serial`) while recording the primary-key constraint.
-  if (opts.isPrimaryKey) {
+  if (opts.isPrimaryKey && inlinePrimaryKey) {
     col = col.primaryKey()
   }
 
@@ -341,7 +376,17 @@ function compileColumns(definition: NormalizedTableDefinition, references?: Refe
       definition.capabilities.revisionProperty === property
         ? { ...column.opts, hasDefault: true, defaultValue: 1 }
         : column.opts
-    colDefs[property] = buildColumn(property, opts, references?.tables ?? {}, sqlName)
+    // A tenant table's declared PK is its logical row identity. Physically the
+    // database keys the row by (tenant, logical identity), so the logical column
+    // must not also emit a second, globally unique inline PRIMARY KEY.
+    const inlinePrimaryKey = !definition.capabilities.tenancy
+    colDefs[property] = buildColumn(
+      property,
+      opts,
+      references?.tables ?? {},
+      sqlName,
+      inlinePrimaryKey,
+    )
   }
   return colDefs
 }
@@ -355,10 +400,9 @@ function compileTable(definition: NormalizedTableDefinition, references?: Refere
 
   return pgTable(definition.name, colDefs, (current) => {
     const constraints: PgTableExtraConfigValue[] = [
-      unique(`${definition.name}_${tenant.column}_${current[primaryProperty].name}_unique`).on(
-        current[tenant.property],
-        current[primaryProperty],
-      ),
+      primaryKey({
+        columns: [current[tenant.property], current[primaryProperty]],
+      }),
     ]
 
     for (const [property, column] of Object.entries(definition.columns)) {
@@ -393,17 +437,29 @@ function hasReferences(definition: NormalizedTableDefinition): boolean {
 function compileSchema(schema: NormalizedSchema): CompiledSchema {
   const compiled: CompiledSchema = {}
 
+  const registerCompiledTable = (
+    definition: NormalizedTableDefinition,
+    // oxlint-disable-next-line typescript/no-explicit-any -- heterogeneous compiled Drizzle tables
+    compiledTable: any,
+  ) => {
+    registerTableCapabilities(compiledTable, definition.capabilities)
+    const [primaryProperty] = primaryKeyEntries(definition)[0] ?? []
+    if (primaryProperty) {
+      logicalPrimaryKeyColumns.set(compiledTable, compiledTable[primaryProperty].name)
+    }
+  }
+
   // First compile every table without references so all targets exist.
   for (const definition of Object.values(schema)) {
     compiled[definition.name] = compileTable(definition)
-    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+    registerCompiledTable(definition, compiled[definition.name])
   }
 
   // Then rebuild only tables that declare references against the complete map.
   const references = { tables: compiled, definitions: schema }
   for (const definition of Object.values(schema).filter(hasReferences)) {
     compiled[definition.name] = compileTable(definition, references)
-    registerTableCapabilities(compiled[definition.name], definition.capabilities)
+    registerCompiledTable(definition, compiled[definition.name])
   }
 
   return compiled
@@ -475,4 +531,405 @@ export function defineSchema<const T extends Record<string, unknown>>(
   const compiled = compileSchema(definitions) as { [K in keyof T]: CompiledTable<T[K]> }
   generatedTables.set(compiled, buildGeneratedTables(definitions))
   return compiled
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- adoption preserves heterogeneous Drizzle tables
+type AnyPgTable = PgTableWithColumns<any>
+
+export interface AdoptedTableConfig<
+  TTable extends AnyPgTable = AnyPgTable,
+  TLogicalPrimaryKey extends string = string,
+  TRevisionProperty extends string | undefined = string | undefined,
+  TSoftDeleteProperty extends string | undefined = string | undefined,
+> {
+  /** The authoritative application-owned Drizzle table object. */
+  table: TTable
+  /** JS property naming the row identity inside one tenant. */
+  logicalPrimaryKey: TLogicalPrimaryKey
+  /**
+   * Expand/contract bridge for mature schemas. The default requires the tenant
+   * and logical key to be the physical primary key. Compatibility mode keeps a
+   * global logical primary key temporarily, but requires an equivalent tenant
+   * unique constraint so tenant-qualified foreign keys can land first.
+   */
+  identity?: 'tenant-primary' | 'global-primary-compatibility'
+  /** Opt in only when handlers are valid against the draft overlay. */
+  draftable?: boolean
+  /** Optional framework-managed integer compare-and-swap property. */
+  revisionProperty?: TRevisionProperty
+  /** Optional framework-managed nullable timestamp tombstone property. */
+  softDeleteProperty?: TSoftDeleteProperty
+}
+
+type AdoptedSystemProperties<
+  TDescriptor extends MultiTenantDescriptor<TenantKeyDefinition>,
+  TConfig,
+> =
+  | TDescriptor['key']['property']
+  | (TConfig extends { revisionProperty: infer TRevision extends string } ? TRevision : never)
+  | (TConfig extends { softDeleteProperty: infer TDeleted extends string } ? TDeleted : never)
+
+type AdoptedSchema<
+  TDescriptor extends MultiTenantDescriptor<TenantKeyDefinition>,
+  TTables extends Record<string, AdoptedTableConfig>,
+> = {
+  [K in keyof TTables]: TTables[K]['table'] &
+    CarriesSystemManagedProperties<AdoptedSystemProperties<TDescriptor, TTables[K]>>
+}
+
+interface AdoptedEntry extends AdoptedRegistration {
+  table: AnyPgTable
+}
+
+function sameAdoptedRegistration(left: AdoptedRegistration, right: AdoptedRegistration): boolean {
+  return (
+    left.identity === right.identity &&
+    left.logicalPrimaryKeyProperty === right.logicalPrimaryKeyProperty &&
+    left.logicalPrimaryKeyColumn === right.logicalPrimaryKeyColumn &&
+    left.capabilities.draftable === right.capabilities.draftable &&
+    left.capabilities.revisionProperty === right.capabilities.revisionProperty &&
+    left.capabilities.softDeleteProperty === right.capabilities.softDeleteProperty &&
+    left.capabilities.tenancy?.descriptorId === right.capabilities.tenancy?.descriptorId
+  )
+}
+
+function normalizedIdentitySqlType(type: string): string {
+  const normalized = type.toLowerCase()
+  if (normalized === 'serial') return 'integer'
+  if (normalized === 'bigserial') return 'bigint'
+  if (normalized === 'smallserial') return 'smallint'
+  return normalized
+}
+
+function adoptedTableIdentity(table: AnyPgTable): string {
+  const tableName = getTableName(table)
+  const schemaName = getTableConfig(table).schema
+  return JSON.stringify([schemaName ?? null, tableName])
+}
+
+function adoptedTableDisplayName(table: AnyPgTable): string {
+  const tableName = getTableName(table)
+  const schemaName = getTableConfig(table).schema
+  return schemaName ? `${schemaName}.${tableName}` : tableName
+}
+
+function isScalarTimestampSqlType(type: string): boolean {
+  const normalized = type.toLowerCase().trim().replaceAll(/\s+/g, ' ')
+  return /^timestamp(?:\s*\(\d+\))?(?: (?:with|without) time zone)?$/.test(normalized)
+}
+
+function adoptedColumn(
+  table: AnyPgTable,
+  property: string,
+): {
+  name: string
+  notNull: boolean
+  primary: boolean
+  hasDefault: boolean
+  isUnique: boolean
+  getSQLType(): string
+} {
+  const columns = getTableColumns(table) as Record<
+    string,
+    {
+      name: string
+      notNull: boolean
+      primary: boolean
+      hasDefault: boolean
+      isUnique: boolean
+      getSQLType(): string
+    }
+  >
+  const column = Object.hasOwn(columns, property) ? columns[property] : undefined
+  if (!column) {
+    throw new Error(`Adopted table "${getTableName(table)}" has no property "${property}"`)
+  }
+  return column
+}
+
+function assertAdoptedIdentity(
+  table: AnyPgTable,
+  logicalPrimaryKey: string,
+  tenancy: TableCapabilities['tenancy'] & {},
+  identity: AdoptedTableConfig['identity'],
+): void {
+  const tableName = getTableName(table)
+  const tenantColumn = adoptedColumn(table, tenancy.property)
+  const logicalColumn = adoptedColumn(table, logicalPrimaryKey)
+  if (tenantColumn.name !== tenancy.column) {
+    throw new Error(
+      `Adopted table "${tableName}" tenant property "${tenancy.property}" must use SQL column "${tenancy.column}"`,
+    )
+  }
+  if (!tenantColumn.notNull) {
+    throw new Error(
+      `Adopted table "${tableName}" tenant column "${tenancy.column}" must be NOT NULL`,
+    )
+  }
+  const expectedTenantType = tenancy.type.opts.type === 'int' ? 'integer' : tenancy.type.opts.type
+  if (normalizedIdentitySqlType(tenantColumn.getSQLType()) !== expectedTenantType) {
+    throw new Error(
+      `Adopted table "${tableName}" tenant column "${tenancy.column}" must use ${expectedTenantType}`,
+    )
+  }
+  if (logicalPrimaryKey === tenancy.property || logicalColumn === tenantColumn) {
+    throw new Error(
+      `Adopted table "${tableName}" requires a logical identity separate from its tenant`,
+    )
+  }
+  const tableConfig = getTableConfig(table)
+  const primaryKeys = tableConfig.primaryKeys
+  const expected = [tenantColumn.name, logicalColumn.name]
+  const hasExpectedPrimaryKey =
+    primaryKeys.length === 1 &&
+    primaryKeys[0].columns.length === expected.length &&
+    primaryKeys[0].columns.every((column, index) => column.name === expected[index])
+  const inlinePrimary = tableConfig.columns.filter((column) => column.primary)
+  if (identity === 'global-primary-compatibility') {
+    const hasGlobalPrimaryKey =
+      (primaryKeys.length === 1 &&
+        primaryKeys[0].columns.length === 1 &&
+        primaryKeys[0].columns[0].name === logicalColumn.name &&
+        inlinePrimary.length === 0) ||
+      (primaryKeys.length === 0 &&
+        inlinePrimary.length === 1 &&
+        inlinePrimary[0].name === logicalColumn.name)
+    const hasTenantUnique = [
+      ...tableConfig.uniqueConstraints.map((constraint) => constraint.columns),
+      ...tableConfig.indexes
+        .filter((index) => index.config.unique && index.config.where === undefined)
+        .map((index) => index.config.columns),
+    ].some(
+      (columns) =>
+        columns.length === expected.length &&
+        columns.every((column, index) => 'name' in column && column.name === expected[index]),
+    )
+    if (!hasGlobalPrimaryKey || !hasTenantUnique) {
+      throw new Error(
+        `Adopted table "${tableName}" compatibility identity requires global primary key "${logicalColumn.name}" and unique (${expected.join(', ')})`,
+      )
+    }
+  } else if (!hasExpectedPrimaryKey || inlinePrimary.length > 0) {
+    throw new Error(
+      `Adopted table "${tableName}" must use the composite primary key (${expected.join(', ')})`,
+    )
+  }
+  if (
+    !['integer', 'text', 'uuid'].includes(normalizedIdentitySqlType(logicalColumn.getSQLType()))
+  ) {
+    throw new Error(
+      `Adopted table "${tableName}" logical identity "${logicalColumn.name}" must be an integer, text, or uuid`,
+    )
+  }
+}
+
+function assertAdoptedRevision(
+  table: AnyPgTable,
+  revisionProperty: string | undefined,
+  logicalPrimaryKey: string,
+  tenantProperty: string,
+): void {
+  if (!revisionProperty) return
+  const tableName = getTableName(table)
+  if (revisionProperty === logicalPrimaryKey || revisionProperty === tenantProperty) {
+    throw new Error(
+      `Adopted table "${tableName}" revision property must not be part of its identity`,
+    )
+  }
+  const revision = adoptedColumn(table, revisionProperty)
+  if (!revision.notNull || normalizedIdentitySqlType(revision.getSQLType()) !== 'integer') {
+    throw new Error(
+      `Adopted table "${tableName}" revision property "${revisionProperty}" must be a required integer`,
+    )
+  }
+}
+
+function assertAdoptedSoftDelete(
+  table: AnyPgTable,
+  softDeleteProperty: string | undefined,
+  logicalPrimaryKey: string,
+  tenantProperty: string,
+  revisionProperty: string | undefined,
+): void {
+  if (!softDeleteProperty) return
+  const tableName = getTableName(table)
+  if (
+    softDeleteProperty === logicalPrimaryKey ||
+    softDeleteProperty === tenantProperty ||
+    softDeleteProperty === revisionProperty
+  ) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property must not be an identity or revision property`,
+    )
+  }
+  const deletedAt = adoptedColumn(table, softDeleteProperty)
+  if (
+    deletedAt.notNull ||
+    deletedAt.hasDefault === true ||
+    !isScalarTimestampSqlType(deletedAt.getSQLType())
+  ) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" must be a nullable timestamp without a default`,
+    )
+  }
+  const config = getTableConfig(table)
+  const constrained =
+    deletedAt.primary ||
+    deletedAt.isUnique ||
+    config.primaryKeys.some((key) =>
+      key.columns.some((column) => column.name === deletedAt.name),
+    ) ||
+    config.uniqueConstraints.some((constraint) =>
+      constraint.columns.some((column) => column.name === deletedAt.name),
+    ) ||
+    config.indexes.some(
+      (index) =>
+        index.config.unique &&
+        index.config.columns.some((column) => 'name' in column && column.name === deletedAt.name),
+    ) ||
+    config.foreignKeys.some((foreignKey) =>
+      foreignKey.reference().columns.some((column) => column.name === deletedAt.name),
+    )
+  if (constrained) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" cannot be an identity, unique, or foreign-key column`,
+    )
+  }
+}
+
+function assertAdoptedForeignKeys(entries: AdoptedEntry[]): void {
+  const adopted = new Map<string, AdoptedEntry>()
+  for (const entry of entries) {
+    const identity = adoptedTableIdentity(entry.table)
+    const previous = adopted.get(identity)
+    if (previous && !sameAdoptedRegistration(previous, entry)) {
+      throw new Error(
+        `Adopted table "${adoptedTableDisplayName(entry.table)}" is described by multiple Drizzle table objects with different adoption contracts`,
+      )
+    }
+    adopted.set(identity, entry)
+  }
+  for (const child of entries) {
+    const childTenant = child.capabilities.tenancy!
+    for (const foreignKey of getTableConfig(child.table).foreignKeys) {
+      const reference = foreignKey.reference()
+      const parent = adopted.get(adoptedTableIdentity(reference.foreignTable as AnyPgTable))
+      if (!parent) continue
+      const parentTenant = parent.capabilities.tenancy!
+      const tenantIndex = reference.columns.findIndex(
+        (column) => column.name === childTenant.column,
+      )
+      if (tenantIndex < 0 || reference.foreignColumns[tenantIndex]?.name !== parentTenant.column) {
+        throw new Error(
+          `Tenant foreign key from "${getTableName(child.table)}" to "${getTableName(parent.table)}" must include tenant column "${childTenant.column}"`,
+        )
+      }
+      const onDelete = foreignKey.onDelete
+      if (parent.capabilities.draftable && (onDelete === 'cascade' || onDelete === 'set null')) {
+        throw new Error(
+          `Tenant foreign key from "${getTableName(child.table)}" cannot use ON DELETE ${onDelete.toUpperCase()} because "${getTableName(parent.table)}" is draftable`,
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Attach WyStack custody to an existing Drizzle schema without defining a
+ * second set of tables. Adoption is deliberately strict: the physical schema
+ * must already encode tenant-qualified identity and every adopted-to-adopted
+ * foreign key must carry the same tenant column.
+ */
+export function adoptSchema<
+  TDescriptor extends MultiTenantDescriptor<TenantKeyDefinition>,
+  const TTables extends Record<string, AdoptedTableConfig>,
+>(descriptor: TDescriptor, tables: TTables): AdoptedSchema<TDescriptor, TTables> {
+  for (const config of Object.values(tables)) {
+    assertApplicationTableName(getTableName(config.table))
+  }
+
+  const tenancy = getTenantCapability(descriptor)
+  const entriesByTable = new Map<AnyPgTable, AdoptedEntry>()
+  const namedEntries = Object.entries(tables).map(([name, config]) => {
+    const capabilities: TableCapabilities = {
+      draftable: config.draftable === true,
+      tenancy,
+      ...(config.revisionProperty ? { revisionProperty: config.revisionProperty } : {}),
+      ...(config.softDeleteProperty ? { softDeleteProperty: config.softDeleteProperty } : {}),
+    }
+    const entry: AdoptedEntry = {
+      table: config.table,
+      capabilities,
+      identity: config.identity ?? 'tenant-primary',
+      logicalPrimaryKeyProperty: config.logicalPrimaryKey,
+      logicalPrimaryKeyColumn: adoptedColumn(config.table, config.logicalPrimaryKey).name,
+    }
+    const previous = entriesByTable.get(config.table)
+    if (previous) {
+      if (!sameAdoptedRegistration(previous, entry)) {
+        throw new Error(
+          `Adopted table "${getTableName(config.table)}" is configured more than once with a different adoption contract`,
+        )
+      }
+      return [name, previous] as const
+    }
+    entriesByTable.set(config.table, entry)
+    return [name, entry] as const
+  })
+  const entries = [...entriesByTable.values()]
+
+  for (const entry of entries) {
+    assertAdoptedIdentity(entry.table, entry.logicalPrimaryKeyProperty, tenancy, entry.identity)
+    assertAdoptedRevision(
+      entry.table,
+      entry.capabilities.revisionProperty,
+      entry.logicalPrimaryKeyProperty,
+      tenancy.property,
+    )
+    assertAdoptedSoftDelete(
+      entry.table,
+      entry.capabilities.softDeleteProperty,
+      entry.logicalPrimaryKeyProperty,
+      tenancy.property,
+      entry.capabilities.revisionProperty,
+    )
+    const previous = adoptedRegistrations.get(entry.table)
+    if (previous && !sameAdoptedRegistration(previous, entry)) {
+      throw new Error(
+        `Adopted table "${getTableName(entry.table)}" is already registered with different capabilities`,
+      )
+    }
+  }
+  const completeAdoptedGraph = new Map(
+    [...adoptedRegistrations].map(([table, registration]) => [table, { table, ...registration }]),
+  )
+  for (const entry of entries) completeAdoptedGraph.set(entry.table, entry)
+  assertAdoptedForeignKeys([...completeAdoptedGraph.values()])
+
+  for (const entry of entries) {
+    registerTableCapabilities(entry.table, entry.capabilities)
+    logicalPrimaryKeyColumns.set(entry.table, entry.logicalPrimaryKeyColumn)
+    adoptedRegistrations.set(entry.table, {
+      capabilities: Object.freeze({
+        ...entry.capabilities,
+        tenancy: entry.capabilities.tenancy
+          ? Object.freeze({ ...entry.capabilities.tenancy })
+          : undefined,
+      }),
+      identity: entry.identity,
+      logicalPrimaryKeyProperty: entry.logicalPrimaryKeyProperty,
+      logicalPrimaryKeyColumn: entry.logicalPrimaryKeyColumn,
+    })
+  }
+  const adopted = Object.fromEntries(
+    namedEntries.map(([name, entry]) => [name, entry.table]),
+  ) as AdoptedSchema<TDescriptor, TTables>
+
+  generatedTables.set(adopted, [
+    ...(entries.some((entry) => entry.capabilities.draftable) ? [buildDraftChangesTable()] : []),
+    ...(entries.some((entry) => entry.capabilities.revisionProperty)
+      ? [buildRowRevisionsTable()]
+      : []),
+  ])
+  return adopted
 }

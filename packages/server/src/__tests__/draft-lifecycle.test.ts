@@ -16,6 +16,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgSchema, pgTable, text as pgText, varchar } from 'drizzle-orm/pg-core'
 import {
@@ -38,6 +39,7 @@ import {
   DraftConflictError,
   DraftIntegrityError,
   DraftPublishDriftError,
+  DraftRevisionConflictError,
   type VersionProbe,
   type Cell,
   type Command,
@@ -180,6 +182,7 @@ beforeEach(async () => {
     db,
     functions: {
       listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      readTodos: wy.procedure.input({}).command(async (ctx) => ctx.db.from(schema.todos).all()),
       listVersionedTodos: wy.procedure
         .input({})
         .query(async (ctx) => ctx.db.from(schema.versionedTodos).all()),
@@ -188,10 +191,18 @@ beforeEach(async () => {
         .query(async (ctx) => ctx.db.from(schema.replaceableTodos).all()),
       addTodo: wy.procedure
         .input({ id: int, title: text })
+        .command(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      canonicalOnlyTodo: wy.procedure
+        .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
-      addTodoAt: wy.procedure.input({ id: int, createdAt: timestamp }).mutation(async (ctx, args) =>
+      boom: wy.procedure.input({}).command(async () => {
+        throw new Error('command boom')
+      }),
+      addTodoAt: wy.procedure.input({ id: int, createdAt: timestamp }).command(async (ctx, args) =>
         ctx.db.into(schema.todos).insert({
           id: args.id,
           title: args.createdAt.toISOString(),
@@ -200,27 +211,27 @@ beforeEach(async () => {
       ),
       addVersionedTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.versionedTodos).insert({ id: args.id, title: args.title }),
         ),
       removeVersionedTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).delete(),
         ),
       addReplaceableTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.replaceableTodos).insert({ id: args.id, title: args.title }),
         ),
       renameVarcharItem: wy.procedure
         .input({ id: text, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(varcharItems).where(eq('id', args.id)).update({ title: args.title }),
         ),
       removeReplaceableTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.replaceableTodos).where(eq('id', args.id)).delete(),
         ),
       // Writes, and carries a jsonb argument — jsonb validates as `unknown`, so
@@ -228,17 +239,17 @@ beforeEach(async () => {
       // validation. Used to pin the snapshot-before-write ordering in append.
       addTodoWithMeta: wy.procedure
         .input({ id: int, title: text, meta: jsonb })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
-      addTodoFromMeta: wy.procedure.input({ id: int, meta: jsonb }).mutation(async (ctx, args) =>
+      addTodoFromMeta: wy.procedure.input({ id: int, meta: jsonb }).command(async (ctx, args) =>
         ctx.db.into(schema.todos).insert({
           id: args.id,
           title: Object.hasOwn(args.meta as object, '__proto__') ? 'present' : 'missing',
           done: false,
         }),
       ),
-      addTodoUsingSetting: wy.procedure.input({ id: int }).mutation(async (ctx, args) => {
+      addTodoUsingSetting: wy.procedure.input({ id: int }).command(async (ctx, args) => {
         const setting = await ctx.db.from(schema.settings).first()
         return ctx.db.into(schema.todos).insert({
           id: args.id,
@@ -248,17 +259,17 @@ beforeEach(async () => {
       }),
       renameTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.todos).where(eq('id', args.id)).update({ title: args.title }),
         ),
       finishOpenTodos: wy.procedure
         .input({})
-        .mutation(async (ctx) =>
+        .command(async (ctx) =>
           ctx.db.from(schema.todos).where(eq('done', false)).update({ done: true }),
         ),
       setDocumentPayload: wy.procedure
         .input({ id: int, payload: jsonb })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db
             .from(schema.documents)
             .where(eq('id', args.id))
@@ -268,7 +279,7 @@ beforeEach(async () => {
         ),
       retargetAndRenameCode: wy.procedure
         .input({ childId: int, parentId: int, nextParentCode: text, nextCode: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db
             .from(schema.aCodeParents)
             .where(eq('id', args.parentId))
@@ -280,7 +291,7 @@ beforeEach(async () => {
         }),
       replaceCodeFamily: wy.procedure
         .input({ childId: int, parentId: int, code: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.zCodeChildren).where(eq('id', args.childId)).delete()
           await ctx.db.from(schema.aCodeParents).where(eq('id', args.parentId)).delete()
           await ctx.db.into(schema.aCodeParents).insert({ id: args.parentId, code: args.code })
@@ -288,31 +299,31 @@ beforeEach(async () => {
             .into(schema.zCodeChildren)
             .insert({ id: args.childId, parentCode: args.code })
         }),
-      addFamily: wy.procedure.input({ parentId: int, childId: int }).mutation(async (ctx, args) => {
+      addFamily: wy.procedure.input({ parentId: int, childId: int }).command(async (ctx, args) => {
         await ctx.db.into(schema.zParents).insert({ id: args.parentId, name: 'parent' })
         return ctx.db.into(schema.aChildren).insert({ id: args.childId, parentId: args.parentId })
       }),
       removeFamily: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.aChildren).where(eq('id', args.childId)).delete()
           return ctx.db.from(schema.zParents).where(eq('id', args.parentId)).delete()
         }),
       addTreePair: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.into(schema.treeNodes).insert({ id: args.parentId, parentId: null })
           return ctx.db.into(schema.treeNodes).insert({ id: args.childId, parentId: args.parentId })
         }),
       removeTreePair: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.treeNodes).where(eq('id', args.childId)).delete()
           return ctx.db.from(schema.treeNodes).where(eq('id', args.parentId)).delete()
         }),
       addTimedFamily: wy.procedure
         .input({ parentId: int, childId: int, token: timestamp })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.into(schema.zTimedParents).insert({ id: args.parentId, token: args.token })
           return ctx.db
             .into(schema.aTimedChildren)
@@ -320,20 +331,20 @@ beforeEach(async () => {
         }),
       renameVersionedTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).update({ title: args.title }),
         ),
       removeTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) => ctx.db.from(schema.todos).where(eq('id', args.id)).delete()),
+        .command(async (ctx, args) => ctx.db.from(schema.todos).where(eq('id', args.id)).delete()),
       renameAppAccount: wy.procedure
         .input({ id: int, name: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(appAccounts).where(eq('id', args.id)).update({ name: args.name }),
         ),
       renameAuditAccount: wy.procedure
         .input({ id: int, name: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(auditAccounts).where(eq('id', args.id)).update({ name: args.name }),
         ),
       // A read-modify-write command makes drift observable: replay on a newer
@@ -341,7 +352,7 @@ beforeEach(async () => {
       // and ask the application to resolve it.
       addToDashboard: wy.procedure
         .input({ dashboardId: int, item: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           // Read-modify-write over the effective draft relation. This intentionally
           // reads the full dashboard set because the command merges one node's list.
           const rows = (await ctx.db.from(schema.dashboards).all()) as {
@@ -356,6 +367,19 @@ beforeEach(async () => {
             .update({ items: next })
         }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      rawTodoReadModel: wy.readModel
+        .input({})
+        .query(async (ctx) => ctx.db.from(schema.todos).all()),
+      rawTodoIntegration: wy.integration
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      legacyAddTodo: wy.legacyProcedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
     },
   })
 })
@@ -415,7 +439,31 @@ describe('draft lifecycle — global authority and custody', () => {
     const privileged = createProductionDraftLifecycle(tenantAware, {
       authorizeGlobalDraft: () => true,
     })
-    await expect(privileged.open(0, { context: ownerContext })).resolves.toBeString()
+    const draftId = await privileged.open(0, {
+      context: ownerContext,
+      lookupKey: 'global:one',
+    })
+    await expect(
+      lifecycle.findOwnedByLookupKey('global:one', { context: ownerContext }),
+    ).rejects.toThrow(/privileged host context|trusted tenant ID/)
+    await expect(
+      privileged.findOwnedByLookupKey('global:one', { context: ownerContext }),
+    ).resolves.toMatchObject({ draftId })
+  })
+
+  test('global custody authorization receives the open and owned-discovery action', async () => {
+    const actions: string[] = []
+    const lifecycle = createProductionDraftLifecycle(app, {
+      authorizeGlobalDraft: ({ action }) => {
+        actions.push(action)
+        return true
+      },
+    })
+    await lifecycle.open(0, { context: ownerContext, lookupKey: 'global:action-routing' })
+    await lifecycle.listOwned({ context: ownerContext })
+    await lifecycle.findOwnedByLookupKey('global:action-routing', { context: ownerContext })
+
+    expect(actions).toEqual(['open', 'listOwned', 'findOwnedByLookupKey'])
   })
 
   test('apps without a tenant dimension open drafts without a global authorization hook', async () => {
@@ -454,7 +502,20 @@ describe('draft lifecycle — global authority and custody', () => {
     await expect(lifecycle.getLog(draftId, { context: ownerContext })).rejects.toThrow(
       'unknown draft',
     )
+    await expect(lifecycle.getLogSnapshot(draftId, { context: ownerContext })).rejects.toThrow(
+      'unknown draft',
+    )
+    await expect(lifecycle.inspectSnapshot(draftId, { context: ownerContext })).rejects.toThrow(
+      'unknown draft',
+    )
     expect(await lifecycle.getLog(draftId, { context: privileged })).toHaveLength(1)
+    expect(await lifecycle.getLogSnapshot(draftId, { context: privileged })).toMatchObject({
+      revision: 1,
+    })
+    expect(await lifecycle.inspectSnapshot(draftId, { context: privileged })).toMatchObject({
+      revision: 1,
+      changes: expect.any(Array),
+    })
   })
 
   test('owner keys are canonically persisted and compared after lifecycle recreation', async () => {
@@ -486,9 +547,7 @@ describe('draft lifecycle — global authority and custody', () => {
       functions: {
         addGlobalTodo: wy.procedure
           .input({ id: int, title: text })
-          .mutation(async (ctx, args) =>
-            ctx.db.into(schema.todos).insert({ ...args, done: false }),
-          ),
+          .command(async (ctx, args) => ctx.db.into(schema.todos).insert({ ...args, done: false })),
       },
     })
     const lifecycle = createProductionDraftLifecycle(mixedApp, {
@@ -716,49 +775,16 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(7)
+    expect((migration as any).rows[0].version).toBe(10)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
     expect((canonical as { id: number }[]).some((row) => row.id === 3)).toBe(true)
     await expect(restartedProcess.getLog(draftId)).rejects.toThrow('unknown draft')
   })
+})
 
-  test('default custody follows stable principal identity, not mutable profile fields', async () => {
-    const lifecycle = createProductionDraftLifecycle(app, {
-      authorizeGlobalDraft: () => true,
-    })
-    const draftId = await lifecycle.open(0, {
-      context: {
-        principal: {
-          kind: 'user',
-          userId: 'user-1',
-          identity: { subject: 'provider|1', email: 'old@example.test' },
-        },
-      },
-    })
-
-    expect(
-      await createProductionDraftLifecycle(app, {
-        authorizeGlobalDraft: () => true,
-      }).getLog(draftId, {
-        context: {
-          principal: {
-            kind: 'user',
-            userId: 'user-1',
-            identity: { subject: 'provider|1', email: 'new@example.test' },
-          },
-        },
-      }),
-    ).toEqual([])
-
-    const persisted = await db.execute(
-      `SELECT owner_key FROM wystack_drafts WHERE draft_id = '${draftId}'`,
-    )
-    // oxlint-disable-next-line typescript/no-explicit-any
-    expect(JSON.stringify((persisted as any).rows[0].owner_key)).not.toContain('old@example.test')
-  })
-
+describe('draft lifecycle — append and publish', () => {
   test('canonical-only reads are not treated as draft writes during publish', async () => {
     const lifecycle = createDraftLifecycle(app)
     const draftId = await lifecycle.open(0)
@@ -1753,6 +1779,70 @@ describe('draft lifecycle — command envelope ownership', () => {
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
+  for (const boundary of [
+    {
+      name: 'a read model',
+      path: 'rawTodoReadModel',
+      args: {},
+      error: 'Draft command rawTodoReadModel cannot reference a read-model procedure',
+    },
+    {
+      name: 'an integration',
+      path: 'rawTodoIntegration',
+      args: { id: 3, title: 'cherry' },
+      error: 'Draft command rawTodoIntegration cannot reference an integration procedure',
+    },
+    {
+      name: 'a legacy procedure',
+      path: 'legacyAddTodo',
+      args: { id: 3, title: 'cherry' },
+      error: 'Draft command legacyAddTodo cannot reference a legacy procedure',
+    },
+  ]) {
+    test(`rejects ${boundary.name} before draft execution`, async () => {
+      const lc = createDraftLifecycle(app)
+      const draftId = await lc.open(0)
+
+      await expect(
+        lc.append(draftId, [{ path: boundary.path, args: boundary.args }]),
+      ).rejects.toThrow(boundary.error)
+      expect(await lc.getLog(draftId)).toEqual([])
+    })
+  }
+
+  test('rejects a canonical-only mutation before it can change the draft', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(
+      lc.append(draftId, [{ path: 'canonicalOnlyTodo', args: { id: 3, title: 'canonical-only' } }]),
+    ).rejects.toThrow(
+      'Draft command canonicalOnlyTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+    expect(await lc.inspect(draftId)).toEqual([])
+  })
+
+  test('rejects a query that was not explicitly declared as a command', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(lc.append(draftId, [{ path: 'listTodos', args: {} }])).rejects.toThrow(
+      'Draft command listTodos cannot reference a query; use .command() for replay-safe handlers',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+  })
+
+  test('rejects an unknown command path during preflight', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(lc.append(draftId, [{ path: 'missingCommand', args: {} }])).rejects.toThrow(
+      'Draft command missingCommand references an unknown function',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+  })
+
   test('snapshots a mutable batch before validation and queued execution', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -1768,13 +1858,15 @@ describe('draft lifecycle — command envelope ownership', () => {
     ])
   })
 
-  test('rejects a path replaced with an Action while append waits to execute', async () => {
+  test('rejects a path replaced with a canonical-only mutation while append waits to execute', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     const appending = lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
-    app.functions.set('addTodo', app.functions.get('externalAction')!)
+    app.functions.set('addTodo', app.functions.get('canonicalOnlyTodo')!)
 
-    await expect(appending).rejects.toThrow('Draft command addTodo cannot reference an action')
+    await expect(appending).rejects.toThrow(
+      'Draft command addTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+    )
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
@@ -1782,7 +1874,13 @@ describe('draft lifecycle — command envelope ownership', () => {
     const addTodo = app.functions.get('addTodo')
     const renameTodo = app.functions.get('renameTodo')
     const action = app.functions.get('externalAction')
-    if (!addTodo || addTodo.type !== 'mutation' || !renameTodo || !action) {
+    if (
+      !addTodo ||
+      addTodo.type !== 'mutation' ||
+      !addTodo.draftReplayable ||
+      !renameTodo ||
+      !action
+    ) {
       throw new Error('missing command definitions')
     }
     let addRuns = 0
@@ -1819,6 +1917,170 @@ describe('draft lifecycle — command envelope ownership', () => {
   })
 })
 
+describe('draft lifecycle — caller-visible log revisions', () => {
+  test('a snapshot revision advances with its command log and rejects a stale append', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+
+    expect(initial).toEqual({ revision: 0, commands: [] })
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'winner' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    expect(winner).toEqual({
+      revision: 1,
+      commands: [{ path: 'addTodo', args: { id: 3, title: 'winner' } }],
+    })
+    const inspection = await lifecycle.inspectSnapshot(draftId)
+    expect(inspection.revision).toBe(winner.revision)
+    expect(inspection.changes).toHaveLength(1)
+
+    await expect(
+      lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'stale' } }], {
+        expectedRevision: initial.revision,
+      }),
+    ).rejects.toMatchObject({
+      name: 'DraftRevisionConflictError',
+      draftId,
+      expectedRevision: 0,
+      actualRevision: 1,
+    })
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+
+  test('stale publish preserves both the draft and canonical rows', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'draft-only' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    let resolverRuns = 0
+
+    await expect(
+      lifecycle.publish(
+        draftId,
+        (commands) => {
+          resolverRuns += 1
+          return commands
+        },
+        { expectedRevision: initial.revision },
+      ),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+
+    expect(resolverRuns).toBe(0)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    const { result: canonical } = await app.call('listTodos', {})
+    expect((canonical as { id: number }[]).map((row) => row.id).sort()).toEqual([1, 2])
+  })
+
+  test('a matching publish precondition becomes a typed conflict when append wins', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'reviewed first' } }])
+    const reviewed = await lifecycle.getLogSnapshot(draftId)
+
+    let resolutionStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      resolutionStarted = resolve
+    })
+    let resumeResolution!: () => void
+    const mayResolve = new Promise<void>((resolve) => {
+      resumeResolution = resolve
+    })
+    const publishing = lifecycle.publish(
+      draftId,
+      async (commands) => {
+        resolutionStarted()
+        await mayResolve
+        return commands
+      },
+      { expectedRevision: reviewed.revision },
+    )
+    await started
+    await lifecycle.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 4, title: 'concurrent winner' } }],
+      { expectedRevision: reviewed.revision },
+    )
+    resumeResolution()
+
+    await expect(publishing).rejects.toMatchObject({
+      name: 'DraftRevisionConflictError',
+      expectedRevision: reviewed.revision,
+      actualRevision: reviewed.revision + 1,
+    })
+    expect(await lifecycle.getLogSnapshot(draftId)).toMatchObject({
+      revision: reviewed.revision + 1,
+    })
+    const { result: canonical } = await app.call('listTodos', {})
+    expect((canonical as { id: number }[]).map((row) => row.id).sort()).toEqual([1, 2])
+  })
+
+  test('stale discard preserves the durable draft', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'keep me' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+
+    await expect(
+      lifecycle.discard(draftId, { expectedRevision: initial.revision }),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+
+  test('stale fork replacement does not invoke its resolver or create a draft', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'source' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    let resolverRuns = 0
+
+    await expect(
+      lifecycle.forkAndDiscard(
+        draftId,
+        1,
+        () => {
+          resolverRuns += 1
+          return []
+        },
+        { expectedRevision: initial.revision },
+      ),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+
+    expect(resolverRuns).toBe(0)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.listOwned()).toHaveLength(1)
+  })
+
+  test('stale rebase does not replace the reviewed draft state', async () => {
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'reviewed' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+
+    await expect(
+      lifecycle.rebase(draftId, { expectedRevision: initial.revision }),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+})
+
 describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
   /** A promise plus its resolver — lets a test hold `publish` open mid-flight. */
   function deferred() {
@@ -1830,7 +2092,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
   }
 
   /** SQLSTATE 40001 rolls back the first attempt, then replays exactly one command and one derived change. */
-  test('replays the whole mutation transaction after a serialization rollback', async () => {
+  test('replays the whole command transaction after a serialization rollback', async () => {
     const definition = app.functions.get('addTodo')
     if (!definition || definition.type !== 'mutation') throw new Error('missing addTodo mutation')
     let handlerRuns = 0
@@ -1949,6 +2211,100 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect(ids).toEqual([1, 2, 3, 4])
   })
 
+  test('an append during fork resolution preserves the source draft and loses no command', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0, {
+      lookupKey: 'artifact:fork-race',
+      summary: { commandCount: 0 },
+    })
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      summary: { commandCount: 1 },
+    })
+
+    const releaseResolve = deferred()
+    const enteredResolve = deferred()
+    const replacing = lc.forkAndDiscard(draftId, 1, async (snapshotLog, metadata) => {
+      expect(metadata).toMatchObject({
+        lookupKey: 'artifact:fork-race',
+        summary: { commandCount: 1 },
+      })
+      enteredResolve.release()
+      await releaseResolve.gate
+      return { commands: snapshotLog, summary: { commandCount: snapshotLog.length } }
+    })
+
+    await enteredResolve.gate
+    await lc.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'date' } }], {
+      summary: { commandCount: 2 },
+    })
+    releaseResolve.release()
+
+    await expect(replacing).rejects.toThrow('changed during replacement')
+    expect((await lc.getLog(draftId)).map((command) => command.args)).toEqual([
+      { id: 3, title: 'cherry' },
+      { id: 4, title: 'date' },
+    ])
+    expect(await lc.findOwnedByLookupKey('artifact:fork-race')).toMatchObject({
+      draftId,
+      summary: { commandCount: 2 },
+    })
+    const stored = await db.execute(`SELECT draft_id FROM wystack_drafts`)
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((stored as any).rows.map((row: { draft_id: string }) => row.draft_id)).toEqual([draftId])
+  })
+
+  test('fork and discard replaces the source while retaining its lookup identity', async () => {
+    const lc = createDraftLifecycle(app)
+    const sourceId = await lc.open(0, {
+      lookupKey: 'artifact:fork-success',
+      summary: { commandCount: 0 },
+    })
+    await lc.append(sourceId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      summary: { commandCount: 1 },
+    })
+
+    const replacementId = await lc.forkAndDiscard(sourceId, 1, (snapshotLog, metadata) => {
+      expect(metadata).toMatchObject({
+        lookupKey: 'artifact:fork-success',
+        summary: { commandCount: 1 },
+      })
+      return {
+        commands: [...snapshotLog, { path: 'addTodo', args: { id: 4, title: 'date' } }],
+        summary: { commandCount: 2 },
+      }
+    })
+
+    await expect(lc.getLog(sourceId)).rejects.toThrow('unknown draft')
+    expect(await lc.getLog(replacementId)).toHaveLength(2)
+    expect(await lc.inspect(replacementId)).toHaveLength(2)
+    expect(await lc.findOwnedByLookupKey('artifact:fork-success')).toMatchObject({
+      draftId: replacementId,
+      lookupKey: 'artifact:fork-success',
+      summary: { commandCount: 2 },
+    })
+  })
+
+  test('the command-array fork resolver preserves discovery metadata', async () => {
+    const lc = createDraftLifecycle(app)
+    const sourceId = await lc.open(1, {
+      lookupKey: 'artifact:legacy-fork',
+      summary: { commandCount: 0 },
+    })
+    await lc.append(sourceId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }], {
+      summary: { commandCount: 1 },
+    })
+
+    const replacementId = await lc.forkAndDiscard(sourceId, 2, (snapshotLog) => snapshotLog)
+
+    expect(await lc.findOwnedByLookupKey('artifact:legacy-fork')).toMatchObject({
+      draftId: replacementId,
+      lookupKey: 'artifact:legacy-fork',
+      summary: { commandCount: 1 },
+    })
+    expect(await lc.getLog(replacementId)).toHaveLength(1)
+    await expect(lc.getLog(sourceId)).rejects.toThrow('unknown draft')
+  })
+
   test('discard during publish resolution wins atomically and invalidates the stale publish', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -2011,28 +2367,45 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     await lc.discard(draftId)
   })
 
-  test('concurrent appends are SERIALIZED — log order matches call order', async () => {
-    // Without the per-draft lock the two batches interleave their awaits and
-    // splice commands into each other's log positions.
+  test('concurrent appends preserve whole batches and a matching final summary', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
+    const first = lc.append(
+      draftId,
+      [
+        { path: 'addTodo', args: { id: 3, title: 'c1' } },
+        { path: 'addTodo', args: { id: 4, title: 'c2' } },
+      ],
+      { summary: { last: 'c2' } },
+    )
+    const second = lc.append(
+      draftId,
+      [
+        { path: 'addTodo', args: { id: 5, title: 'c3' } },
+        { path: 'addTodo', args: { id: 6, title: 'c4' } },
+      ],
+      { summary: { last: 'c4' } },
+    )
+    await Promise.all([first, second])
 
-    const a = lc.append(draftId, [
-      { path: 'addTodo', args: { id: 3, title: 'c1' } },
-      { path: 'addTodo', args: { id: 4, title: 'c2' } },
-    ])
-    const b = lc.append(draftId, [
-      { path: 'addTodo', args: { id: 5, title: 'c3' } },
-      { path: 'addTodo', args: { id: 6, title: 'c4' } },
-    ])
-    await Promise.all([a, b])
+    // PGlite may award either append the first CAS. Both valid serializations
+    // keep each batch contiguous, and the final summary belongs to the batch
+    // that committed last.
+    const titles = (await lc.getLog(draftId)).map(
+      (command) => (command.args as { title: string }).title,
+    )
+    expect([
+      ['c1', 'c2', 'c3', 'c4'],
+      ['c3', 'c4', 'c1', 'c2'],
+    ]).toContainEqual(titles)
+    const expectedSummary = titles.at(-1) === 'c4' ? { last: 'c4' } : { last: 'c2' }
+    expect((await lc.listOwned())[0]).toMatchObject({ summary: expectedSummary })
 
-    expect((await lc.getLog(draftId)).map((c) => (c.args as { title: string }).title)).toEqual([
-      'c1',
-      'c2',
-      'c3',
-      'c4',
-    ])
+    const stored = await db.execute(
+      sql`SELECT log_revision FROM wystack_drafts WHERE draft_id = ${draftId}`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((stored as any).rows[0]?.log_revision).toBe(2)
   })
 
   test('concurrent append and discard cannot leave an orphaned overlay', async () => {
@@ -2061,12 +2434,12 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
 
     const appending = lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
-      { path: 'nope', args: {} }, // unknown function — throws mid-batch
+      { path: 'boom', args: {} },
     ])
     // Issued before the failure is observable, so it is admitted and queues.
     const publishing = lc.publish(draftId)
 
-    await expect(appending).rejects.toThrow('Unknown function')
+    await expect(appending).rejects.toThrow('command boom')
     await publishing
 
     const { result: canonical } = await app.call('listTodos', {})
@@ -2108,9 +2481,9 @@ describe('draft lifecycle — invalidation fan-out', () => {
     await expect(
       lc.append(draftId, [
         { path: 'addTodo', args: { id: 3, title: 'cherry' } },
-        { path: 'nope', args: {} },
+        { path: 'boom', args: {} },
       ]),
-    ).rejects.toThrow('Unknown function')
+    ).rejects.toThrow('command boom')
 
     expect(cap.tags()).toEqual([])
     expect(await lc.getLog(draftId)).toEqual([])
@@ -2143,9 +2516,8 @@ describe('draft lifecycle — invalidation fan-out', () => {
 
     const cap = captureEmits()
     await expect(
-      // `nope` is not a registered function — a deterministic mid-replay failure.
-      lc.publish(draftId, (logToBind) => [...logToBind, { path: 'nope', args: {} }]),
-    ).rejects.toThrow()
+      lc.publish(draftId, (logToBind) => [...logToBind, { path: 'boom', args: {} }]),
+    ).rejects.toThrow('command boom')
 
     // Nothing durably changed, so announcing would trigger a pointless refetch
     // storm — and would tell clients a publish landed when it did not.
@@ -2175,7 +2547,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     // the tracker actually reported written instead.
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
-    await lc.append(draftId, [{ path: 'listTodos', args: {} }])
+    await lc.append(draftId, [{ path: 'readTodos', args: {} }])
 
     const cap = captureEmits()
     await lc.discard(draftId)

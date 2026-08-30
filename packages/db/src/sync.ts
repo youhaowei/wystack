@@ -21,7 +21,9 @@
  *
  * ── What it does NOT do ──────────────────────────────────────────────────
  * - ALTER TABLE — if the schema changes, old tables keep their old shape.
- *   That's a migration concern (drizzle-kit / `wystack migrate` — future).
+ *   That's a migration concern. The v0.2 tenant-primary contract has one
+ *   explicit framework migration, `migrateTenantPrimaryKeys`; other evolution
+ *   belongs in application-owned migrations.
  * - Index creation (beyond UNIQUE constraints).
  * - Check constraints, policies, enableRLS, generated columns.
  * - Tables in non-default Postgres schemas.

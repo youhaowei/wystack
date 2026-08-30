@@ -14,6 +14,9 @@ import {
   procedureSelectTerminalMethods,
   type FunctionDef,
   type FunctionContext,
+  type RawFunctionContext,
+  type RawProcedureDb,
+  type CommandDb,
   type DbInput,
   type ProcedureDb,
 } from './types'
@@ -44,16 +47,21 @@ export interface WyStackSystem {
   emit: (tablesWritten: Set<string>) => void
   /**
    * Run one registered function's handler using a SUPPLIED DrizzleTracker instead
-   * of a fresh per-call one. The handler receives a `ProcedureDb`, not the tracker
-   * itself. This is the seam `applyCommands` uses to dispatch every command in a
-   * batch through one native transaction and one merged Tag-set.
+   * of a fresh per-call one. The handler receives a database facade, not the
+   * tracker itself. This is the seam `applyCommands` uses to dispatch every
+   * command in a batch through one native transaction and one merged Tag-set.
+   * Native handlers receive the restricted facade (commands are typed to its
+   * transaction-free `CommandDb` subset); explicitly branded raw boundaries
+   * receive `RawProcedureDb` for canonical dispatch and are rejected by every
+   * command/draft entry point before replay.
    *
    * Validation runs inside the composed handler after middleware exactly as in
    * `call`, so a batch command and a plain RPC to the same path validate identically. The
    * caller owns the DrizzleTracker lifecycle (creation, transaction, tracking-set
    * collection); this method injects runtime context and invokes the composed
    * handler with `{ ...context, db: procedureFacade, can }`, which then validates
-   * args without exposing raw SQL, scope changes, or tracking custody.
+   * args. Native procedures never receive raw SQL or tracking custody; neither
+   * facade exposes tenant/draft scope changes.
    *
    * Calling it directly bypasses the transaction envelope, so the privileged
    * host caller is responsible for atomicity and invalidation.
@@ -61,10 +69,10 @@ export interface WyStackSystem {
    * `tracked` may also be a `DraftDrizzleTracker` (a `base.withDraft(draftId)` handle):
    * this is the seam the draft lifecycle's `append` uses to route an UNMODIFIED
    * command handler's writes (`ctx.db.into/update/delete`) into the durable
-   * draft overlay. `runHandler` converts either tracker to the same restricted
-   * `ProcedureDb` surface (`from`, `into`, and `transaction`), so the substitution
-   * is transparent to handlers while raw SQL, scope changes, and tracking sets
-   * remain framework custody.
+   * draft overlay. `runHandler` converts either tracker to the same native
+   * `from`/`into` surface, so the substitution is transparent to command
+   * handlers while raw SQL, scope changes, and tracking sets remain framework
+   * custody.
    */
   runHandler: (
     path: string,
@@ -158,16 +166,85 @@ function toProcedureInsertBuilder(source: object): object {
   return Object.freeze(facade)
 }
 
-function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
+function toCommandDb(tracked: DrizzleTracker | DraftDrizzleTracker): CommandDb {
   return Object.freeze({
     from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
-      toProcedureSelectBuilder(tracked.from(table))) as ProcedureDb['from'],
+      toProcedureSelectBuilder(tracked.from(table))) as CommandDb['from'],
     into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
-      toProcedureInsertBuilder(tracked.into(table))) as ProcedureDb['into'],
+      toProcedureInsertBuilder(tracked.into(table))) as CommandDb['into'],
+  })
+}
+
+function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
+  const commandDb = toCommandDb(tracked)
+  return Object.freeze({
+    ...commandDb,
     transaction: async <R>(
       fn: (tx: ProcedureDb) => Promise<R>,
       opts?: Parameters<ProcedureDb['transaction']>[1],
     ) => tracked.transaction((tx) => fn(toProcedureDb(tx)), opts),
+  })
+}
+
+function mappedTrackingSet(target: Set<string>, qualify: (tag: string) => string): Set<string> {
+  let facade: Set<string>
+  facade = new Proxy(target, {
+    get(source, property) {
+      if (property === 'add') {
+        return (tag: string) => {
+          source.add(qualify(tag))
+          return facade
+        }
+      }
+      if (property === 'forEach') {
+        return (
+          callback: (value: string, key: string, set: Set<string>) => void,
+          thisArg?: unknown,
+        ) =>
+          source.forEach((value, key) => {
+            callback.call(thisArg, value, key, facade)
+          })
+      }
+      if (property === 'has') return (tag: string) => source.has(qualify(tag))
+      if (property === 'delete') return (tag: string) => source.delete(qualify(tag))
+      const value = Reflect.get(source, property, source)
+      return typeof value === 'function' ? value.bind(source) : value
+    },
+  })
+  return facade
+}
+
+function toRawProcedureDb(
+  tracked: DrizzleTracker | DraftDrizzleTracker,
+  qualifyTag: (tag: string) => string,
+): RawProcedureDb {
+  const assertGlobalTag = (tag: string) => {
+    if (tag.startsWith('tenant:') || tag.startsWith('draft:')) {
+      throw new Error(
+        `Global tracking tag "${tag}" uses a reserved tenant or draft identity prefix`,
+      )
+    }
+  }
+  return Object.freeze({
+    raw: tracked.raw,
+    tablesRead: mappedTrackingSet(tracked.tablesRead, qualifyTag),
+    tablesWritten: mappedTrackingSet(tracked.tablesWritten, qualifyTag),
+    trackGlobalRead: (tag: string) => {
+      assertGlobalTag(tag)
+      tracked.tablesRead.add(tag)
+    },
+    trackGlobalWrite: (tag: string) => {
+      assertGlobalTag(tag)
+      tracked.tablesWritten.add(tag)
+    },
+    from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
+      toProcedureSelectBuilder(tracked.from(table))) as RawProcedureDb['from'],
+    into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
+      toProcedureInsertBuilder(tracked.into(table))) as RawProcedureDb['into'],
+    transaction: async <R>(
+      fn: (tx: RawProcedureDb) => Promise<R>,
+      opts?: Parameters<RawProcedureDb['transaction']>[1],
+    ) => tracked.transaction((tx) => fn(toRawProcedureDb(tx, qualifyTag)), opts),
   })
 }
 
@@ -194,6 +271,14 @@ export async function buildWyStack(opts: {
   // their own — see the WyStackApp.invalidationSource contract.
   const invalidation = createDispatchInvalidationSource()
 
+  function qualifyRawTag(tracked: DrizzleTracker | DraftDrizzleTracker, tag: string): string {
+    const tenantId = 'tenantId' in tracked ? tracked.tenantId : undefined
+    if (tenantId === undefined || !opts.tenancy) return tag
+    const tenantKey = encodeURIComponent(String(opts.tenancy.canonicalize(tenantId)))
+    const prefix = `tenant:${tenantKey}:`
+    return tag.startsWith(prefix) ? tag : `${prefix}${tag}`
+  }
+
   // Resolve DB: either use createDb for config, or treat as raw Drizzle instance
   const dbConfig = resolveDbConfig(opts.db)
   const drizzleDb = dbConfig ? await createDb(dbConfig) : opts.db
@@ -206,6 +291,46 @@ export async function buildWyStack(opts: {
     const fn = functions.get(path)
     if (!fn) throw new Error(`Unknown function: ${path}`)
     return fn
+  }
+
+  async function runDefinition(
+    fn: FunctionDef,
+    path: string,
+    args: unknown,
+    tracked: DrizzleTracker | DraftDrizzleTracker,
+    context: Record<string, unknown>,
+  ): Promise<unknown> {
+    // Native handlers receive only their declared database capability.
+    // Replay-safe commands omit transaction at runtime as well as in their
+    // CommandDb type because command application and draft replay own the
+    // outer transaction. Raw SQL and scope-changing methods are unavailable
+    // in both type and runtime.
+    // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
+    // without restoring withTenant()/withDraft() custody.
+    const databaseAccess: unknown = fn.databaseAccess
+    let db: ProcedureDb | CommandDb | RawProcedureDb
+    switch (databaseAccess) {
+      case 'native':
+        db =
+          fn.type === 'mutation' && fn.draftReplayable === true
+            ? toCommandDb(tracked)
+            : toProcedureDb(tracked)
+        break
+      case 'read-model-raw':
+      case 'integration-raw':
+      case 'legacy-raw':
+        db = toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
+        break
+      default:
+        throw new Error(
+          `Function "${path}" has unsupported databaseAccess; expected "native", ` +
+            `"read-model-raw", "integration-raw", or "legacy-raw"`,
+        )
+    }
+    const ctx = { ...context, db } as FunctionContext | RawFunctionContext
+    // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
+    ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
+    return fn.handler(ctx, args)
   }
 
   const system: WyStackSystem = Object.freeze({
@@ -235,14 +360,7 @@ export async function buildWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      // Handlers receive only the restricted ProcedureDb surface. A
-      // draft tracker implements transaction() as a fail-loud nested-transaction
-      // guard because lifecycle append/publish own the outer boundaries. Raw SQL
-      // and scope-changing methods are unavailable in both type and runtime.
-      const ctx = { ...context, db: toProcedureDb(tracked) } as FunctionContext
-      // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
-      ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
-      return fn.handler(ctx, args)
+      return runDefinition(fn, path, args, tracked, context)
     },
   })
 
@@ -255,9 +373,13 @@ export async function buildWyStack(opts: {
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
       // Fresh DrizzleTracker per call — no shared mutable state
       const tracked = await system.scopeTracked(system.createTracked(), context)
+      const definition = getFunction(path)
       let result: unknown
       try {
-        result = await system.runHandler(path, args, tracked, context)
+        result =
+          definition.type === 'mutation' && definition.draftReplayable === true
+            ? await tracked.transaction((tx) => runDefinition(definition, path, args, tx, context))
+            : await runDefinition(definition, path, args, tracked, context)
       } finally {
         // Fuse: any COMMITTED tracked write dispatched through `call` fans out
         // on the app's source. The finally is load-bearing for Actions: a

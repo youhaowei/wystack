@@ -21,17 +21,37 @@ export interface StageOk<TPatch> {
   readonly patch: TPatch
 }
 
+type FrameworkContextPatch = {
+  readonly db?: never
+  readonly can?: never
+}
+
 export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
-  ctx: TCtxIn
-  next: <P = {}>(patch?: P) => StageOk<P>
+  readonly ctx: Readonly<TCtxIn>
+  next: <P extends object = {}>(patch?: P & FrameworkContextPatch) => StageOk<P>
 }) => StageOk<TPatch> | Promise<StageOk<TPatch>>
 
 /** Boolean permission probe: denials return false; policy errors propagate. */
 // oxlint-disable-next-line typescript/no-explicit-any -- permissions remain contravariant over app-specific contexts
 export type Can = (permission: Permission<any>) => Promise<boolean>
 
-export const procedureSelectChainedMethods = ['select', 'where', 'orderBy', 'limit'] as const
-export const procedureSelectTerminalMethods = ['all', 'first', 'update', 'delete', 'toSql'] as const
+export const procedureSelectChainedMethods = [
+  'select',
+  'where',
+  'includeDeleted',
+  'onlyDeleted',
+  'orderBy',
+  'limit',
+] as const
+export const procedureSelectTerminalMethods = [
+  'all',
+  'first',
+  'update',
+  'delete',
+  'softDelete',
+  'restore',
+  'toSql',
+] as const
 export const procedureInsertMethods = ['insert'] as const
 
 type ProcedureSelectMethod =
@@ -49,7 +69,7 @@ export type ProcedureInsertBuilder<T extends ProcedureTable> = Pick<
   (typeof procedureInsertMethods)[number]
 >
 
-/** Database surface available to application procedures. Tenant/draft binding,
+/** Database surface available to native application procedures. Tenant/draft binding,
  * raw SQL, and tracking sets remain framework custody. */
 export interface ProcedureDb {
   from<T extends ProcedureTable>(table: T): ProcedureSelectBuilder<T>
@@ -57,11 +77,68 @@ export interface ProcedureDb {
   transaction<R>(fn: (tx: ProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
-/** Function context passed to every query/mutation/action handler. */
+/**
+ * Database surface available to replayable command handlers. The lifecycle
+ * owns the transaction boundary, so commands cannot open nested transactions.
+ */
+export type CommandDb = Pick<ProcedureDb, 'from' | 'into'>
+
+/** Preserve app and middleware fields while narrowing a command handler's DB. */
+export type CommandContext<TContext> = Overwrite<TContext, { db: CommandDb }>
+
+/**
+ * Raw database surface for app-owned SQL boundaries.
+ *
+ * The raw connection and manual tracking sets support joins, aggregates, and
+ * bulk workflows that the native DSL cannot yet express. Trusted tenant
+ * resolution and tag qualification remain framework-owned, but raw SQL tenant
+ * and soft-delete predicates are application-owned. Tenant and draft
+ * scope-changing methods remain framework custody on every raw boundary.
+ */
+export interface RawProcedureDb extends ProcedureDb {
+  readonly raw: DrizzleTracker['raw']
+  readonly tablesRead: Set<string>
+  readonly tablesWritten: Set<string>
+  /** Record an unqualified global-table read; tenant/draft identity prefixes are rejected. */
+  trackGlobalRead(tag: string): void
+  /** Record an unqualified global-table write; tenant/draft identity prefixes are rejected. */
+  trackGlobalWrite(tag: string): void
+  transaction<R>(fn: (tx: RawProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
+}
+
+/** Backward-compatible name for the raw legacy migration facade. */
+export type LegacyProcedureDb = RawProcedureDb
+
+/**
+ * Base context for query, mutation, and action handlers. The command terminal
+ * narrows this with `CommandContext` so replayable handlers cannot transact.
+ */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
   db: ProcedureDb
   can: Can
 }
+
+/** Context shared by explicit raw boundaries after any configured tenant resolution. */
+export type RawFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  TAppContext & {
+    db: RawProcedureDb
+    can: Can
+  }
+
+/** Context passed only to handlers built with `defineApp().readModel`. */
+export type ReadModelFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
+/** Context passed only to handlers built with `defineApp().integration`. */
+export type IntegrationFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
+/** Backward-compatible context for `defineApp().legacyProcedure`. */
+export type LegacyFunctionContext<TAppContext extends object = Record<string, unknown>> =
+  RawFunctionContext<TAppContext>
+
+/** Runtime marker controlling which database facade a registered handler receives. */
+export type ProcedureDatabaseAccess = 'native' | 'read-model-raw' | 'integration-raw' | 'legacy-raw'
 
 /**
  * Maps a DSL ColumnDef to its TypeScript arg type, honoring optionality:
@@ -87,9 +164,15 @@ export type InferArgs<T extends Record<string, AnyColumnDef>> = {
   [K in keyof T as IsOptionalColumn<T[K]> extends true ? K : never]?: InferArg<T[K]>
 }
 
-// oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export interface QueryDef<TArgs = any, TReturn = any> {
+export interface QueryDef<
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TArgs = any,
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TReturn = any,
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
+> {
   type: 'query'
+  databaseAccess: TDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
@@ -102,24 +185,35 @@ export interface ActionDef<
   // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
   TReturn = any,
   TType extends 'action' | 'mutation' = 'action',
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
 > {
   type: TType
+  databaseAccess: TDatabaseAccess
   path: string
   args: Record<string, AnyColumnDef>
   // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing FunctionDef storage shape
   handler: (ctx: any, args: TArgs) => Promise<TReturn>
 }
 
-// A Mutation is the transaction-eligible database-write specialization of Action.
-// Mutation handlers may be replayed after a rolled-back transaction (including
-// draft append/rebase/publish and PostgreSQL deadlock/serialization recovery),
-// so external I/O belongs in an Action rather than a Mutation.
+// A Mutation is the canonical database-write specialization of Action. It is
+// callable through the normal RPC path, but is not draft-replayable by default:
+// handlers may rely on canonical-only transaction/orchestration semantics.
+// `.command(...)` is the explicit replay-safety attestation for DB-only handlers.
+export interface MutationDef<
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TArgs = any,
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TReturn = any,
+  TDraftReplayable extends boolean = boolean,
+  TDatabaseAccess extends ProcedureDatabaseAccess = ProcedureDatabaseAccess,
+> extends ActionDef<TArgs, TReturn, 'mutation', TDatabaseAccess> {
+  /** Capability attestation consumed by applyCommands and the draft lifecycle. */
+  draftReplayable: TDraftReplayable
+}
+
+/** A mutation whose author explicitly attested it is safe for ordered draft replay. */
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export interface MutationDef<TArgs = any, TReturn = any> extends ActionDef<
-  TArgs,
-  TReturn,
-  'mutation'
-> {}
+export type CommandDef<TArgs = any, TReturn = any> = MutationDef<TArgs, TReturn, true, 'native'>
 
 export type FunctionDef = QueryDef | MutationDef | ActionDef
 

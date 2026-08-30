@@ -12,6 +12,7 @@ import type {
 } from './tracker-core'
 import {
   assertRevisionInput,
+  assertSoftDeleteInput,
   assertTenantInput,
   emptyClauses,
   materializeJsonNulls,
@@ -115,6 +116,7 @@ export class InsertBuilder<T extends AnyTable> {
       const record = row as Record<string, unknown>
       assertTenantInput(this._table, record)
       assertRevisionInput(this._table, record)
+      assertSoftDeleteInput(this._table, record)
       const sanitized = materializeJsonNulls(this._table, withoutUndefined(record))
       return tenant ? { ...sanitized, [tenant.tenancy.property]: tenant.tenantId } : sanitized
     })

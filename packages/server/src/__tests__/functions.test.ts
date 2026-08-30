@@ -9,6 +9,7 @@ describe('procedure builder', () => {
   test('creates a QueryDef with correct type', () => {
     const q = wy.procedure.input({ type: text.optional() }).query(async (_ctx, _args) => [])
     expect(q.type).toBe('query')
+    expect(q.databaseAccess).toBe('native')
     expect(q.path).toBe('')
     expect(q.args.type).toBeDefined()
   })
@@ -20,11 +21,52 @@ describe('procedure builder', () => {
     expect(result).toEqual({ received: 42 })
   })
 
-  test('creates a MutationDef with correct type', () => {
-    const m = wy.procedure
+  test('distinguishes canonical mutations from replayable commands without changing RPC type', () => {
+    const mutation = wy.procedure
       .input({ title: text })
       .mutation(async (_ctx, _args) => ({ created: true }))
-    expect(m.type).toBe('mutation')
+    const command = wy.procedure
+      .input({ title: text })
+      .command(async (_ctx, _args) => ({ created: true }))
+
+    expect(mutation).toMatchObject({ type: 'mutation', draftReplayable: false })
+    expect(command).toMatchObject({ type: 'mutation', draftReplayable: true })
+  })
+
+  test('readModel exposes only a raw query terminal', async () => {
+    const definition = wy.readModel
+      .use(({ next }) => next({ source: 'read-model' }))
+      .input({ id: int })
+      .query(async (ctx, args) => `${ctx.source}:${args.id}`)
+
+    expect(definition.databaseAccess).toBe('read-model-raw')
+    expect(wy.readModel.mutation).toBeUndefined()
+    expect(wy.readModel.action).toBeUndefined()
+    expect(wy.readModel.command).toBeUndefined()
+    await expect(definition.handler({}, { id: 7 })).resolves.toBe('read-model:7')
+    await expect(definition.handler({}, { id: 'invalid' } as never)).rejects.toThrow(
+      'Validation failed',
+    )
+  })
+
+  test('integration exposes only a canonical raw mutation terminal', async () => {
+    const definition = wy.integration
+      .use(({ next }) => next({ source: 'integration' }))
+      .input({ id: int })
+      .mutation(async (ctx, args) => `${ctx.source}:${args.id}`)
+
+    expect(definition).toMatchObject({
+      databaseAccess: 'integration-raw',
+      type: 'mutation',
+      draftReplayable: false,
+    })
+    expect(wy.integration.query).toBeUndefined()
+    expect(wy.integration.action).toBeUndefined()
+    expect(wy.integration.command).toBeUndefined()
+    await expect(definition.handler({}, { id: 7 })).resolves.toBe('integration:7')
+    await expect(definition.handler({}, { id: 'invalid' } as never)).rejects.toThrow(
+      'Validation failed',
+    )
   })
 
   test('creates an ActionDef with validation and middleware parity', async () => {
@@ -36,6 +78,22 @@ describe('procedure builder', () => {
     expect(action.type).toBe('action')
     await expect(action.handler({}, { prompt: 'run' })).resolves.toBe('middleware:run')
     await expect(action.handler({}, { prompt: 123 } as never)).rejects.toThrow('Validation failed')
+  })
+
+  test('legacyProcedure preserves middleware and input validation while branding the definition', async () => {
+    const definition = wy.legacyProcedure
+      .use(({ next }) => next({ source: 'legacy-middleware' }))
+      .input({ id: int })
+      .query(async (ctx, args) => ({ source: ctx.source, id: args.id }))
+
+    expect(definition.databaseAccess).toBe('legacy-raw')
+    await expect(definition.handler({}, { id: 7 })).resolves.toEqual({
+      source: 'legacy-middleware',
+      id: 7,
+    })
+    await expect(definition.handler({}, { id: 'invalid' } as never)).rejects.toThrow(
+      'Validation failed',
+    )
   })
 
   test('composes minimal middleware patches with Overwrite', async () => {

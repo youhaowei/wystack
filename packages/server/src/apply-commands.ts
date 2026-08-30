@@ -1,6 +1,7 @@
 // @wystack/server — applyCommands engine (the command MECHANISM)
 //
-// `applyCommands` is the single write entry point for batched mutations. It is
+// `applyCommands` is the single write entry point for explicitly replayable
+// command handlers. It is
 // the generic substrate under an application's artifact write-side: a frozen-API
 // primitive that knows NOTHING about concrete command types. It composes three
 // existing pieces — `WyStackApp.system.runHandler` (typed dispatch against a supplied
@@ -30,7 +31,7 @@
 // for semantics.
 //
 // This is deliberately the mechanism only. The command VOCABULARY (concrete
-// command paths, Action-exclusion policy, artifact-grouped PreviewDiff
+// command paths, replay-eligibility policy, artifact-grouped PreviewDiff
 // with real compute) is a separate application layer that
 // supplies the `path`s this engine dispatches. Keeping the seam clean keeps
 // this engine a candidate for promotion to a generic WyStack primitive.
@@ -43,6 +44,46 @@
 
 import type { DrizzleTracker } from '@wystack/db'
 import type { WyStackApp } from './create'
+import type { FunctionDef, ProcedureDatabaseAccess } from './types'
+
+const nonNativeProcedureLabels = {
+  'read-model-raw': 'a read-model procedure',
+  'integration-raw': 'an integration procedure',
+  'legacy-raw': 'a legacy procedure',
+} satisfies Record<Exclude<ProcedureDatabaseAccess, 'native'>, string>
+
+/**
+ * Enforce the registry capability boundary shared by direct batches and the
+ * durable draft lifecycle. Only known native mutations that explicitly opt in
+ * through `.command(...)` may enter an ordered command log.
+ */
+export function assertReplayableCommand(
+  definition: FunctionDef | undefined,
+  path: string,
+  label: 'Command' | 'Draft command',
+): void {
+  if (!definition) {
+    throw new Error(`${label} ${path} references an unknown function`)
+  }
+  if (definition.databaseAccess !== 'native') {
+    throw new Error(
+      `${label} ${path} cannot reference ${nonNativeProcedureLabels[definition.databaseAccess]}`,
+    )
+  }
+  if (definition.type === 'action') {
+    throw new Error(`${label} ${path} cannot reference an action`)
+  }
+  if (definition.type === 'query') {
+    throw new Error(
+      `${label} ${path} cannot reference a query; use .command() for replay-safe handlers`,
+    )
+  }
+  if (definition.draftReplayable !== true) {
+    throw new Error(
+      `${label} ${path} cannot reference a canonical-only mutation; use .command() for replay-safe handlers`,
+    )
+  }
+}
 
 /**
  * One command in a batch envelope: a reference to a registered WyStack function
@@ -227,17 +268,12 @@ async function executeCommands(
   const { mode, context = {}, tx: outerTx } = opts
   const commands = batch.map(snapshotCommand)
 
-  // Reject Actions before opening or joining a transaction so external
-  // I/O/orchestration can never accidentally execute while a database
-  // transaction is held open. Query commands remain supported for backward
-  // compatibility (including authorization-before-validation workflows).
+  // Reject unknown paths and every definition that lacks explicit command
+  // eligibility before opening or joining a transaction.
   // Validate the snapshots, then execute those same snapshots: callers retain
   // ownership of `batch` and may mutate it while an earlier handler is awaited.
   for (const command of commands) {
-    const definition = app.functions.get(command.path)
-    if (definition?.type === 'action') {
-      throw new Error(`Command ${command.path} cannot reference an action`)
-    }
+    assertReplayableCommand(app.functions.get(command.path), command.path, 'Command')
   }
 
   if (mode === 'commit') {
@@ -363,11 +399,8 @@ async function applyAll(
   for (const cmd of batch) {
     // The public registry is mutable. Recheck immediately before dispatch so
     // an earlier handler or concurrent owner cannot replace this path with an
-    // Action after the pre-transaction scan and run external work under `tx`.
-    const definition = app.functions.get(cmd.path)
-    if (definition?.type === 'action') {
-      throw new Error(`Command ${cmd.path} cannot reference an action`)
-    }
+    // ineligible definition after the pre-transaction scan and run it under `tx`.
+    assertReplayableCommand(app.functions.get(cmd.path), cmd.path, 'Command')
     const value = await app.system.runHandler(cmd.path, cmd.args, tx, context)
     // Echo the command's opaque correlation id onto its result; the engine
     // never interprets it, only carries it from input to output.

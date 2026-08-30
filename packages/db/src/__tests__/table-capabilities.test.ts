@@ -41,6 +41,7 @@ describe('composable table capabilities', () => {
       expect(forged instanceof TableDefinition).toBe(false)
       expect(() => forged.draftable()).toThrow('require a factory-created definition')
       expect(() => forged.revision('id')).toThrow('require a factory-created definition')
+      expect(() => forged.softDelete('id')).toThrow('require a factory-created definition')
       expect(() => defineSchema({ forged })).toThrow('table(...)')
     })
 
@@ -424,6 +425,50 @@ describe('composable table capabilities', () => {
     })
   })
 
+  describe('soft-delete state', () => {
+    test('soft deletion composes with tenancy, drafts, and revisions', () => {
+      const tenancy = multiTenant({
+        key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+      })
+      const schema = defineSchema({
+        records: tenancy
+          .table({
+            id: uuid.primaryKey(),
+            name: text,
+            deletedAt: timestamp.nullable(),
+            revision: int,
+          })
+          .draftable()
+          .softDelete('deletedAt')
+          .revision('revision'),
+      })
+
+      expect(getTableCapabilities(schema.records)).toMatchObject({
+        draftable: true,
+        revisionProperty: 'revision',
+        softDeleteProperty: 'deletedAt',
+        tenancy: { property: 'workspaceId' },
+      })
+    })
+
+    test('soft-delete properties must be dedicated nullable timestamps without defaults', () => {
+      expect(() => table({ id: uuid.primaryKey() }).softDelete('id')).toThrow('nullable timestamp')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp }).softDelete('deletedAt'),
+      ).toThrow('nullable timestamp')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp.nullable().defaultNow() }).softDelete(
+          'deletedAt',
+        ),
+      ).toThrow('must not have a default')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp.nullable().unique() }).softDelete(
+          'deletedAt',
+        ),
+      ).toThrow('cannot be an identity, unique, or foreign-key column')
+    })
+  })
+
   describe('compiled schema ownership', () => {
     /** Nested reference metadata is snapshotted, so later mutation cannot retarget a foreign key. */
     test('table definitions snapshot nested reference metadata', () => {
@@ -589,6 +634,28 @@ describe('composable table capabilities', () => {
   })
 
   describe('tenant-local constraints', () => {
+    /** Physical row identity includes tenant scope while preserving the declared key as a logical column. */
+    test('tenant tables compile tenant scope and logical identity as one primary key', () => {
+      const tenancy = multiTenant({
+        key: {
+          property: 'workspaceId',
+          column: 'workspace_id',
+          type: uuid,
+        },
+      })
+      const schema = defineSchema({
+        accounts: tenancy.table({ id: uuid.primaryKey(), slug: text }),
+      })
+
+      const config = getTableConfig(schema.accounts)
+      expect(config.primaryKeys).toHaveLength(1)
+      expect(config.primaryKeys[0].columns.map((column) => column.name)).toEqual([
+        'workspace_id',
+        'id',
+      ])
+      expect(config.columns.find((column) => column.name === 'id')?.primary).toBe(false)
+    })
+
     /** Tenant-local uniqueness and references include tenant identity in their compiled constraints. */
     test('tenant-local uniqueness and references include the tenant key', () => {
       const tenancy = multiTenant({
@@ -614,12 +681,7 @@ describe('composable table capabilities', () => {
       )
       const postReference = getTableConfig(schema.posts).foreignKeys[0].reference()
 
-      expect(accountConstraints).toEqual(
-        expect.arrayContaining([
-          ['workspace_id', 'id'],
-          ['workspace_id', 'slug'],
-        ]),
-      )
+      expect(accountConstraints).toContainEqual(['workspace_id', 'slug'])
       expect({
         localColumns: postReference.columns.map((column) => column.name),
         targetTable: getTableName(postReference.foreignTable),

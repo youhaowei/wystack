@@ -67,15 +67,95 @@ export class DraftPublishDriftError extends Error {
   }
 }
 
-export interface OpenOptions {
+/** A caller's durable-draft snapshot no longer matches the stored command log. */
+export class DraftRevisionConflictError extends Error {
+  readonly draftId: string
+  readonly expectedRevision: number
+  readonly actualRevision: number | undefined
+
+  constructor(draftId: string, expectedRevision: number, actualRevision?: number) {
+    super(
+      actualRevision === undefined
+        ? `draft lifecycle: draft "${draftId}" no longer exists at expected revision ${expectedRevision}`
+        : `draft lifecycle: draft "${draftId}" is at revision ${actualRevision}, expected ${expectedRevision}`,
+    )
+    this.name = 'DraftRevisionConflictError'
+    this.draftId = draftId
+    this.expectedRevision = expectedRevision
+    this.actualRevision = actualRevision
+  }
+}
+
+export interface DraftContextOptions {
   context?: Record<string, unknown>
 }
 
-export interface DraftOperationOptions {
-  context?: Record<string, unknown>
+export type DraftSummary =
+  | null
+  | boolean
+  | number
+  | string
+  | DraftSummary[]
+  | { [key: string]: DraftSummary }
+
+export const MAX_DRAFT_LOOKUP_KEY_BYTES = 512
+/** Summaries are returned up to 100 at a time, so keep each serialized value small. */
+export const MAX_DRAFT_SUMMARY_BYTES = 4 * 1024
+/** Maximum number of nested JSON array/object containers in a summary. */
+export const MAX_DRAFT_SUMMARY_DEPTH = 16
+
+export interface OpenOptions extends DraftContextOptions {
+  /** Exact owner-scoped discovery key. Must encode to at most 512 UTF-8 bytes. */
+  lookupKey?: string
+  /** Lightweight JSON metadata returned by discovery; limited to 4 KiB and 16 containers deep. */
+  summary?: DraftSummary
 }
 
-export interface RebaseOptions extends DraftOperationOptions {
+export const DEFAULT_OWNED_DRAFT_PAGE_SIZE = 50
+export const MAX_OWNED_DRAFT_PAGE_SIZE = 100
+
+/** Stable keyset cursor; tenant-and-owner custody is resolved separately for every call. */
+export interface OwnedDraftCursor {
+  createdAt: string
+  draftId: string
+}
+
+export interface ListOwnedOptions extends DraftContextOptions {
+  /** Defaults to 50 and must not exceed 100. */
+  limit?: number
+  /** Continue strictly after this immutable `(createdAt, draftId)` tuple. */
+  cursor?: OwnedDraftCursor
+}
+
+export interface DraftOperationOptions extends DraftContextOptions {}
+
+export interface DraftMutationOptions extends DraftOperationOptions {
+  /** Require this exact revision of the durable command log. */
+  expectedRevision?: number
+}
+
+export interface AppendOptions extends DraftMutationOptions {
+  /** Omit to preserve the current summary; provide a JSON value to atomically replace it. */
+  summary?: DraftSummary
+}
+
+export interface DraftMetadataSnapshot {
+  lookupKey?: string
+  summary?: DraftSummary
+}
+
+export interface ForkResolution {
+  commands: DraftCommand[]
+  /** Omit to preserve the source summary; provide a JSON value to replace it atomically. */
+  summary?: DraftSummary
+}
+
+export type ForkResolveHook = (
+  log: DraftCommand[],
+  metadata: DraftMetadataSnapshot,
+) => DraftCommand[] | ForkResolution | Promise<DraftCommand[] | ForkResolution>
+
+export interface RebaseOptions extends DraftMutationOptions {
   acceptConflicts?: (report: ConflictReport) => boolean | Promise<boolean>
 }
 
@@ -115,6 +195,8 @@ export interface DraftGraphReadBuilder<
     ...columns: [K, ...K[]]
   ): DraftGraphReadBuilder<TTable, Pick<DraftGraphRow<TTable>, K>>
   where(filters: FilterDescriptor | FilterDescriptor[]): DraftGraphReadBuilder<TTable, TRow>
+  includeDeleted(): DraftGraphReadBuilder<TTable, TRow>
+  onlyDeleted(): DraftGraphReadBuilder<TTable, TRow>
   orderBy(column: string, direction?: 'asc' | 'desc'): DraftGraphReadBuilder<TTable, TRow>
   limit(count: number): DraftGraphReadBuilder<TTable, TRow>
   all(): Promise<TRow[]>
@@ -145,13 +227,17 @@ export interface DraftAuthorizationRequest {
 }
 
 export type DraftOperationAction =
+  | 'listOwned'
+  | 'findOwnedByLookupKey'
   | 'append'
   | 'publish'
   | 'discard'
+  | 'forkAndDiscard'
   | 'rebase'
   | 'detectConflict'
   | 'inspect'
   | 'getLog'
+  | 'getLogSnapshot'
 
 export interface GlobalDraftAuthorizationRequest {
   action: 'open' | DraftOperationAction
@@ -185,23 +271,98 @@ export type DraftInspectionValue =
   | { kind: 'json'; value: unknown }
   | { kind: 'value'; value: unknown }
 
+export interface OwnedDraftSummary {
+  draftId: string
+  baseVersion: Version
+  /** Immutable RFC 3339 timestamp used by owner-scoped keyset pagination. */
+  createdAt: string
+  /** RFC 3339 display metadata for the draft's last committed lifecycle change. */
+  updatedAt: string
+  lookupKey?: string
+  summary?: DraftSummary
+  /** Pass the final result's cursor to `listOwned` to continue the listing. */
+  cursor: OwnedDraftCursor
+}
+
+export interface OpenWithCommandsResult {
+  draftId: string
+  results: CommandResult[]
+}
+
+/** One coherent, authorized view of the durable command log. */
+export interface DraftLogSnapshot {
+  /** Monotonic revision advanced by every committed log replacement or rebase. */
+  revision: number
+  commands: DraftCommand[]
+}
+
+/** One coherent, authorized view of the derived review rows. */
+export interface DraftInspectionSnapshot {
+  /** Monotonic revision whose materialized changes are represented below. */
+  revision: number
+  changes: DraftInspectionRow[]
+}
+
+export interface GetOrOpenWithCommandsOptions extends OpenOptions {
+  /** Exact owner-scoped key used to serialize competing initializers. */
+  lookupKey: string
+}
+
+export interface GetOrOpenWithCommandsResult extends OpenWithCommandsResult {
+  /** False when an exact tenant + owner + lookup-key draft already existed. */
+  created: boolean
+}
+
 export interface DraftLifecycle {
   open(baseVersion: Version, opts?: OpenOptions): Promise<string>
-  /** Persist and execute commands against the effective draft relation atomically. */
-  append(
-    draftId: string,
+  /** Open and materialize a non-empty initial command batch in one transaction. */
+  openWithCommands(
+    baseVersion: Version,
     batch: DraftCommand[],
+    opts?: OpenOptions,
+  ): Promise<OpenWithCommandsResult>
+  /**
+   * Return the exact owned lookup-key draft, or atomically create and materialize it.
+   * Every contender for the key must use this method to opt into exclusivity.
+   */
+  getOrOpenWithCommands(
+    baseVersion: Version,
+    batch: DraftCommand[],
+    opts: GetOrOpenWithCommandsOptions,
+  ): Promise<GetOrOpenWithCommandsResult>
+  /** Enumerate one bounded page in the exact tenant and owner scope resolved from context. */
+  listOwned(opts?: ListOwnedOptions): Promise<OwnedDraftSummary[]>
+  /** Find the newest exact lookup-key match in the resolved tenant and owner scope. */
+  findOwnedByLookupKey(
+    lookupKey: string,
     opts?: DraftOperationOptions,
-  ): Promise<CommandResult[]>
+  ): Promise<OwnedDraftSummary | undefined>
+  /** Persist and execute commands against the effective draft relation atomically. */
+  append(draftId: string, batch: DraftCommand[], opts?: AppendOptions): Promise<CommandResult[]>
   /** Verify command replay, apply the reviewed row changes, and sweep derived state atomically. */
   publish(
     draftId: string,
     resolve?: ResolveHook,
-    opts?: DraftOperationOptions,
+    opts?: DraftMutationOptions,
   ): Promise<CommitResult>
-  discard(draftId: string, opts?: DraftOperationOptions): Promise<void>
+  discard(draftId: string, opts?: DraftMutationOptions): Promise<void>
+  /**
+   * Resolve a replacement log from one authorized snapshot, materialize it in
+   * a new draft, and retire the source draft in the same transaction. If the
+   * source advances while the resolver runs, neither side is changed.
+   */
+  forkAndDiscard(
+    draftId: string,
+    baseVersion: Version,
+    resolve: ForkResolveHook,
+    opts?: DraftMutationOptions,
+  ): Promise<string>
   rebase(draftId: string, opts?: RebaseOptions): Promise<ConflictReport>
   detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
   inspect(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionRow[]>
+  /** Read review rows and their revision from one transactionally coherent snapshot. */
+  inspectSnapshot(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionSnapshot>
   getLog(draftId: string, opts?: DraftOperationOptions): Promise<DraftCommand[]>
+  /** Read commands and their revision from one transactionally coherent authorized snapshot. */
+  getLogSnapshot(draftId: string, opts?: DraftOperationOptions): Promise<DraftLogSnapshot>
 }

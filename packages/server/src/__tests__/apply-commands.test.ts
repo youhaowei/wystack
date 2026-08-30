@@ -41,33 +41,56 @@ beforeEach(async () => {
     )
   `)
 
+  const readModelTodos = wy.readModel
+    .input({})
+    .query(async (ctx) => ctx.db.from(schema.todos).all())
+  const integrationAddTodo = wy.integration
+    .input({ id: int, title: text })
+    .mutation(async (ctx, args) =>
+      ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+    )
+
   app = await wy.build({
     db,
     functions: {
       listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      readTodos: wy.procedure.input({}).command(async (ctx) => ctx.db.from(schema.todos).all()),
       listTags: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.tags).all()),
       addTodo: wy.procedure
+        .input({ id: int, title: text })
+        .command(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      canonicalOnlyTodo: wy.procedure
         .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
       addTag: wy.procedure
         .input({ id: int, label: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.tags).insert({ id: args.id, label: args.label }),
         ),
       // Marks a todo done — used to prove a later command can read/write an
       // entity an earlier command in the same batch created.
       markDone: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.todos).where(eq('id', args.id)).update({ done: true }),
         ),
       // Always throws — used to prove mid-batch failure rolls the whole batch back.
-      boom: wy.procedure.input({}).mutation(async () => {
+      boom: wy.procedure.input({}).command(async () => {
         throw new Error('command boom')
       }),
       externalAction: wy.procedure.input({}).action(async () => 'external'),
+      readModelTodos,
+      integrationAddTodo,
+      forgedIntegrationCommand: { ...integrationAddTodo, draftReplayable: true },
+      legacyAddTodo: wy.legacyProcedure
+        .input({ id: int, title: text })
+        .mutation(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
     },
   })
 })
@@ -79,13 +102,91 @@ describe('applyCommands — commit mode', () => {
     ).rejects.toThrow('Command externalAction cannot reference an action')
   })
 
-  test('rejects a path replaced with an Action after upfront validation', async () => {
-    const applying = applyCommands(app, [{ path: 'addTodo', args: { id: 1, title: 'A' } }], {
-      mode: 'commit',
-    })
-    app.functions.set('addTodo', app.functions.get('externalAction')!)
+  for (const boundary of [
+    {
+      name: 'read model',
+      path: 'readModelTodos',
+      args: {},
+      error: 'Command readModelTodos cannot reference a read-model procedure',
+    },
+    {
+      name: 'integration with a forged replay flag',
+      path: 'forgedIntegrationCommand',
+      args: { id: 1, title: 'A' },
+      error: 'Command forgedIntegrationCommand cannot reference an integration procedure',
+    },
+    {
+      name: 'legacy procedure',
+      path: 'legacyAddTodo',
+      args: { id: 1, title: 'A' },
+      error: 'Command legacyAddTodo cannot reference a legacy procedure',
+    },
+  ]) {
+    test(`rejects the non-native ${boundary.name} during preflight`, async () => {
+      await expect(
+        applyCommands(app, [{ path: boundary.path, args: boundary.args }], { mode: 'commit' }),
+      ).rejects.toThrow(boundary.error)
 
-    await expect(applying).rejects.toThrow('Command addTodo cannot reference an action')
+      const { result } = await app.call('listTodos', {})
+      expect(result).toEqual([])
+    })
+  }
+
+  test('rejects a query that was not explicitly declared as a command', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'listTodos', args: {} }], { mode: 'commit' }),
+    ).rejects.toThrow(
+      'Command listTodos cannot reference a query; use .command() for replay-safe handlers',
+    )
+  })
+
+  test('rejects an unknown command path during preflight', async () => {
+    await expect(
+      applyCommands(app, [{ path: 'missingCommand', args: {} }], { mode: 'commit' }),
+    ).rejects.toThrow('Command missingCommand references an unknown function')
+  })
+
+  test('rechecks replay eligibility after upfront validation', async () => {
+    const addTodo = app.functions.get('addTodo')!
+    const replacements = [
+      ['externalAction', 'Command addTodo cannot reference an action'],
+      [
+        'canonicalOnlyTodo',
+        'Command addTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+      ],
+      ['forgedIntegrationCommand', 'Command addTodo cannot reference an integration procedure'],
+    ] as const
+
+    for (const [replacement, error] of replacements) {
+      const applying = applyCommands(app, [{ path: 'addTodo', args: { id: 1, title: 'A' } }], {
+        mode: 'commit',
+      })
+      app.functions.set('addTodo', app.functions.get(replacement)!)
+      await expect(applying).rejects.toThrow(error)
+      app.functions.set('addTodo', addTodo)
+    }
+  })
+
+  test('keeps ordinary mutations canonical-callable but rejects them from command batches', async () => {
+    await app.call('canonicalOnlyTodo', { id: 1, title: 'canonical' })
+
+    await expect(
+      applyCommands(app, [{ path: 'canonicalOnlyTodo', args: { id: 2, title: 'draft' } }], {
+        mode: 'commit',
+      }),
+    ).rejects.toThrow(
+      'Command canonicalOnlyTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+    )
+
+    const { result } = await app.call('listTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'canonical', done: false }])
+  })
+
+  test('keeps integration mutations canonically callable', async () => {
+    await app.call('integrationAddTodo', { id: 1, title: 'imported' })
+
+    const { result } = await app.call('listTodos', {})
+    expect(result).toEqual([{ id: 1, title: 'imported', done: false }])
   })
 
   test('applies all commands atomically and persists them', async () => {
@@ -542,7 +643,7 @@ describe('applyCommands — outer-tx param (commit mode)', () => {
         await applyCommands(
           app,
           [
-            { path: 'listTodos', args: {} },
+            { path: 'readTodos', args: {} },
             { path: 'addTodo', args: { id: 1, title: 'rolled-back prefix' } },
             { path: 'boom', args: {} },
           ],

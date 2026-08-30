@@ -14,6 +14,7 @@ import {
   assertDraftWriteScope,
   assertJsonNullInputs,
   assertRevisionInput,
+  assertSoftDeleteInput,
   assertTenantInput,
   draftCastType,
   draftChangesRelation,
@@ -25,6 +26,7 @@ import {
   requireColumn,
   requireTenantScope,
   revisionProperty,
+  softDeleteProperty,
   sqlLiteral,
   withoutUndefined,
 } from './tracker-core'
@@ -436,9 +438,11 @@ export class DraftInsertBuilder<T extends AnyTable> {
       const txDraft = createDrizzleTracker(txDb, this._tenantScope).withDraft(this._draftId)
       committedTracker = txDraft
       const revision = revisionProperty(this._table)
+      const deletedAt = softDeleteProperty(this._table)
       const prepared = rows.map((row, index) => {
         const supplied = row as Record<string, unknown>
         assertRevisionInput(this._table, supplied)
+        assertSoftDeleteInput(this._table, supplied)
         assertJsonNullInputs(this._table, supplied)
         const tenantProperty = tryGetTableCapabilities(this._table)?.tenancy?.property
         const r = materializeDraftInsertDefaults(
@@ -448,6 +452,7 @@ export class DraftInsertBuilder<T extends AnyTable> {
             pkPropKey ?? pkColName,
             ...(tenantProperty ? [tenantProperty] : []),
             ...(revision ? [revision] : []),
+            ...(deletedAt ? [deletedAt] : []),
           ]),
         )
         assertTenantInput(this._table, r)

@@ -49,7 +49,7 @@ beforeEach(async () => {
     functions: {
       addInsight: wy.procedure
         .input({ id: uuid, name: text })
-        .mutation(async (ctx, args) => ctx.db.into(schema.insights).insert(args)),
+        .command(async (ctx, args) => ctx.db.into(schema.insights).insert(args)),
       listInsights: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.insights).all()),
       addCatalog: wy.procedure
         .input({ id: uuid, name: text })
@@ -160,8 +160,23 @@ describe('server tenant resolution', () => {
     const resolveOwner = (context: Record<string, unknown>) => context.principalId
     const alice = { ...alpha, principalId: 'alice' }
     const bob = { ...alpha, principalId: 'bob' }
+    const betaAlice = { ...beta, principalId: 'alice' }
     const firstProcess = createDraftLifecycle(app, { resolveOwner })
-    const draftId = await firstProcess.open(0, { context: alice })
+    const draftId = await firstProcess.open(0, {
+      context: alice,
+      lookupKey: 'artifact:file-1',
+      summary: { scope: 'alpha-alice' },
+    })
+    const betaDraftId = await firstProcess.open(0, {
+      context: betaAlice,
+      lookupKey: 'artifact:file-1',
+      summary: { scope: 'beta-alice' },
+    })
+    const bobDraftId = await firstProcess.open(0, {
+      context: bob,
+      lookupKey: 'artifact:file-1',
+      summary: { scope: 'alpha-bob' },
+    })
     await firstProcess.append(
       draftId,
       [
@@ -174,6 +189,24 @@ describe('server tenant resolution', () => {
     )
 
     const restartedProcess = createDraftLifecycle(app, { resolveOwner })
+    expect(
+      (await restartedProcess.listOwned({ context: alice })).map((draft) => draft.draftId),
+    ).toEqual([draftId])
+    expect(
+      (await restartedProcess.listOwned({ context: betaAlice })).map((draft) => draft.draftId),
+    ).toEqual([betaDraftId])
+    expect(
+      (await restartedProcess.listOwned({ context: bob })).map((draft) => draft.draftId),
+    ).toEqual([bobDraftId])
+    expect(
+      await restartedProcess.findOwnedByLookupKey('artifact:file-1', { context: alice }),
+    ).toMatchObject({ draftId, summary: { scope: 'alpha-alice' } })
+    expect(
+      await restartedProcess.findOwnedByLookupKey('artifact:file-1', { context: betaAlice }),
+    ).toMatchObject({ draftId: betaDraftId, summary: { scope: 'beta-alice' } })
+    expect(
+      await restartedProcess.findOwnedByLookupKey('artifact:file-1', { context: bob }),
+    ).toMatchObject({ draftId: bobDraftId, summary: { scope: 'alpha-bob' } })
     await expect(restartedProcess.getLog(draftId, { context: beta })).rejects.toThrow(
       'unknown draft',
     )
@@ -209,7 +242,7 @@ describe('server tenant resolution', () => {
       functions: {
         addInsight: wy.procedure
           .input({ id: uuid, name: text })
-          .mutation(async (ctx, args) => ctx.db.into(intSchema.integerInsights).insert(args)),
+          .command(async (ctx, args) => ctx.db.into(intSchema.integerInsights).insert(args)),
       },
     })
     const lifecycle = createDraftLifecycle(integerApp)
