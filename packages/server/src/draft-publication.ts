@@ -360,11 +360,11 @@ function orderReviewedChangeSteps(changes: ResolvedReviewedChange[]): ReviewedCh
 
 /**
  * Reviewed rows retain their final state rather than every intermediate tombstone.
- * An active row that is soft-deleted and restored inside one draft therefore ends
- * with the same tombstone value but two consumed revision tokens. Advance only
- * that compacted pair; every other no-progress case remains publish drift.
+ * Once that final state is applied, an active row may still have revision tokens
+ * from compacted soft-delete history. Advance those tokens one at a time; every
+ * other no-progress case remains publish drift.
  */
-async function advanceCompactedSoftDeleteRoundTrip(
+async function advanceCompactedSoftDeleteRevision(
   tracker: DrizzleTracker,
   change: ResolvedReviewedChange,
   published: Record<string, unknown>,
@@ -377,7 +377,7 @@ async function advanceCompactedSoftDeleteRoundTrip(
   if (split.property !== deletedAt || split.value !== null) return false
   if (
     typeof change.desiredRevision !== 'number' ||
-    change.desiredRevision - publishedRevision < 2
+    change.desiredRevision - publishedRevision < 1
   ) {
     return false
   }
@@ -408,7 +408,7 @@ async function advanceCompactedSoftDeleteRoundTrip(
     conditions.push(drizzleEq(tenantColumn, tenantId))
   }
 
-  const nextRevision = publishedRevision + 2
+  const nextRevision = publishedRevision + 1
   const advanced = await tracker.raw
     .update(change.table)
     .set({ [revision]: nextRevision })
@@ -447,7 +447,7 @@ async function advanceReviewedRevision(
     if (
       published &&
       publishedRevision === previousRevision &&
-      (await advanceCompactedSoftDeleteRoundTrip(tracker, change, published, previousRevision))
+      (await advanceCompactedSoftDeleteRevision(tracker, change, published, previousRevision))
     ) {
       published = await scopedBuilder().where(eq(change.pkProperty, change.pkValue)).first()
       publishedRevision = published?.[revision]

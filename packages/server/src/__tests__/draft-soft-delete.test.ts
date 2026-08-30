@@ -57,6 +57,15 @@ beforeEach(async () => {
         .command(async (ctx, args) =>
           ctx.db.from(schema.archivedTodos).where(eq('id', args.id)).restore(),
         ),
+      renameTodo: wy.procedure
+        .input({ id: int, title: text })
+        .command(async (ctx, args) =>
+          ctx.db
+            .from(schema.archivedTodos)
+            .includeDeleted()
+            .where(eq('id', args.id))
+            .update({ title: args.title }),
+        ),
     },
   })
 })
@@ -159,6 +168,35 @@ describe('draft lifecycle — framework soft deletion', () => {
 
     expect((await app.call('listActive', {})).result).toMatchObject([
       { id: 1, deletedAt: null, revision: 3 },
+    ])
+  })
+
+  test('publishes a compacted round trip with multiple ordinary updates', async () => {
+    const drafts = lifecycle()
+    const draftId = await drafts.open(0)
+    await drafts.append(draftId, [
+      {
+        path: 'softDeleteTodo',
+        args: { id: 1, at: new Date('2026-08-29T17:30:00.000Z') },
+      },
+      { path: 'restoreTodo', args: { id: 1 } },
+      { path: 'renameTodo', args: { id: 1, title: 'first rename' } },
+      { path: 'renameTodo', args: { id: 1, title: 'final rename' } },
+    ])
+
+    expect(
+      await app.system
+        .createTracked()
+        .withDraft(draftId)
+        .from(schema.archivedTodos)
+        .where(eq('id', 1))
+        .first(),
+    ).toMatchObject({ title: 'final rename', deletedAt: null, revision: 5 })
+
+    await drafts.publish(draftId)
+
+    expect((await app.call('listActive', {})).result).toMatchObject([
+      { id: 1, title: 'final rename', deletedAt: null, revision: 5 },
     ])
   })
 
