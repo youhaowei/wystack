@@ -41,6 +41,29 @@ bun run check      # lint + format + typecheck + test
 
 See [DESIGN.md](./DESIGN.md) for the full framework design.
 
+## Schema bootstrap and migration
+
+`syncSchema(db, schema)` creates missing development tables. It deliberately
+does not alter existing tables. Applications upgrading a database bootstrapped
+by WyStack before tenant-qualified primary keys must run the explicit contract
+migration once, with a migration-capable role, before serving the new version:
+
+```ts
+import { migrateTenantPrimaryKeys, syncSchema } from '@wystack/db'
+
+await syncSchema(db, schema)
+await migrateTenantPrimaryKeys(db, schema)
+```
+
+The migration accepts only the known expand shape: a global logical primary key
+plus a unique `(tenant, logical ID)` index. It is atomic and idempotent. It keeps
+the tenant-qualified unique index so existing composite foreign keys remain
+valid, and fails with the exact blocker when a foreign key still references only
+the old global ID. The passed Drizzle schema must already declare the target
+composite primary key; an adopted `global-primary-compatibility` model is
+rejected so application metadata cannot keep claiming the retired shape. All
+other schema evolution remains application-owned.
+
 ## Server functions
 
 WyStack exposes a Query and two one-shot function kinds:

@@ -20,6 +20,7 @@ export {
   softDeleteProperty,
 } from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
+export { migrateTenantPrimaryKeys } from './tenant-primary-migration'
 export { ensureRowRevisionStorage } from './row-revisions'
 export { withFrameworkBootstrapLock } from './framework-storage'
 export { text, int, boolean, timestamp, jsonb, uuid, ColumnDef } from './dsl'
@@ -66,6 +67,10 @@ export type {
   NullFilterOp,
 } from './operators'
 export type { SyncTarget } from './sync'
+export type {
+  TenantPrimaryKeyMigrationResult,
+  TenantPrimaryKeyMigrationTarget,
+} from './tenant-primary-migration'
 export type {
   DrizzleTracker,
   DraftDrizzleTracker,

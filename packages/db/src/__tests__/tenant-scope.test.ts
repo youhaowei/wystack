@@ -186,6 +186,62 @@ describe('tenant-scoped database access', () => {
     expect(await alpha.from(schema.archivedInsights).all()).toHaveLength(1)
   })
 
+  test('rejects invalid tombstone timestamps in canonical and draft writes', async () => {
+    const id = '00000000-0000-4000-8000-000000000057'
+    const alpha = tracked.withTenant('alpha')
+    await alpha.into(schema.archivedInsights).insert({ id, name: 'active' })
+    const invalidDate = new Date(Number.NaN)
+
+    await expect(
+      alpha.from(schema.archivedInsights).where(eq('id', id)).softDelete(invalidDate),
+    ).rejects.toThrow('requires a valid explicit Date')
+    await expect(
+      alpha
+        .withDraft('invalid-timestamp')
+        .from(schema.archivedInsights)
+        .where(eq('id', id))
+        .softDelete(invalidDate),
+    ).rejects.toThrow('requires a valid explicit Date')
+  })
+
+  test('rejects untyped tombstone fields on canonical and draft inserts and updates', async () => {
+    const canonicalId = '00000000-0000-4000-8000-000000000058'
+    const draftId = '00000000-0000-4000-8000-000000000059'
+    const alpha = tracked.withTenant('alpha')
+    const draft = alpha.withDraft('forged-tombstones')
+
+    await expect(
+      alpha.into(schema.archivedInsights).insert({
+        id: canonicalId,
+        name: 'forged canonical insert',
+        // @ts-expect-error — runtime custody must also reject untyped callers
+        deletedAt: new Date(),
+      }),
+    ).rejects.toThrow('use softDelete(at) or restore()')
+    await alpha.into(schema.archivedInsights).insert({ id: canonicalId, name: 'canonical active' })
+    await expect(
+      alpha.from(schema.archivedInsights).where(eq('id', canonicalId)).update({
+        // @ts-expect-error — runtime custody must also reject untyped callers
+        deletedAt: new Date(),
+      }),
+    ).rejects.toThrow('use softDelete(at) or restore()')
+
+    await expect(
+      draft.into(schema.archivedInsights).insert({
+        id: draftId,
+        name: 'forged draft insert',
+        // @ts-expect-error — runtime custody must also reject untyped callers
+        deletedAt: new Date(),
+      }),
+    ).rejects.toThrow('use softDelete(at) or restore()')
+    await expect(
+      draft.from(schema.archivedInsights).where(eq('id', canonicalId)).update({
+        // @ts-expect-error — runtime custody must also reject untyped callers
+        deletedAt: null,
+      }),
+    ).rejects.toThrow('use softDelete(at) or restore()')
+  })
+
   test('draft soft deletion changes only the effective view and can be restored', async () => {
     const id = '00000000-0000-4000-8000-000000000056'
     const removedAt = new Date('2026-08-29T13:00:00.000Z')

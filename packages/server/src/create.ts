@@ -16,6 +16,7 @@ import {
   type FunctionContext,
   type RawFunctionContext,
   type RawProcedureDb,
+  type CommandDb,
   type DbInput,
   type ProcedureDb,
 } from './types'
@@ -165,12 +166,19 @@ function toProcedureInsertBuilder(source: object): object {
   return Object.freeze(facade)
 }
 
-function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
+function toCommandDb(tracked: DrizzleTracker | DraftDrizzleTracker): CommandDb {
   return Object.freeze({
     from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
-      toProcedureSelectBuilder(tracked.from(table))) as ProcedureDb['from'],
+      toProcedureSelectBuilder(tracked.from(table))) as CommandDb['from'],
     into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
-      toProcedureInsertBuilder(tracked.into(table))) as ProcedureDb['into'],
+      toProcedureInsertBuilder(tracked.into(table))) as CommandDb['into'],
+  })
+}
+
+function toProcedureDb(tracked: DrizzleTracker | DraftDrizzleTracker): ProcedureDb {
+  const commandDb = toCommandDb(tracked)
+  return Object.freeze({
+    ...commandDb,
     transaction: async <R>(
       fn: (tx: ProcedureDb) => Promise<R>,
       opts?: Parameters<ProcedureDb['transaction']>[1],
@@ -297,16 +305,19 @@ export async function buildWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      // Native handlers receive only the restricted ProcedureDb surface. A
-      // draft tracker implements transaction() as a fail-loud nested-transaction
-      // guard because lifecycle append/publish own the outer boundaries. Raw SQL
-      // and scope-changing methods are unavailable in both type and runtime.
+      // Native handlers receive only their declared database capability.
+      // Replay-safe commands omit transaction at runtime as well as in their
+      // CommandDb type because command application and draft replay own the
+      // outer transaction. Raw SQL and scope-changing methods are unavailable
+      // in both type and runtime.
       // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
       // without restoring withTenant()/withDraft() custody.
       const db =
         fn.databaseAccess !== 'native'
           ? toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
-          : toProcedureDb(tracked)
+          : fn.type === 'mutation' && fn.draftReplayable === true
+            ? toCommandDb(tracked)
+            : toProcedureDb(tracked)
       const ctx = { ...context, db } as FunctionContext | RawFunctionContext
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
