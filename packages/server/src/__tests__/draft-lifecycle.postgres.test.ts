@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
 import { defineSchema, int, table, text } from '@wystack/db'
 import postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
@@ -239,6 +239,10 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     ;[firstApp, secondApp] = await Promise.all([buildApp(firstClient), buildApp(secondClient)])
   })
 
+  afterEach(async () => {
+    await secondClient?.unsafe('RESET default_transaction_isolation')
+  })
+
   afterAll(async () => {
     await Promise.all([firstClient?.end({ timeout: 1 }), secondClient?.end({ timeout: 1 })])
     if (admin) {
@@ -263,10 +267,11 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     ).toEqual([[], []])
   })
 
-  test('exclusive owned lookup initialization serializes contenders across connections', async () => {
+  test('exclusive owned lookup initialization sees the winner under a repeatable-read host default', async () => {
     const first = lifecycle(firstApp)
     const second = lifecycle(secondApp)
     const lookupKey = 'postgres-proof:exclusive-open'
+    await secondClient.unsafe("SET default_transaction_isolation TO 'repeatable read'")
     let commandStarted!: () => void
     const firstCommandStarted = new Promise<void>((resolve) => {
       commandStarted = resolve
@@ -311,15 +316,6 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     const [firstResult, secondResult] = await Promise.all([firstResultPromise, secondResultPromise])
     if (lockWaitError) throw lockWaitError
 
-    expect(firstResult.draftId).toBe(secondResult.draftId)
-    expect({
-      created: firstResult.created,
-      resultIds: firstResult.results.map(({ id }) => id),
-    }).toEqual({ created: true, resultIds: ['first'] })
-    expect({ created: secondResult.created, results: secondResult.results }).toEqual({
-      created: false,
-      results: [],
-    })
     const [counts] = await firstClient<{ drafts: string; commands: string }[]>`
       SELECT
         (SELECT count(*) FROM wystack_drafts WHERE lookup_key = ${lookupKey}) AS drafts,
@@ -327,7 +323,20 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           JOIN wystack_drafts d ON d.draft_id = c.draft_id
           WHERE d.lookup_key = ${lookupKey}) AS commands
     `
-    expect({ drafts: Number(counts?.drafts), commands: Number(counts?.commands) }).toEqual({
+    expect({
+      sameDraft: firstResult.draftId === secondResult.draftId,
+      firstCreated: firstResult.created,
+      secondCreated: secondResult.created,
+      firstResultIds: firstResult.results.map(({ id }) => id),
+      secondResults: secondResult.results,
+      drafts: Number(counts?.drafts),
+      commands: Number(counts?.commands),
+    }).toEqual({
+      sameDraft: true,
+      firstCreated: true,
+      secondCreated: false,
+      firstResultIds: ['first'],
+      secondResults: [],
       drafts: 1,
       commands: 1,
     })

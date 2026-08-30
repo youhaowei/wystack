@@ -332,8 +332,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
   /** Record a deterministic tombstone clear in derived storage. */
   async restore(): Promise<TableSelectedRow<T>[]> {
     const property = requireSoftDeleteProperty(this._table)
-    const scoped =
-      this._clauses.softDeleteScope === 'active' ? this._with({ softDeleteScope: 'only' }) : this
+    const scoped = this._with({ softDeleteScope: 'only' })
     return scoped._update({ [property]: null } as TrackedUpdateValues<T>, true)
   }
 

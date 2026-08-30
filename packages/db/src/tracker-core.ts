@@ -551,8 +551,8 @@ export interface DrizzleTracker {
    * `opts` is passed through to the lowering's native transaction. Isolation
    * level / access mode can only be set at transaction start — once `fn` runs the
    * transaction is already open and `tx.raw` offers no path to set them — so this
-   * slot is the only entry point for them, and the contract carries it now even
-   * though no caller sets it yet.
+   * slot is the only entry point for them. Framework-owned lifecycle transactions
+   * use it when their correctness depends on a specific visibility contract.
    */
   transaction<R>(fn: (tx: DrizzleTracker) => Promise<R>, opts?: TransactionOptions): Promise<R>
   /**

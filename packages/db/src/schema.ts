@@ -227,13 +227,14 @@ function validateTableDefinition(
   validateTableReferences(definition, schema)
 }
 
-function validateSchema(schema: NormalizedSchema): void {
-  const reservedTable = Object.keys(schema).find((tableName) => tableName.startsWith('wystack_'))
-  if (reservedTable) {
-    throw new Error(
-      `Table name "${reservedTable}" uses the reserved "wystack_" framework namespace`,
-    )
+function assertApplicationTableName(tableName: string): void {
+  if (tableName.startsWith('wystack_')) {
+    throw new Error(`Table name "${tableName}" uses the reserved "wystack_" framework namespace`)
   }
+}
+
+function validateSchema(schema: NormalizedSchema): void {
+  for (const tableName of Object.keys(schema)) assertApplicationTableName(tableName)
 
   const tenancyDescriptors = new Set(
     Object.values(schema)
@@ -821,6 +822,10 @@ export function adoptSchema<
   TDescriptor extends MultiTenantDescriptor<TenantKeyDefinition>,
   const TTables extends Record<string, AdoptedTableConfig>,
 >(descriptor: TDescriptor, tables: TTables): AdoptedSchema<TDescriptor, TTables> {
+  for (const config of Object.values(tables)) {
+    assertApplicationTableName(getTableName(config.table))
+  }
+
   const tenancy = getTenantCapability(descriptor)
   const entriesByTable = new Map<AnyPgTable, AdoptedEntry>()
   const namedEntries = Object.entries(tables).map(([name, config]) => {

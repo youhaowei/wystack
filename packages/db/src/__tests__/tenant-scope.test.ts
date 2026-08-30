@@ -186,6 +186,25 @@ describe('tenant-scoped database access', () => {
     expect(await alpha.from(schema.archivedInsights).all()).toHaveLength(1)
   })
 
+  test('canonical restore ignores active rows after includeDeleted()', async () => {
+    const activeId = '00000000-0000-4000-8000-000000000091'
+    const deletedId = '00000000-0000-4000-8000-000000000092'
+    const removedAt = new Date('2026-08-29T12:30:00.000Z')
+    const alpha = tracked.withTenant('alpha')
+    await alpha.into(schema.archivedInsights).insert({ id: activeId, name: 'active' })
+    await alpha.into(schema.archivedInsights).insert({ id: deletedId, name: 'deleted' })
+    await alpha.from(schema.archivedInsights).where(eq('id', deletedId)).softDelete(removedAt)
+
+    const restored = await alpha.from(schema.archivedInsights).includeDeleted().restore()
+
+    expect(restored).toMatchObject([
+      { id: deletedId, name: 'deleted', revision: 3, deletedAt: null },
+    ])
+    expect(
+      await alpha.from(schema.archivedInsights).includeDeleted().where(eq('id', activeId)).first(),
+    ).toMatchObject({ id: activeId, name: 'active', revision: 1, deletedAt: null })
+  })
+
   test('rejects invalid tombstone timestamps in canonical and draft writes', async () => {
     const id = '00000000-0000-4000-8000-000000000057'
     const alpha = tracked.withTenant('alpha')
@@ -268,6 +287,26 @@ describe('tenant-scoped database access', () => {
       revision: 3,
       deletedAt: null,
     })
+  })
+
+  test('draft restore ignores active rows after includeDeleted()', async () => {
+    const activeId = '00000000-0000-4000-8000-000000000093'
+    const deletedId = '00000000-0000-4000-8000-000000000094'
+    const removedAt = new Date('2026-08-29T13:30:00.000Z')
+    const alpha = tracked.withTenant('alpha')
+    await alpha.into(schema.archivedInsights).insert({ id: activeId, name: 'active' })
+    await alpha.into(schema.archivedInsights).insert({ id: deletedId, name: 'deleted' })
+    await alpha.from(schema.archivedInsights).where(eq('id', deletedId)).softDelete(removedAt)
+    const draft = alpha.withDraft('restore-only-deleted')
+
+    const restored = await draft.from(schema.archivedInsights).includeDeleted().restore()
+
+    expect(restored).toMatchObject([
+      { id: deletedId, name: 'deleted', revision: 3, deletedAt: null },
+    ])
+    expect(
+      await draft.from(schema.archivedInsights).includeDeleted().where(eq('id', activeId)).first(),
+    ).toMatchObject({ id: activeId, name: 'active', revision: 1, deletedAt: null })
   })
 
   test('tenant and draft scopes compose across reads and writes', async () => {

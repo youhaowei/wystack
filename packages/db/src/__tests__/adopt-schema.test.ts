@@ -59,6 +59,19 @@ afterEach(async () => {
 })
 
 describe('adoptSchema', () => {
+  test('rejects a reserved physical table name before registration', () => {
+    const records = tenantTable('wystack_draft_row_changes')
+
+    expect(() =>
+      adoptSchema(tenancy, {
+        recordsAlias: { table: records, logicalPrimaryKey: 'id', draftable: true },
+      }),
+    ).toThrow(
+      'Table name "wystack_draft_row_changes" uses the reserved "wystack_" framework namespace',
+    )
+    expect(() => getTableCapabilities(records)).toThrow('Table was not compiled by defineSchema')
+  })
+
   test('adds native tenant and draft custody to the authoritative Drizzle table', async () => {
     const records = softDeleteTenantTable('adopted_records')
     const schema = adoptSchema(tenancy, {

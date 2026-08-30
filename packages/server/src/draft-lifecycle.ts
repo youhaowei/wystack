@@ -314,7 +314,11 @@ export function createDraftLifecycle(
   ): Promise<T> {
     for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
       try {
-        return await app.system.createTracked().transaction(callback)
+        // A lookup read after an advisory-lock wait must see the winner's commit,
+        // even when the host connection defaults to a snapshot isolation level.
+        return await app.system
+          .createTracked()
+          .transaction(callback, { isolationLevel: 'read committed' })
       } catch (error) {
         if (
           !retryableTransactionCodes.has(transactionErrorCode(error) ?? '') ||
