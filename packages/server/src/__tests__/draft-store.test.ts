@@ -79,8 +79,9 @@ describe('draft storage migrations', () => {
          'wystack_drafts_custody_lookup_idx'
        ) ORDER BY indexname`,
     )
-    const hashFunction = await db.execute(
-      `SELECT provolatile FROM pg_proc WHERE proname = 'jsonb_hash_extended'`,
+    const digestFunction = await db.execute(
+      `SELECT provolatile FROM pg_proc
+       WHERE proname = 'md5' AND proargtypes = '25'::oidvector`,
     )
     const revisionLedger = await db.execute(
       `SELECT table_name FROM information_schema.tables
@@ -107,7 +108,7 @@ describe('draft storage migrations', () => {
        WHERE contype = 'f' AND confrelid = 'wystack_drafts'::regclass`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((migration as any).rows[0].version).toBe(9)
+    expect((migration as any).rows[0].version).toBe(10)
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((tables as any).rows.map((row: { table_name: string }) => row.table_name)).toEqual([
       'wystack_draft_commands',
@@ -124,16 +125,16 @@ describe('draft storage migrations', () => {
     expect(discoveryIndexRows[0]).toMatchObject({
       indexname: 'wystack_drafts_custody_created_idx',
       indexdef: expect.stringContaining(
-        'jsonb_hash_extended(tenant_scope, (0)::bigint), jsonb_hash_extended(owner_key, (0)::bigint), created_at DESC, draft_id DESC',
+        'md5((tenant_scope)::text), md5((owner_key)::text), created_at DESC, draft_id DESC',
       ),
     })
     expect(discoveryIndexRows[1]).toMatchObject({
       indexname: 'wystack_drafts_custody_lookup_idx',
       indexdef: expect.stringContaining(
-        'jsonb_hash_extended(tenant_scope, (0)::bigint), jsonb_hash_extended(owner_key, (0)::bigint), lookup_key, created_at DESC, draft_id DESC',
+        'md5((tenant_scope)::text), md5((owner_key)::text), lookup_key, created_at DESC, draft_id DESC',
       ),
     })
-    expect((hashFunction as { rows: unknown[] }).rows).toEqual([{ provolatile: 'i' }])
+    expect((digestFunction as { rows: unknown[] }).rows).toEqual([{ provolatile: 'i' }])
     expect((revisionLedger as { rows: unknown[] }).rows).toHaveLength(1)
     expect((integrityColumn as { rows: unknown[] }).rows).toEqual([
       { column_name: 'integrity_hash', is_nullable: 'NO' },
@@ -217,10 +218,143 @@ describe('draft storage migrations', () => {
     expect(
       (indexes as { rows: Array<{ indexdef: string }> }).rows.every(
         (row) =>
-          row.indexdef.includes('jsonb_hash_extended(tenant_scope') &&
-          row.indexdef.includes('jsonb_hash_extended(owner_key'),
+          row.indexdef.includes('md5((tenant_scope)::text)') &&
+          row.indexdef.includes('md5((owner_key)::text)'),
       ),
     ).toBe(true)
+  })
+
+  test('v10 replaces stale same-named custody indexes without rebuilding correct definitions', async () => {
+    const pg = createTestDatabase()
+    const db = drizzle(pg)
+    await ensureDraftStorage(db)
+    await db.execute(`DROP INDEX wystack_drafts_custody_created_idx`)
+    await db.execute(`DROP INDEX wystack_drafts_custody_lookup_idx`)
+    await db.execute(`CREATE INDEX wystack_drafts_custody_created_idx
+      ON wystack_drafts (
+        jsonb_hash_extended(tenant_scope, 0),
+        jsonb_hash_extended(owner_key, 0),
+        created_at DESC,
+        draft_id DESC
+      )`)
+    await db.execute(`CREATE INDEX wystack_drafts_custody_lookup_idx
+      ON wystack_drafts (
+        jsonb_hash_extended(tenant_scope, 0),
+        jsonb_hash_extended(owner_key, 0),
+        lookup_key,
+        created_at DESC,
+        draft_id DESC
+      ) WHERE lookup_key IS NOT NULL`)
+    await db.execute(`UPDATE wystack_framework_migrations
+      SET version = 9 WHERE migration_name = 'draft-storage'`)
+    const stale = await db.execute(`SELECT indexrelid::text AS oid
+      FROM pg_index
+      WHERE indexrelid IN (
+        'wystack_drafts_custody_created_idx'::regclass,
+        'wystack_drafts_custody_lookup_idx'::regclass
+      ) ORDER BY indexrelid::regclass::text`)
+
+    await ensureDraftStorage(db)
+
+    const repaired =
+      await db.execute(`SELECT indexrelid::text AS oid, pg_get_indexdef(indexrelid) AS definition
+      FROM pg_index
+      WHERE indexrelid IN (
+        'wystack_drafts_custody_created_idx'::regclass,
+        'wystack_drafts_custody_lookup_idx'::regclass
+      ) ORDER BY indexrelid::regclass::text`)
+    const staleRows = (stale as { rows: Array<{ oid: string }> }).rows
+    const repairedRows = (repaired as { rows: Array<{ oid: string; definition: string }> }).rows
+    expect(repairedRows.map(({ oid }) => oid)).not.toEqual(staleRows.map(({ oid }) => oid))
+    expect(
+      repairedRows.every(
+        ({ definition }) =>
+          definition.includes('md5((tenant_scope)::text)') &&
+          definition.includes('md5((owner_key)::text)') &&
+          !definition.includes('jsonb_hash_extended'),
+      ),
+    ).toBe(true)
+
+    await db.execute(`UPDATE wystack_framework_migrations
+      SET version = 9 WHERE migration_name = 'draft-storage'`)
+    await ensureDraftStorage(db)
+    const checkedAgain = await db.execute(`SELECT indexrelid::text AS oid
+      FROM pg_index
+      WHERE indexrelid IN (
+        'wystack_drafts_custody_created_idx'::regclass,
+        'wystack_drafts_custody_lookup_idx'::regclass
+      ) ORDER BY indexrelid::regclass::text`)
+    expect((checkedAgain as { rows: Array<{ oid: string }> }).rows).toEqual(
+      repairedRows.map(({ oid }) => ({ oid })),
+    )
+  })
+
+  test('v10 preserves host indexes that collide with reserved custody names and fails closed', async () => {
+    const pg = createTestDatabase()
+    const db = drizzle(pg)
+    await ensureDraftStorage(db)
+    await db.execute(`DROP INDEX wystack_drafts_custody_created_idx`)
+    await db.execute(`DROP INDEX wystack_drafts_custody_lookup_idx`)
+    await db.execute(`CREATE TABLE host_index_owner (id INTEGER, lookup_id INTEGER)`)
+    await db.execute(`CREATE INDEX wystack_drafts_custody_created_idx ON host_index_owner (id)`)
+    await db.execute(
+      `CREATE INDEX wystack_drafts_custody_lookup_idx ON host_index_owner (lookup_id)`,
+    )
+    await db.execute(`UPDATE wystack_framework_migrations
+      SET version = 9 WHERE migration_name = 'draft-storage'`)
+    const collidingIndexes = await db.execute(`SELECT c.relname, c.oid::text AS oid
+      FROM pg_class c
+      WHERE c.relname IN (
+        'wystack_drafts_custody_created_idx',
+        'wystack_drafts_custody_lookup_idx'
+      )
+      ORDER BY c.relname`)
+
+    await expect(ensureDraftStorage(db)).rejects.toThrow()
+    expect(
+      (
+        await db.execute(`SELECT c.relname, c.oid::text AS oid
+          FROM pg_class c
+          WHERE c.relname IN (
+            'wystack_drafts_custody_created_idx',
+            'wystack_drafts_custody_lookup_idx'
+          )
+          ORDER BY c.relname`)
+      ).rows,
+    ).toEqual(collidingIndexes.rows)
+
+    await db.execute(`DROP INDEX wystack_drafts_custody_created_idx`)
+    await db.execute(`CREATE INDEX wystack_drafts_custody_created_idx
+      ON wystack_drafts (
+        md5(tenant_scope::text),
+        md5(owner_key::text),
+        created_at DESC,
+        draft_id DESC
+      )`)
+    const lookupCollision = await db.execute(`SELECT c.oid::text AS oid
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+      JOIN pg_class t ON t.oid = i.indrelid
+      WHERE c.relname = 'wystack_drafts_custody_lookup_idx'
+        AND t.relname = 'host_index_owner'`)
+
+    await expect(ensureDraftStorage(db)).rejects.toThrow()
+    expect(
+      (
+        await db.execute(`SELECT c.oid::text AS oid
+          FROM pg_class c
+          JOIN pg_index i ON i.indexrelid = c.oid
+          JOIN pg_class t ON t.oid = i.indrelid
+          WHERE c.relname = 'wystack_drafts_custody_lookup_idx'
+            AND t.relname = 'host_index_owner'`)
+      ).rows,
+    ).toEqual(lookupCollision.rows)
+    expect(
+      (
+        await db.execute(`SELECT version FROM wystack_framework_migrations
+          WHERE migration_name = 'draft-storage'`)
+      ).rows,
+    ).toEqual([{ version: 9 }])
   })
 
   test('upgrades v2 touched-table metadata without replacing durable rows', async () => {

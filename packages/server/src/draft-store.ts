@@ -104,7 +104,7 @@ function draftIntegrityExpression(
   )::text)`
 }
 
-const draftStorageVersion = 9
+const draftStorageVersion = 10
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -285,9 +285,11 @@ const storageDdlV7 = [
 ]
 
 // Custody values are arbitrary JSON and may be much larger than PostgreSQL's
-// btree entry limit. Index fixed-size immutable hashes, then retain the exact
-// JSONB predicates in every query as collision rechecks. created_at is the
-// immutable keyset; updated_at remains display metadata only.
+// btree entry limit. Index fixed-size deterministic MD5 digests of PostgreSQL's
+// canonical JSONB text, then retain exact JSONB predicates in every query as
+// collision rechecks. The digest is an index-routing value, not a security
+// primitive. created_at is the immutable keyset; updated_at remains display
+// metadata only.
 const storageDdlV8 = [
   sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS lookup_key TEXT`),
   sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS summary JSONB`),
@@ -309,15 +311,15 @@ const storageDdlV8 = [
     END $$`),
   sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_created_idx
     ON wystack_drafts (
-      jsonb_hash_extended(tenant_scope, 0),
-      jsonb_hash_extended(owner_key, 0),
+      md5(tenant_scope::text),
+      md5(owner_key::text),
       created_at DESC,
       draft_id DESC
     )`),
   sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_lookup_idx
     ON wystack_drafts (
-      jsonb_hash_extended(tenant_scope, 0),
-      jsonb_hash_extended(owner_key, 0),
+      md5(tenant_scope::text),
+      md5(owner_key::text),
       lookup_key,
       created_at DESC,
       draft_id DESC
@@ -331,6 +333,157 @@ const storageDdlV9 = [
     ADD COLUMN IF NOT EXISTS soft_delete_column TEXT`),
   sql`UPDATE wystack_drafts d
     SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))}`,
+]
+
+// v8 used PostgreSQL's internal jsonb_hash_extended implementation and
+// CREATE INDEX IF NOT EXISTS, which could retain a same-named stale definition.
+// Inspect the complete index shape and rebuild only definitions that differ
+// from the stable digest contract. The migration ledger keeps this a one-time
+// check; the guards also make the DDL itself safe to resume.
+const storageDdlV10 = [
+  sql.raw(`DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class index_relation
+        JOIN pg_catalog.pg_namespace index_namespace
+          ON index_namespace.oid = index_relation.relnamespace
+        WHERE index_namespace.nspname = current_schema()
+          AND index_relation.relname = 'wystack_drafts_custody_created_idx'
+      ) AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_index index_entry
+        JOIN pg_catalog.pg_class index_relation
+          ON index_relation.oid = index_entry.indexrelid
+        JOIN pg_catalog.pg_namespace index_namespace
+          ON index_namespace.oid = index_relation.relnamespace
+        JOIN pg_catalog.pg_class table_relation
+          ON table_relation.oid = index_entry.indrelid
+        JOIN pg_catalog.pg_am access_method
+          ON access_method.oid = index_relation.relam
+        WHERE index_namespace.nspname = current_schema()
+          AND index_relation.relname = 'wystack_drafts_custody_created_idx'
+          AND table_relation.relname = 'wystack_drafts'
+          AND access_method.amname = 'btree'
+          AND index_entry.indisvalid
+          AND index_entry.indisready
+          AND NOT index_entry.indisunique
+          AND index_entry.indnkeyatts = 4
+          AND index_entry.indnatts = 4
+          AND pg_get_indexdef(index_entry.indexrelid, 1, true) = 'md5(tenant_scope::text)'
+          AND pg_get_indexdef(index_entry.indexrelid, 2, true) = 'md5(owner_key::text)'
+          AND pg_get_indexdef(index_entry.indexrelid, 3, true) = 'created_at'
+          AND pg_get_indexdef(index_entry.indexrelid, 4, true) = 'draft_id'
+          AND pg_index_column_has_property(index_entry.indexrelid, 3, 'desc')
+          AND pg_index_column_has_property(index_entry.indexrelid, 4, 'desc')
+          AND index_entry.indpred IS NULL
+      ) THEN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_index index_entry
+          JOIN pg_catalog.pg_class index_relation
+            ON index_relation.oid = index_entry.indexrelid
+          JOIN pg_catalog.pg_namespace index_namespace
+            ON index_namespace.oid = index_relation.relnamespace
+          JOIN pg_catalog.pg_class table_relation
+            ON table_relation.oid = index_entry.indrelid
+          JOIN pg_catalog.pg_namespace table_namespace
+            ON table_namespace.oid = table_relation.relnamespace
+          WHERE index_namespace.nspname = current_schema()
+            AND index_relation.relname = 'wystack_drafts_custody_created_idx'
+            AND table_namespace.nspname = current_schema()
+            AND table_relation.relname = 'wystack_drafts'
+        ) THEN
+          RAISE EXCEPTION
+            'draft storage migration: reserved index name wystack_drafts_custody_created_idx belongs to another relation';
+        END IF;
+        EXECUTE format(
+          'DROP INDEX %I.%I',
+          current_schema(),
+          'wystack_drafts_custody_created_idx'
+        );
+      END IF;
+    END $$`),
+  sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_created_idx
+    ON wystack_drafts (
+      md5(tenant_scope::text),
+      md5(owner_key::text),
+      created_at DESC,
+      draft_id DESC
+    )`),
+  sql.raw(`DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class index_relation
+        JOIN pg_catalog.pg_namespace index_namespace
+          ON index_namespace.oid = index_relation.relnamespace
+        WHERE index_namespace.nspname = current_schema()
+          AND index_relation.relname = 'wystack_drafts_custody_lookup_idx'
+      ) AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_index index_entry
+        JOIN pg_catalog.pg_class index_relation
+          ON index_relation.oid = index_entry.indexrelid
+        JOIN pg_catalog.pg_namespace index_namespace
+          ON index_namespace.oid = index_relation.relnamespace
+        JOIN pg_catalog.pg_class table_relation
+          ON table_relation.oid = index_entry.indrelid
+        JOIN pg_catalog.pg_am access_method
+          ON access_method.oid = index_relation.relam
+        WHERE index_namespace.nspname = current_schema()
+          AND index_relation.relname = 'wystack_drafts_custody_lookup_idx'
+          AND table_relation.relname = 'wystack_drafts'
+          AND access_method.amname = 'btree'
+          AND index_entry.indisvalid
+          AND index_entry.indisready
+          AND NOT index_entry.indisunique
+          AND index_entry.indnkeyatts = 5
+          AND index_entry.indnatts = 5
+          AND pg_get_indexdef(index_entry.indexrelid, 1, true) = 'md5(tenant_scope::text)'
+          AND pg_get_indexdef(index_entry.indexrelid, 2, true) = 'md5(owner_key::text)'
+          AND pg_get_indexdef(index_entry.indexrelid, 3, true) = 'lookup_key'
+          AND pg_get_indexdef(index_entry.indexrelid, 4, true) = 'created_at'
+          AND pg_get_indexdef(index_entry.indexrelid, 5, true) = 'draft_id'
+          AND pg_index_column_has_property(index_entry.indexrelid, 4, 'desc')
+          AND pg_index_column_has_property(index_entry.indexrelid, 5, 'desc')
+          AND pg_get_expr(index_entry.indpred, index_entry.indrelid, true) =
+            'lookup_key IS NOT NULL'
+      ) THEN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_index index_entry
+          JOIN pg_catalog.pg_class index_relation
+            ON index_relation.oid = index_entry.indexrelid
+          JOIN pg_catalog.pg_namespace index_namespace
+            ON index_namespace.oid = index_relation.relnamespace
+          JOIN pg_catalog.pg_class table_relation
+            ON table_relation.oid = index_entry.indrelid
+          JOIN pg_catalog.pg_namespace table_namespace
+            ON table_namespace.oid = table_relation.relnamespace
+          WHERE index_namespace.nspname = current_schema()
+            AND index_relation.relname = 'wystack_drafts_custody_lookup_idx'
+            AND table_namespace.nspname = current_schema()
+            AND table_relation.relname = 'wystack_drafts'
+        ) THEN
+          RAISE EXCEPTION
+            'draft storage migration: reserved index name wystack_drafts_custody_lookup_idx belongs to another relation';
+        END IF;
+        EXECUTE format(
+          'DROP INDEX %I.%I',
+          current_schema(),
+          'wystack_drafts_custody_lookup_idx'
+        );
+      END IF;
+    END $$`),
+  sql.raw(`CREATE INDEX IF NOT EXISTS wystack_drafts_custody_lookup_idx
+    ON wystack_drafts (
+      md5(tenant_scope::text),
+      md5(owner_key::text),
+      lookup_key,
+      created_at DESC,
+      draft_id DESC
+    ) WHERE lookup_key IS NOT NULL`),
 ]
 
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
@@ -383,6 +536,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     }
     if (installedVersion < 9) {
       for (const statement of storageDdlV9) await tx.execute(statement)
+    }
+    if (installedVersion < 10) {
+      for (const statement of storageDdlV10) await tx.execute(statement)
     }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
@@ -439,6 +595,36 @@ export async function readStoredDraft(
   }
 }
 
+/**
+ * Lock the draft row while its command rows are read. Mutations update this row
+ * last, so the returned revision and subsequent command read belong to one
+ * committed log state even when an append is already in flight.
+ */
+export async function readStoredDraftForLogSnapshot(
+  raw: RawDb,
+  draftId: string,
+): Promise<StoredDraft | undefined> {
+  const rows = normalizeRows(
+    await raw.execute(sql`
+      SELECT draft_id, base_version, tenant_scope, owner_key, lookup_key, summary, log_revision
+      FROM wystack_drafts
+      WHERE draft_id = ${draftId}
+      FOR SHARE
+    `),
+  )
+  const row = rows[0]
+  if (!row) return undefined
+  return {
+    draftId: String(row['draft_id']),
+    baseVersion: decodeEnvelope(row['base_version']),
+    logRevision: Number(row['log_revision']),
+    tenantId: decodeEnvelope(row['tenant_scope']),
+    ownerKey: decodeEnvelope(row['owner_key']),
+    lookupKey: row['lookup_key'] == null ? undefined : String(row['lookup_key']),
+    summary: decodeEnvelope(row['summary']) as DraftSummary | undefined,
+  }
+}
+
 export async function listStoredDraftsForOwner(
   raw: RawDb,
   tenantId: unknown,
@@ -461,10 +647,8 @@ export async function listStoredDraftsForOwner(
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
              ) AS updated_at_display
       FROM wystack_drafts
-      WHERE jsonb_hash_extended(tenant_scope, 0) =
-              jsonb_hash_extended(${tenantScope}::jsonb, 0)
-        AND jsonb_hash_extended(owner_key, 0) =
-              jsonb_hash_extended(${encodedOwnerKey}::jsonb, 0)
+      WHERE md5(tenant_scope::text) = md5((${tenantScope}::jsonb)::text)
+        AND md5(owner_key::text) = md5((${encodedOwnerKey}::jsonb)::text)
         AND tenant_scope = ${tenantScope}::jsonb
         AND owner_key = ${encodedOwnerKey}::jsonb
         ${
@@ -501,10 +685,8 @@ export async function findStoredDraftForOwnerByLookupKey(
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
              ) AS updated_at_display
       FROM wystack_drafts
-      WHERE jsonb_hash_extended(tenant_scope, 0) =
-              jsonb_hash_extended(${tenantScope}::jsonb, 0)
-        AND jsonb_hash_extended(owner_key, 0) =
-              jsonb_hash_extended(${encodedOwnerKey}::jsonb, 0)
+      WHERE md5(tenant_scope::text) = md5((${tenantScope}::jsonb)::text)
+        AND md5(owner_key::text) = md5((${encodedOwnerKey}::jsonb)::text)
         AND tenant_scope = ${tenantScope}::jsonb
         AND owner_key = ${encodedOwnerKey}::jsonb
         AND lookup_key = ${normalizedLookupKey}
@@ -795,7 +977,7 @@ export async function replaceStoredDraftBase(
     `),
   )
   if (rows.length !== 1) {
-    throw new Error(`draft lifecycle: draft "${draftId}" changed concurrently`)
+    throw new StoredDraftRevisionChangedError(draftId)
   }
 }
 

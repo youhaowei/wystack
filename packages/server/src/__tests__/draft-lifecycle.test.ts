@@ -38,6 +38,7 @@ import {
   DraftConflictError,
   DraftIntegrityError,
   DraftPublishDriftError,
+  DraftRevisionConflictError,
   type VersionProbe,
   type Cell,
   type Command,
@@ -500,7 +501,13 @@ describe('draft lifecycle — global authority and custody', () => {
     await expect(lifecycle.getLog(draftId, { context: ownerContext })).rejects.toThrow(
       'unknown draft',
     )
+    await expect(lifecycle.getLogSnapshot(draftId, { context: ownerContext })).rejects.toThrow(
+      'unknown draft',
+    )
     expect(await lifecycle.getLog(draftId, { context: privileged })).toHaveLength(1)
+    expect(await lifecycle.getLogSnapshot(draftId, { context: privileged })).toMatchObject({
+      revision: 1,
+    })
   })
 
   test('owner keys are canonically persisted and compared after lifecycle recreation', async () => {
@@ -760,7 +767,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(9)
+    expect((migration as any).rows[0].version).toBe(10)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -1899,6 +1906,167 @@ describe('draft lifecycle — command envelope ownership', () => {
     )
     expect(actionRuns).toBe(0)
     expect(await lifecycle.getLog(draftId)).toHaveLength(2)
+  })
+})
+
+describe('draft lifecycle — caller-visible log revisions', () => {
+  test('a snapshot revision advances with its command log and rejects a stale append', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+
+    expect(initial).toEqual({ revision: 0, commands: [] })
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'winner' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    expect(winner).toEqual({
+      revision: 1,
+      commands: [{ path: 'addTodo', args: { id: 3, title: 'winner' } }],
+    })
+
+    await expect(
+      lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'stale' } }], {
+        expectedRevision: initial.revision,
+      }),
+    ).rejects.toMatchObject({
+      name: 'DraftRevisionConflictError',
+      draftId,
+      expectedRevision: 0,
+      actualRevision: 1,
+    })
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+
+  test('stale publish preserves both the draft and canonical rows', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'draft-only' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    let resolverRuns = 0
+
+    await expect(
+      lifecycle.publish(
+        draftId,
+        (commands) => {
+          resolverRuns += 1
+          return commands
+        },
+        { expectedRevision: initial.revision },
+      ),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+
+    expect(resolverRuns).toBe(0)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    const { result: canonical } = await app.call('listTodos', {})
+    expect((canonical as { id: number }[]).map((row) => row.id).sort()).toEqual([1, 2])
+  })
+
+  test('a matching publish precondition becomes a typed conflict when append wins', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'reviewed first' } }])
+    const reviewed = await lifecycle.getLogSnapshot(draftId)
+
+    let resolutionStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      resolutionStarted = resolve
+    })
+    let resumeResolution!: () => void
+    const mayResolve = new Promise<void>((resolve) => {
+      resumeResolution = resolve
+    })
+    const publishing = lifecycle.publish(
+      draftId,
+      async (commands) => {
+        resolutionStarted()
+        await mayResolve
+        return commands
+      },
+      { expectedRevision: reviewed.revision },
+    )
+    await started
+    await lifecycle.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 4, title: 'concurrent winner' } }],
+      { expectedRevision: reviewed.revision },
+    )
+    resumeResolution()
+
+    await expect(publishing).rejects.toMatchObject({
+      name: 'DraftRevisionConflictError',
+      expectedRevision: reviewed.revision,
+      actualRevision: reviewed.revision + 1,
+    })
+    expect(await lifecycle.getLogSnapshot(draftId)).toMatchObject({
+      revision: reviewed.revision + 1,
+    })
+    const { result: canonical } = await app.call('listTodos', {})
+    expect((canonical as { id: number }[]).map((row) => row.id).sort()).toEqual([1, 2])
+  })
+
+  test('stale discard preserves the durable draft', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'keep me' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+
+    await expect(
+      lifecycle.discard(draftId, { expectedRevision: initial.revision }),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
+  })
+
+  test('stale fork replacement does not invoke its resolver or create a draft', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'source' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+    let resolverRuns = 0
+
+    await expect(
+      lifecycle.forkAndDiscard(
+        draftId,
+        1,
+        () => {
+          resolverRuns += 1
+          return []
+        },
+        { expectedRevision: initial.revision },
+      ),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+
+    expect(resolverRuns).toBe(0)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.listOwned()).toHaveLength(1)
+  })
+
+  test('stale rebase does not replace the reviewed draft state', async () => {
+    const probe = makeProbe()
+    const lifecycle = createDraftLifecycle(app, { versionProbe: probe })
+    const draftId = await lifecycle.open(await probe.current())
+    const initial = await lifecycle.getLogSnapshot(draftId)
+    await lifecycle.append(draftId, [{ path: 'renameTodo', args: { id: 1, title: 'reviewed' } }], {
+      expectedRevision: initial.revision,
+    })
+    const winner = await lifecycle.getLogSnapshot(draftId)
+
+    await expect(
+      lifecycle.rebase(draftId, { expectedRevision: initial.revision }),
+    ).rejects.toBeInstanceOf(DraftRevisionConflictError)
+    expect(await lifecycle.getLogSnapshot(draftId)).toEqual(winner)
+    expect(await lifecycle.inspect(draftId)).toHaveLength(1)
   })
 })
 

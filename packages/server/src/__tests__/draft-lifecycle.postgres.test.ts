@@ -2,7 +2,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test
 import { defineSchema, int, table, text } from '@wystack/db'
 import postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
-import { createDraftLifecycle } from '../draft-lifecycle'
+import { createDraftLifecycle, DraftRevisionConflictError } from '../draft-lifecycle'
+import { ensureDraftStorage } from '../draft-store'
 import { defineApp } from '../define-app'
 
 const postgresUrl = process.env['WYSTACK_TEST_POSTGRES_URL']
@@ -43,6 +44,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
   let admin: ReturnType<typeof postgres>
   let firstClient: ReturnType<typeof postgres>
   let secondClient: ReturnType<typeof postgres>
+  let lockClient: ReturnType<typeof postgres>
   let firstApp: Awaited<ReturnType<typeof wy.build>>
   let secondApp: Awaited<ReturnType<typeof wy.build>>
 
@@ -194,6 +196,11 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       onnotice: () => {},
       connection: { search_path: namespace, application_name: `${namespace}_second` },
     })
+    lockClient = postgres(postgresUrl!, {
+      max: 1,
+      onnotice: () => {},
+      connection: { search_path: namespace, application_name: `${namespace}_locker` },
+    })
     await firstClient.unsafe(
       'CREATE TABLE dashboards (id INTEGER PRIMARY KEY, items TEXT NOT NULL)',
     )
@@ -244,7 +251,11 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
   })
 
   afterAll(async () => {
-    await Promise.all([firstClient?.end({ timeout: 1 }), secondClient?.end({ timeout: 1 })])
+    await Promise.all([
+      firstClient?.end({ timeout: 1 }),
+      secondClient?.end({ timeout: 1 }),
+      lockClient?.end({ timeout: 1 }),
+    ])
     if (admin) {
       await admin.unsafe(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`)
       await admin.end({ timeout: 1 })
@@ -265,6 +276,65 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
         second.getLog(secondDraft, { context: privilegedContext }),
       ]),
     ).toEqual([[], []])
+  })
+
+  test('v10 custody-index migration preserves correct definitions and rebuilds stale ones', async () => {
+    await ensureDraftStorage(drizzle(firstClient))
+    const readIndexes = () =>
+      firstClient<{ index_name: string; oid: string; definition: string }[]>`
+        SELECT c.relname AS index_name, c.oid::text AS oid, pg_get_indexdef(c.oid) AS definition
+        FROM pg_class c
+        WHERE c.relname IN (
+          'wystack_drafts_custody_created_idx',
+          'wystack_drafts_custody_lookup_idx'
+        )
+        ORDER BY c.relname
+      `
+    const expected = await readIndexes()
+    await firstClient`
+      UPDATE wystack_framework_migrations
+      SET version = 9
+      WHERE migration_name = 'draft-storage'
+    `
+
+    await ensureDraftStorage(drizzle(firstClient))
+    expect(await readIndexes()).toEqual(expected)
+
+    await firstClient.unsafe('DROP INDEX wystack_drafts_custody_created_idx')
+    await firstClient.unsafe('DROP INDEX wystack_drafts_custody_lookup_idx')
+    await firstClient.unsafe(`CREATE INDEX wystack_drafts_custody_created_idx
+      ON wystack_drafts (
+        jsonb_hash_extended(tenant_scope, 0),
+        jsonb_hash_extended(owner_key, 0),
+        created_at DESC,
+        draft_id DESC
+      )`)
+    await firstClient.unsafe(`CREATE INDEX wystack_drafts_custody_lookup_idx
+      ON wystack_drafts (
+        jsonb_hash_extended(tenant_scope, 0),
+        jsonb_hash_extended(owner_key, 0),
+        lookup_key,
+        created_at DESC,
+        draft_id DESC
+      ) WHERE lookup_key IS NOT NULL`)
+    const stale = await readIndexes()
+    await firstClient`
+      UPDATE wystack_framework_migrations
+      SET version = 9
+      WHERE migration_name = 'draft-storage'
+    `
+
+    await ensureDraftStorage(drizzle(firstClient))
+    const repaired = await readIndexes()
+    expect(repaired.map(({ oid }) => oid)).not.toEqual(stale.map(({ oid }) => oid))
+    expect(
+      repaired.every(
+        ({ definition }) =>
+          definition.includes('md5((tenant_scope)::text)') &&
+          definition.includes('md5((owner_key)::text)') &&
+          !definition.includes('jsonb_hash_extended'),
+      ),
+    ).toBe(true)
   })
 
   test('exclusive owned lookup initialization sees the winner under a repeatable-read host default', async () => {
@@ -340,6 +410,62 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       drafts: 1,
       commands: 1,
     })
+  })
+
+  test('fork replacement owns the lookup lock until discovery can return the replacement', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const lookupKey = 'postgres-proof:fork-lookup-handoff'
+    const sourceId = await first.open(0, { context: privilegedContext, lookupKey })
+    await first.append(
+      sourceId,
+      [{ id: 'source', path: 'addTodo', args: { id: 21_001, title: 'source' } }],
+      { context: privilegedContext },
+    )
+
+    let replacementStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      replacementStarted = resolve
+    })
+    let releaseReplacement!: () => void
+    const mayCommit = new Promise<void>((resolve) => {
+      releaseReplacement = resolve
+    })
+    const replacing = first.forkAndDiscard(sourceId, 1, (commands) => commands, {
+      context: {
+        ...privilegedContext,
+        initialCommandBarrier: async () => {
+          replacementStarted()
+          await mayCommit
+        },
+      },
+    })
+    await started
+
+    const discovering = second.getOrOpenWithCommands(
+      1,
+      [{ id: 'fallback', path: 'addTodo', args: { id: 21_002, title: 'fallback' } }],
+      { context: privilegedContext, lookupKey },
+    )
+    let lockWaitError: unknown
+    try {
+      await waitForConnectionLock(
+        `${namespace}_second`,
+        'owned lookup discovery did not wait for fork replacement',
+        'advisory',
+      )
+    } catch (error) {
+      lockWaitError = error
+    } finally {
+      releaseReplacement()
+    }
+
+    const [replacementId, discovered] = await Promise.all([replacing, discovering])
+    if (lockWaitError) throw lockWaitError
+    expect(discovered).toMatchObject({ draftId: replacementId, created: false, results: [] })
+    await expect(first.getLog(sourceId, { context: privilegedContext })).rejects.toThrow(
+      'unknown draft',
+    )
   })
 
   test('publishes immediate foreign keys in dependency order', async () => {
@@ -471,6 +597,106 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     ).toMatchObject({ draftId, summary: { last: 'first' } })
     expect(firstHandlerRuns).toBe(2)
     expect(await first.inspect(draftId, { context: privilegedContext })).toHaveLength(2)
+  })
+
+  test('two clients at one revision admit one append and reject the stale loser without replay', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const draftId = await first.open(0, { context: privilegedContext })
+    const [firstSnapshot, secondSnapshot] = await Promise.all([
+      first.getLogSnapshot(draftId, { context: privilegedContext }),
+      second.getLogSnapshot(draftId, { context: privilegedContext }),
+    ])
+    expect(firstSnapshot).toEqual({ revision: 0, commands: [] })
+    expect(secondSnapshot).toEqual(firstSnapshot)
+
+    let firstAttemptStarted!: () => void
+    const firstStarted = new Promise<void>((resolve) => {
+      firstAttemptStarted = resolve
+    })
+    let resumeFirstAttempt!: () => void
+    const firstMayContinue = new Promise<void>((resolve) => {
+      resumeFirstAttempt = resolve
+    })
+    let firstHandlerRuns = 0
+    const firstBarrier = async () => {
+      firstHandlerRuns += 1
+      firstAttemptStarted()
+      await firstMayContinue
+    }
+
+    const staleAppend = first.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 1, title: 'stale contender' } }],
+      {
+        context: { ...privilegedContext, initialCommandBarrier: firstBarrier },
+        expectedRevision: firstSnapshot.revision,
+      },
+    )
+    await firstStarted
+    try {
+      await second.append(draftId, [{ path: 'addTodo', args: { id: 2, title: 'winner' } }], {
+        context: privilegedContext,
+        expectedRevision: secondSnapshot.revision,
+      })
+    } finally {
+      resumeFirstAttempt()
+    }
+
+    await expect(staleAppend).rejects.toBeInstanceOf(DraftRevisionConflictError)
+    expect(firstHandlerRuns).toBe(1)
+    expect(await first.getLogSnapshot(draftId, { context: privilegedContext })).toEqual({
+      revision: 1,
+      commands: [{ path: 'addTodo', args: { id: 2, title: 'winner' } }],
+    })
+    expect(await first.inspect(draftId, { context: privilegedContext })).toHaveLength(1)
+  })
+
+  test('a log snapshot waits for an in-flight append and returns its committed revision', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const draftId = await first.open(0, { context: privilegedContext })
+    let rowLocked!: () => void
+    const rowIsLocked = new Promise<void>((resolve) => {
+      rowLocked = resolve
+    })
+    let releaseRow!: () => void
+    const rowMayRelease = new Promise<void>((resolve) => {
+      releaseRow = resolve
+    })
+    const lockTransaction = lockClient.begin(async (tx) => {
+      await tx`SELECT draft_id FROM wystack_drafts WHERE draft_id = ${draftId} FOR UPDATE`
+      rowLocked()
+      await rowMayRelease
+    })
+    await rowIsLocked
+
+    const append = first.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 3, title: 'snapshot winner' } }],
+      { context: privilegedContext, expectedRevision: 0 },
+    )
+    let snapshot!: ReturnType<typeof second.getLogSnapshot>
+    try {
+      await waitForConnectionLock(
+        `${namespace}_first`,
+        'append did not pause at the final draft-row revision update',
+        'transactionid',
+      )
+      snapshot = second.getLogSnapshot(draftId, { context: privilegedContext })
+      await waitForConnectionLock(
+        `${namespace}_second`,
+        'log snapshot did not wait behind the in-flight revision update',
+      )
+    } finally {
+      releaseRow()
+    }
+
+    const [, , committedSnapshot] = await Promise.all([lockTransaction, append, snapshot])
+    expect(committedSnapshot).toEqual({
+      revision: 1,
+      commands: [{ path: 'addTodo', args: { id: 3, title: 'snapshot winner' } }],
+    })
   })
 
   test('concurrent publishes apply reviewed changes exactly once', async () => {

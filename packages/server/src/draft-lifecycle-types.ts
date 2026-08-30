@@ -67,6 +67,25 @@ export class DraftPublishDriftError extends Error {
   }
 }
 
+/** A caller's durable-draft snapshot no longer matches the stored command log. */
+export class DraftRevisionConflictError extends Error {
+  readonly draftId: string
+  readonly expectedRevision: number
+  readonly actualRevision: number | undefined
+
+  constructor(draftId: string, expectedRevision: number, actualRevision?: number) {
+    super(
+      actualRevision === undefined
+        ? `draft lifecycle: draft "${draftId}" no longer exists at expected revision ${expectedRevision}`
+        : `draft lifecycle: draft "${draftId}" is at revision ${actualRevision}, expected ${expectedRevision}`,
+    )
+    this.name = 'DraftRevisionConflictError'
+    this.draftId = draftId
+    this.expectedRevision = expectedRevision
+    this.actualRevision = actualRevision
+  }
+}
+
 export interface DraftContextOptions {
   context?: Record<string, unknown>
 }
@@ -110,7 +129,12 @@ export interface ListOwnedOptions extends DraftContextOptions {
 
 export interface DraftOperationOptions extends DraftContextOptions {}
 
-export interface AppendOptions extends DraftOperationOptions {
+export interface DraftMutationOptions extends DraftOperationOptions {
+  /** Require this exact revision of the durable command log. */
+  expectedRevision?: number
+}
+
+export interface AppendOptions extends DraftMutationOptions {
   /** Omit to preserve the current summary; provide a JSON value to atomically replace it. */
   summary?: DraftSummary
 }
@@ -131,7 +155,7 @@ export type ForkResolveHook = (
   metadata: DraftMetadataSnapshot,
 ) => DraftCommand[] | ForkResolution | Promise<DraftCommand[] | ForkResolution>
 
-export interface RebaseOptions extends DraftOperationOptions {
+export interface RebaseOptions extends DraftMutationOptions {
   acceptConflicts?: (report: ConflictReport) => boolean | Promise<boolean>
 }
 
@@ -213,6 +237,7 @@ export type DraftOperationAction =
   | 'detectConflict'
   | 'inspect'
   | 'getLog'
+  | 'getLogSnapshot'
 
 export interface GlobalDraftAuthorizationRequest {
   action: 'open' | DraftOperationAction
@@ -264,6 +289,13 @@ export interface OpenWithCommandsResult {
   results: CommandResult[]
 }
 
+/** One coherent, authorized view of the durable command log. */
+export interface DraftLogSnapshot {
+  /** Monotonic revision advanced by every committed log replacement or rebase. */
+  revision: number
+  commands: DraftCommand[]
+}
+
 export interface GetOrOpenWithCommandsOptions extends OpenOptions {
   /** Exact owner-scoped key used to serialize competing initializers. */
   lookupKey: string
@@ -304,9 +336,9 @@ export interface DraftLifecycle {
   publish(
     draftId: string,
     resolve?: ResolveHook,
-    opts?: DraftOperationOptions,
+    opts?: DraftMutationOptions,
   ): Promise<CommitResult>
-  discard(draftId: string, opts?: DraftOperationOptions): Promise<void>
+  discard(draftId: string, opts?: DraftMutationOptions): Promise<void>
   /**
    * Resolve a replacement log from one authorized snapshot, materialize it in
    * a new draft, and retire the source draft in the same transaction. If the
@@ -316,10 +348,12 @@ export interface DraftLifecycle {
     draftId: string,
     baseVersion: Version,
     resolve: ForkResolveHook,
-    opts?: DraftOperationOptions,
+    opts?: DraftMutationOptions,
   ): Promise<string>
   rebase(draftId: string, opts?: RebaseOptions): Promise<ConflictReport>
   detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
   inspect(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionRow[]>
   getLog(draftId: string, opts?: DraftOperationOptions): Promise<DraftCommand[]>
+  /** Read commands and their revision from one transactionally coherent authorized snapshot. */
+  getLogSnapshot(draftId: string, opts?: DraftOperationOptions): Promise<DraftLogSnapshot>
 }

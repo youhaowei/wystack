@@ -16,6 +16,7 @@ export {
   MAX_OWNED_DRAFT_PAGE_SIZE,
   DraftConflictError,
   DraftIntegrityError,
+  DraftRevisionConflictError,
 } from './draft-lifecycle'
 export { createRoutes } from './routes'
 // mountNodeRoutes is intentionally NOT re-exported here — it lives at the
@@ -89,6 +90,8 @@ export type {
   GetOrOpenWithCommandsResult,
   ListOwnedOptions,
   AppendOptions,
+  DraftMutationOptions,
+  DraftLogSnapshot,
   DraftMetadataSnapshot,
   ForkResolution,
   ForkResolveHook,

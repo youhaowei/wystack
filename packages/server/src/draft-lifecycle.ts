@@ -46,6 +46,7 @@ import {
   type DraftGraphReadTracker,
   type DraftLifecycle,
   type DraftLifecycleOptions,
+  DraftRevisionConflictError,
   type DraftMetadataSnapshot,
   type DraftSummary,
   type ForkResolution,
@@ -63,6 +64,7 @@ export {
   DraftIntegrityError,
   DraftPublishDriftError,
 } from './draft-lifecycle-types'
+export { DraftRevisionConflictError }
 export type * from './draft-lifecycle-types'
 import type { WyStackApp } from './create'
 import {
@@ -77,6 +79,7 @@ import {
   lockStoredDraftLookup,
   readStoredCommands,
   readStoredDraft,
+  readStoredDraftForLogSnapshot,
   readStoredTouchedTables,
   refreshStoredDraftIntegrityAndAdvance,
   replaceStoredDraftBase,
@@ -335,6 +338,41 @@ export function createDraftLifecycle(
     return new Error(`draft lifecycle: unknown draft "${draftId}"`)
   }
 
+  function normalizeExpectedRevision(value: number | undefined): number | undefined {
+    if (value === undefined) return undefined
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error('draft lifecycle: expected revision must be a non-negative safe integer')
+    }
+    return value
+  }
+
+  function assertExpectedRevision(draft: StoredDraft, expectedRevision: number | undefined): void {
+    if (expectedRevision !== undefined && draft.logRevision !== expectedRevision) {
+      throw new DraftRevisionConflictError(draft.draftId, expectedRevision, draft.logRevision)
+    }
+  }
+
+  async function requireCurrentForMutation(
+    raw: DrizzleTracker['raw'],
+    draftId: string,
+    expectedRevision: number | undefined,
+  ): Promise<StoredDraft> {
+    const draft = await readStoredDraft(raw, draftId)
+    if (!draft) {
+      if (expectedRevision !== undefined) {
+        throw new DraftRevisionConflictError(draftId, expectedRevision)
+      }
+      throw notFound(draftId)
+    }
+    assertExpectedRevision(draft, expectedRevision)
+    return draft
+  }
+
+  async function throwRevisionConflict(draftId: string, expectedRevision: number): Promise<never> {
+    const latest = await readStoredDraft(app.system.createTracked().raw, draftId)
+    throw new DraftRevisionConflictError(draftId, expectedRevision, latest?.logRevision)
+  }
+
   async function authorizeTracker(
     tracked: DrizzleTracker,
     draft: StoredDraft,
@@ -590,6 +628,7 @@ export function createDraftLifecycle(
     async append(draftId, batch, operationOpts = {}) {
       const commands = batch.map(snapshotCommand)
       const summaryReplacement = snapshotSummaryReplacement(operationOpts, 'draft summary')
+      const expectedRevision = normalizeExpectedRevision(operationOpts.expectedRevision)
       await storageReady()
       const context = operationOpts.context ?? {}
       for (const command of commands) {
@@ -598,12 +637,13 @@ export function createDraftLifecycle(
       const authorizationTracker = app.system.createTracked()
       const authorized = await requireStored(authorizationTracker.raw, draftId)
       await authorizeTracker(authorizationTracker, authorized, context, 'append')
+      assertExpectedRevision(authorized, expectedRevision)
       let draftWrites = new Set<string>()
       let results: CommandResult[] | undefined
       for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
           results = await runReplayableTransaction(async (tx) => {
-            const stored = await requireStored(tx.raw, draftId)
+            const stored = await requireCurrentForMutation(tx.raw, draftId, expectedRevision)
             assertAuthorizedSnapshot(stored, authorized)
             const scopedTx = scopeFromAuthorizedSnapshot(tx, authorized)
             await assertStoredDraftIntegrity(tx.raw, draftId)
@@ -642,7 +682,11 @@ export function createDraftLifecycle(
           })
           break
         } catch (error) {
-          if (!(error instanceof StoredDraftRevisionChangedError) || attempt === 4) throw error
+          if (!(error instanceof StoredDraftRevisionChangedError)) throw error
+          if (expectedRevision !== undefined) {
+            await throwRevisionConflict(draftId, expectedRevision)
+          }
+          if (attempt === 4) throw error
         }
       }
       if (!results) {
@@ -653,11 +697,13 @@ export function createDraftLifecycle(
     },
 
     async publish(draftId, resolve, operationOpts = {}) {
+      const expectedRevision = normalizeExpectedRevision(operationOpts.expectedRevision)
       await storageReady()
       const context = operationOpts.context ?? {}
       const snapshotTracked = app.system.createTracked()
       const snapshot = await requireStored(snapshotTracked.raw, draftId)
       const snapshotScoped = await authorizeTracker(snapshotTracked, snapshot, context, 'publish')
+      assertExpectedRevision(snapshot, expectedRevision)
       await assertStoredDraftIntegrity(snapshotScoped.raw, draftId)
       const snapshotLog = await readStoredCommands(snapshotScoped.raw, draftId)
       const boundLog = resolve
@@ -673,10 +719,13 @@ export function createDraftLifecycle(
         // draft while graph validation runs, and the final revision CAS then
         // rejects this stale attempt without making a host callback hold locks.
         await lockDraftForPublication(tx.raw, draftId)
-        const current = await requireStored(tx.raw, draftId)
+        const current = await requireCurrentForMutation(tx.raw, draftId, expectedRevision)
         assertAuthorizedSnapshot(current, snapshot)
         const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
         if (current.logRevision !== snapshot.logRevision) {
+          if (expectedRevision !== undefined) {
+            throw new DraftRevisionConflictError(draftId, expectedRevision, current.logRevision)
+          }
           throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
         }
         await assertStoredDraftIntegrity(tx.raw, draftId)
@@ -720,6 +769,9 @@ export function createDraftLifecycle(
         const deleted = await deleteStoredDraftAtRevision(tx.raw, draftId, snapshot.logRevision)
         if (!deleted) {
           const latest = await readStoredDraft(tx.raw, draftId)
+          if (expectedRevision !== undefined) {
+            throw new DraftRevisionConflictError(draftId, expectedRevision, latest?.logRevision)
+          }
           if (!latest) throw notFound(draftId)
           throw new Error(`draft lifecycle: draft "${draftId}" changed during publish; retry`)
         }
@@ -735,14 +787,16 @@ export function createDraftLifecycle(
     },
 
     async discard(draftId, operationOpts = {}) {
+      const expectedRevision = normalizeExpectedRevision(operationOpts.expectedRevision)
       await storageReady()
       const context = operationOpts.context ?? {}
       const authorizationTracker = app.system.createTracked()
       const authorized = await requireStored(authorizationTracker.raw, draftId)
       await authorizeTracker(authorizationTracker, authorized, context, 'discard')
+      assertExpectedRevision(authorized, expectedRevision)
       let draftWrites = new Set<string>()
       await runReplayableTransaction(async (tx) => {
-        const stored = await requireStored(tx.raw, draftId)
+        const stored = await requireCurrentForMutation(tx.raw, draftId, expectedRevision)
         assertAuthorizedSnapshot(stored, authorized)
         const touched = await readStoredTouchedTables(tx.raw, draftId)
         await clearDerivedChanges(tx.raw, draftId)
@@ -754,6 +808,9 @@ export function createDraftLifecycle(
         const deleted = await deleteStoredDraftAtRevision(tx.raw, draftId, authorized.logRevision)
         if (!deleted) {
           const latest = await readStoredDraft(tx.raw, draftId)
+          if (expectedRevision !== undefined) {
+            throw new DraftRevisionConflictError(draftId, expectedRevision, latest?.logRevision)
+          }
           if (!latest) throw notFound(draftId)
           throw new Error(`draft lifecycle: draft "${draftId}" changed during discard; retry`)
         }
@@ -762,6 +819,7 @@ export function createDraftLifecycle(
     },
 
     async forkAndDiscard(draftId, baseVersion, resolve, operationOpts = {}) {
+      const expectedRevision = normalizeExpectedRevision(operationOpts.expectedRevision)
       await storageReady()
       const context = operationOpts.context ?? {}
       const snapshotTracked = app.system.createTracked()
@@ -772,6 +830,7 @@ export function createDraftLifecycle(
         context,
         'forkAndDiscard',
       )
+      assertExpectedRevision(snapshot, expectedRevision)
       await assertStoredDraftIntegrity(snapshotScoped.raw, draftId)
       const snapshotLog = await readStoredCommands(snapshotScoped.raw, draftId)
       const resolverMetadata: DraftMetadataSnapshot = {
@@ -806,9 +865,20 @@ export function createDraftLifecycle(
       const replacementId = mintDraftId()
       let emitted = new Set<string>()
       await runReplayableTransaction(async (tx) => {
-        const current = await requireStored(tx.raw, draftId)
+        if (snapshot.lookupKey !== undefined) {
+          await lockStoredDraftLookup(
+            tx.raw,
+            snapshot.tenantId,
+            snapshot.ownerKey,
+            snapshot.lookupKey,
+          )
+        }
+        const current = await requireCurrentForMutation(tx.raw, draftId, expectedRevision)
         assertAuthorizedSnapshot(current, snapshot)
         if (current.logRevision !== snapshot.logRevision) {
+          if (expectedRevision !== undefined) {
+            throw new DraftRevisionConflictError(draftId, expectedRevision, current.logRevision)
+          }
           throw new Error(`draft lifecycle: draft "${draftId}" changed during replacement; retry`)
         }
         await assertStoredDraftIntegrity(tx.raw, draftId)
@@ -850,6 +920,9 @@ export function createDraftLifecycle(
         const deleted = await deleteStoredDraftAtRevision(tx.raw, draftId, snapshot.logRevision)
         if (!deleted) {
           const latest = await readStoredDraft(tx.raw, draftId)
+          if (expectedRevision !== undefined) {
+            throw new DraftRevisionConflictError(draftId, expectedRevision, latest?.logRevision)
+          }
           if (!latest) throw notFound(draftId)
           throw new Error(`draft lifecycle: draft "${draftId}" changed during replacement; retry`)
         }
@@ -866,6 +939,7 @@ export function createDraftLifecycle(
     },
 
     async rebase(draftId, operationOpts = {}) {
+      const expectedRevision = normalizeExpectedRevision(operationOpts.expectedRevision)
       await storageReady()
       if (!versionProbe) {
         throw new Error('draft lifecycle: rebase requires a versionProbe')
@@ -875,6 +949,7 @@ export function createDraftLifecycle(
       const snapshotTracked = app.system.createTracked()
       const snapshot = await requireStored(snapshotTracked.raw, draftId)
       const snapshotScoped = await authorizeTracker(snapshotTracked, snapshot, context, 'rebase')
+      assertExpectedRevision(snapshot, expectedRevision)
       await assertStoredDraftIntegrity(snapshotScoped.raw, draftId)
       const log = await readStoredCommands(snapshotScoped.raw, draftId)
       const previousTouched = await readStoredTouchedTables(snapshotScoped.raw, draftId)
@@ -904,43 +979,53 @@ export function createDraftLifecycle(
           `draft lifecycle: canonical version changed during rebase; retry "${draftId}"`,
         )
       }
-      await runReplayableTransaction(async (tx) => {
-        const stored = await requireStored(tx.raw, draftId)
-        assertAuthorizedSnapshot(stored, snapshot)
-        const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
-        if (stored.logRevision !== snapshot.logRevision) {
-          throw new Error(`draft lifecycle: draft "${draftId}" changed during rebase; retry`)
-        }
-        await assertStoredDraftIntegrity(tx.raw, draftId)
-        await clearDerivedChanges(tx.raw, draftId)
+      try {
+        await runReplayableTransaction(async (tx) => {
+          const stored = await requireCurrentForMutation(tx.raw, draftId, expectedRevision)
+          assertAuthorizedSnapshot(stored, snapshot)
+          const scopedTx = scopeFromAuthorizedSnapshot(tx, snapshot)
+          if (stored.logRevision !== snapshot.logRevision) {
+            if (expectedRevision !== undefined) {
+              throw new DraftRevisionConflictError(draftId, expectedRevision, stored.logRevision)
+            }
+            throw new Error(`draft lifecycle: draft "${draftId}" changed during rebase; retry`)
+          }
+          await assertStoredDraftIntegrity(tx.raw, draftId)
+          await clearDerivedChanges(tx.raw, draftId)
 
-        const touchedTables = new Map<string, AnyTable>()
-        const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
-        for (const command of log) {
-          await runDraftCommand(command, draftDb, context)
-        }
-        const rebuiltTouched = describeTouchedTables(
-          touchedTables,
-          draftDb.tablesWritten,
-          draftId,
-          scopedTx.tenantId,
-        )
-        await deleteStoredTouchedTables(tx.raw, draftId)
-        await upsertStoredTouchedTables(tx.raw, draftId, rebuiltTouched)
-        await validateGraph?.({
-          phase: 'effective',
-          draftId,
-          db: graphReadTracker(draftDb),
-          context,
+          const touchedTables = new Map<string, AnyTable>()
+          const draftDb = recordTouchedTables(scopedTx.withDraft(draftId), touchedTables)
+          for (const command of log) {
+            await runDraftCommand(command, draftDb, context)
+          }
+          const rebuiltTouched = describeTouchedTables(
+            touchedTables,
+            draftDb.tablesWritten,
+            draftId,
+            scopedTx.tenantId,
+          )
+          await deleteStoredTouchedTables(tx.raw, draftId)
+          await upsertStoredTouchedTables(tx.raw, draftId, rebuiltTouched)
+          await validateGraph?.({
+            phase: 'effective',
+            draftId,
+            db: graphReadTracker(draftDb),
+            context,
+          })
+          await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
+          emitted = new Set([
+            ...previousTouched.flatMap((table) =>
+              table.invalidationTag ? [table.invalidationTag] : [],
+            ),
+            ...draftDb.tablesWritten,
+          ])
         })
-        await replaceStoredDraftBase(tx.raw, draftId, currentVersion, stored.logRevision)
-        emitted = new Set([
-          ...previousTouched.flatMap((table) =>
-            table.invalidationTag ? [table.invalidationTag] : [],
-          ),
-          ...draftDb.tablesWritten,
-        ])
-      })
+      } catch (error) {
+        if (error instanceof StoredDraftRevisionChangedError && expectedRevision !== undefined) {
+          await throwRevisionConflict(draftId, expectedRevision)
+        }
+        throw error
+      }
       if (emitted.size > 0) app.system.emit(emitted)
       return report
     },
@@ -993,6 +1078,25 @@ export function createDraftLifecycle(
       const stored = await requireStored(app.system.createTracked().raw, draftId)
       const scoped = await authorizeTracker(app.system.createTracked(), stored, context, 'getLog')
       return readStoredCommands(scoped.raw, draftId)
+    },
+
+    async getLogSnapshot(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const authorizationTracker = app.system.createTracked()
+      const authorized = await requireStored(authorizationTracker.raw, draftId)
+      await authorizeTracker(authorizationTracker, authorized, context, 'getLogSnapshot')
+
+      return runReplayableTransaction(async (tx) => {
+        const current = await readStoredDraftForLogSnapshot(tx.raw, draftId)
+        if (!current) throw notFound(draftId)
+        assertAuthorizedSnapshot(current, authorized)
+        await assertStoredDraftIntegrity(tx.raw, draftId)
+        return {
+          revision: current.logRevision,
+          commands: await readStoredCommands(tx.raw, draftId),
+        }
+      })
     },
   }
 }
