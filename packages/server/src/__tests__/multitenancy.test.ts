@@ -49,7 +49,7 @@ beforeEach(async () => {
     functions: {
       addInsight: wy.procedure
         .input({ id: uuid, name: text })
-        .mutation(async (ctx, args) => ctx.db.into(schema.insights).insert(args)),
+        .command(async (ctx, args) => ctx.db.into(schema.insights).insert(args)),
       listInsights: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.insights).all()),
       addCatalog: wy.procedure
         .input({ id: uuid, name: text })
@@ -242,7 +242,7 @@ describe('server tenant resolution', () => {
       functions: {
         addInsight: wy.procedure
           .input({ id: uuid, name: text })
-          .mutation(async (ctx, args) => ctx.db.into(intSchema.integerInsights).insert(args)),
+          .command(async (ctx, args) => ctx.db.into(intSchema.integerInsights).insert(args)),
       },
     })
     const lifecycle = createDraftLifecycle(integerApp)

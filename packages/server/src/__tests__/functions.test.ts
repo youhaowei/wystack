@@ -21,11 +21,16 @@ describe('procedure builder', () => {
     expect(result).toEqual({ received: 42 })
   })
 
-  test('creates a MutationDef with correct type', () => {
-    const m = wy.procedure
+  test('distinguishes canonical mutations from replayable commands without changing RPC type', () => {
+    const mutation = wy.procedure
       .input({ title: text })
       .mutation(async (_ctx, _args) => ({ created: true }))
-    expect(m.type).toBe('mutation')
+    const command = wy.procedure
+      .input({ title: text })
+      .command(async (_ctx, _args) => ({ created: true }))
+
+    expect(mutation).toMatchObject({ type: 'mutation', draftReplayable: false })
+    expect(command).toMatchObject({ type: 'mutation', draftReplayable: true })
   })
 
   test('creates an ActionDef with validation and middleware parity', async () => {

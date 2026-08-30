@@ -217,6 +217,7 @@ beforeEach(async () => {
     db,
     functions: {
       listTodos: wy.procedure.input({}).query(async (ctx) => ctx.db.from(schema.todos).all()),
+      readTodos: wy.procedure.input({}).command(async (ctx) => ctx.db.from(schema.todos).all()),
       listVersionedTodos: wy.procedure
         .input({})
         .query(async (ctx) => ctx.db.from(schema.versionedTodos).all()),
@@ -225,10 +226,18 @@ beforeEach(async () => {
         .query(async (ctx) => ctx.db.from(schema.replaceableTodos).all()),
       addTodo: wy.procedure
         .input({ id: int, title: text })
+        .command(async (ctx, args) =>
+          ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
+        ),
+      canonicalOnlyTodo: wy.procedure
+        .input({ id: int, title: text })
         .mutation(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
-      addTodoAt: wy.procedure.input({ id: int, createdAt: timestamp }).mutation(async (ctx, args) =>
+      boom: wy.procedure.input({}).command(async () => {
+        throw new Error('command boom')
+      }),
+      addTodoAt: wy.procedure.input({ id: int, createdAt: timestamp }).command(async (ctx, args) =>
         ctx.db.into(schema.todos).insert({
           id: args.id,
           title: args.createdAt.toISOString(),
@@ -237,27 +246,27 @@ beforeEach(async () => {
       ),
       addVersionedTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.versionedTodos).insert({ id: args.id, title: args.title }),
         ),
       removeVersionedTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).delete(),
         ),
       addReplaceableTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.replaceableTodos).insert({ id: args.id, title: args.title }),
         ),
       renameVarcharItem: wy.procedure
         .input({ id: text, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(varcharItems).where(eq('id', args.id)).update({ title: args.title }),
         ),
       removeReplaceableTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.replaceableTodos).where(eq('id', args.id)).delete(),
         ),
       // Writes, and carries a jsonb argument — jsonb validates as `unknown`, so
@@ -265,17 +274,17 @@ beforeEach(async () => {
       // validation. Used to pin the snapshot-before-write ordering in append.
       addTodoWithMeta: wy.procedure
         .input({ id: int, title: text, meta: jsonb })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.into(schema.todos).insert({ id: args.id, title: args.title, done: false }),
         ),
-      addTodoFromMeta: wy.procedure.input({ id: int, meta: jsonb }).mutation(async (ctx, args) =>
+      addTodoFromMeta: wy.procedure.input({ id: int, meta: jsonb }).command(async (ctx, args) =>
         ctx.db.into(schema.todos).insert({
           id: args.id,
           title: Object.hasOwn(args.meta as object, '__proto__') ? 'present' : 'missing',
           done: false,
         }),
       ),
-      addTodoUsingSetting: wy.procedure.input({ id: int }).mutation(async (ctx, args) => {
+      addTodoUsingSetting: wy.procedure.input({ id: int }).command(async (ctx, args) => {
         const setting = await ctx.db.from(schema.settings).first()
         return ctx.db.into(schema.todos).insert({
           id: args.id,
@@ -285,17 +294,17 @@ beforeEach(async () => {
       }),
       renameTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.todos).where(eq('id', args.id)).update({ title: args.title }),
         ),
       finishOpenTodos: wy.procedure
         .input({})
-        .mutation(async (ctx) =>
+        .command(async (ctx) =>
           ctx.db.from(schema.todos).where(eq('done', false)).update({ done: true }),
         ),
       setDocumentPayload: wy.procedure
         .input({ id: int, payload: jsonb })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db
             .from(schema.documents)
             .where(eq('id', args.id))
@@ -305,7 +314,7 @@ beforeEach(async () => {
         ),
       retargetAndRenameCode: wy.procedure
         .input({ childId: int, parentId: int, nextParentCode: text, nextCode: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db
             .from(schema.aCodeParents)
             .where(eq('id', args.parentId))
@@ -317,7 +326,7 @@ beforeEach(async () => {
         }),
       replaceCodeFamily: wy.procedure
         .input({ childId: int, parentId: int, code: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.zCodeChildren).where(eq('id', args.childId)).delete()
           await ctx.db.from(schema.aCodeParents).where(eq('id', args.parentId)).delete()
           await ctx.db.into(schema.aCodeParents).insert({ id: args.parentId, code: args.code })
@@ -325,31 +334,31 @@ beforeEach(async () => {
             .into(schema.zCodeChildren)
             .insert({ id: args.childId, parentCode: args.code })
         }),
-      addFamily: wy.procedure.input({ parentId: int, childId: int }).mutation(async (ctx, args) => {
+      addFamily: wy.procedure.input({ parentId: int, childId: int }).command(async (ctx, args) => {
         await ctx.db.into(schema.zParents).insert({ id: args.parentId, name: 'parent' })
         return ctx.db.into(schema.aChildren).insert({ id: args.childId, parentId: args.parentId })
       }),
       removeFamily: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.aChildren).where(eq('id', args.childId)).delete()
           return ctx.db.from(schema.zParents).where(eq('id', args.parentId)).delete()
         }),
       addTreePair: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.into(schema.treeNodes).insert({ id: args.parentId, parentId: null })
           return ctx.db.into(schema.treeNodes).insert({ id: args.childId, parentId: args.parentId })
         }),
       removeTreePair: wy.procedure
         .input({ parentId: int, childId: int })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.from(schema.treeNodes).where(eq('id', args.childId)).delete()
           return ctx.db.from(schema.treeNodes).where(eq('id', args.parentId)).delete()
         }),
       addTimedFamily: wy.procedure
         .input({ parentId: int, childId: int, token: timestamp })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           await ctx.db.into(schema.zTimedParents).insert({ id: args.parentId, token: args.token })
           return ctx.db
             .into(schema.aTimedChildren)
@@ -357,20 +366,20 @@ beforeEach(async () => {
         }),
       renameVersionedTodo: wy.procedure
         .input({ id: int, title: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).update({ title: args.title }),
         ),
       removeTodo: wy.procedure
         .input({ id: int })
-        .mutation(async (ctx, args) => ctx.db.from(schema.todos).where(eq('id', args.id)).delete()),
+        .command(async (ctx, args) => ctx.db.from(schema.todos).where(eq('id', args.id)).delete()),
       renameAppAccount: wy.procedure
         .input({ id: int, name: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(appAccounts).where(eq('id', args.id)).update({ name: args.name }),
         ),
       renameAuditAccount: wy.procedure
         .input({ id: int, name: text })
-        .mutation(async (ctx, args) =>
+        .command(async (ctx, args) =>
           ctx.db.from(auditAccounts).where(eq('id', args.id)).update({ name: args.name }),
         ),
       // A read-modify-write command makes drift observable: replay on a newer
@@ -378,7 +387,7 @@ beforeEach(async () => {
       // and ask the application to resolve it.
       addToDashboard: wy.procedure
         .input({ dashboardId: int, item: text })
-        .mutation(async (ctx, args) => {
+        .command(async (ctx, args) => {
           // Read-modify-write over the effective draft relation. This intentionally
           // reads the full dashboard set because the command merges one node's list.
           const rows = (await ctx.db.from(schema.dashboards).all()) as {
@@ -537,9 +546,7 @@ describe('draft lifecycle — global authority and custody', () => {
       functions: {
         addGlobalTodo: wy.procedure
           .input({ id: int, title: text })
-          .mutation(async (ctx, args) =>
-            ctx.db.into(schema.todos).insert({ ...args, done: false }),
-          ),
+          .command(async (ctx, args) => ctx.db.into(schema.todos).insert({ ...args, done: false })),
       },
     })
     const lifecycle = createProductionDraftLifecycle(mixedApp, {
@@ -809,14 +816,14 @@ describe('draft lifecycle — owned discovery and atomic creation', () => {
         0,
         [
           { path: 'addTodo', args: { id: 3, title: 'must roll back' } },
-          { path: 'unknownInitialCommand', args: {} },
+          { path: 'boom', args: {} },
         ],
         {
           lookupKey: 'artifact:atomic-failure',
           summary: { title: 'Must not survive' },
         },
       ),
-    ).rejects.toThrow('Unknown function')
+    ).rejects.toThrow('command boom')
 
     expect(await lifecycle.findOwnedByLookupKey('artifact:atomic-failure')).toBeUndefined()
     expect(await lifecycle.listOwned()).toEqual([])
@@ -972,11 +979,11 @@ describe('draft lifecycle — owned discovery and atomic creation', () => {
         draftId,
         [
           { path: 'addTodo', args: { id: 92, title: 'rolled back' } },
-          { path: 'nope', args: {} },
+          { path: 'boom', args: {} },
         ],
         { context, summary: { state: 'must-not-commit' } },
       ),
-    ).rejects.toThrow('Unknown function')
+    ).rejects.toThrow('command boom')
     expect(await lifecycle.findOwnedByLookupKey('artifact:file-2', { context })).toMatchObject({
       summary: { state: 'initial' },
     })
@@ -2118,6 +2125,39 @@ describe('draft lifecycle — command envelope ownership', () => {
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
+  test('rejects a canonical-only mutation before it can change the draft', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(
+      lc.append(draftId, [{ path: 'canonicalOnlyTodo', args: { id: 3, title: 'canonical-only' } }]),
+    ).rejects.toThrow(
+      'Draft command canonicalOnlyTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+    expect(await lc.inspect(draftId)).toEqual([])
+  })
+
+  test('rejects a query that was not explicitly declared as a command', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(lc.append(draftId, [{ path: 'listTodos', args: {} }])).rejects.toThrow(
+      'Draft command listTodos cannot reference a query; use .command() for replay-safe handlers',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+  })
+
+  test('rejects an unknown command path during preflight', async () => {
+    const lc = createDraftLifecycle(app)
+    const draftId = await lc.open(0)
+
+    await expect(lc.append(draftId, [{ path: 'missingCommand', args: {} }])).rejects.toThrow(
+      'Draft command missingCommand references an unknown function',
+    )
+    expect(await lc.getLog(draftId)).toEqual([])
+  })
+
   test('snapshots a mutable batch before validation and queued execution', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
@@ -2133,13 +2173,15 @@ describe('draft lifecycle — command envelope ownership', () => {
     ])
   })
 
-  test('rejects a path replaced with an Action while append waits to execute', async () => {
+  test('rejects a path replaced with a canonical-only mutation while append waits to execute', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
     const appending = lc.append(draftId, [{ path: 'addTodo', args: { id: 3, title: 'cherry' } }])
-    app.functions.set('addTodo', app.functions.get('externalAction')!)
+    app.functions.set('addTodo', app.functions.get('canonicalOnlyTodo')!)
 
-    await expect(appending).rejects.toThrow('Draft command addTodo cannot reference an action')
+    await expect(appending).rejects.toThrow(
+      'Draft command addTodo cannot reference a canonical-only mutation; use .command() for replay-safe handlers',
+    )
     expect(await lc.getLog(draftId)).toEqual([])
   })
 
@@ -2147,7 +2189,13 @@ describe('draft lifecycle — command envelope ownership', () => {
     const addTodo = app.functions.get('addTodo')
     const renameTodo = app.functions.get('renameTodo')
     const action = app.functions.get('externalAction')
-    if (!addTodo || addTodo.type !== 'mutation' || !renameTodo || !action) {
+    if (
+      !addTodo ||
+      addTodo.type !== 'mutation' ||
+      !addTodo.draftReplayable ||
+      !renameTodo ||
+      !action
+    ) {
       throw new Error('missing command definitions')
     }
     let addRuns = 0
@@ -2195,7 +2243,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
   }
 
   /** SQLSTATE 40001 rolls back the first attempt, then replays exactly one command and one derived change. */
-  test('replays the whole mutation transaction after a serialization rollback', async () => {
+  test('replays the whole command transaction after a serialization rollback', async () => {
     const definition = app.functions.get('addTodo')
     if (!definition || definition.type !== 'mutation') throw new Error('missing addTodo mutation')
     let handlerRuns = 0
@@ -2529,12 +2577,12 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
 
     const appending = lc.append(draftId, [
       { path: 'addTodo', args: { id: 3, title: 'cherry' } },
-      { path: 'nope', args: {} }, // unknown function — throws mid-batch
+      { path: 'boom', args: {} },
     ])
     // Issued before the failure is observable, so it is admitted and queues.
     const publishing = lc.publish(draftId)
 
-    await expect(appending).rejects.toThrow('Unknown function')
+    await expect(appending).rejects.toThrow('command boom')
     await publishing
 
     const { result: canonical } = await app.call('listTodos', {})
@@ -2576,9 +2624,9 @@ describe('draft lifecycle — invalidation fan-out', () => {
     await expect(
       lc.append(draftId, [
         { path: 'addTodo', args: { id: 3, title: 'cherry' } },
-        { path: 'nope', args: {} },
+        { path: 'boom', args: {} },
       ]),
-    ).rejects.toThrow('Unknown function')
+    ).rejects.toThrow('command boom')
 
     expect(cap.tags()).toEqual([])
     expect(await lc.getLog(draftId)).toEqual([])
@@ -2611,9 +2659,8 @@ describe('draft lifecycle — invalidation fan-out', () => {
 
     const cap = captureEmits()
     await expect(
-      // `nope` is not a registered function — a deterministic mid-replay failure.
-      lc.publish(draftId, (logToBind) => [...logToBind, { path: 'nope', args: {} }]),
-    ).rejects.toThrow()
+      lc.publish(draftId, (logToBind) => [...logToBind, { path: 'boom', args: {} }]),
+    ).rejects.toThrow('command boom')
 
     // Nothing durably changed, so announcing would trigger a pointless refetch
     // storm — and would tell clients a publish landed when it did not.
@@ -2643,7 +2690,7 @@ describe('draft lifecycle — invalidation fan-out', () => {
     // the tracker actually reported written instead.
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
-    await lc.append(draftId, [{ path: 'listTodos', args: {} }])
+    await lc.append(draftId, [{ path: 'readTodos', args: {} }])
 
     const cap = captureEmits()
     await lc.discard(draftId)

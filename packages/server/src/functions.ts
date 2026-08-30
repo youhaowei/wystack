@@ -7,6 +7,8 @@ import {
   type InferArgs,
   type MiddlewareFn,
   type ActionDef,
+  type CommandContext,
+  type CommandDef,
   type MutationDef,
   type Overwrite,
   type ProcedureDatabaseAccess,
@@ -21,22 +23,32 @@ type AnyMiddleware = MiddlewareFn<any, any>
 export interface ProcedureBuilder<
   TContext,
   TArgSchema extends Record<string, AnyColumnDef> = Record<never, never>,
+  TDatabaseAccess extends ProcedureDatabaseAccess = 'native',
 > {
   use<TPatch>(
     middleware: MiddlewareFn<TContext, TPatch>,
-  ): ProcedureBuilder<Overwrite<TContext, TPatch>, TArgSchema>
+  ): ProcedureBuilder<Overwrite<TContext, TPatch>, TArgSchema, TDatabaseAccess>
   authorize(
     permission: Permission<NoInfer<TContext>>,
-  ): ProcedureBuilder<Overwrite<TContext, { principal: Principal }>, TArgSchema>
+  ): ProcedureBuilder<Overwrite<TContext, { principal: Principal }>, TArgSchema, TDatabaseAccess>
   input<TNextArgSchema extends Record<string, AnyColumnDef>>(
     schema: TNextArgSchema,
-  ): ProcedureBuilder<TContext, TNextArgSchema>
+  ): ProcedureBuilder<TContext, TNextArgSchema, TDatabaseAccess>
   query<TReturn>(
     handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
   ): QueryDef<InferArgs<TArgSchema>, TReturn>
   mutation<TReturn>(
     handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
-  ): MutationDef<InferArgs<TArgSchema>, TReturn>
+  ): MutationDef<InferArgs<TArgSchema>, TReturn, false>
+  /**
+   * Attest that a native, DB-only handler is safe for ordered draft replay.
+   * WyStack restricts the DB surface but cannot inspect captured side effects.
+   */
+  command: TDatabaseAccess extends 'native'
+    ? <TReturn>(
+        handler: (ctx: CommandContext<TContext>, args: InferArgs<TArgSchema>) => Promise<TReturn>,
+      ) => CommandDef<InferArgs<TArgSchema>, TReturn>
+    : never
   action<TReturn>(
     handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
   ): ActionDef<InferArgs<TArgSchema>, TReturn>
@@ -61,6 +73,7 @@ function isStageOk(value: unknown): value is StageOk<unknown> {
 function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TReturn>(
   type: 'query' | 'mutation' | 'action',
   databaseAccess: ProcedureDatabaseAccess,
+  draftReplayable: boolean,
   args: TArgSchema,
   middleware: readonly AnyMiddleware[],
   handler: (ctx: TContext, args: InferArgs<TArgSchema>) => Promise<TReturn>,
@@ -70,9 +83,7 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
   | ActionDef<InferArgs<TArgSchema>, TReturn> {
   const argsSchema = buildArgsSchema(args)
 
-  return {
-    type,
-    databaseAccess,
+  const definition = {
     path: '',
     args,
     // Keep the stored context deliberately broad: client inference only needs
@@ -101,59 +112,117 @@ function terminal<TContext, TArgSchema extends Record<string, AnyColumnDef>, TRe
       return handler(currentContext, parsed.data as InferArgs<TArgSchema>)
     },
   }
+
+  if (type === 'mutation') {
+    return { ...definition, type, databaseAccess, draftReplayable }
+  }
+  return { ...definition, type, databaseAccess }
 }
 
 export function createProcedure<TContext>(
+  databaseAccess?: 'native',
+): ProcedureBuilder<TContext, Record<never, never>, 'native'>
+export function createProcedure<TContext>(
+  databaseAccess: 'legacy-raw',
+): ProcedureBuilder<TContext, Record<never, never>, 'legacy-raw'>
+export function createProcedure<TContext>(
   databaseAccess: ProcedureDatabaseAccess = 'native',
-): ProcedureBuilder<TContext> {
-  function createBuilder<TCurrentContext, TArgSchema extends Record<string, AnyColumnDef>>(
+): ProcedureBuilder<TContext, Record<never, never>, ProcedureDatabaseAccess> {
+  function createBuilder<
+    TCurrentContext,
+    TArgSchema extends Record<string, AnyColumnDef>,
+    TCurrentDatabaseAccess extends ProcedureDatabaseAccess,
+  >(
     middleware: readonly AnyMiddleware[],
     args: TArgSchema,
-  ): ProcedureBuilder<TCurrentContext, TArgSchema> {
+    currentDatabaseAccess: TCurrentDatabaseAccess,
+  ): ProcedureBuilder<TCurrentContext, TArgSchema, TCurrentDatabaseAccess> {
     return {
       use<TPatch>(stage: MiddlewareFn<TCurrentContext, TPatch>) {
-        return createBuilder<Overwrite<TCurrentContext, TPatch>, TArgSchema>(
-          [...middleware, stage],
-          args,
-        )
+        return createBuilder<
+          Overwrite<TCurrentContext, TPatch>,
+          TArgSchema,
+          TCurrentDatabaseAccess
+        >([...middleware, stage], args, currentDatabaseAccess)
       },
       authorize(permission: Permission<NoInfer<TCurrentContext>>) {
-        return createBuilder<Overwrite<TCurrentContext, { principal: Principal }>, TArgSchema>(
-          [...middleware, authorize<TCurrentContext>(permission)],
-          args,
-        )
+        return createBuilder<
+          Overwrite<TCurrentContext, { principal: Principal }>,
+          TArgSchema,
+          TCurrentDatabaseAccess
+        >([...middleware, authorize<TCurrentContext>(permission)], args, currentDatabaseAccess)
       },
       input<TNextArgSchema extends Record<string, AnyColumnDef>>(schema: TNextArgSchema) {
-        return createBuilder<TCurrentContext, TNextArgSchema>(middleware, schema)
+        return createBuilder<TCurrentContext, TNextArgSchema, TCurrentDatabaseAccess>(
+          middleware,
+          schema,
+          currentDatabaseAccess,
+        )
       },
       query<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('query', databaseAccess, args, middleware, handler) as QueryDef<
-          InferArgs<TArgSchema>,
-          TReturn
-        >
+        return terminal(
+          'query',
+          currentDatabaseAccess,
+          false,
+          args,
+          middleware,
+          handler,
+        ) as QueryDef<InferArgs<TArgSchema>, TReturn>
       },
       mutation<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('mutation', databaseAccess, args, middleware, handler) as MutationDef<
-          InferArgs<TArgSchema>,
-          TReturn
-        >
+        return terminal(
+          'mutation',
+          currentDatabaseAccess,
+          false,
+          args,
+          middleware,
+          handler,
+        ) as MutationDef<InferArgs<TArgSchema>, TReturn, false>
       },
+      command: (currentDatabaseAccess === 'native'
+        ? <TReturn>(
+            handler: (
+              ctx: CommandContext<TCurrentContext>,
+              handlerArgs: InferArgs<TArgSchema>,
+            ) => Promise<TReturn>,
+          ) =>
+            terminal(
+              'mutation',
+              currentDatabaseAccess,
+              true,
+              args,
+              middleware,
+              handler,
+            ) as CommandDef<InferArgs<TArgSchema>, TReturn>
+        : undefined) as ProcedureBuilder<
+        TCurrentContext,
+        TArgSchema,
+        TCurrentDatabaseAccess
+      >['command'],
       action<TReturn>(
         handler: (ctx: TCurrentContext, handlerArgs: InferArgs<TArgSchema>) => Promise<TReturn>,
       ) {
-        return terminal('action', databaseAccess, args, middleware, handler) as ActionDef<
-          InferArgs<TArgSchema>,
-          TReturn
-        >
+        return terminal(
+          'action',
+          currentDatabaseAccess,
+          false,
+          args,
+          middleware,
+          handler,
+        ) as ActionDef<InferArgs<TArgSchema>, TReturn>
       },
     }
   }
 
-  return createBuilder<TContext, Record<never, never>>([], {})
+  return createBuilder<TContext, Record<never, never>, ProcedureDatabaseAccess>(
+    [],
+    {},
+    databaseAccess,
+  )
 }
 
 export function authorize<TContext>(

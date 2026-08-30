@@ -53,7 +53,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       functions: {
         retargetAndRenameCode: wy.procedure
           .input({ childId: int, parentId: int, nextParentCode: text, nextCode: text })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db
               .from(schema.aCodeParents)
               .where({ op: 'eq', column: 'id', value: args.parentId })
@@ -65,7 +65,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           }),
         replaceCodeFamily: wy.procedure
           .input({ childId: int, parentId: int, code: text })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db
               .from(schema.zCodeChildren)
               .where({ op: 'eq', column: 'id', value: args.childId })
@@ -81,7 +81,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           }),
         addFamily: wy.procedure
           .input({ parentId: int, childId: int })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db.into(schema.zParents).insert({ id: args.parentId, name: 'parent' })
             return ctx.db
               .into(schema.aChildren)
@@ -89,18 +89,18 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           }),
         addTreePair: wy.procedure
           .input({ parentId: int, childId: int })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db.into(schema.treeNodes).insert({ id: args.parentId, parentId: null })
             return ctx.db
               .into(schema.treeNodes)
               .insert({ id: args.childId, parentId: args.parentId })
           }),
-        addTodo: wy.procedure.input({ id: int, title: text }).mutation(async (ctx, args) => {
+        addTodo: wy.procedure.input({ id: int, title: text }).command(async (ctx, args) => {
           const barrier = ctx['initialCommandBarrier']
           if (typeof barrier === 'function') await barrier()
           return ctx.db.into(schema.todos).insert(args)
         }),
-        addToDashboard: wy.procedure.input({ id: int, item: text }).mutation(async (ctx, args) => {
+        addToDashboard: wy.procedure.input({ id: int, item: text }).command(async (ctx, args) => {
           const current = (await ctx.db.from(schema.dashboards).first()) as {
             id: number
             items: string
@@ -110,7 +110,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
         }),
         renameAlphaThenZeta: wy.procedure
           .input({ id: int, title: text })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db
               .from(schema.alphaRows)
               .where({ op: 'eq', column: 'id', value: args.id })
@@ -124,7 +124,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           }),
         renameVersionedTodo: wy.procedure
           .input({ id: int, title: text })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             const barrier = ctx['writeBarrier']
             if (typeof barrier === 'function') await barrier()
             return ctx.db
@@ -134,7 +134,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           }),
         renameZetaThenAlpha: wy.procedure
           .input({ id: int, title: text })
-          .mutation(async (ctx, args) => {
+          .command(async (ctx, args) => {
             await ctx.db
               .from(schema.zetaRows)
               .where({ op: 'eq', column: 'id', value: args.id })

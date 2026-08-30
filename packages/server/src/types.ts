@@ -58,6 +58,15 @@ export interface ProcedureDb {
 }
 
 /**
+ * Database surface available to replayable command handlers. The lifecycle
+ * owns the transaction boundary, so commands cannot open nested transactions.
+ */
+export type CommandDb = Pick<ProcedureDb, 'from' | 'into'>
+
+/** Preserve app and middleware fields while narrowing a command handler's DB. */
+export type CommandContext<TContext> = Overwrite<TContext, { db: CommandDb }>
+
+/**
  * Compatibility-only database surface for procedures that have not yet moved
  * onto WyStack's tracked query DSL.
  *
@@ -72,7 +81,10 @@ export interface LegacyProcedureDb extends ProcedureDb {
   transaction<R>(fn: (tx: LegacyProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 
-/** Function context passed to every query/mutation/action handler. */
+/**
+ * Base context for query, mutation, and action handlers. The command terminal
+ * narrows this with `CommandContext` so replayable handlers cannot transact.
+ */
 export type FunctionContext<TAppContext extends object = Record<string, unknown>> = TAppContext & {
   db: ProcedureDb
   can: Can
@@ -137,16 +149,24 @@ export interface ActionDef<
   handler: (ctx: any, args: TArgs) => Promise<TReturn>
 }
 
-// A Mutation is the transaction-eligible database-write specialization of Action.
-// Mutation handlers may be replayed after a rolled-back transaction (including
-// draft append/rebase/publish and PostgreSQL deadlock/serialization recovery),
-// so external I/O belongs in an Action rather than a Mutation.
+// A Mutation is the canonical database-write specialization of Action. It is
+// callable through the normal RPC path, but is not draft-replayable by default:
+// handlers may rely on canonical-only transaction/orchestration semantics.
+// `.command(...)` is the explicit replay-safety attestation for DB-only handlers.
+export interface MutationDef<
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TArgs = any,
+  // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
+  TReturn = any,
+  TDraftReplayable extends boolean = boolean,
+> extends ActionDef<TArgs, TReturn, 'mutation'> {
+  /** Capability attestation consumed by applyCommands and the draft lifecycle. */
+  draftReplayable: TDraftReplayable
+}
+
+/** A mutation whose author explicitly attested it is safe for ordered draft replay. */
 // oxlint-disable-next-line typescript/no-explicit-any -- generic defaults need `any` for TypeScript variance compatibility
-export interface MutationDef<TArgs = any, TReturn = any> extends ActionDef<
-  TArgs,
-  TReturn,
-  'mutation'
-> {}
+export type CommandDef<TArgs = any, TReturn = any> = MutationDef<TArgs, TReturn, true>
 
 export type FunctionDef = QueryDef | MutationDef | ActionDef
 

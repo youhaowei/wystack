@@ -29,7 +29,7 @@
 import { createDrizzleTracker, type DrizzleTracker, type SelectBuilder } from '@wystack/db'
 import { isPrincipal } from '@wystack/identity'
 import { sql } from 'drizzle-orm'
-import type { CommandResult, CommitResult } from './apply-commands'
+import { assertReplayableCommand, type CommandResult, type CommitResult } from './apply-commands'
 import {
   compactLog,
   snapshotCommand,
@@ -242,14 +242,8 @@ export function createDraftLifecycle(
     return storageInitialization
   }
 
-  function assertDraftCommandIsInternal(command: DraftCommand): void {
-    const definition = app.functions.get(command.path)
-    if (definition?.type === 'action') {
-      throw new Error(`Draft command ${command.path} cannot reference an action`)
-    }
-    if (definition?.databaseAccess === 'legacy-raw') {
-      throw new Error(`Draft command ${command.path} cannot reference a legacy procedure`)
-    }
+  function assertDraftCommandIsReplayable(command: DraftCommand): void {
+    assertReplayableCommand(app.functions.get(command.path), command.path, 'Draft command')
   }
 
   async function runDraftCommand(
@@ -258,8 +252,8 @@ export function createDraftLifecycle(
     context: Record<string, unknown>,
   ): Promise<unknown> {
     // The registry is mutable. Check immediately before dispatch so an earlier
-    // command cannot replace a later path with an Action during this batch.
-    assertDraftCommandIsInternal(command)
+    // command cannot replace a later path with an ineligible definition.
+    assertDraftCommandIsReplayable(command)
     return app.system.runHandler(command.path, command.args, db, context)
   }
 
@@ -306,8 +300,8 @@ export function createDraftLifecycle(
   /**
    * PostgreSQL can abort either participant when independently valid command
    * handlers acquire canonical rows in opposite orders. Retry only the whole,
-   * framework-owned lifecycle transaction: command mutations are already
-   * replayable by the draft contract, Actions are rejected, and invalidation is
+   * framework-owned lifecycle transaction: explicit command handlers attest
+   * replay safety, ineligible definitions are rejected, and invalidation is
    * emitted only after the final commit. Authorization, resolution, and
    * conflict-acceptance hooks remain outside this boundary.
    */
@@ -401,7 +395,7 @@ export function createDraftLifecycle(
     if (commands.length === 0) {
       throw new Error('draft lifecycle: opening with commands requires a non-empty batch')
     }
-    for (const command of commands) assertDraftCommandIsInternal(command)
+    for (const command of commands) assertDraftCommandIsReplayable(command)
     return commands
   }
 
@@ -611,7 +605,7 @@ export function createDraftLifecycle(
       await storageReady()
       const context = operationOpts.context ?? {}
       for (const command of commands) {
-        assertDraftCommandIsInternal(command)
+        assertDraftCommandIsReplayable(command)
       }
       const authorizationTracker = app.system.createTracked()
       const authorized = await requireStored(authorizationTracker.raw, draftId)
@@ -682,7 +676,7 @@ export function createDraftLifecycle(
         ? (await resolve([...snapshotLog])).map((command) => snapshotCommand(command))
         : [...snapshotLog]
       for (const command of boundLog) {
-        assertDraftCommandIsInternal(command)
+        assertDraftCommandIsReplayable(command)
       }
 
       let draftWrites = new Set<string>()
@@ -816,7 +810,7 @@ export function createDraftLifecycle(
         summaryReplacement = snapshotSummaryReplacement(resolved as ForkResolution, 'draft summary')
       }
       const replacementLog = compactLog(commands.map((command) => snapshotCommand(command)))
-      for (const command of replacementLog) assertDraftCommandIsInternal(command)
+      for (const command of replacementLog) assertDraftCommandIsReplayable(command)
       const replacementSummary = summaryReplacement.replace
         ? summaryReplacement.summary
         : snapshot.summary

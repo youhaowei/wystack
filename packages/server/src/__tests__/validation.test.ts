@@ -167,7 +167,7 @@ describe('validation in call()', () => {
         protectedTodo: wy.procedure
           .authorize(protectedPermission)
           .input({ id: int })
-          .query(async (_ctx, args) => ({ id: args.id })),
+          .command(async (_ctx, args) => ({ id: args.id })),
       },
     })
   })

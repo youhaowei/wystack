@@ -1,0 +1,23 @@
+/** Compile-time contracts for the explicit replay-safe command terminal. */
+import { defineApp } from './define-app'
+
+type Expect<T extends true> = T
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
+
+type Definition = ReturnType<typeof defineApp<Record<string, unknown>>>
+type CommandHandler = Parameters<Definition['procedure']['command']>[0]
+type CommandHandlerContext = Parameters<CommandHandler>[0]
+type MutationHandler = Parameters<Definition['procedure']['mutation']>[0]
+type MutationHandlerContext = Parameters<MutationHandler>[0]
+
+type _CommandHandlerOmitsTransactions = Expect<
+  Equal<Extract<keyof CommandHandlerContext['db'], 'transaction'>, never>
+>
+type _MutationHandlerRetainsTransactions = Expect<
+  Equal<Extract<keyof MutationHandlerContext['db'], 'transaction'>, 'transaction'>
+>
+
+export type __CommandProcedureContract = [
+  _CommandHandlerOmitsTransactions,
+  _MutationHandlerRetainsTransactions,
+]

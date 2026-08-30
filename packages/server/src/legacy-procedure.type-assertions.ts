@@ -16,7 +16,10 @@ import type {
 
 type Expect<T extends true> = T
 type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
-type BuilderContext<T> = T extends ProcedureBuilder<infer TContext, infer _TArgs> ? TContext : never
+type BuilderContext<T> =
+  T extends ProcedureBuilder<infer TContext, infer _TArgs, infer _TDatabaseAccess>
+    ? TContext
+    : never
 
 type AppContext = { orgId: string }
 type Definition = ReturnType<typeof defineApp<AppContext>>
@@ -41,6 +44,9 @@ type _LegacyDbOmitsScopeCapabilities = Expect<
 type _LegacyContextRemainsUsableAsNative = Expect<
   LegacyFunctionContext<AppContext> extends FunctionContext<AppContext> ? true : false
 >
+type _LegacyBuilderCannotDeclareCommands = Expect<
+  Equal<Definition['legacyProcedure']['command'], never>
+>
 
 export type __LegacyProcedureContract = [
   _NativeBuilderUsesNativeContext,
@@ -49,4 +55,5 @@ export type __LegacyProcedureContract = [
   _LegacyDbExposesCompatibilityCapabilities,
   _LegacyDbOmitsScopeCapabilities,
   _LegacyContextRemainsUsableAsNative,
+  _LegacyBuilderCannotDeclareCommands,
 ]

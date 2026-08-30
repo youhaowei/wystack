@@ -39,10 +39,13 @@ export {
 export type {
   QueryDef,
   MutationDef,
+  CommandDef,
   ActionDef,
   FunctionContext,
   LegacyFunctionContext,
+  CommandContext,
   ProcedureDb,
+  CommandDb,
   LegacyProcedureDb,
   ProcedureDatabaseAccess,
   FunctionDef,
