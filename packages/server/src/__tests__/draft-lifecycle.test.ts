@@ -449,6 +449,21 @@ describe('draft lifecycle — global authority and custody', () => {
     ).resolves.toMatchObject({ draftId })
   })
 
+  test('global custody authorization receives the open and owned-discovery action', async () => {
+    const actions: string[] = []
+    const lifecycle = createProductionDraftLifecycle(app, {
+      authorizeGlobalDraft: ({ action }) => {
+        actions.push(action)
+        return true
+      },
+    })
+    await lifecycle.open(0, { context: ownerContext, lookupKey: 'global:action-routing' })
+    await lifecycle.listOwned({ context: ownerContext })
+    await lifecycle.findOwnedByLookupKey('global:action-routing', { context: ownerContext })
+
+    expect(actions).toEqual(['open', 'listOwned', 'findOwnedByLookupKey'])
+  })
+
   test('apps without a tenant dimension open drafts without a global authorization hook', async () => {
     const lifecycle = createProductionDraftLifecycle(app)
     const draftId = await lifecycle.open(0, { context: ownerContext })
@@ -2173,13 +2188,10 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     await lc.discard(draftId)
   })
 
-  test('concurrent appends are SERIALIZED — log order matches call order', async () => {
-    // Without the per-draft lock the two batches interleave their awaits and
-    // splice commands into each other's log positions.
+  test('concurrent appends preserve whole batches and a matching final summary', async () => {
     const lc = createDraftLifecycle(app)
     const draftId = await lc.open(0)
-
-    const a = lc.append(
+    const first = lc.append(
       draftId,
       [
         { path: 'addTodo', args: { id: 3, title: 'c1' } },
@@ -2187,7 +2199,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
       ],
       { summary: { last: 'c2' } },
     )
-    const b = lc.append(
+    const second = lc.append(
       draftId,
       [
         { path: 'addTodo', args: { id: 5, title: 'c3' } },
@@ -2195,15 +2207,26 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
       ],
       { summary: { last: 'c4' } },
     )
-    await Promise.all([a, b])
+    await Promise.all([first, second])
 
-    expect((await lc.getLog(draftId)).map((c) => (c.args as { title: string }).title)).toEqual([
-      'c1',
-      'c2',
-      'c3',
-      'c4',
-    ])
-    expect((await lc.listOwned())[0]).toMatchObject({ summary: { last: 'c4' } })
+    // PGlite may award either append the first CAS. Both valid serializations
+    // keep each batch contiguous, and the final summary belongs to the batch
+    // that committed last.
+    const titles = (await lc.getLog(draftId)).map(
+      (command) => (command.args as { title: string }).title,
+    )
+    expect([
+      ['c1', 'c2', 'c3', 'c4'],
+      ['c3', 'c4', 'c1', 'c2'],
+    ]).toContainEqual(titles)
+    const expectedSummary = titles.at(-1) === 'c4' ? { last: 'c4' } : { last: 'c2' }
+    expect((await lc.listOwned())[0]).toMatchObject({ summary: expectedSummary })
+
+    const stored = await db.execute(
+      `SELECT log_revision FROM wystack_drafts WHERE draft_id = '${draftId}'`,
+    )
+    // oxlint-disable-next-line typescript/no-explicit-any
+    expect((stored as any).rows[0]?.log_revision).toBe(2)
   })
 
   test('concurrent append and discard cannot leave an orphaned overlay', async () => {

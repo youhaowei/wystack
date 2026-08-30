@@ -310,6 +310,23 @@ describe('draft lifecycle — owned discovery and atomic creation', () => {
     })
   })
 
+  test('rejects an explicitly undefined append summary without clearing the current value', async () => {
+    const drafts = lifecycle()
+    const context = { owner: 'alice' }
+    const draftId = await drafts.open(0, {
+      context,
+      lookupKey: 'artifact:file-undefined-summary',
+      summary: { state: 'initial' },
+    })
+
+    await expect(drafts.append(draftId, [], { context, summary: undefined })).rejects.toThrow(
+      'draft summary must be an explicit JSON value',
+    )
+    expect(
+      await drafts.findOwnedByLookupKey('artifact:file-undefined-summary', { context }),
+    ).toMatchObject({ summary: { state: 'initial' } })
+  })
+
   test('validates lookup keys at open and discovery entrypoints', async () => {
     const drafts = lifecycle()
     await expect(

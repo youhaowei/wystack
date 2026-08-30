@@ -408,24 +408,59 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     expect(replacement).toEqual({ child_id: 3 })
   })
 
-  test('concurrent appends serialize one durable log across separate connections', async () => {
+  test('a paused append retries after the concurrent winner and commits last', async () => {
     const first = lifecycle(firstApp)
     const second = lifecycle(secondApp)
     const draftId = await first.open(0, { context: privilegedContext })
     await second.getLog(draftId, { context: privilegedContext })
 
-    await Promise.all([
-      first.append(draftId, [{ path: 'addTodo', args: { id: 1, title: 'first' } }], {
-        context: privilegedContext,
-      }),
-      second.append(draftId, [{ path: 'addTodo', args: { id: 2, title: 'second' } }], {
-        context: privilegedContext,
-      }),
+    let firstAttemptStarted!: () => void
+    const firstStarted = new Promise<void>((resolve) => {
+      firstAttemptStarted = resolve
+    })
+    let resumeFirstAttempt!: () => void
+    const firstMayContinue = new Promise<void>((resolve) => {
+      resumeFirstAttempt = resolve
+    })
+    let firstHandlerRuns = 0
+    const firstBarrier = async () => {
+      firstHandlerRuns += 1
+      if (firstHandlerRuns > 1) return
+      firstAttemptStarted()
+      await firstMayContinue
+    }
+
+    const firstAppend = first.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 1, title: 'first' } }],
+      {
+        context: { ...privilegedContext, initialCommandBarrier: firstBarrier },
+        summary: { last: 'first' },
+      },
+    )
+    await firstStarted
+    const secondAppend = second.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 2, title: 'second' } }],
+      { context: privilegedContext, summary: { last: 'second' } },
+    )
+    const [secondOutcome] = await Promise.allSettled([secondAppend])
+    resumeFirstAttempt()
+    const [firstOutcome] = await Promise.allSettled([firstAppend])
+
+    expect([firstOutcome, secondOutcome]).toEqual([
+      expect.objectContaining({ status: 'fulfilled' }),
+      expect.objectContaining({ status: 'fulfilled' }),
     ])
 
     const log = await first.getLog(draftId, { context: privilegedContext })
-    expect(log).toHaveLength(2)
-    expect(log.map((command) => (command.args as { id: number }).id).sort()).toEqual([1, 2])
+    expect(log.map((command) => (command.args as { id: number }).id)).toEqual([2, 1])
+    expect(
+      (await first.listOwned({ context: privilegedContext })).find(
+        (draft) => draft.draftId === draftId,
+      ),
+    ).toMatchObject({ draftId, summary: { last: 'first' } })
+    expect(firstHandlerRuns).toBe(2)
     expect(await first.inspect(draftId, { context: privilegedContext })).toHaveLength(2)
   })
 
@@ -581,6 +616,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     await waitForConnectionLock(
       `${namespace}_second`,
       'publish did not block on the append-held zeta row',
+      'transactionid',
     )
     release()
 

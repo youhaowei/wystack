@@ -403,19 +403,22 @@ export function createDraftLifecycle(
     return commands
   }
 
-  async function resolveOpenCustody(context: Record<string, unknown>): Promise<{
-    tenantId: unknown | undefined
+  async function resolveDraftCustody(
+    action: 'open' | 'listOwned' | 'findOwnedByLookupKey',
+    context: Record<string, unknown>,
+  ): Promise<{
+    tracked: DrizzleTracker
     ownerKey: unknown
   }> {
     const resolvedOwnerKey = await ownerKey(context)
     requireStableOwner(resolvedOwnerKey)
     const unscoped = app.system.createTracked()
-    const hasGlobalAuthority = await hasGlobalDraftAuthority('open', context)
-    const scoped = hasGlobalAuthority ? unscoped : await app.system.scopeTracked(unscoped, context)
-    if (scoped.tenantId === undefined && !hasGlobalAuthority) {
+    const hasGlobalAuthority = await hasGlobalDraftAuthority(action, context)
+    const tracked = hasGlobalAuthority ? unscoped : await app.system.scopeTracked(unscoped, context)
+    if (tracked.tenantId === undefined && !hasGlobalAuthority) {
       throw new Error('draft lifecycle: global drafts require privileged host context')
     }
-    return { tenantId: scoped.tenantId, ownerKey: resolvedOwnerKey }
+    return { tracked, ownerKey: resolvedOwnerKey }
   }
 
   async function materializeOpenedDraft(
@@ -459,45 +462,20 @@ export function createDraftLifecycle(
     return { results, draftWrites: new Set(draftDb.tablesWritten) }
   }
 
-  async function resolveOwnedScope(
-    action: 'listOwned' | 'findOwnedByLookupKey',
-    context: Record<string, unknown>,
-  ): Promise<{ tracked: DrizzleTracker; ownerKey: unknown }> {
-    const resolvedOwnerKey = await ownerKey(context)
-    requireStableOwner(resolvedOwnerKey)
-    const unscoped = app.system.createTracked()
-    const hasGlobalAuthority = await hasGlobalDraftAuthority(action, context)
-    const tracked = hasGlobalAuthority ? unscoped : await app.system.scopeTracked(unscoped, context)
-    if (tracked.tenantId === undefined && !hasGlobalAuthority) {
-      throw new Error('draft lifecycle: global drafts require privileged host context')
-    }
-    await storageReady()
-    return { tracked, ownerKey: resolvedOwnerKey }
-  }
-
   return {
     async open(baseVersion, openOpts = {}) {
       const lookupKey =
         openOpts.lookupKey === undefined ? undefined : validateDraftLookupKey(openOpts.lookupKey)
       const initialSummary = snapshotSummaryReplacement(openOpts, 'draft summary')
       const context = openOpts.context ?? {}
-      const resolvedOwnerKey = await ownerKey(context)
-      requireStableOwner(resolvedOwnerKey)
-      const unscoped = app.system.createTracked()
-      const hasGlobalAuthority = await hasGlobalDraftAuthority('open', context)
-      const scoped = hasGlobalAuthority
-        ? unscoped
-        : await app.system.scopeTracked(unscoped, context)
-      if (scoped.tenantId === undefined && !hasGlobalAuthority) {
-        throw new Error('draft lifecycle: global drafts require privileged host context')
-      }
+      const custody = await resolveDraftCustody('open', context)
       await storageReady()
       const draftId = mintDraftId()
-      await insertStoredDraft(scoped.raw, {
+      await insertStoredDraft(custody.tracked.raw, {
         draftId,
         baseVersion,
-        tenantId: scoped.tenantId,
-        ownerKey: resolvedOwnerKey,
+        tenantId: custody.tracked.tenantId,
+        ownerKey: custody.ownerKey,
         lookupKey,
         summary: initialSummary.replace ? initialSummary.summary : undefined,
       })
@@ -510,7 +488,7 @@ export function createDraftLifecycle(
         openOpts.lookupKey === undefined ? undefined : validateDraftLookupKey(openOpts.lookupKey)
       const initialSummary = snapshotSummaryReplacement(openOpts, 'draft summary')
       const context = openOpts.context ?? {}
-      const custody = await resolveOpenCustody(context)
+      const custody = await resolveDraftCustody('open', context)
       await storageReady()
 
       const draftId = mintDraftId()
@@ -518,7 +496,7 @@ export function createDraftLifecycle(
         materializeOpenedDraft(tx, {
           draftId,
           baseVersion,
-          tenantId: custody.tenantId,
+          tenantId: custody.tracked.tenantId,
           ownerKey: custody.ownerKey,
           lookupKey,
           summary: initialSummary.replace ? initialSummary.summary : undefined,
@@ -536,15 +514,15 @@ export function createDraftLifecycle(
       const lookupKey = validateDraftLookupKey(openOpts.lookupKey)
       const initialSummary = snapshotSummaryReplacement(openOpts, 'draft summary')
       const context = openOpts.context ?? {}
-      const custody = await resolveOpenCustody(context)
+      const custody = await resolveDraftCustody('open', context)
       await storageReady()
 
       const candidateDraftId = mintDraftId()
       const outcome = await runReplayableTransaction(async (tx) => {
-        await lockStoredDraftLookup(tx.raw, custody.tenantId, custody.ownerKey, lookupKey)
+        await lockStoredDraftLookup(tx.raw, custody.tracked.tenantId, custody.ownerKey, lookupKey)
         const existing = await findStoredDraftForOwnerByLookupKey(
           tx.raw,
-          custody.tenantId,
+          custody.tracked.tenantId,
           custody.ownerKey,
           lookupKey,
         )
@@ -560,7 +538,7 @@ export function createDraftLifecycle(
         const opened = await materializeOpenedDraft(tx, {
           draftId: candidateDraftId,
           baseVersion,
-          tenantId: custody.tenantId,
+          tenantId: custody.tracked.tenantId,
           ownerKey: custody.ownerKey,
           lookupKey,
           summary: initialSummary.replace ? initialSummary.summary : undefined,
@@ -580,7 +558,8 @@ export function createDraftLifecycle(
 
     async listOwned(listOpts = {}) {
       const context = listOpts.context ?? {}
-      const scope = await resolveOwnedScope('listOwned', context)
+      const scope = await resolveDraftCustody('listOwned', context)
+      await storageReady()
       const drafts = await listStoredDraftsForOwner(
         scope.tracked.raw,
         scope.tracked.tenantId,
@@ -593,7 +572,8 @@ export function createDraftLifecycle(
     async findOwnedByLookupKey(lookupKey, operationOpts = {}) {
       const normalizedLookupKey = validateDraftLookupKey(lookupKey)
       const context = operationOpts.context ?? {}
-      const scope = await resolveOwnedScope('findOwnedByLookupKey', context)
+      const scope = await resolveDraftCustody('findOwnedByLookupKey', context)
+      await storageReady()
       const draft = await findStoredDraftForOwnerByLookupKey(
         scope.tracked.raw,
         scope.tracked.tenantId,
