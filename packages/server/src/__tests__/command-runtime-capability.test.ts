@@ -22,6 +22,10 @@ beforeEach(async () => {
     [stageOkBrand]: true,
     patch: { db: escapedTracker },
   })) as unknown as MiddlewareFn<Record<string, unknown>, { db: typeof escapedTracker }>
+  const mutateCommandDb = (async ({ ctx, next }) => {
+    ;(ctx as unknown as { db: typeof escapedTracker }).db = escapedTracker
+    return next()
+  }) as MiddlewareFn<Record<string, unknown>, Record<never, never>>
   app = await wy.build({
     db,
     functions: {
@@ -44,6 +48,12 @@ beforeEach(async () => {
         .input({})
         .command(async (ctx) => {
           await ctx.db.into(schema.commandCapabilityTodos).insert({ id: 2, title: 'escaped' })
+        }),
+      middlewareContextMutation: wy.procedure
+        .use(mutateCommandDb)
+        .input({})
+        .command(async (ctx) => {
+          await ctx.db.into(schema.commandCapabilityTodos).insert({ id: 3, title: 'escaped' })
         }),
     },
   })
@@ -97,5 +107,63 @@ describe('replay-safe command runtime capability', () => {
     await lifecycle.discard(draftId)
 
     expect((await app.call('listCommandTodos', {})).result).toEqual([])
+  })
+
+  test('keeps middleware from mutating CommandDb before direct or draft writes', async () => {
+    await expect(app.call('middlewareContextMutation', {})).rejects.toThrow()
+
+    const lifecycle = createDraftLifecycle(app, {
+      resolveOwner: () => 'command-capability-owner',
+      authorizeGlobalDraft: () => true,
+    })
+    const draftId = await lifecycle.open(0)
+    await expect(
+      lifecycle.append(draftId, [{ path: 'middlewareContextMutation', args: {} }]),
+    ).rejects.toThrow()
+    await lifecycle.discard(draftId)
+
+    expect((await app.call('listCommandTodos', {})).result).toEqual([])
+  })
+
+  test('executes the exact command definition classified before its transaction opens', async () => {
+    const localPg = new PGlite()
+    try {
+      const db = drizzle(localPg)
+      await syncSchema(db, schema)
+      const originalTransaction = db.transaction.bind(db)
+      let localApp: Awaited<ReturnType<typeof wy.build>>
+      let swapOnTransactionOpen = false
+      db.transaction = (async (fn, config) => {
+        if (swapOnTransactionOpen) {
+          swapOnTransactionOpen = false
+          localApp.functions.set('switchableCommand', localApp.functions.get('replacementAction')!)
+        }
+        return originalTransaction(fn, config)
+      }) as typeof db.transaction
+      localApp = await wy.build({
+        db,
+        functions: {
+          switchableCommand: wy.procedure.input({}).command(async (ctx) => {
+            await ctx.db.into(schema.commandCapabilityTodos).insert({ id: 4, title: 'command' })
+            return 'command'
+          }),
+          replacementAction: wy.procedure.input({}).action(async (ctx) => {
+            await ctx.db.into(schema.commandCapabilityTodos).insert({ id: 5, title: 'action' })
+            return 'action'
+          }),
+          list: wy.procedure
+            .input({})
+            .query(async (ctx) => ctx.db.from(schema.commandCapabilityTodos).all()),
+        },
+      })
+
+      swapOnTransactionOpen = true
+      expect((await localApp.call('switchableCommand', {})).result).toBe('command')
+      expect((await localApp.call('list', {})).result).toEqual([
+        expect.objectContaining({ id: 4, title: 'command' }),
+      ])
+    } finally {
+      await localPg.close()
+    }
   })
 })

@@ -396,6 +396,17 @@ describe('defineApp().build()', () => {
           ctx.db.trackGlobalRead('catalog')
           return ctx.db.raw.execute('SELECT id FROM catalog')
         }),
+        writeCatalogRaw: tenantWy.integration.input({}).mutation(async (ctx) => {
+          await ctx.db.transaction(async (tx) => {
+            tx.trackGlobalWrite('catalog')
+          })
+        }),
+        spoofTenantRead: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.trackGlobalRead('tenant:beta:notes')
+        }),
+        spoofDraftWrite: tenantWy.integration.input({}).mutation(async (ctx) => {
+          ctx.db.trackGlobalWrite('draft:other:notes')
+        }),
         writeCatalog: tenantWy.procedure.input({ id: int }).command(async (ctx, args) => {
           await ctx.db.into(mixedSchema.catalog).insert({ id: args.id, value: 'global' })
         }),
@@ -406,10 +417,19 @@ describe('defineApp().build()', () => {
 
     const read = await tenantApp.call('readCatalog', {}, { orgId: 'alpha' })
     const write = await tenantApp.call('writeCatalog', { id: 1 }, { orgId: 'alpha' })
+    const rawWrite = await tenantApp.call('writeCatalogRaw', {}, { orgId: 'alpha' })
 
     expect(read.tablesRead).toEqual(new Set(['catalog']))
     expect(write.tablesWritten).toEqual(new Set(['catalog']))
+    expect(rawWrite.tablesWritten).toEqual(new Set(['catalog']))
     expect([...read.tablesRead].some((tag) => write.tablesWritten.has(tag))).toBe(true)
+    expect([...read.tablesRead].some((tag) => rawWrite.tablesWritten.has(tag))).toBe(true)
+    await expect(tenantApp.call('spoofTenantRead', {}, { orgId: 'alpha' })).rejects.toThrow(
+      'uses a reserved tenant or draft identity prefix',
+    )
+    await expect(tenantApp.call('spoofDraftWrite', {}, { orgId: 'alpha' })).rejects.toThrow(
+      'uses a reserved tenant or draft identity prefix',
+    )
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

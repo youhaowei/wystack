@@ -130,7 +130,7 @@ function terminal<
     // FunctionDef assignability, while the builder type-checks the user handler.
     // oxlint-disable-next-line typescript/no-explicit-any -- load-bearing public FunctionDef shape
     async handler(ctx: any, rawArgs: InferArgs<TArgSchema>): Promise<TReturn> {
-      let currentContext = ctx
+      let currentContext = Object.freeze({ ...ctx })
 
       for (const stage of middleware) {
         const result = await stage({ ctx: currentContext, next: stageOk })
@@ -144,7 +144,7 @@ function terminal<
         // oxlint-disable-next-line typescript/no-explicit-any -- app permissions carry app-specific contexts
         nextContext.can = (permission: Permission<any>) =>
           evaluate(nextContext.principal, permission, nextContext)
-        currentContext = nextContext
+        currentContext = Object.freeze(nextContext)
       }
 
       const parsed = argsSchema.safeParse(rawArgs)

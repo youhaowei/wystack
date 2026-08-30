@@ -27,7 +27,7 @@ type FrameworkContextPatch = {
 }
 
 export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
-  ctx: TCtxIn
+  readonly ctx: Readonly<TCtxIn>
   next: <P extends object = {}>(patch?: P & FrameworkContextPatch) => StageOk<P>
 }) => StageOk<TPatch> | Promise<StageOk<TPatch>>
 
@@ -99,9 +99,9 @@ export interface RawProcedureDb extends ProcedureDb {
   readonly raw: DrizzleTracker['raw']
   readonly tablesRead: Set<string>
   readonly tablesWritten: Set<string>
-  /** Record a global-table read while dispatch itself is tenant scoped. */
+  /** Record an unqualified global-table read; tenant/draft identity prefixes are rejected. */
   trackGlobalRead(tag: string): void
-  /** Record a global-table write while dispatch itself is tenant scoped. */
+  /** Record an unqualified global-table write; tenant/draft identity prefixes are rejected. */
   trackGlobalWrite(tag: string): void
   transaction<R>(fn: (tx: RawProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }

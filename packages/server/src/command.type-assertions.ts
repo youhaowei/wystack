@@ -22,6 +22,11 @@ commandApp.procedure.use(({ next }) => {
   // @ts-expect-error — middleware cannot replace the framework-owned database facade
   return next({ db: {} })
 })
+commandApp.procedure.use(({ ctx, next }) => {
+  // @ts-expect-error — middleware receives an immutable framework context
+  ctx.db = {}
+  return next()
+})
 
 export type __CommandProcedureContract = [
   _CommandHandlerOmitsTransactions,

@@ -218,14 +218,23 @@ function toRawProcedureDb(
   tracked: DrizzleTracker | DraftDrizzleTracker,
   qualifyTag: (tag: string) => string,
 ): RawProcedureDb {
+  const assertGlobalTag = (tag: string) => {
+    if (tag.startsWith('tenant:') || tag.startsWith('draft:')) {
+      throw new Error(
+        `Global tracking tag "${tag}" uses a reserved tenant or draft identity prefix`,
+      )
+    }
+  }
   return Object.freeze({
     raw: tracked.raw,
     tablesRead: mappedTrackingSet(tracked.tablesRead, qualifyTag),
     tablesWritten: mappedTrackingSet(tracked.tablesWritten, qualifyTag),
     trackGlobalRead: (tag: string) => {
+      assertGlobalTag(tag)
       tracked.tablesRead.add(tag)
     },
     trackGlobalWrite: (tag: string) => {
+      assertGlobalTag(tag)
       tracked.tablesWritten.add(tag)
     },
     from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
@@ -284,6 +293,46 @@ export async function buildWyStack(opts: {
     return fn
   }
 
+  async function runDefinition(
+    fn: FunctionDef,
+    path: string,
+    args: unknown,
+    tracked: DrizzleTracker | DraftDrizzleTracker,
+    context: Record<string, unknown>,
+  ): Promise<unknown> {
+    // Native handlers receive only their declared database capability.
+    // Replay-safe commands omit transaction at runtime as well as in their
+    // CommandDb type because command application and draft replay own the
+    // outer transaction. Raw SQL and scope-changing methods are unavailable
+    // in both type and runtime.
+    // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
+    // without restoring withTenant()/withDraft() custody.
+    const databaseAccess: unknown = fn.databaseAccess
+    let db: ProcedureDb | CommandDb | RawProcedureDb
+    switch (databaseAccess) {
+      case 'native':
+        db =
+          fn.type === 'mutation' && fn.draftReplayable === true
+            ? toCommandDb(tracked)
+            : toProcedureDb(tracked)
+        break
+      case 'read-model-raw':
+      case 'integration-raw':
+      case 'legacy-raw':
+        db = toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
+        break
+      default:
+        throw new Error(
+          `Function "${path}" has unsupported databaseAccess; expected "native", ` +
+            `"read-model-raw", "integration-raw", or "legacy-raw"`,
+        )
+    }
+    const ctx = { ...context, db } as FunctionContext | RawFunctionContext
+    // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
+    ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
+    return fn.handler(ctx, args)
+  }
+
   const system: WyStackSystem = Object.freeze({
     emit: invalidation.emit,
     resolvesTenant: opts.resolveTenant !== undefined,
@@ -311,37 +360,7 @@ export async function buildWyStack(opts: {
       context: Record<string, unknown> = {},
     ) {
       const fn = getFunction(path)
-      // Native handlers receive only their declared database capability.
-      // Replay-safe commands omit transaction at runtime as well as in their
-      // CommandDb type because command application and draft replay own the
-      // outer transaction. Raw SQL and scope-changing methods are unavailable
-      // in both type and runtime.
-      // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
-      // without restoring withTenant()/withDraft() custody.
-      const databaseAccess: unknown = fn.databaseAccess
-      let db: ProcedureDb | CommandDb | RawProcedureDb
-      switch (databaseAccess) {
-        case 'native':
-          db =
-            fn.type === 'mutation' && fn.draftReplayable === true
-              ? toCommandDb(tracked)
-              : toProcedureDb(tracked)
-          break
-        case 'read-model-raw':
-        case 'integration-raw':
-        case 'legacy-raw':
-          db = toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
-          break
-        default:
-          throw new Error(
-            `Function "${path}" has unsupported databaseAccess; expected "native", ` +
-              `"read-model-raw", "integration-raw", or "legacy-raw"`,
-          )
-      }
-      const ctx = { ...context, db } as FunctionContext | RawFunctionContext
-      // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
-      ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)
-      return fn.handler(ctx, args)
+      return runDefinition(fn, path, args, tracked, context)
     },
   })
 
@@ -359,8 +378,8 @@ export async function buildWyStack(opts: {
       try {
         result =
           definition.type === 'mutation' && definition.draftReplayable === true
-            ? await tracked.transaction((tx) => system.runHandler(path, args, tx, context))
-            : await system.runHandler(path, args, tracked, context)
+            ? await tracked.transaction((tx) => runDefinition(definition, path, args, tx, context))
+            : await runDefinition(definition, path, args, tracked, context)
       } finally {
         // Fuse: any COMMITTED tracked write dispatched through `call` fans out
         // on the app's source. The finally is load-bearing for Actions: a

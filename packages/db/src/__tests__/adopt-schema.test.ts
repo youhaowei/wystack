@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
+  customType,
   foreignKey,
   integer,
   pgSchema,
@@ -246,11 +247,32 @@ describe('adoptSchema', () => {
       },
       (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
     )
+    const timestampArray = customType<{ data: Date[] }>({
+      dataType: () => 'timestamp ARRAY',
+    })
+    const customArray = pgTable(
+      'custom_array_deleted_at_records',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        deletedAt: timestampArray('deleted_at'),
+      },
+      (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+    )
 
     expect(() =>
       adoptSchema(tenancy, {
         records: {
           table: required,
+          logicalPrimaryKey: 'id',
+          softDeleteProperty: 'deletedAt',
+        },
+      }),
+    ).toThrow('must be a nullable timestamp without a default')
+    expect(() =>
+      adoptSchema(tenancy, {
+        records: {
+          table: customArray,
           logicalPrimaryKey: 'id',
           softDeleteProperty: 'deletedAt',
         },
@@ -379,6 +401,44 @@ describe('adoptSchema', () => {
     ).toThrow(
       'Tenant foreign key from "object_aliased_children" to "parents" must include tenant column "workspace_id"',
     )
+  })
+
+  test('keeps quoted schema and table identities collision-free', () => {
+    const firstSchema = pgSchema('a')
+    const secondSchema = pgSchema('a.b')
+    const adoptedParents = firstSchema.table(
+      'b.c',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+      },
+      (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+    )
+    const unrelatedParents = secondSchema.table('c', {
+      id: pgText('id').primaryKey(),
+    })
+    const children = secondSchema.table(
+      'children',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        parentId: pgText('parent_id').notNull(),
+      },
+      (row) => [
+        primaryKey({ columns: [row.workspaceId, row.id] }),
+        foreignKey({ columns: [row.parentId], foreignColumns: [unrelatedParents.id] }),
+      ],
+    )
+
+    adoptSchema(tenancy, {
+      parents: { table: adoptedParents, logicalPrimaryKey: 'id' },
+    })
+
+    expect(
+      adoptSchema(tenancy, {
+        children: { table: children, logicalPrimaryKey: 'id' },
+      }).children as unknown,
+    ).toBe(children as unknown)
   })
 
   test('rejects implicit cascading writes into a draftable table', () => {

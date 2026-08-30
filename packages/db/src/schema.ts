@@ -604,7 +604,18 @@ function normalizedIdentitySqlType(type: string): string {
 function adoptedTableIdentity(table: AnyPgTable): string {
   const tableName = getTableName(table)
   const schemaName = getTableConfig(table).schema
+  return JSON.stringify([schemaName ?? null, tableName])
+}
+
+function adoptedTableDisplayName(table: AnyPgTable): string {
+  const tableName = getTableName(table)
+  const schemaName = getTableConfig(table).schema
   return schemaName ? `${schemaName}.${tableName}` : tableName
+}
+
+function isScalarTimestampSqlType(type: string): boolean {
+  const normalized = type.toLowerCase().trim().replaceAll(/\s+/g, ' ')
+  return /^timestamp(?:\s*\(\d+\))?(?: (?:with|without) time zone)?$/.test(normalized)
 }
 
 function adoptedColumn(
@@ -752,12 +763,10 @@ function assertAdoptedSoftDelete(
     )
   }
   const deletedAt = adoptedColumn(table, softDeleteProperty)
-  const deletedAtType = normalizedIdentitySqlType(deletedAt.getSQLType())
   if (
     deletedAt.notNull ||
     deletedAt.hasDefault === true ||
-    !deletedAtType.startsWith('timestamp') ||
-    deletedAtType.endsWith('[]')
+    !isScalarTimestampSqlType(deletedAt.getSQLType())
   ) {
     throw new Error(
       `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" must be a nullable timestamp without a default`,
@@ -795,7 +804,7 @@ function assertAdoptedForeignKeys(entries: AdoptedEntry[]): void {
     const previous = adopted.get(identity)
     if (previous && !sameAdoptedRegistration(previous, entry)) {
       throw new Error(
-        `Adopted table "${identity}" is described by multiple Drizzle table objects with different adoption contracts`,
+        `Adopted table "${adoptedTableDisplayName(entry.table)}" is described by multiple Drizzle table objects with different adoption contracts`,
       )
     }
     adopted.set(identity, entry)
