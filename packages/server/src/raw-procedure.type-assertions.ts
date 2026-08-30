@@ -4,7 +4,18 @@ import type { ProcedureBuilder } from './functions'
 import type { IntegrationFunctionContext, RawProcedureDb, ReadModelFunctionContext } from './types'
 
 type Expect<T extends true> = T
-type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
+type IsAny<T> = 0 extends 1 & T ? true : false
+type IsNotAny<T> = IsAny<T> extends true ? false : true
+type Equal<A, B> =
+  IsAny<A> extends true
+    ? false
+    : IsAny<B> extends true
+      ? false
+      : [A] extends [B]
+        ? [B] extends [A]
+          ? true
+          : false
+        : false
 type BuilderContext<T> =
   T extends ProcedureBuilder<infer TContext, infer _TArgs, infer _TDatabaseAccess>
     ? TContext
@@ -19,6 +30,9 @@ type IntegrationDefinition = ReturnType<Definition['integration']['mutation']>
 type RawCapabilities = 'raw' | 'tablesRead' | 'tablesWritten'
 type ScopeCapabilities = 'withTenant' | 'withDraft'
 
+type _ReadModelContextIsNotAny = Expect<IsNotAny<ReadModelContext>>
+type _IntegrationContextIsNotAny = Expect<IsNotAny<IntegrationContext>>
+type _RawProcedureDbIsNotAny = Expect<IsNotAny<RawProcedureDb>>
 type _ReadModelUsesRawContext = Expect<
   Equal<ReadModelContext, ReadModelFunctionContext<AppContext>>
 >
@@ -46,6 +60,9 @@ type _IntegrationCannotDeclareActions = Expect<Equal<Definition['integration']['
 type _IntegrationCannotDeclareCommands = Expect<Equal<Definition['integration']['command'], never>>
 
 export type __RawProcedureContract = [
+  _ReadModelContextIsNotAny,
+  _IntegrationContextIsNotAny,
+  _RawProcedureDbIsNotAny,
   _ReadModelUsesRawContext,
   _IntegrationUsesRawContext,
   _RawDbExposesExplicitCapabilities,

@@ -312,12 +312,26 @@ export async function buildWyStack(opts: {
       // in both type and runtime.
       // Explicit raw boundaries restore raw Drizzle + manual Tag tracking
       // without restoring withTenant()/withDraft() custody.
-      const db =
-        fn.databaseAccess !== 'native'
-          ? toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
-          : fn.type === 'mutation' && fn.draftReplayable === true
-            ? toCommandDb(tracked)
-            : toProcedureDb(tracked)
+      const databaseAccess: unknown = fn.databaseAccess
+      let db: ProcedureDb | CommandDb | RawProcedureDb
+      switch (databaseAccess) {
+        case 'native':
+          db =
+            fn.type === 'mutation' && fn.draftReplayable === true
+              ? toCommandDb(tracked)
+              : toProcedureDb(tracked)
+          break
+        case 'read-model-raw':
+        case 'integration-raw':
+        case 'legacy-raw':
+          db = toRawProcedureDb(tracked, (tag) => qualifyRawTag(tracked, tag))
+          break
+        default:
+          throw new Error(
+            `Function "${path}" has unsupported databaseAccess; expected "native", ` +
+              `"read-model-raw", "integration-raw", or "legacy-raw"`,
+          )
+      }
       const ctx = { ...context, db } as FunctionContext | RawFunctionContext
       // oxlint-disable-next-line typescript/no-explicit-any -- ctx.can accepts app-specific permission contexts
       ctx.can = (permission: Permission<any>) => evaluate(ctx.principal, permission, ctx)

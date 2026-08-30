@@ -99,6 +99,90 @@ describe('adoptSchema', () => {
     })
   })
 
+  test('allows identical aliases for one authoritative table', () => {
+    const records = softDeleteTenantTable('identically_aliased_records')
+    const config = {
+      table: records,
+      logicalPrimaryKey: 'id' as const,
+      draftable: true,
+      revisionProperty: 'rowRevision' as const,
+      softDeleteProperty: 'deletedAt' as const,
+    }
+
+    const schema = adoptSchema(tenancy, {
+      records: config,
+      recordsAlias: { ...config },
+    })
+
+    expect(schema.records as unknown).toBe(records as unknown)
+    expect(schema.recordsAlias as unknown).toBe(records as unknown)
+    expect(getTableCapabilities(records)).toMatchObject({
+      draftable: true,
+      revisionProperty: 'rowRevision',
+      softDeleteProperty: 'deletedAt',
+    })
+  })
+
+  const duplicateConfigurationCases = [
+    {
+      contract: 'logical primary key',
+      first: { logicalPrimaryKey: 'id' as const },
+      second: { logicalPrimaryKey: 'value' as const },
+    },
+    {
+      contract: 'draft custody',
+      first: { logicalPrimaryKey: 'id' as const, draftable: true },
+      second: { logicalPrimaryKey: 'id' as const, draftable: false },
+    },
+    {
+      contract: 'revision custody',
+      first: { logicalPrimaryKey: 'id' as const, revisionProperty: 'rowRevision' as const },
+      second: { logicalPrimaryKey: 'id' as const },
+    },
+    {
+      contract: 'soft-delete custody',
+      first: { logicalPrimaryKey: 'id' as const, softDeleteProperty: 'deletedAt' as const },
+      second: { logicalPrimaryKey: 'id' as const },
+    },
+  ]
+
+  for (const [index, example] of duplicateConfigurationCases.entries()) {
+    test(`rejects duplicate aliases with conflicting ${example.contract}`, () => {
+      const records = softDeleteTenantTable(`conflicting_alias_records_${index}`)
+
+      expect(() =>
+        adoptSchema(tenancy, {
+          first: { table: records, ...example.first },
+          second: { table: records, ...example.second },
+        }),
+      ).toThrow('configured more than once with a different adoption contract')
+
+      // Conflict detection happens before registration, so a corrected retry
+      // can adopt the table without inheriting the rejected alias metadata.
+      expect(
+        adoptSchema(tenancy, {
+          records: { table: records, logicalPrimaryKey: 'id' },
+        }).records as unknown,
+      ).toBe(records as unknown)
+    })
+  }
+
+  test('rejects re-adoption under a different tenancy descriptor', () => {
+    const records = tenantTable('descriptor_conflict_records')
+    adoptSchema(tenancy, {
+      records: { table: records, logicalPrimaryKey: 'id' },
+    })
+    const otherTenancy = multiTenant({
+      key: { property: 'workspaceId', column: 'workspace_id', type: text },
+    })
+
+    expect(() =>
+      adoptSchema(otherTenancy, {
+        recordsAlias: { table: records, logicalPrimaryKey: 'id' },
+      }),
+    ).toThrow('already registered with different capabilities')
+  })
+
   test('rejects a tenant table whose physical identity is still global', () => {
     const records = pgTable('global_records', {
       workspaceId: pgText('workspace_id').notNull(),

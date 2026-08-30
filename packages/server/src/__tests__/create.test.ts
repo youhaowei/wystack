@@ -7,6 +7,7 @@ import {
   assertPermissionIds,
   defineApp,
   PermissionDeniedError,
+  type FunctionDef,
   type RawProcedureDb,
 } from '../index'
 
@@ -289,6 +290,34 @@ describe('defineApp().build()', () => {
     expect(call.tablesRead.has('legacy-manual-read')).toBe(true)
   })
 
+  for (const forgedAccess of [
+    { contract: 'missing', omit: true, value: undefined },
+    { contract: 'invalid', omit: false, value: 'implicit-raw' },
+  ] as const) {
+    test(`fails closed for a forged definition with ${forgedAccess.contract} databaseAccess`, async () => {
+      const path = `forged-${forgedAccess.contract}-database-access`
+      let handlerRan = false
+      const baseDefinition = {
+        type: 'query' as const,
+        path,
+        args: {},
+        handler: async () => {
+          handlerRan = true
+          return true
+        },
+      }
+      const definition = (forgedAccess.omit
+        ? baseDefinition
+        : { ...baseDefinition, databaseAccess: forgedAccess.value }) as unknown as FunctionDef
+      app.functions.set(path, definition)
+
+      await expect(app.call(path, {})).rejects.toThrow(
+        `Function "${path}" has unsupported databaseAccess`,
+      )
+      expect(handlerRan).toBe(false)
+    })
+  }
+
   test('tenant-qualifies manual invalidation tags on every raw boundary', async () => {
     const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
     const tenancy = multiTenant({
@@ -300,7 +329,12 @@ describe('defineApp().build()', () => {
       functions: {
         readModelRead: tenantWy.readModel.input({}).query(async (ctx) => {
           ctx.db.tablesRead.add('seed')
-          ctx.db.tablesRead.forEach((_value, _key, tracked) => tracked.add('checklists'))
+          let addedThroughCallbackFacade = false
+          ctx.db.tablesRead.forEach((_value, _key, tracked) => {
+            if (addedThroughCallbackFacade) return
+            addedThroughCallbackFacade = true
+            tracked.add('checklists')
+          })
           return true
         }),
         integrationWrite: tenantWy.integration.input({}).mutation(async (ctx) => {

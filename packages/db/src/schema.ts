@@ -73,10 +73,17 @@ interface ReferenceContext {
 const tableCapabilities = new WeakMap<object, Readonly<TableCapabilities>>()
 const logicalPrimaryKeyColumns = new WeakMap<object, string>()
 const generatedTables = new WeakMap<object, PgTable[]>()
-const adoptedRegistrations = new Map<
-  AnyPgTable,
-  { capabilities: Readonly<TableCapabilities>; logicalPrimaryKeyColumn: string }
->()
+
+interface AdoptedRegistration {
+  capabilities: Readonly<TableCapabilities>
+  identity: 'tenant-primary' | 'global-primary-compatibility'
+  logicalPrimaryKeyProperty: string
+  logicalPrimaryKeyColumn: string
+}
+
+// Intentionally strong: cross-call adoption validates one module-lifetime table
+// graph, so later foreign-key checks must retain prior Drizzle table objects.
+const adoptedRegistrations = new Map<AnyPgTable, AdoptedRegistration>()
 
 function normalizeTableDefinition(definition: unknown): {
   columns: ColumnMap
@@ -569,6 +576,22 @@ type AdoptedSchema<
     CarriesSystemManagedProperties<AdoptedSystemProperties<TDescriptor, TTables[K]>>
 }
 
+interface AdoptedEntry extends AdoptedRegistration {
+  table: AnyPgTable
+}
+
+function sameAdoptedRegistration(left: AdoptedRegistration, right: AdoptedRegistration): boolean {
+  return (
+    left.identity === right.identity &&
+    left.logicalPrimaryKeyProperty === right.logicalPrimaryKeyProperty &&
+    left.logicalPrimaryKeyColumn === right.logicalPrimaryKeyColumn &&
+    left.capabilities.draftable === right.capabilities.draftable &&
+    left.capabilities.revisionProperty === right.capabilities.revisionProperty &&
+    left.capabilities.softDeleteProperty === right.capabilities.softDeleteProperty &&
+    left.capabilities.tenancy?.descriptorId === right.capabilities.tenancy?.descriptorId
+  )
+}
+
 function normalizedIdentitySqlType(type: string): string {
   const normalized = type.toLowerCase()
   if (normalized === 'serial') return 'integer'
@@ -799,43 +822,52 @@ export function adoptSchema<
   const TTables extends Record<string, AdoptedTableConfig>,
 >(descriptor: TDescriptor, tables: TTables): AdoptedSchema<TDescriptor, TTables> {
   const tenancy = getTenantCapability(descriptor)
-  const entries = Object.values(tables).map((config) => {
-    assertAdoptedIdentity(config.table, config.logicalPrimaryKey, tenancy, config.identity)
-    assertAdoptedRevision(
-      config.table,
-      config.revisionProperty,
-      config.logicalPrimaryKey,
-      tenancy.property,
-    )
-    assertAdoptedSoftDelete(
-      config.table,
-      config.softDeleteProperty,
-      config.logicalPrimaryKey,
-      tenancy.property,
-      config.revisionProperty,
-    )
+  const entriesByTable = new Map<AnyPgTable, AdoptedEntry>()
+  const namedEntries = Object.entries(tables).map(([name, config]) => {
     const capabilities: TableCapabilities = {
       draftable: config.draftable === true,
       tenancy,
       ...(config.revisionProperty ? { revisionProperty: config.revisionProperty } : {}),
       ...(config.softDeleteProperty ? { softDeleteProperty: config.softDeleteProperty } : {}),
     }
-    return {
-      ...config,
+    const entry: AdoptedEntry = {
+      table: config.table,
       capabilities,
+      identity: config.identity ?? 'tenant-primary',
+      logicalPrimaryKeyProperty: config.logicalPrimaryKey,
       logicalPrimaryKeyColumn: adoptedColumn(config.table, config.logicalPrimaryKey).name,
     }
+    const previous = entriesByTable.get(config.table)
+    if (previous) {
+      if (!sameAdoptedRegistration(previous, entry)) {
+        throw new Error(
+          `Adopted table "${getTableName(config.table)}" is configured more than once with a different adoption contract`,
+        )
+      }
+      return [name, previous] as const
+    }
+    entriesByTable.set(config.table, entry)
+    return [name, entry] as const
   })
+  const entries = [...entriesByTable.values()]
+
   for (const entry of entries) {
+    assertAdoptedIdentity(entry.table, entry.logicalPrimaryKeyProperty, tenancy, entry.identity)
+    assertAdoptedRevision(
+      entry.table,
+      entry.capabilities.revisionProperty,
+      entry.logicalPrimaryKeyProperty,
+      tenancy.property,
+    )
+    assertAdoptedSoftDelete(
+      entry.table,
+      entry.capabilities.softDeleteProperty,
+      entry.logicalPrimaryKeyProperty,
+      tenancy.property,
+      entry.capabilities.revisionProperty,
+    )
     const previous = adoptedRegistrations.get(entry.table)
-    if (
-      previous &&
-      (previous.logicalPrimaryKeyColumn !== entry.logicalPrimaryKeyColumn ||
-        previous.capabilities.draftable !== entry.capabilities.draftable ||
-        previous.capabilities.revisionProperty !== entry.capabilities.revisionProperty ||
-        previous.capabilities.softDeleteProperty !== entry.capabilities.softDeleteProperty ||
-        previous.capabilities.tenancy?.descriptorId !== entry.capabilities.tenancy?.descriptorId)
-    ) {
+    if (previous && !sameAdoptedRegistration(previous, entry)) {
       throw new Error(
         `Adopted table "${getTableName(entry.table)}" is already registered with different capabilities`,
       )
@@ -850,22 +882,23 @@ export function adoptSchema<
   for (const entry of entries) completeAdoptedGraph.set(entry.table, entry)
   assertAdoptedForeignKeys([...completeAdoptedGraph.values()])
 
+  for (const entry of entries) {
+    registerTableCapabilities(entry.table, entry.capabilities)
+    logicalPrimaryKeyColumns.set(entry.table, entry.logicalPrimaryKeyColumn)
+    adoptedRegistrations.set(entry.table, {
+      capabilities: Object.freeze({
+        ...entry.capabilities,
+        tenancy: entry.capabilities.tenancy
+          ? Object.freeze({ ...entry.capabilities.tenancy })
+          : undefined,
+      }),
+      identity: entry.identity,
+      logicalPrimaryKeyProperty: entry.logicalPrimaryKeyProperty,
+      logicalPrimaryKeyColumn: entry.logicalPrimaryKeyColumn,
+    })
+  }
   const adopted = Object.fromEntries(
-    Object.entries(tables).map(([name, config]) => {
-      const entry = entries.find((candidate) => candidate.table === config.table)!
-      registerTableCapabilities(config.table, entry.capabilities)
-      logicalPrimaryKeyColumns.set(config.table, entry.logicalPrimaryKeyColumn)
-      adoptedRegistrations.set(config.table, {
-        capabilities: Object.freeze({
-          ...entry.capabilities,
-          tenancy: entry.capabilities.tenancy
-            ? Object.freeze({ ...entry.capabilities.tenancy })
-            : undefined,
-        }),
-        logicalPrimaryKeyColumn: entry.logicalPrimaryKeyColumn,
-      })
-      return [name, config.table]
-    }),
+    namedEntries.map(([name, entry]) => [name, entry.table]),
   ) as AdoptedSchema<TDescriptor, TTables>
 
   generatedTables.set(adopted, [
