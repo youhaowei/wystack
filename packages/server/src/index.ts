@@ -92,6 +92,7 @@ export type {
   AppendOptions,
   DraftMutationOptions,
   DraftLogSnapshot,
+  DraftInspectionSnapshot,
   DraftMetadataSnapshot,
   ForkResolution,
   ForkResolveHook,

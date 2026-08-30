@@ -296,6 +296,13 @@ export interface DraftLogSnapshot {
   commands: DraftCommand[]
 }
 
+/** One coherent, authorized view of the derived review rows. */
+export interface DraftInspectionSnapshot {
+  /** Monotonic revision whose materialized changes are represented below. */
+  revision: number
+  changes: DraftInspectionRow[]
+}
+
 export interface GetOrOpenWithCommandsOptions extends OpenOptions {
   /** Exact owner-scoped key used to serialize competing initializers. */
   lookupKey: string
@@ -353,6 +360,8 @@ export interface DraftLifecycle {
   rebase(draftId: string, opts?: RebaseOptions): Promise<ConflictReport>
   detectConflict(draftId: string, opts?: DraftOperationOptions): Promise<ConflictReport>
   inspect(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionRow[]>
+  /** Read review rows and their revision from one transactionally coherent snapshot. */
+  inspectSnapshot(draftId: string, opts?: DraftOperationOptions): Promise<DraftInspectionSnapshot>
   getLog(draftId: string, opts?: DraftOperationOptions): Promise<DraftCommand[]>
   /** Read commands and their revision from one transactionally coherent authorized snapshot. */
   getLogSnapshot(draftId: string, opts?: DraftOperationOptions): Promise<DraftLogSnapshot>

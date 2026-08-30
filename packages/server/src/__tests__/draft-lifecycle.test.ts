@@ -504,9 +504,16 @@ describe('draft lifecycle — global authority and custody', () => {
     await expect(lifecycle.getLogSnapshot(draftId, { context: ownerContext })).rejects.toThrow(
       'unknown draft',
     )
+    await expect(lifecycle.inspectSnapshot(draftId, { context: ownerContext })).rejects.toThrow(
+      'unknown draft',
+    )
     expect(await lifecycle.getLog(draftId, { context: privileged })).toHaveLength(1)
     expect(await lifecycle.getLogSnapshot(draftId, { context: privileged })).toMatchObject({
       revision: 1,
+    })
+    expect(await lifecycle.inspectSnapshot(draftId, { context: privileged })).toMatchObject({
+      revision: 1,
+      changes: expect.any(Array),
     })
   })
 
@@ -1924,6 +1931,9 @@ describe('draft lifecycle — caller-visible log revisions', () => {
       revision: 1,
       commands: [{ path: 'addTodo', args: { id: 3, title: 'winner' } }],
     })
+    const inspection = await lifecycle.inspectSnapshot(draftId)
+    expect(inspection.revision).toBe(winner.revision)
+    expect(inspection.changes).toHaveLength(1)
 
     await expect(
       lifecycle.append(draftId, [{ path: 'addTodo', args: { id: 4, title: 'stale' } }], {

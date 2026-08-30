@@ -79,7 +79,7 @@ import {
   lockStoredDraftLookup,
   readStoredCommands,
   readStoredDraft,
-  readStoredDraftForLogSnapshot,
+  readStoredDraftForSnapshot,
   readStoredTouchedTables,
   refreshStoredDraftIntegrityAndAdvance,
   replaceStoredDraftBase,
@@ -1072,6 +1072,25 @@ export function createDraftLifecycle(
       return inspectDraftRows(scoped.raw, draftId)
     },
 
+    async inspectSnapshot(draftId, operationOpts = {}) {
+      await storageReady()
+      const context = operationOpts.context ?? {}
+      const authorizationTracker = app.system.createTracked()
+      const authorized = await requireStored(authorizationTracker.raw, draftId)
+      await authorizeTracker(authorizationTracker, authorized, context, 'inspect')
+
+      return runReplayableTransaction(async (tx) => {
+        const current = await readStoredDraftForSnapshot(tx.raw, draftId)
+        if (!current) throw notFound(draftId)
+        assertAuthorizedSnapshot(current, authorized)
+        await assertStoredDraftIntegrity(tx.raw, draftId)
+        return {
+          revision: current.logRevision,
+          changes: await inspectDraftRows(tx.raw, draftId),
+        }
+      })
+    },
+
     async getLog(draftId, operationOpts = {}) {
       await storageReady()
       const context = operationOpts.context ?? {}
@@ -1088,7 +1107,7 @@ export function createDraftLifecycle(
       await authorizeTracker(authorizationTracker, authorized, context, 'getLogSnapshot')
 
       return runReplayableTransaction(async (tx) => {
-        const current = await readStoredDraftForLogSnapshot(tx.raw, draftId)
+        const current = await readStoredDraftForSnapshot(tx.raw, draftId)
         if (!current) throw notFound(draftId)
         assertAuthorizedSnapshot(current, authorized)
         await assertStoredDraftIntegrity(tx.raw, draftId)

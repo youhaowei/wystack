@@ -596,11 +596,13 @@ export async function readStoredDraft(
 }
 
 /**
- * Lock the draft row while its command rows are read. Mutations update this row
- * last, so the returned revision and subsequent command read belong to one
- * committed log state even when an append is already in flight.
+ * Fence a revision-coupled snapshot on the draft row. Lifecycle mutations
+ * write every command, descriptor, and review row first, then update or delete
+ * this parent row last. Readers hold FOR SHARE through their dependent reads,
+ * so the returned revision and derived rows belong to one committed draft
+ * state even when a mutation is already in flight.
  */
-export async function readStoredDraftForLogSnapshot(
+export async function readStoredDraftForSnapshot(
   raw: RawDb,
   draftId: string,
 ): Promise<StoredDraft | undefined> {

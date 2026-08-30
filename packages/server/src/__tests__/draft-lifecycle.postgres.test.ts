@@ -162,7 +162,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     applicationName: string,
     failureMessage: string,
     lockType?: string,
-  ): Promise<void> {
+  ): Promise<string> {
     const deadline = Date.now() + 2_000
     while (true) {
       const [lock] = await admin<{ locktype: string }[]>`
@@ -174,7 +174,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
           AND (${lockType ?? null}::text IS NULL OR l.locktype = ${lockType ?? null})
         LIMIT 1
       `
-      if (lock) return
+      if (lock) return lock.locktype
       if (Date.now() >= deadline) {
         throw new Error(failureMessage)
       }
@@ -665,7 +665,9 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       releaseRow = resolve
     })
     const lockTransaction = lockClient.begin(async (tx) => {
-      await tx`SELECT draft_id FROM wystack_drafts WHERE draft_id = ${draftId} FOR UPDATE`
+      // KEY SHARE remains compatible so child/review rows can be written. The
+      // append can only pause here once it reaches its final parent-row update.
+      await tx`SELECT draft_id FROM wystack_drafts WHERE draft_id = ${draftId} FOR NO KEY UPDATE`
       rowLocked()
       await rowMayRelease
     })
@@ -684,10 +686,11 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
         'transactionid',
       )
       snapshot = second.getLogSnapshot(draftId, { context: privilegedContext })
-      await waitForConnectionLock(
+      const snapshotLockType = await waitForConnectionLock(
         `${namespace}_second`,
         'log snapshot did not wait behind the in-flight revision update',
       )
+      expect(['transactionid', 'tuple']).toContain(snapshotLockType)
     } finally {
       releaseRow()
     }
@@ -696,6 +699,59 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
     expect(committedSnapshot).toEqual({
       revision: 1,
       commands: [{ path: 'addTodo', args: { id: 3, title: 'snapshot winner' } }],
+    })
+  })
+
+  test('an inspection snapshot waits for an in-flight append and returns its committed changes', async () => {
+    const first = lifecycle(firstApp)
+    const second = lifecycle(secondApp)
+    const draftId = await first.open(0, { context: privilegedContext })
+    let rowLocked!: () => void
+    const rowIsLocked = new Promise<void>((resolve) => {
+      rowLocked = resolve
+    })
+    let releaseRow!: () => void
+    const rowMayRelease = new Promise<void>((resolve) => {
+      releaseRow = resolve
+    })
+    const lockTransaction = lockClient.begin(async (tx) => {
+      // KEY SHARE remains compatible so child/review rows can be written. The
+      // append can only pause here once it reaches its final parent-row update.
+      await tx`SELECT draft_id FROM wystack_drafts WHERE draft_id = ${draftId} FOR NO KEY UPDATE`
+      rowLocked()
+      await rowMayRelease
+    })
+    await rowIsLocked
+
+    const append = first.append(
+      draftId,
+      [{ path: 'addTodo', args: { id: 4, title: 'inspection winner' } }],
+      { context: privilegedContext, expectedRevision: 0 },
+    )
+    let snapshot!: ReturnType<typeof second.inspectSnapshot>
+    try {
+      await waitForConnectionLock(
+        `${namespace}_first`,
+        'append did not pause at the final draft-row revision update',
+        'transactionid',
+      )
+      snapshot = second.inspectSnapshot(draftId, { context: privilegedContext })
+      const snapshotLockType = await waitForConnectionLock(
+        `${namespace}_second`,
+        'inspection snapshot did not wait behind the in-flight revision update',
+      )
+      expect(['transactionid', 'tuple']).toContain(snapshotLockType)
+    } finally {
+      releaseRow()
+    }
+
+    const [, , committedSnapshot] = await Promise.all([lockTransaction, append, snapshot])
+    expect(committedSnapshot.revision).toBe(1)
+    expect(committedSnapshot.changes).toHaveLength(1)
+    expect(committedSnapshot.changes[0]).toMatchObject({
+      table: 'todos',
+      rowKey: { type: 'integer', value: 4 },
+      operation: 'insert',
     })
   })
 
