@@ -376,6 +376,18 @@ async function globalIdentityUniqueness(
  * composite primary key; the temporary adopted `global-primary-compatibility`
  * model is rejected so code and storage cannot silently disagree after the
  * contract step.
+ *
+ * This is not an online migration. Each planned table uses a regular
+ * ADD ... PRIMARY KEY, so PostgreSQL takes an ACCESS EXCLUSIVE lock and scans
+ * the table to build a new unique B-tree index. It does not reuse the retained
+ * tenant-qualified index, which is normally owned by its UNIQUE constraint.
+ * Each lock remains held from that table's ALTER TABLE until the outer
+ * transaction commits. Use a dedicated migration connection with appropriate
+ * nonzero lock_timeout and statement_timeout values; when both are set, keep
+ * lock_timeout lower. Large-table callers that need a shorter blocking window
+ * should build a separate eligible unique index concurrently outside the
+ * transaction, then use an application-owned ADD CONSTRAINT ... PRIMARY KEY
+ * USING INDEX swap. That still requires an ACCESS EXCLUSIVE lock.
  */
 export async function migrateTenantPrimaryKeys(
   db: TenantPrimaryKeyMigrationTarget,

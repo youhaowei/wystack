@@ -426,7 +426,7 @@ describe('draft lifecycle — owned discovery and atomic creation', () => {
     ).toEqual([])
 
     const persisted = await db.execute(
-      `SELECT owner_key FROM wystack_drafts WHERE draft_id = '${draftId}'`,
+      sql`SELECT owner_key FROM wystack_drafts WHERE draft_id = ${draftId}`,
     )
     const ownerKey = (persisted as { rows: Array<{ owner_key: unknown }> }).rows[0]?.owner_key
     expect(JSON.stringify(ownerKey)).not.toContain('old@example.test')

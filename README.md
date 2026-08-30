@@ -72,11 +72,26 @@ This is a structural PostgreSQL-catalog guarantee, not semantic proof over
 arbitrary triggers or custom runtime behavior. PostgreSQL dependency rows do not
 fully separate key expressions from predicates, so the migration deliberately
 fails closed on ambiguous catalog shapes and reports the exact blocking object.
-Use an explicit tenant key or remove the blocker intentionally. The passed
-Drizzle schema must already declare the target composite primary key; an adopted
-`global-primary-compatibility` model is rejected so application metadata cannot
-keep claiming the retired shape. All other schema evolution remains
-application-owned.
+Use an explicit tenant key or remove the blocker intentionally. `adoptSchema`
+may explicitly represent the pre-contract `global-primary-compatibility` shape,
+but the schema passed to this migration must declare the target composite
+primary key; the migration rejects compatibility metadata so application
+metadata cannot keep claiming the retired shape. All other schema evolution
+remains application-owned.
+
+This helper is an offline contract migration. For each planned table, the
+regular `ADD ... PRIMARY KEY` takes an `ACCESS EXCLUSIVE` lock and scans the
+table to build a new unique B-tree index. The retained expand-phase
+`(tenant, logical ID)` index is normally owned by its `UNIQUE` constraint and is
+not reused. Each lock remains held from that table's `ALTER TABLE` until the
+outer transaction commits, so earlier tables stay locked while later tables
+migrate. Run the helper on a dedicated migration connection with appropriate
+nonzero `lock_timeout` and `statement_timeout` settings; when both are set, keep
+`lock_timeout` lower. For a shorter blocking window on large tables, use an
+application-owned migration that builds a separate eligible unique B-tree index
+with `CREATE UNIQUE INDEX CONCURRENTLY` outside the transaction, then attaches
+it with `ADD CONSTRAINT ... PRIMARY KEY USING INDEX`. This shortens but does not
+remove the exclusive-lock window; the helper does not implement that path.
 
 ## Server functions
 
