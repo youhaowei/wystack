@@ -122,6 +122,46 @@ describe('draft lifecycle — framework soft deletion', () => {
     ])
   })
 
+  test('publishes a soft-delete and restore round trip while retaining revision progress', async () => {
+    const drafts = lifecycle()
+    const draftId = await drafts.open(0)
+    await drafts.append(draftId, [
+      {
+        path: 'softDeleteTodo',
+        args: { id: 1, at: new Date('2026-08-29T17:00:00.000Z') },
+      },
+      { path: 'restoreTodo', args: { id: 1 } },
+    ])
+
+    expect(
+      await app.system
+        .createTracked()
+        .withDraft(draftId)
+        .from(schema.archivedTodos)
+        .where(eq('id', 1))
+        .first(),
+    ).toMatchObject({ deletedAt: null, revision: 3 })
+
+    await db.execute(
+      `ALTER TABLE "archivedTodos"
+       ADD CONSTRAINT archived_todos_round_trip_revision_guard CHECK (revision <> 3)`,
+    )
+    await expect(drafts.publish(draftId)).rejects.toThrow('Failed query: update')
+    expect((await app.call('listActive', {})).result).toMatchObject([
+      { id: 1, deletedAt: null, revision: 1 },
+    ])
+    expect(await drafts.getLog(draftId)).toHaveLength(2)
+
+    await db.execute(
+      `ALTER TABLE "archivedTodos" DROP CONSTRAINT archived_todos_round_trip_revision_guard`,
+    )
+    await drafts.publish(draftId)
+
+    expect((await app.call('listActive', {})).result).toMatchObject([
+      { id: 1, deletedAt: null, revision: 3 },
+    ])
+  })
+
   test('fails closed when stored soft-delete custody differs from the schema', async () => {
     const drafts = lifecycle()
     const draftId = await drafts.open(0)

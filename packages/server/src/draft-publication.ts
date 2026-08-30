@@ -1,13 +1,19 @@
 import {
   eq,
   jsonNull,
+  publishedInvalidationIdentity,
   resolvePkColumnName,
   softDeleteProperty,
   tryGetTableCapabilities,
   type DrizzleTracker,
 } from '@wystack/db'
-import { getTableColumns } from 'drizzle-orm'
-import { getTableConfig } from 'drizzle-orm/pg-core'
+import {
+  and as drizzleAnd,
+  eq as drizzleEq,
+  getTableColumns,
+  isNull as drizzleIsNull,
+} from 'drizzle-orm'
+import { getTableConfig, type AnyPgColumn } from 'drizzle-orm/pg-core'
 import { inspectDraftRows } from './draft-inspection'
 import {
   DraftPublishDriftError,
@@ -352,6 +358,67 @@ function orderReviewedChangeSteps(changes: ResolvedReviewedChange[]): ReviewedCh
   return ordered
 }
 
+/**
+ * Reviewed rows retain their final state rather than every intermediate tombstone.
+ * An active row that is soft-deleted and restored inside one draft therefore ends
+ * with the same tombstone value but two consumed revision tokens. Advance only
+ * that compacted pair; every other no-progress case remains publish drift.
+ */
+async function advanceCompactedSoftDeleteRoundTrip(
+  tracker: DrizzleTracker,
+  change: ResolvedReviewedChange,
+  published: Record<string, unknown>,
+  publishedRevision: number,
+): Promise<boolean> {
+  const revision = change.revisionProperty
+  const deletedAt = softDeleteProperty(change.table)
+  if (!revision || !deletedAt || published[deletedAt] !== null) return false
+  const split = splitSoftDeleteValue(change)
+  if (split.property !== deletedAt || split.value !== null) return false
+  if (
+    typeof change.desiredRevision !== 'number' ||
+    change.desiredRevision - publishedRevision < 2
+  ) {
+    return false
+  }
+
+  const columns = getTableColumns(change.table) as Record<string, AnyPgColumn>
+  const pkColumn = columns[change.pkProperty]
+  const revisionColumn = columns[revision]
+  const deletedAtColumn = columns[deletedAt]
+  if (!pkColumn || !revisionColumn || !deletedAtColumn) {
+    throw new Error(`draft lifecycle: cannot resolve managed columns for "${change.source.table}"`)
+  }
+  const conditions = [
+    drizzleEq(pkColumn, change.pkValue),
+    drizzleEq(revisionColumn, publishedRevision),
+    drizzleIsNull(deletedAtColumn),
+  ]
+  const tenancy = tryGetTableCapabilities(change.table)?.tenancy
+  let tenantId: unknown
+  if (tenancy) {
+    if (!change.source.tenantKey) {
+      throw new Error(`draft lifecycle: missing tenant identity for "${change.source.table}"`)
+    }
+    const tenantColumn = columns[tenancy.property]
+    if (!tenantColumn) {
+      throw new Error(`draft lifecycle: cannot resolve tenant column for "${change.source.table}"`)
+    }
+    tenantId = encodedIdentityValue(change.source.tenantKey)
+    conditions.push(drizzleEq(tenantColumn, tenantId))
+  }
+
+  const nextRevision = publishedRevision + 2
+  const advanced = await tracker.raw
+    .update(change.table)
+    .set({ [revision]: nextRevision })
+    .where(drizzleAnd(...conditions))
+    .returning({ revision: revisionColumn })
+  if (advanced.length !== 1 || Number(advanced[0]?.revision) !== nextRevision) return false
+  tracker.tablesWritten.add(publishedInvalidationIdentity(change.table, tenantId))
+  return true
+}
+
 async function advanceReviewedRevision(
   tracker: DrizzleTracker,
   draftId: string,
@@ -377,6 +444,14 @@ async function advanceReviewedRevision(
     await advanceReviewedChangeOnce(tracker, change)
     published = await scopedBuilder().where(eq(change.pkProperty, change.pkValue)).first()
     publishedRevision = published?.[revision]
+    if (
+      published &&
+      publishedRevision === previousRevision &&
+      (await advanceCompactedSoftDeleteRoundTrip(tracker, change, published, previousRevision))
+    ) {
+      published = await scopedBuilder().where(eq(change.pkProperty, change.pkValue)).first()
+      publishedRevision = published?.[revision]
+    }
     if (
       !published ||
       typeof publishedRevision !== 'number' ||

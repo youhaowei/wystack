@@ -130,6 +130,26 @@ async function databaseCause(promise: Promise<unknown>): Promise<Error> {
   throw new Error('Expected the database operation to fail')
 }
 
+async function primaryKeyColumns(client: PGlite, tableName: string): Promise<string> {
+  const result = await client.query<{ columns: string }>(
+    `SELECT string_agg(attribute.attname, ',' ORDER BY key_column.ordinality) AS columns
+     FROM pg_constraint AS constraint_record
+     JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
+     JOIN LATERAL unnest(constraint_record.conkey)
+       WITH ORDINALITY AS key_column(attribute_number, ordinality) ON TRUE
+     JOIN pg_attribute AS attribute
+       ON attribute.attrelid = relation.oid
+      AND attribute.attnum = key_column.attribute_number
+     WHERE constraint_record.contype = 'p'
+       AND relation.relname = $1
+     GROUP BY relation.relname`,
+    [tableName],
+  )
+  const columns = result.rows[0]?.columns
+  if (!columns) throw new Error(`Expected ${tableName} to have a primary key`)
+  return columns
+}
+
 afterEach(async () => {
   const databases = [...openDatabases]
   openDatabases.clear()
@@ -591,6 +611,49 @@ describe('migrateTenantPrimaryKeys', () => {
     await expect(migrateTenantPrimaryKeys(drizzle(client), invalidReadySchema)).rejects.toThrow(
       /index "invalid_ready_current_accounts_id_unique_idx".*direct UNIQUE key made only of \(id\) slots/,
     )
+  })
+
+  test('rejects a legacy primary key without a tenant-qualified unique index', async () => {
+    const tableName = 'missing_tenant_unique_accounts'
+    const legacySchema = defineSchema({
+      [tableName]: tenancy.table({ id: text.primaryKey(), name: text }),
+    })
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE ${tableName} (
+        workspace_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL
+      )
+    `)
+
+    await expect(migrateTenantPrimaryKeys(drizzle(client), legacySchema)).rejects.toThrow(
+      /requires a non-partial unique index.*\(workspace_id,id\)/,
+    )
+    expect(await primaryKeyColumns(client, tableName)).toBe('id')
+  })
+
+  test('rejects nullable tenant identity before changing the legacy primary key', async () => {
+    const tableName = 'nullable_tenant_identity_accounts'
+    const legacySchema = defineSchema({
+      [tableName]: tenancy.table({ id: text.primaryKey(), name: text }),
+    })
+    const client = createTestDatabase()
+    await client.waitReady
+    await client.exec(`
+      CREATE TABLE ${tableName} (
+        workspace_id TEXT,
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        CONSTRAINT ${tableName}_workspace_id_id_unique UNIQUE (workspace_id, id)
+      )
+    `)
+
+    await expect(migrateTenantPrimaryKeys(drizzle(client), legacySchema)).rejects.toThrow(
+      /requires NOT NULL identity columns/,
+    )
+    expect(await primaryKeyColumns(client, tableName)).toBe('id')
   })
 
   test('rejects a compatibility model that has not declared the target primary key', async () => {

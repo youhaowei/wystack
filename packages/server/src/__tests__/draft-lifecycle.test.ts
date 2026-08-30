@@ -16,6 +16,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgSchema, pgTable, text as pgText, varchar } from 'drizzle-orm/pg-core'
 import {
@@ -2401,7 +2402,7 @@ describe('draft lifecycle — concurrent operations on ONE draft (#88)', () => {
     expect((await lc.listOwned())[0]).toMatchObject({ summary: expectedSummary })
 
     const stored = await db.execute(
-      `SELECT log_revision FROM wystack_drafts WHERE draft_id = '${draftId}'`,
+      sql`SELECT log_revision FROM wystack_drafts WHERE draft_id = ${draftId}`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
     expect((stored as any).rows[0]?.log_revision).toBe(2)

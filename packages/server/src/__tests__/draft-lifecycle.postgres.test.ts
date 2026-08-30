@@ -161,19 +161,22 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
   async function waitForConnectionLock(
     applicationName: string,
     failureMessage: string,
-    lockType?: string,
+    lockTypes?: string | readonly string[],
   ): Promise<string> {
+    const acceptedLockTypes = typeof lockTypes === 'string' ? [lockTypes] : lockTypes
     const deadline = Date.now() + 2_000
     while (true) {
-      const [lock] = await admin<{ locktype: string }[]>`
+      const locks = await admin<{ locktype: string }[]>`
         SELECT l.locktype
         FROM pg_locks l
         JOIN pg_stat_activity a ON a.pid = l.pid
         WHERE a.application_name = ${applicationName}
           AND NOT l.granted
-          AND (${lockType ?? null}::text IS NULL OR l.locktype = ${lockType ?? null})
-        LIMIT 1
+        ORDER BY l.locktype
       `
+      const lock = locks.find(
+        ({ locktype }) => !acceptedLockTypes || acceptedLockTypes.includes(locktype),
+      )
       if (lock) return lock.locktype
       if (Date.now() >= deadline) {
         throw new Error(failureMessage)
@@ -689,6 +692,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       const snapshotLockType = await waitForConnectionLock(
         `${namespace}_second`,
         'log snapshot did not wait behind the in-flight revision update',
+        ['transactionid', 'tuple'],
       )
       expect(['transactionid', 'tuple']).toContain(snapshotLockType)
     } finally {
@@ -739,6 +743,7 @@ describeWithPostgres('draft lifecycle — real PostgreSQL multi-connection concu
       const snapshotLockType = await waitForConnectionLock(
         `${namespace}_second`,
         'inspection snapshot did not wait behind the in-flight revision update',
+        ['transactionid', 'tuple'],
       )
       expect(['transactionid', 'tuple']).toContain(snapshotLockType)
     } finally {
