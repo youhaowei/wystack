@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
-import { ensureDraftStorage, listStoredDraftsForOwner } from '../draft-store'
+import {
+  assertStoredDraftIntegrity,
+  ensureDraftStorage,
+  listStoredDraftsForOwner,
+} from '../draft-store'
 import {
   installV2MetadataUpgradeFixture,
   installV7CustodyUpgradeFixture,
@@ -103,7 +107,7 @@ describe('draft storage migrations', () => {
        WHERE contype = 'f' AND confrelid = 'wystack_drafts'::regclass`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
-    expect((migration as any).rows[0].version).toBe(8)
+    expect((migration as any).rows[0].version).toBe(9)
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
     expect((tables as any).rows.map((row: { table_name: string }) => row.table_name)).toEqual([
       'wystack_draft_commands',
@@ -277,6 +281,7 @@ describe('draft storage migrations', () => {
       (row) => row.column_name,
     )
     expect(columnNames).toContain('revision_column')
+    expect(columnNames).toContain('soft_delete_column')
     expect(columnNames).toContain('invalidation_tag')
     expect(columnNames).not.toContain('shadow_tag')
     // oxlint-disable-next-line typescript/no-explicit-any -- PGlite execute result wrapper
@@ -298,6 +303,37 @@ describe('draft storage migrations', () => {
     ])
     expect((joined as { rows: unknown[] }).rows).toEqual([{ id: 7 }])
     expect((command as { rows: unknown[] }).rows).toHaveLength(1)
+  })
+
+  test('a v9 upgrade adds soft-delete descriptors and refreshes active draft integrity', async () => {
+    const pg = createTestDatabase()
+    const db = drizzle(pg)
+    await ensureDraftStorage(db)
+    await db.execute(`
+      INSERT INTO wystack_drafts
+        (draft_id, base_version, tenant_scope, owner_key, integrity_hash)
+      VALUES
+        ('pre-v9', '{"present":true,"value":0}', '{"present":false}',
+         '{"present":true,"value":"owner"}', 'legacy-v8')
+    `)
+    await db.execute(`
+      INSERT INTO wystack_draft_tables
+        (draft_id, schema_name, table_name, pk_column, pk_type, invalidation_tag)
+      VALUES ('pre-v9', '', 'items', 'id', 'integer', 'draft:pre-v9:items')
+    `)
+    await db.execute(`ALTER TABLE wystack_draft_tables DROP COLUMN soft_delete_column`)
+    await db.execute(`
+      UPDATE wystack_framework_migrations SET version = 8
+      WHERE migration_name = 'draft-storage'
+    `)
+
+    await ensureDraftStorage(db)
+
+    await expect(assertStoredDraftIntegrity(db, 'pre-v9')).resolves.toBeUndefined()
+    const descriptor = await db.execute(`
+      SELECT soft_delete_column FROM wystack_draft_tables WHERE draft_id = 'pre-v9'
+    `)
+    expect((descriptor as { rows: unknown[] }).rows).toEqual([{ soft_delete_column: null }])
   })
 
   test('a v5 upgrade forces active revisioned drafts to rebase', async () => {

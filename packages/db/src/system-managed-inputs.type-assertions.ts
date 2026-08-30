@@ -11,7 +11,7 @@
  * legal. The final functions separately prove returned row shapes, including
  * projection narrowing after chained draft read clauses.
  */
-import { defineSchema, eq, int, multiTenant, table, text, uuid } from './index'
+import { defineSchema, eq, int, multiTenant, table, text, timestamp, uuid } from './index'
 import type { DrizzleTracker } from './tracker-core'
 
 const workspaces = multiTenant({
@@ -37,6 +37,16 @@ const schema = defineSchema({
     .table({ id: uuid.primaryKey(), name: text, revision: int })
     .draftable()
     .revision('revision'),
+  archivedProjects: workspaces
+    .table({
+      id: uuid.primaryKey(),
+      name: text,
+      deletedAt: timestamp.nullable(),
+      revision: int,
+    })
+    .softDelete('deletedAt')
+    .revision('revision')
+    .draftable(),
 })
 
 declare const tracked: DrizzleTracker
@@ -104,6 +114,29 @@ function revisionTokensCannotBeWritten() {
   void draft.from(schema.draftProjects).update({ revision: 99 })
 }
 
+/** Tombstones come only from the dedicated deterministic terminals. */
+function tombstonesCannotBeWrittenAsDomainFields() {
+  const scoped = tracked.withTenant('alpha')
+  const draft = scoped.withDraft('draft-1')
+
+  void scoped.into(schema.archivedProjects).insert({
+    id: 'archived-1',
+    name: 'archived',
+    // @ts-expect-error — tombstones are owned by softDelete()/restore()
+    deletedAt: new Date(),
+  })
+  // @ts-expect-error — ordinary updates cannot bypass the tombstone terminals
+  void scoped.from(schema.archivedProjects).update({ deletedAt: new Date() })
+  // @ts-expect-error — draft updates retain the same custody boundary
+  void draft.from(schema.archivedProjects).update({ deletedAt: null })
+
+  void scoped
+    .from(schema.archivedProjects)
+    .where(eq('id', 'archived-1'))
+    .softDelete(new Date('2026-08-29T12:00:00.000Z'))
+  void draft.from(schema.archivedProjects).where(eq('id', 'archived-1')).restore()
+}
+
 /** Returned rows expose managed fields with their domain types, but no invented fields. */
 async function returnedRowsExposeManagedFields() {
   const row = await tracked
@@ -146,6 +179,7 @@ void [
   applicationFieldsRemainWritable,
   tenantIdentityCannotBeWritten,
   revisionTokensCannotBeWritten,
+  tombstonesCannotBeWrittenAsDomainFields,
   returnedRowsExposeManagedFields,
   draftProjectionStaysNarrow,
 ]

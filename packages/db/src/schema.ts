@@ -532,6 +532,7 @@ export interface AdoptedTableConfig<
   TTable extends AnyPgTable = AnyPgTable,
   TLogicalPrimaryKey extends string = string,
   TRevisionProperty extends string | undefined = string | undefined,
+  TSoftDeleteProperty extends string | undefined = string | undefined,
 > {
   /** The authoritative application-owned Drizzle table object. */
   table: TTable
@@ -548,6 +549,8 @@ export interface AdoptedTableConfig<
   draftable?: boolean
   /** Optional framework-managed integer compare-and-swap property. */
   revisionProperty?: TRevisionProperty
+  /** Optional framework-managed nullable timestamp tombstone property. */
+  softDeleteProperty?: TSoftDeleteProperty
 }
 
 type AdoptedSystemProperties<
@@ -556,6 +559,7 @@ type AdoptedSystemProperties<
 > =
   | TDescriptor['key']['property']
   | (TConfig extends { revisionProperty: infer TRevision extends string } ? TRevision : never)
+  | (TConfig extends { softDeleteProperty: infer TDeleted extends string } ? TDeleted : never)
 
 type AdoptedSchema<
   TDescriptor extends MultiTenantDescriptor<TenantKeyDefinition>,
@@ -576,10 +580,24 @@ function normalizedIdentitySqlType(type: string): string {
 function adoptedColumn(
   table: AnyPgTable,
   property: string,
-): { name: string; notNull: boolean; primary: boolean; getSQLType(): string } {
+): {
+  name: string
+  notNull: boolean
+  primary: boolean
+  hasDefault: boolean
+  isUnique: boolean
+  getSQLType(): string
+} {
   const columns = getTableColumns(table) as Record<
     string,
-    { name: string; notNull: boolean; primary: boolean; getSQLType(): string }
+    {
+      name: string
+      notNull: boolean
+      primary: boolean
+      hasDefault: boolean
+      isUnique: boolean
+      getSQLType(): string
+    }
   >
   const column = Object.hasOwn(columns, property) ? columns[property] : undefined
   if (!column) {
@@ -685,6 +703,59 @@ function assertAdoptedRevision(
   }
 }
 
+function assertAdoptedSoftDelete(
+  table: AnyPgTable,
+  softDeleteProperty: string | undefined,
+  logicalPrimaryKey: string,
+  tenantProperty: string,
+  revisionProperty: string | undefined,
+): void {
+  if (!softDeleteProperty) return
+  const tableName = getTableName(table)
+  if (
+    softDeleteProperty === logicalPrimaryKey ||
+    softDeleteProperty === tenantProperty ||
+    softDeleteProperty === revisionProperty
+  ) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property must not be an identity or revision property`,
+    )
+  }
+  const deletedAt = adoptedColumn(table, softDeleteProperty)
+  if (
+    deletedAt.notNull ||
+    deletedAt.hasDefault === true ||
+    !normalizedIdentitySqlType(deletedAt.getSQLType()).startsWith('timestamp')
+  ) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" must be a nullable timestamp without a default`,
+    )
+  }
+  const config = getTableConfig(table)
+  const constrained =
+    deletedAt.primary ||
+    deletedAt.isUnique ||
+    config.primaryKeys.some((key) =>
+      key.columns.some((column) => column.name === deletedAt.name),
+    ) ||
+    config.uniqueConstraints.some((constraint) =>
+      constraint.columns.some((column) => column.name === deletedAt.name),
+    ) ||
+    config.indexes.some(
+      (index) =>
+        index.config.unique &&
+        index.config.columns.some((column) => 'name' in column && column.name === deletedAt.name),
+    ) ||
+    config.foreignKeys.some((foreignKey) =>
+      foreignKey.reference().columns.some((column) => column.name === deletedAt.name),
+    )
+  if (constrained) {
+    throw new Error(
+      `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" cannot be an identity, unique, or foreign-key column`,
+    )
+  }
+}
+
 function assertAdoptedForeignKeys(
   entries: Array<{
     table: AnyPgTable
@@ -736,10 +807,18 @@ export function adoptSchema<
       config.logicalPrimaryKey,
       tenancy.property,
     )
+    assertAdoptedSoftDelete(
+      config.table,
+      config.softDeleteProperty,
+      config.logicalPrimaryKey,
+      tenancy.property,
+      config.revisionProperty,
+    )
     const capabilities: TableCapabilities = {
       draftable: config.draftable === true,
       tenancy,
       ...(config.revisionProperty ? { revisionProperty: config.revisionProperty } : {}),
+      ...(config.softDeleteProperty ? { softDeleteProperty: config.softDeleteProperty } : {}),
     }
     return {
       ...config,
@@ -754,6 +833,7 @@ export function adoptSchema<
       (previous.logicalPrimaryKeyColumn !== entry.logicalPrimaryKeyColumn ||
         previous.capabilities.draftable !== entry.capabilities.draftable ||
         previous.capabilities.revisionProperty !== entry.capabilities.revisionProperty ||
+        previous.capabilities.softDeleteProperty !== entry.capabilities.softDeleteProperty ||
         previous.capabilities.tenancy?.descriptorId !== entry.capabilities.tenancy?.descriptorId)
     ) {
       throw new Error(

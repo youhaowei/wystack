@@ -159,6 +159,8 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
 type ValidationReadBuilder = {
   select(...columns: string[]): ValidationReadBuilder
   where(filters: Parameters<DraftGraphReadBuilder<AnyTable>['where']>[0]): ValidationReadBuilder
+  includeDeleted(): ValidationReadBuilder
+  onlyDeleted(): ValidationReadBuilder
   orderBy(column: string, direction?: 'asc' | 'desc'): ValidationReadBuilder
   limit(count: number): ValidationReadBuilder
   all(): Promise<unknown[]>
@@ -186,6 +188,8 @@ function graphReadTracker(
         return wrapBuilder<TTable, Pick<ValidationRow<TTable>, K>>(builder.select(...columns))
       },
       where: (filters) => wrapBuilder<TTable, TRow>(builder.where(filters)),
+      includeDeleted: () => wrapBuilder<TTable, TRow>(builder.includeDeleted()),
+      onlyDeleted: () => wrapBuilder<TTable, TRow>(builder.onlyDeleted()),
       orderBy: (column, direction) => wrapBuilder<TTable, TRow>(builder.orderBy(column, direction)),
       limit: (count) => wrapBuilder<TTable, TRow>(builder.limit(count)),
       all: () => builder.all() as Promise<TRow[]>,

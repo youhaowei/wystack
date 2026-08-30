@@ -10,6 +10,7 @@ import {
   syncSchema,
   table,
   text,
+  timestamp,
 } from '../index'
 import { uuid } from '../dsl'
 import { enumerateDraftRowChanges } from '../drizzle-tracker'
@@ -25,6 +26,16 @@ const tenancy = multiTenant({
 const schema = defineSchema({
   catalog: table({ id: uuid.primaryKey(), name: text }).draftable(),
   insights: tenancy.table({ id: uuid.primaryKey(), name: text }).draftable(),
+  archivedInsights: tenancy
+    .table({
+      id: uuid.primaryKey(),
+      name: text,
+      deletedAt: timestamp.nullable(),
+      revision: int,
+    })
+    .softDelete('deletedAt')
+    .revision('revision')
+    .draftable(),
 })
 
 const uuidTenantSchema = defineSchema({
@@ -140,6 +151,67 @@ describe('tenant-scoped database access', () => {
     await expect(alpha.from(schema.insights).update({ workspaceId: 'beta' })).rejects.toThrow(
       'system-managed',
     )
+  })
+
+  test('soft deletion is tenant-bound, hidden by default, restorable, and revisioned', async () => {
+    const sharedId = '00000000-0000-4000-8000-000000000055'
+    const removedAt = new Date('2026-08-29T12:00:00.000Z')
+    const alpha = createDrizzleTracker(tracked.raw).withTenant('alpha')
+    const beta = createDrizzleTracker(tracked.raw).withTenant('beta')
+    await alpha.into(schema.archivedInsights).insert({ id: sharedId, name: 'alpha' })
+    await beta.into(schema.archivedInsights).insert({ id: sharedId, name: 'beta' })
+    const alphaDeletion = createDrizzleTracker(tracked.raw).withTenant('alpha')
+
+    await expect(
+      alphaDeletion.from(schema.archivedInsights).where(eq('id', sharedId)).delete(),
+    ).rejects.toThrow('physical delete() is unavailable')
+    const deleted = await alphaDeletion
+      .from(schema.archivedInsights)
+      .where(eq('id', sharedId))
+      .softDelete(removedAt)
+
+    expect(deleted).toMatchObject([{ name: 'alpha', revision: 2, deletedAt: removedAt }])
+    expect(await alpha.from(schema.archivedInsights).all()).toEqual([])
+    expect(await alpha.from(schema.archivedInsights).onlyDeleted().all()).toMatchObject([
+      { name: 'alpha', revision: 2, deletedAt: removedAt },
+    ])
+    expect(await alpha.from(schema.archivedInsights).includeDeleted().all()).toHaveLength(1)
+    expect(await beta.from(schema.archivedInsights).all()).toMatchObject([
+      { name: 'beta', revision: 1, deletedAt: null },
+    ])
+    expect([...alphaDeletion.tablesWritten]).toEqual(['tenant:alpha:archivedInsights'])
+
+    const restored = await alpha.from(schema.archivedInsights).where(eq('id', sharedId)).restore()
+    expect(restored).toMatchObject([{ name: 'alpha', revision: 3, deletedAt: null }])
+    expect(await alpha.from(schema.archivedInsights).all()).toHaveLength(1)
+  })
+
+  test('draft soft deletion changes only the effective view and can be restored', async () => {
+    const id = '00000000-0000-4000-8000-000000000056'
+    const removedAt = new Date('2026-08-29T13:00:00.000Z')
+    const alpha = tracked.withTenant('alpha')
+    await alpha.into(schema.archivedInsights).insert({ id, name: 'drafted' })
+    const draft = alpha.withDraft('soft-delete-draft')
+
+    await expect(draft.from(schema.archivedInsights).where(eq('id', id)).delete()).rejects.toThrow(
+      'physical delete() is unavailable',
+    )
+    await draft.from(schema.archivedInsights).where(eq('id', id)).softDelete(removedAt)
+
+    expect(await alpha.from(schema.archivedInsights).where(eq('id', id)).first()).toMatchObject({
+      revision: 1,
+      deletedAt: null,
+    })
+    expect(await draft.from(schema.archivedInsights).where(eq('id', id)).first()).toBeNull()
+    expect(
+      await draft.from(schema.archivedInsights).onlyDeleted().where(eq('id', id)).first(),
+    ).toMatchObject({ revision: 2, deletedAt: removedAt })
+
+    await draft.from(schema.archivedInsights).where(eq('id', id)).restore()
+    expect(await draft.from(schema.archivedInsights).where(eq('id', id)).first()).toMatchObject({
+      revision: 3,
+      deletedAt: null,
+    })
   })
 
   test('tenant and draft scopes compose across reads and writes', async () => {

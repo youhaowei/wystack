@@ -30,8 +30,23 @@ export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
 // oxlint-disable-next-line typescript/no-explicit-any -- permissions remain contravariant over app-specific contexts
 export type Can = (permission: Permission<any>) => Promise<boolean>
 
-export const procedureSelectChainedMethods = ['select', 'where', 'orderBy', 'limit'] as const
-export const procedureSelectTerminalMethods = ['all', 'first', 'update', 'delete', 'toSql'] as const
+export const procedureSelectChainedMethods = [
+  'select',
+  'where',
+  'includeDeleted',
+  'onlyDeleted',
+  'orderBy',
+  'limit',
+] as const
+export const procedureSelectTerminalMethods = [
+  'all',
+  'first',
+  'update',
+  'delete',
+  'softDelete',
+  'restore',
+  'toSql',
+] as const
 export const procedureInsertMethods = ['insert'] as const
 
 type ProcedureSelectMethod =
@@ -72,8 +87,8 @@ export type CommandContext<TContext> = Overwrite<TContext, { db: CommandDb }>
  * The raw connection and manual tracking sets support joins, aggregates, and
  * bulk workflows that the native DSL cannot yet express. Trusted tenant
  * resolution and tag qualification remain framework-owned, but raw SQL tenant
- * predicates are application-owned. Tenant and draft scope-changing methods
- * remain framework custody on every raw boundary.
+ * and soft-delete predicates are application-owned. Tenant and draft
+ * scope-changing methods remain framework custody on every raw boundary.
  */
 export interface RawProcedureDb extends ProcedureDb {
   readonly raw: DrizzleTracker['raw']

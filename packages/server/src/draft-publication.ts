@@ -2,6 +2,7 @@ import {
   eq,
   jsonNull,
   resolvePkColumnName,
+  softDeleteProperty,
   tryGetTableCapabilities,
   type DrizzleTracker,
 } from '@wystack/db'
@@ -192,7 +193,11 @@ async function resolveReviewedChange(
 
   let finalRow: Record<string, unknown> | undefined
   if (change.operation !== 'delete') {
-    finalRow = (await reviewed.from(table).where(eq(pkProperty, pkValue)).first()) ?? undefined
+    const finalBuilder = reviewed.from(table)
+    finalRow =
+      (await (capabilities?.softDeleteProperty ? finalBuilder.includeDeleted() : finalBuilder)
+        .where(eq(pkProperty, pkValue))
+        .first()) ?? undefined
     if (!finalRow) {
       throw new DraftPublishDriftError(draftId, [{ ...driftTarget(change), reason: 'target' }])
     }
@@ -357,10 +362,11 @@ async function advanceReviewedRevision(
   if (typeof change.desiredRevision !== 'number') {
     throw new Error(`draft lifecycle: invalid reviewed revision for "${change.source.table}"`)
   }
-  let published = await tracker
-    .from(change.table)
-    .where(eq(change.pkProperty, change.pkValue))
-    .first()
+  const scopedBuilder = () => {
+    const builder = tracker.from(change.table)
+    return softDeleteProperty(change.table) ? builder.includeDeleted() : builder
+  }
+  let published = await scopedBuilder().where(eq(change.pkProperty, change.pkValue)).first()
   let publishedRevision = published?.[revision]
   while (
     published &&
@@ -368,14 +374,8 @@ async function advanceReviewedRevision(
     publishedRevision < change.desiredRevision
   ) {
     const previousRevision = publishedRevision
-    await tracker
-      .from(change.table)
-      .where(eq(change.pkProperty, change.pkValue))
-      .update(change.values)
-    published = await tracker
-      .from(change.table)
-      .where(eq(change.pkProperty, change.pkValue))
-      .first()
+    await advanceReviewedChangeOnce(tracker, change)
+    published = await scopedBuilder().where(eq(change.pkProperty, change.pkValue)).first()
     publishedRevision = published?.[revision]
     if (
       !published ||
@@ -392,23 +392,85 @@ async function advanceReviewedRevision(
   }
 }
 
+function splitSoftDeleteValue(change: ResolvedReviewedChange): {
+  values: Record<string, unknown>
+  property?: string
+  value?: unknown
+} {
+  const property = softDeleteProperty(change.table)
+  if (!property || !Object.hasOwn(change.values, property)) return { values: change.values }
+  const values = { ...change.values }
+  const value = values[property]
+  delete values[property]
+  return { values, property, value }
+}
+
+async function applySoftDeleteValue(
+  tracker: DrizzleTracker,
+  change: ResolvedReviewedChange,
+  value: unknown,
+): Promise<void> {
+  const builder = tracker
+    .from(change.table)
+    .includeDeleted()
+    .where(eq(change.pkProperty, change.pkValue))
+  if (value === null) {
+    await builder.restore()
+    return
+  }
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    throw new Error(
+      `draft lifecycle: invalid reviewed soft-delete timestamp for "${change.source.table}"`,
+    )
+  }
+  await builder.softDelete(value)
+}
+
+/** Advance one reviewed mutation step without exposing the tombstone property to update(). */
+async function advanceReviewedChangeOnce(
+  tracker: DrizzleTracker,
+  change: ResolvedReviewedChange,
+): Promise<void> {
+  const split = splitSoftDeleteValue(change)
+  if (split.property) {
+    await applySoftDeleteValue(tracker, change, split.value)
+    return
+  }
+  if (Object.keys(split.values).length === 0) {
+    // Preserve the established drift classification. The caller's readback sees
+    // no revision progress and reports an anchor mismatch for this exact row.
+    return
+  }
+  const builder = tracker.from(change.table)
+  await (softDeleteProperty(change.table) ? builder.includeDeleted() : builder)
+    .where(eq(change.pkProperty, change.pkValue))
+    .update(split.values)
+}
+
 async function applyReviewedChangeStep(
   tracker: DrizzleTracker,
   draftId: string,
   step: ReviewedChangeStep,
 ): Promise<void> {
   const { change } = step
-  const where = tracker.from(change.table).where(eq(change.pkProperty, change.pkValue))
+  const baseBuilder = tracker.from(change.table)
+  const where = (
+    softDeleteProperty(change.table) ? baseBuilder.includeDeleted() : baseBuilder
+  ).where(eq(change.pkProperty, change.pkValue))
   if (step.kind === 'delete') {
     await where.delete()
     return
   }
+  const split = splitSoftDeleteValue(change)
   if (change.source.operation === 'insert') {
     await tracker
       .into(change.table)
-      .insert({ [change.pkProperty]: change.pkValue, ...change.values })
-  } else if (Object.keys(change.values).length > 0 || change.revisionProperty) {
-    await where.update(change.values)
+      .insert({ [change.pkProperty]: change.pkValue, ...split.values })
+  } else if (Object.keys(split.values).length > 0 || (change.revisionProperty && !split.property)) {
+    await where.update(split.values)
+  }
+  if (split.property) {
+    await applySoftDeleteValue(tracker, change, split.value)
   }
   await advanceReviewedRevision(tracker, draftId, change)
 }

@@ -7,6 +7,7 @@ export {
   enumerateDraftRowChanges,
   publishedInvalidationIdentity,
   draftInvalidationIdentity,
+  softDeleteProperty,
 } from './tracker-core'
 export { normalizeExecuteRows, decodeRowFromDriver, resolvePkColumnName } from './tracker-codecs'
 

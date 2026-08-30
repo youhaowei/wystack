@@ -25,7 +25,9 @@ import {
   assertJsonNullInputs,
   assertNoReadClauses,
   assertRevisionInput,
+  assertSoftDeleteInput,
   assertTenantInput,
+  assertValidSoftDeleteTimestamp,
   draftChangesRelation,
   draftFieldValueSql,
   draftTableTrackingTag,
@@ -34,8 +36,10 @@ import {
   noTenantScope,
   quoteSqlIdentifier,
   requireColumn,
+  requireSoftDeleteProperty,
   requireTenantScope,
   revisionProperty,
+  softDeleteProperty,
   sqlLiteral,
   tableTrackingTag,
   typedKeyValueSql,
@@ -156,6 +160,18 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
 
+  /** Include both active and soft-deleted effective rows in this builder's scope. */
+  includeDeleted(): DraftSelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'include' })
+  }
+
+  /** Restrict this builder to soft-deleted effective rows. */
+  onlyDeleted(): DraftSelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'only' })
+  }
+
   /**
    * Order the coalesced read by `col` (a property key, as everywhere else).
    *
@@ -198,8 +214,12 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     txDraft: DraftDrizzleTracker,
     pkProperty: string,
   ): Promise<Record<string, unknown>[]> {
-    const candidates = (await txDraft
-      .from(this._table)
+    const scope = <TRowValue>(builder: DraftSelectBuilder<T, TRowValue>) => {
+      if (this._clauses.softDeleteScope === 'include') return builder.includeDeleted()
+      if (this._clauses.softDeleteScope === 'only') return builder.onlyDeleted()
+      return builder
+    }
+    const candidates = (await scope(txDraft.from(this._table))
       .where(this._clauses.filters)
       .all()) as Record<string, unknown>[]
     candidates.sort((left, right) =>
@@ -218,8 +238,7 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
 
     const lockedMatches: Record<string, unknown>[] = []
     for (const candidate of candidates) {
-      const match = await txDraft
-        .from(this._table)
+      const match = await scope(txDraft.from(this._table))
         .where([
           ...this._clauses.filters,
           { op: 'eq', column: pkProperty, value: candidate[pkProperty] },
@@ -243,11 +262,19 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
    * because a write cannot honor their return-shaping semantics.
    */
   async update(values: TrackedUpdateValues<T>): Promise<TableSelectedRow<T>[]> {
+    return this._update(values, false)
+  }
+
+  private async _update(
+    values: TrackedUpdateValues<T>,
+    allowSoftDeleteInput: boolean,
+  ): Promise<TableSelectedRow<T>[]> {
     assertNoReadClauses('update', this._clauses)
     assertDraftWriteScope(this._table, this._tenantScope)
     const patch = withoutUndefined(values as Record<string, unknown>)
     assertTenantInput(this._table, patch)
     assertRevisionInput(this._table, patch)
+    if (!allowSoftDeleteInput) assertSoftDeleteInput(this._table, patch)
     if (Object.keys(patch).length === 0) return []
     assertJsonNullInputs(this._table, patch)
 
@@ -278,8 +305,10 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
           tombstone: false,
           intent: 'update',
         })
-        const effective = await txDraft
-          .from(this._table)
+        const effectiveBuilder = txDraft.from(this._table)
+        const effective = await (
+          softDeleteProperty(this._table) ? effectiveBuilder.includeDeleted() : effectiveBuilder
+        )
           .where({ op: 'eq', column: pkProperty, value: pkValue })
           .first()
         if (effective) updated.push(effective)
@@ -293,6 +322,21 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     return rows
   }
 
+  /** Record a deterministic tombstone update in derived storage. */
+  async softDelete(at: Date): Promise<TableSelectedRow<T>[]> {
+    const property = requireSoftDeleteProperty(this._table)
+    assertValidSoftDeleteTimestamp(at)
+    return this._update({ [property]: new Date(at.getTime()) } as TrackedUpdateValues<T>, true)
+  }
+
+  /** Record a deterministic tombstone clear in derived storage. */
+  async restore(): Promise<TableSelectedRow<T>[]> {
+    const property = requireSoftDeleteProperty(this._table)
+    const scoped =
+      this._clauses.softDeleteScope === 'active' ? this._with({ softDeleteScope: 'only' }) : this
+    return scoped._update({ [property]: null } as TrackedUpdateValues<T>, true)
+  }
+
   /**
    * Record a delete operation in the central draft relation.
    * so the coalesce read suppresses it. Mirrors the canonical
@@ -302,6 +346,11 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
    * receives a delete marker in derived storage.
    */
   async delete(): Promise<TableSelectedRow<T>[]> {
+    if (softDeleteProperty(this._table)) {
+      throw new Error(
+        `Table "${getTableName(this._table)}" uses soft deletion; physical delete() is unavailable. Use softDelete(at).`,
+      )
+    }
     assertNoReadClauses('delete', this._clauses)
     assertDraftWriteScope(this._table, this._tenantScope)
     const columns = getTableColumns(this._table) as Record<string, { name: string }>
@@ -511,6 +560,15 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
     const effectiveFilters = this._clauses.filters.map((filter) =>
       lowerPredicate(filter, columns, effectiveExpression),
     )
+    const deletedProperty = softDeleteProperty(this._table)
+    if (deletedProperty && this._clauses.softDeleteScope !== 'include') {
+      const deletedColumn = requireColumn(columns, deletedProperty)
+      effectiveFilters.unshift(
+        sql.raw(
+          `(${effectiveExpression(deletedColumn)} IS ${this._clauses.softDeleteScope === 'only' ? 'NOT ' : ''}NULL)`,
+        ),
+      )
+    }
     const filterPredicate = effectiveFilters.length
       ? sql`${sql.raw(' AND ')}${sql.join(effectiveFilters, sql.raw(' AND '))}`
       : sql.raw('')
@@ -533,6 +591,14 @@ export class DraftSelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> 
       if (tenant && tenantColumn) {
         candidatePredicates.push(
           sql`${sql.raw(`c.${quoteSqlIdentifier(tenantColumn.name)} = `)}${sql.param(mapColumnValue(tenantColumn, tenant.tenantId))}`,
+        )
+      }
+      if (deletedProperty && this._clauses.softDeleteScope !== 'include') {
+        const deletedColumn = requireColumn(columns, deletedProperty)
+        candidatePredicates.push(
+          sql.raw(
+            `(c.${quoteSqlIdentifier(deletedColumn.name as string)} IS ${this._clauses.softDeleteScope === 'only' ? 'NOT ' : ''}NULL)`,
+          ),
         )
       }
       for (const filter of this._clauses.filters) {

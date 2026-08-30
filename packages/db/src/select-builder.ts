@@ -4,6 +4,7 @@ import {
   desc,
   eq as drizzleEq,
   getTableColumns,
+  getTableName,
   inArray as drizzleInArray,
   isNotNull as drizzleIsNotNull,
   isNull as drizzleIsNull,
@@ -26,14 +27,18 @@ import type {
 import {
   assertNoReadClauses,
   assertRevisionInput,
+  assertSoftDeleteInput,
   assertTenantInput,
+  assertValidSoftDeleteTimestamp,
   drizzleOpMap,
   emptyClauses,
   materializeJsonNulls,
   noTenantScope,
   requireColumn,
+  requireSoftDeleteProperty,
   requireTenantScope,
   revisionProperty,
+  softDeleteProperty,
   tableTrackingTag,
   withoutUndefined,
 } from './tracker-core'
@@ -119,6 +124,18 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     return this._with({ filters: [...this._clauses.filters, ...toAdd] })
   }
 
+  /** Include both active and soft-deleted rows in this builder's scope. */
+  includeDeleted(): SelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'include' })
+  }
+
+  /** Restrict this builder to soft-deleted rows. */
+  onlyDeleted(): SelectBuilder<T, TRow> {
+    requireSoftDeleteProperty(this._table)
+    return this._with({ softDeleteScope: 'only' })
+  }
+
   orderBy(col: string, dir: 'asc' | 'desc' = 'asc'): SelectBuilder<T, TRow> {
     // Rejected here rather than at lowering time, for the same reason `select()`
     // rejects an empty column list: the lowering used to gate on truthiness, so
@@ -153,6 +170,15 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     if (tenant) {
       conditions.unshift(
         drizzleEq(requireColumn(columns, tenant.tenancy.property), tenant.tenantId),
+      )
+    }
+    const deletedProperty = softDeleteProperty(this._table)
+    if (deletedProperty && this._clauses.softDeleteScope !== 'include') {
+      const deletedColumn = requireColumn(columns, deletedProperty)
+      conditions.unshift(
+        this._clauses.softDeleteScope === 'only'
+          ? drizzleIsNotNull(deletedColumn)
+          : drizzleIsNull(deletedColumn),
       )
     }
     return conditions
@@ -301,11 +327,16 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
   }
 
   async update(values: TrackedUpdateValues<T>) {
+    return this._update(values, false)
+  }
+
+  private async _update(values: TrackedUpdateValues<T>, allowSoftDeleteInput: boolean) {
     if (this._writeError) throw new Error(this._writeError)
     assertNoReadClauses('update', this._clauses)
     assertTenantInput(this._table, values as Record<string, unknown>)
     const supplied = withoutUndefined(values as Record<string, unknown>)
     assertRevisionInput(this._table, supplied)
+    if (!allowSoftDeleteInput) assertSoftDeleteInput(this._table, supplied)
     if (Object.keys(supplied).length === 0) return []
     const patch = materializeJsonNulls(this._table, supplied)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
@@ -324,8 +355,32 @@ export class SelectBuilder<T extends AnyTable, TRow = TableSelectedRow<T>> {
     return rows
   }
 
+  /**
+   * Logically remove matching rows at the explicit instant supplied by the
+   * caller. Requiring the value keeps replayable commands deterministic.
+   */
+  async softDelete(at: Date) {
+    const property = requireSoftDeleteProperty(this._table)
+    assertValidSoftDeleteTimestamp(at)
+    return this._update({ [property]: new Date(at.getTime()) } as TrackedUpdateValues<T>, true)
+  }
+
+  /** Restore matching rows by clearing their framework-owned tombstone. */
+  async restore() {
+    const property = requireSoftDeleteProperty(this._table)
+    const scoped =
+      this._clauses.softDeleteScope === 'active' ? this._with({ softDeleteScope: 'only' }) : this
+    return scoped._update({ [property]: null } as TrackedUpdateValues<T>, true)
+  }
+
   async delete() {
     if (this._writeError) throw new Error(this._writeError)
+    const deletedProperty = softDeleteProperty(this._table)
+    if (deletedProperty) {
+      throw new Error(
+        `Table "${getTableName(this._table)}" uses soft deletion; physical delete() is unavailable. Use softDelete(at).`,
+      )
+    }
     assertNoReadClauses('delete', this._clauses)
     // oxlint-disable-next-line typescript/no-explicit-any -- Drizzle column objects are dynamically typed
     const columns = getTableColumns(this._table) as Record<string, any>

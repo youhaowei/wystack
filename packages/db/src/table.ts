@@ -51,6 +51,8 @@ export interface TableCapabilities {
   readonly draftable: boolean
   readonly tenancy?: TenantCapability
   readonly revisionProperty?: string
+  /** Nullable timestamp property owned by WyStack for logical row removal. */
+  readonly softDeleteProperty?: string
 }
 
 const standardColumnDefinitionOwnKeys = new Set(Reflect.ownKeys(uuid))
@@ -271,6 +273,9 @@ export class TableDefinition<
     if (this.capabilities.tenancy?.property === property) {
       throw new Error(`Revision property "${property}" cannot be the tenant key`)
     }
+    if (this.capabilities.softDeleteProperty === property) {
+      throw new Error(`Revision property "${property}" cannot be the soft-delete property`)
+    }
     if (definition.opts.isPrimaryKey) {
       throw new Error(`Revision property "${property}" cannot be a primary key`)
     }
@@ -290,6 +295,56 @@ export class TableDefinition<
       ...this.capabilities,
       revisionProperty: property,
     })
+  }
+
+  /**
+   * Put logical row removal under WyStack custody. The named property must be a
+   * nullable timestamp with no default: active rows carry SQL NULL and only the
+   * explicit softDelete()/restore() terminals may change it.
+   */
+  softDelete<TKey extends Extract<keyof TColumns, string>>(
+    property: TKey,
+  ): TableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TRevisionProperty> {
+    TableDefinition.#assertAuthentic(this)
+    if (this.capabilities.softDeleteProperty) {
+      throw new Error(
+        `Soft-delete property is already configured as "${this.capabilities.softDeleteProperty}"`,
+      )
+    }
+    const definition = this.columns[property]
+    if (!definition) throw new Error(`Unknown soft-delete property "${property}"`)
+    if (this.capabilities.tenancy?.property === property) {
+      throw new Error(`Soft-delete property "${property}" cannot be the tenant key`)
+    }
+    if (this.capabilities.revisionProperty === property) {
+      throw new Error(`Soft-delete property "${property}" cannot be the revision property`)
+    }
+    if (definition.opts.type !== 'timestamp' || definition.opts.isArray) {
+      throw new Error(`Soft-delete property "${property}" must be a nullable timestamp`)
+    }
+    if (!definition.opts.isNullable || definition.opts.isOptional) {
+      throw new Error(`Soft-delete property "${property}" must be a nullable timestamp`)
+    }
+    if (definition.opts.hasDefault) {
+      throw new Error(`Soft-delete property "${property}" must not have a default`)
+    }
+    if (
+      definition.opts.isPrimaryKey ||
+      definition.opts.isUnique ||
+      definition.opts.isUniqueWithinTenant ||
+      definition.opts.ref
+    ) {
+      throw new Error(
+        `Soft-delete property "${property}" cannot be an identity, unique, or foreign-key column`,
+      )
+    }
+    return createTableDefinition<TColumns, TDraftable, TSystemManaged | TKey, TRevisionProperty>(
+      this.columns,
+      {
+        ...this.capabilities,
+        softDeleteProperty: property,
+      },
+    )
   }
 }
 

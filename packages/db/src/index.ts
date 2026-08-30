@@ -17,6 +17,7 @@ export {
   jsonNull,
   publishedInvalidationIdentity,
   draftInvalidationIdentity,
+  softDeleteProperty,
 } from './drizzle-tracker'
 export { syncSchema, renderCreateTableIfNotExists } from './sync'
 export { ensureRowRevisionStorage } from './row-revisions'

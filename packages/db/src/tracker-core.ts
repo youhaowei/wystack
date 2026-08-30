@@ -147,6 +147,11 @@ export function revisionProperty(table: AnyTable): string | undefined {
   return tryGetTableCapabilities(table)?.revisionProperty
 }
 
+/** Framework-owned nullable timestamp used to hide logically removed rows. */
+export function softDeleteProperty(table: AnyTable): string | undefined {
+  return tryGetTableCapabilities(table)?.softDeleteProperty
+}
+
 export function assertRevisionInput(table: AnyTable, values: Record<string, unknown>): void {
   const property = revisionProperty(table)
   if (!property) return
@@ -154,6 +159,34 @@ export function assertRevisionInput(table: AnyTable, values: Record<string, unkn
   const column = requireColumn(columns, property)
   if (Object.hasOwn(values, property) || Object.hasOwn(values, column.name)) {
     throw new Error(`Revision property "${property}" is system-managed and cannot be supplied`)
+  }
+}
+
+export function assertSoftDeleteInput(table: AnyTable, values: Record<string, unknown>): void {
+  const property = softDeleteProperty(table)
+  if (!property) return
+  const columns = getTableColumns(table) as Record<string, { name: string }>
+  const column = requireColumn(columns, property)
+  if (Object.hasOwn(values, property) || Object.hasOwn(values, column.name)) {
+    throw new Error(
+      `Soft-delete property "${property}" is system-managed; use softDelete(at) or restore()`,
+    )
+  }
+}
+
+export function requireSoftDeleteProperty(table: AnyTable): string {
+  const property = softDeleteProperty(table)
+  if (!property) {
+    throw new Error(
+      `Table "${getTableName(table)}" does not opt into soft deletion; configure a soft-delete property first`,
+    )
+  }
+  return property
+}
+
+export function assertValidSoftDeleteTimestamp(at: Date): void {
+  if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
+    throw new Error('softDelete(at) requires a valid explicit Date')
   }
 }
 
@@ -247,6 +280,8 @@ export interface ReadClauses {
   orderByCol?: string
   orderDir: 'asc' | 'desc'
   limitVal?: number
+  /** Active rows by default; callers must explicitly widen tombstone visibility. */
+  softDeleteScope: 'active' | 'include' | 'only'
 }
 
 /** Fresh state for a builder with nothing attached. A factory, not a shared
@@ -254,6 +289,7 @@ export interface ReadClauses {
 export const emptyClauses = (): ReadClauses => ({
   filters: [],
   orderDir: 'asc',
+  softDeleteScope: 'active',
 })
 
 /**
@@ -454,9 +490,10 @@ export const drizzleOpMap = {
  *   - `from(table).all()`            → coalesced read (canonical ⊕ draft delta)
  *   - `into(table).insert(rows)`     → sparse central change upsert
  *   - `from(table).where(eqPk).update(vals)` → sparse JSONB field edit
+ *   - `from(table).where(eqPk).softDelete(at)` / `.restore()` → sparse tombstone edit
  *   - `from(table).where(eqPk).delete()`     → central delete operation
  *
- * The write methods (`into` + the `DraftSelectBuilder.update/delete`) are what
+ * The write methods (`into` plus the draft builder's mutation terminals) are what
  * make an EXISTING command handler — which writes via `ctx.db.into(table)` /
  * `ctx.db.from(table).where(...).update(...)` — land in the draft overlay
  * UNMODIFIED when `ctx.db = base.withDraft(draftId)`. The handler is unaware it

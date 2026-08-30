@@ -68,6 +68,15 @@ const schema = defineSchema({
   versionedTodos: table({ id: int.primaryKey(), title: text, revision: int })
     .revision('revision')
     .draftable(),
+  archivedTodos: table({
+    id: int.primaryKey(),
+    title: text,
+    deletedAt: timestamp.nullable(),
+    revision: int,
+  })
+    .softDelete('deletedAt')
+    .revision('revision')
+    .draftable(),
   replaceableTodos: table({
     id: int.primaryKey(),
     title: text,
@@ -194,6 +203,9 @@ beforeEach(async () => {
     `CREATE TABLE "versionedTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, revision INTEGER NOT NULL)`,
   )
   await db.execute(
+    `CREATE TABLE "archivedTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, "deletedAt" TIMESTAMP, revision INTEGER NOT NULL)`,
+  )
+  await db.execute(
     `CREATE TABLE "replaceableTodos" (id INTEGER PRIMARY KEY, title TEXT NOT NULL, note TEXT)`,
   )
   await db.execute(`CREATE TABLE settings (id INTEGER PRIMARY KEY, prefix TEXT NOT NULL)`)
@@ -209,6 +221,9 @@ beforeEach(async () => {
   await db.execute(`INSERT INTO "treeNodes" (id,"parentId") VALUES (10,NULL),(11,10)`)
   await db.execute(`INSERT INTO "versionedTodos" (id,title,revision) VALUES (1,'apple',1)`)
   await db.execute(
+    `INSERT INTO "archivedTodos" (id,title,"deletedAt",revision) VALUES (1,'archive me',NULL,1)`,
+  )
+  await db.execute(
     `INSERT INTO "replaceableTodos" (id,title,note) VALUES (1,'original','old note')`,
   )
   await db.execute(`INSERT INTO settings (id,prefix) VALUES (1,'from-setting')`)
@@ -221,6 +236,12 @@ beforeEach(async () => {
       listVersionedTodos: wy.procedure
         .input({})
         .query(async (ctx) => ctx.db.from(schema.versionedTodos).all()),
+      listArchivedTodos: wy.procedure
+        .input({})
+        .query(async (ctx) => ctx.db.from(schema.archivedTodos).all()),
+      listAllArchivedTodos: wy.procedure
+        .input({})
+        .query(async (ctx) => ctx.db.from(schema.archivedTodos).includeDeleted().all()),
       listReplaceableTodos: wy.procedure
         .input({})
         .query(async (ctx) => ctx.db.from(schema.replaceableTodos).all()),
@@ -368,6 +389,21 @@ beforeEach(async () => {
         .input({ id: int, title: text })
         .command(async (ctx, args) =>
           ctx.db.from(schema.versionedTodos).where(eq('id', args.id)).update({ title: args.title }),
+        ),
+      renameArchivedTodo: wy.procedure
+        .input({ id: int, title: text })
+        .command(async (ctx, args) =>
+          ctx.db.from(schema.archivedTodos).where(eq('id', args.id)).update({ title: args.title }),
+        ),
+      softDeleteTodo: wy.procedure
+        .input({ id: int, at: timestamp })
+        .command(async (ctx, args) =>
+          ctx.db.from(schema.archivedTodos).where(eq('id', args.id)).softDelete(args.at),
+        ),
+      restoreTodo: wy.procedure
+        .input({ id: int })
+        .command(async (ctx, args) =>
+          ctx.db.from(schema.archivedTodos).where(eq('id', args.id)).restore(),
         ),
       removeTodo: wy.procedure
         .input({ id: int })
@@ -579,6 +615,97 @@ describe('draft lifecycle — global authority and custody', () => {
 })
 
 describe('draft lifecycle — golden path (open→append→read→publish)', () => {
+  test('publishes an explicit soft-delete tombstone without hiding canonical data early', async () => {
+    const removedAt = new Date('2026-08-29T14:00:00.000Z')
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+
+    await lifecycle.append(draftId, [{ path: 'softDeleteTodo', args: { id: 1, at: removedAt } }])
+
+    expect((await app.call('listArchivedTodos', {})).result).toHaveLength(1)
+    const effective = app.system.createTracked().withDraft(draftId)
+    expect(await effective.from(schema.archivedTodos).where(eq('id', 1)).first()).toBeNull()
+    expect(
+      await effective.from(schema.archivedTodos).onlyDeleted().where(eq('id', 1)).first(),
+    ).toMatchObject({ deletedAt: removedAt, revision: 2 })
+    expect(await lifecycle.inspect(draftId)).toMatchObject([
+      {
+        operation: 'update',
+        fields: {
+          deletedAt: { value: { kind: 'value', value: removedAt.toISOString() } },
+        },
+      },
+    ])
+
+    await lifecycle.publish(draftId)
+
+    expect((await app.call('listArchivedTodos', {})).result).toEqual([])
+    expect((await app.call('listAllArchivedTodos', {})).result).toMatchObject([
+      { id: 1, deletedAt: removedAt, revision: 2 },
+    ])
+  })
+
+  test('discarding a soft-delete draft leaves its canonical row active', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'softDeleteTodo',
+        args: { id: 1, at: new Date('2026-08-29T15:00:00.000Z') },
+      },
+    ])
+
+    await lifecycle.discard(draftId)
+
+    expect((await app.call('listArchivedTodos', {})).result).toMatchObject([
+      { id: 1, deletedAt: null, revision: 1 },
+    ])
+  })
+
+  test('publishes restore as a tombstone clear and preserves replayed revision history', async () => {
+    await app.call('softDeleteTodo', {
+      id: 1,
+      at: new Date('2026-08-29T16:00:00.000Z'),
+    })
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [{ path: 'restoreTodo', args: { id: 1 } }])
+
+    expect((await app.call('listArchivedTodos', {})).result).toEqual([])
+    expect(
+      await app.system
+        .createTracked()
+        .withDraft(draftId)
+        .from(schema.archivedTodos)
+        .where(eq('id', 1))
+        .first(),
+    ).toMatchObject({ deletedAt: null, revision: 3 })
+
+    await lifecycle.publish(draftId)
+
+    expect((await app.call('listArchivedTodos', {})).result).toMatchObject([
+      { id: 1, deletedAt: null, revision: 3 },
+    ])
+  })
+
+  test('a canonical write conflicting with a drafted soft delete keeps the draft retryable', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'softDeleteTodo',
+        args: { id: 1, at: new Date('2026-08-29T17:00:00.000Z') },
+      },
+    ])
+    await app.call('renameArchivedTodo', { id: 1, title: 'canonical wins' })
+
+    await expect(lifecycle.publish(draftId)).rejects.toBeInstanceOf(DraftConflictError)
+    expect((await app.call('listArchivedTodos', {})).result).toMatchObject([
+      { id: 1, title: 'canonical wins', deletedAt: null, revision: 2 },
+    ])
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+  })
+
   test('rebase fails closed when materialized row changes disagree with the command log', async () => {
     const lifecycle = createDraftLifecycle(app, { versionProbe: makeProbe() })
     const draftId = await lifecycle.open(0)
@@ -782,7 +909,7 @@ describe('draft lifecycle — golden path (open→append→read→publish)', () 
       `SELECT version FROM wystack_framework_migrations WHERE migration_name = 'draft-storage'`,
     )
     // oxlint-disable-next-line typescript/no-explicit-any
-    expect((migration as any).rows[0].version).toBe(8)
+    expect((migration as any).rows[0].version).toBe(9)
 
     await restartedProcess.publish(draftId)
     const { result: canonical } = await app.call('listTodos', {})
@@ -1639,6 +1766,27 @@ describe('draft lifecycle — row-local revision conflicts', () => {
     expect(await lifecycle.getLog(draftId)).toHaveLength(1)
     const { result } = await app.call('listVersionedTodos', {})
     expect(result).toEqual([{ id: 1, title: 'external', revision: 2 }])
+  })
+
+  test('publish fails closed when soft-delete custody differs from the stored descriptor', async () => {
+    const lifecycle = createDraftLifecycle(app)
+    const draftId = await lifecycle.open(0)
+    await lifecycle.append(draftId, [
+      {
+        path: 'softDeleteTodo',
+        args: { id: 1, at: new Date('2026-08-29T18:00:00.000Z') },
+      },
+    ])
+    await db.execute(
+      `UPDATE wystack_draft_tables SET soft_delete_column = NULL WHERE draft_id = '${draftId}' AND table_name = 'archivedTodos'`,
+    )
+    await refreshStoredDraftIntegrity(db, draftId)
+
+    await expect(lifecycle.publish(draftId)).rejects.toMatchObject({
+      conflicts: [{ table: 'archivedTodos', id: 1, reason: 'revision' }],
+    })
+    expect(await lifecycle.getLog(draftId)).toHaveLength(1)
+    expect((await app.call('listArchivedTodos', {})).result).toHaveLength(1)
   })
 
   test('a leftover row-revision ledger entry does not block publishing an unrevisioned table', async () => {

@@ -72,6 +72,7 @@ export function describeTouchedTables(
         tenantColumn: tenant?.name,
         tenantType: tenant ? normalizeSqlType(tenant.getSQLType()) : undefined,
         revisionColumn: liveRevisionColumn(table),
+        softDeleteColumn: liveSoftDeleteColumn(table),
         invalidationTag: draftTag,
       },
     ]
@@ -81,6 +82,14 @@ export function describeTouchedTables(
 /** The revision column the live schema declares for `table`, if any. */
 function liveRevisionColumn(table: AnyTable): string | undefined {
   const property = tryGetTableCapabilities(table)?.revisionProperty
+  if (!property) return undefined
+  const columns = getTableColumns(table) as Record<string, { name: string }>
+  return columns[property]?.name
+}
+
+/** The tombstone column the live schema declares for `table`, if any. */
+function liveSoftDeleteColumn(table: AnyTable): string | undefined {
+  const property = tryGetTableCapabilities(table)?.softDeleteProperty
   if (!property) return undefined
   const columns = getTableColumns(table) as Record<string, { name: string }>
   return columns[property]?.name
@@ -105,7 +114,13 @@ export async function assertStoredDescriptorsCurrent(
   for (const table of stored) {
     const tableIdentity = table.schema ? `${table.schema}.${table.table}` : table.table
     const live = liveTables.get(tableIdentity)
-    if (!live || liveRevisionColumn(live) === table.revisionColumn) continue
+    if (
+      !live ||
+      (liveRevisionColumn(live) === table.revisionColumn &&
+        liveSoftDeleteColumn(live) === table.softDeleteColumn)
+    ) {
+      continue
+    }
     const rows = normalizeRows(
       await raw.execute(sql`
         SELECT row_key FROM wystack_draft_row_changes

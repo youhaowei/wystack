@@ -7,6 +7,7 @@ import {
   pgTable,
   primaryKey,
   text as pgText,
+  timestamp as pgTimestamp,
   unique,
 } from 'drizzle-orm/pg-core'
 import {
@@ -36,6 +37,20 @@ function tenantTable(name: string) {
   )
 }
 
+function softDeleteTenantTable(name: string) {
+  return pgTable(
+    name,
+    {
+      workspaceId: pgText('workspace_id').notNull(),
+      id: pgText('id').notNull(),
+      value: pgText('value').notNull(),
+      deletedAt: pgTimestamp('deleted_at'),
+      rowRevision: integer('row_revision').notNull().default(1),
+    },
+    (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+  )
+}
+
 let client: PGlite | undefined
 
 afterEach(async () => {
@@ -45,13 +60,14 @@ afterEach(async () => {
 
 describe('adoptSchema', () => {
   test('adds native tenant and draft custody to the authoritative Drizzle table', async () => {
-    const records = tenantTable('adopted_records')
+    const records = softDeleteTenantTable('adopted_records')
     const schema = adoptSchema(tenancy, {
       records: {
         table: records,
         logicalPrimaryKey: 'id',
         draftable: true,
         revisionProperty: 'rowRevision',
+        softDeleteProperty: 'deletedAt',
       },
     })
 
@@ -59,6 +75,7 @@ describe('adoptSchema', () => {
     expect(getTableCapabilities(records)).toMatchObject({
       draftable: true,
       revisionProperty: 'rowRevision',
+      softDeleteProperty: 'deletedAt',
       tenancy: { property: 'workspaceId', column: 'workspace_id' },
     })
 
@@ -93,6 +110,46 @@ describe('adoptSchema', () => {
         records: { table: records, logicalPrimaryKey: 'id' },
       }),
     ).toThrow('must use the composite primary key (workspace_id, id)')
+  })
+
+  test('validates the adopted tombstone against the physical Drizzle column', () => {
+    const required = pgTable(
+      'required_deleted_at_records',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        deletedAt: pgTimestamp('deleted_at').notNull(),
+      },
+      (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+    )
+    const defaulted = pgTable(
+      'defaulted_deleted_at_records',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        deletedAt: pgTimestamp('deleted_at').defaultNow(),
+      },
+      (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+    )
+
+    expect(() =>
+      adoptSchema(tenancy, {
+        records: {
+          table: required,
+          logicalPrimaryKey: 'id',
+          softDeleteProperty: 'deletedAt',
+        },
+      }),
+    ).toThrow('must be a nullable timestamp without a default')
+    expect(() =>
+      adoptSchema(tenancy, {
+        records: {
+          table: defaulted,
+          logicalPrimaryKey: 'id',
+          softDeleteProperty: 'deletedAt',
+        },
+      }),
+    ).toThrow('must be a nullable timestamp without a default')
   })
 
   test('makes a globally keyed table an explicit expand-contract compatibility state', () => {

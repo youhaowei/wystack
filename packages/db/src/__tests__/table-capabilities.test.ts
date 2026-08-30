@@ -41,6 +41,7 @@ describe('composable table capabilities', () => {
       expect(forged instanceof TableDefinition).toBe(false)
       expect(() => forged.draftable()).toThrow('require a factory-created definition')
       expect(() => forged.revision('id')).toThrow('require a factory-created definition')
+      expect(() => forged.softDelete('id')).toThrow('require a factory-created definition')
       expect(() => defineSchema({ forged })).toThrow('table(...)')
     })
 
@@ -421,6 +422,50 @@ describe('composable table capabilities', () => {
         default: 1,
       })
       expect(getTableColumns(schema.records).revision.getSQLType()).toBe('integer')
+    })
+  })
+
+  describe('soft-delete state', () => {
+    test('soft deletion composes with tenancy, drafts, and revisions', () => {
+      const tenancy = multiTenant({
+        key: { property: 'workspaceId', column: 'workspace_id', type: uuid },
+      })
+      const schema = defineSchema({
+        records: tenancy
+          .table({
+            id: uuid.primaryKey(),
+            name: text,
+            deletedAt: timestamp.nullable(),
+            revision: int,
+          })
+          .draftable()
+          .softDelete('deletedAt')
+          .revision('revision'),
+      })
+
+      expect(getTableCapabilities(schema.records)).toMatchObject({
+        draftable: true,
+        revisionProperty: 'revision',
+        softDeleteProperty: 'deletedAt',
+        tenancy: { property: 'workspaceId' },
+      })
+    })
+
+    test('soft-delete properties must be dedicated nullable timestamps without defaults', () => {
+      expect(() => table({ id: uuid.primaryKey() }).softDelete('id')).toThrow('nullable timestamp')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp }).softDelete('deletedAt'),
+      ).toThrow('nullable timestamp')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp.nullable().defaultNow() }).softDelete(
+          'deletedAt',
+        ),
+      ).toThrow('must not have a default')
+      expect(() =>
+        table({ id: uuid.primaryKey(), deletedAt: timestamp.nullable().unique() }).softDelete(
+          'deletedAt',
+        ),
+      ).toThrow('cannot be an identity, unique, or foreign-key column')
     })
   })
 

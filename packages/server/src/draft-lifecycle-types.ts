@@ -171,6 +171,8 @@ export interface DraftGraphReadBuilder<
     ...columns: [K, ...K[]]
   ): DraftGraphReadBuilder<TTable, Pick<DraftGraphRow<TTable>, K>>
   where(filters: FilterDescriptor | FilterDescriptor[]): DraftGraphReadBuilder<TTable, TRow>
+  includeDeleted(): DraftGraphReadBuilder<TTable, TRow>
+  onlyDeleted(): DraftGraphReadBuilder<TTable, TRow>
   orderBy(column: string, direction?: 'asc' | 'desc'): DraftGraphReadBuilder<TTable, TRow>
   limit(count: number): DraftGraphReadBuilder<TTable, TRow>
   all(): Promise<TRow[]>

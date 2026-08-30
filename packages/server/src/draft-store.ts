@@ -52,6 +52,7 @@ export interface StoredTouchedTable {
   tenantColumn: string | undefined
   tenantType: string | undefined
   revisionColumn: string | undefined
+  softDeleteColumn: string | undefined
   invalidationTag: string | undefined
 }
 
@@ -61,7 +62,12 @@ const migrationTableDdl = sql.raw(`CREATE TABLE IF NOT EXISTS wystack_framework_
   applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`)
 
-function draftIntegrityExpression(draftId: SQL): SQL {
+function draftIntegrityExpression(
+  draftId: SQL,
+  opts: { includesSoftDeleteColumn?: boolean } = { includesSoftDeleteColumn: true },
+): SQL {
+  const softDeleteColumn =
+    opts.includesSoftDeleteColumn === false ? sql.empty() : sql.raw(', t.soft_delete_column')
   return sql`md5(jsonb_build_object(
     'commands', COALESCE((
       SELECT jsonb_agg(
@@ -75,7 +81,8 @@ function draftIntegrityExpression(draftId: SQL): SQL {
       SELECT jsonb_agg(
         jsonb_build_array(
           t.schema_name, t.table_name, t.pk_column, t.pk_type,
-          t.tenant_column, t.tenant_type, t.revision_column, t.invalidation_tag
+          t.tenant_column, t.tenant_type, t.revision_column
+          ${softDeleteColumn}, t.invalidation_tag
         )
         ORDER BY t.schema_name, t.table_name
       )
@@ -97,7 +104,7 @@ function draftIntegrityExpression(draftId: SQL): SQL {
   )::text)`
 }
 
-const draftStorageVersion = 8
+const draftStorageVersion = 9
 const storageDdlV1 = [
   sql.raw(`CREATE TABLE IF NOT EXISTS wystack_drafts (
     draft_id TEXT PRIMARY KEY,
@@ -247,7 +254,9 @@ const storageDdlV5 = [
 const storageDdlV6 = [
   sql.raw(`ALTER TABLE wystack_drafts ADD COLUMN IF NOT EXISTS integrity_hash TEXT`),
   sql`UPDATE wystack_drafts d
-    SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))}`,
+    SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'), {
+      includesSoftDeleteColumn: false,
+    })}`,
   sql.raw(`ALTER TABLE wystack_drafts ALTER COLUMN integrity_hash SET NOT NULL`),
 ]
 
@@ -315,6 +324,15 @@ const storageDdlV8 = [
     ) WHERE lookup_key IS NOT NULL`),
 ]
 
+// Table capability snapshots make replay fail closed when a deployment changes
+// whether an already-touched canonical relation is logically removable.
+const storageDdlV9 = [
+  sql.raw(`ALTER TABLE wystack_draft_tables
+    ADD COLUMN IF NOT EXISTS soft_delete_column TEXT`),
+  sql`UPDATE wystack_drafts d
+    SET integrity_hash = ${draftIntegrityExpression(sql.raw('d.draft_id'))}`,
+]
+
 export async function ensureDraftStorage(raw: RawDb): Promise<void> {
   await withFrameworkBootstrapLock(raw, async (tx: RawDb) => {
     await tx.execute(migrationTableDdl)
@@ -362,6 +380,9 @@ export async function ensureDraftStorage(raw: RawDb): Promise<void> {
     }
     if (installedVersion < 8) {
       for (const statement of storageDdlV8) await tx.execute(statement)
+    }
+    if (installedVersion < 9) {
+      for (const statement of storageDdlV9) await tx.execute(statement)
     }
     await tx.execute(sql`
       UPDATE wystack_framework_migrations
@@ -706,11 +727,12 @@ export async function upsertStoredTouchedTables(
     await raw.execute(sql`
       INSERT INTO wystack_draft_tables
         (draft_id, schema_name, table_name, pk_column, pk_type,
-         tenant_column, tenant_type, revision_column, invalidation_tag)
+         tenant_column, tenant_type, revision_column, soft_delete_column, invalidation_tag)
       VALUES
         (${draftId}, ${table.schema ?? ''}, ${table.table}, ${table.pkColumn}, ${table.pkType},
          ${table.tenantColumn ?? null}, ${table.tenantType ?? null},
-         ${table.revisionColumn ?? null}, ${table.invalidationTag ?? null})
+         ${table.revisionColumn ?? null}, ${table.softDeleteColumn ?? null},
+         ${table.invalidationTag ?? null})
       ON CONFLICT (draft_id, schema_name, table_name)
       DO UPDATE SET
         pk_column = EXCLUDED.pk_column,
@@ -718,6 +740,7 @@ export async function upsertStoredTouchedTables(
         tenant_column = EXCLUDED.tenant_column,
         tenant_type = EXCLUDED.tenant_type,
         revision_column = EXCLUDED.revision_column,
+        soft_delete_column = EXCLUDED.soft_delete_column,
         invalidation_tag = COALESCE(
           EXCLUDED.invalidation_tag,
           wystack_draft_tables.invalidation_tag
@@ -733,7 +756,7 @@ export async function readStoredTouchedTables(
   const rows = normalizeRows(
     await raw.execute(sql`
       SELECT schema_name, table_name, pk_column, pk_type,
-             tenant_column, tenant_type, revision_column, invalidation_tag
+             tenant_column, tenant_type, revision_column, soft_delete_column, invalidation_tag
       FROM wystack_draft_tables
       WHERE draft_id = ${draftId}
       ORDER BY schema_name, table_name
@@ -747,6 +770,8 @@ export async function readStoredTouchedTables(
     tenantColumn: row['tenant_column'] == null ? undefined : String(row['tenant_column']),
     tenantType: row['tenant_type'] == null ? undefined : String(row['tenant_type']),
     revisionColumn: row['revision_column'] == null ? undefined : String(row['revision_column']),
+    softDeleteColumn:
+      row['soft_delete_column'] == null ? undefined : String(row['soft_delete_column']),
     invalidationTag: row['invalidation_tag'] == null ? undefined : String(row['invalidation_tag']),
   }))
 }
