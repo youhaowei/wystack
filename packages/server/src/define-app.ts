@@ -32,15 +32,17 @@ export function defineApp<TAppContext extends object = Record<string, unknown>>(
     /**
      * Raw SQL for app-owned joins and aggregates, dispatched after any
      * configured trusted tenant resolution. Manual tags are tenant-qualified
-     * when scoped; the handler owns raw SQL tenant predicates. Read models
-     * expose only the query terminal.
+     * when scoped; trackGlobalRead() records a deliberately global dependency.
+     * The handler owns raw SQL tenant predicates. Read models expose only the
+     * query terminal.
      */
     readModel: createProcedure<ReadModelFunctionContext<TAppContext>>('read-model-raw'),
     /**
      * Raw SQL for canonical workflows such as bulk import, dispatched after any
      * configured trusted tenant resolution. Manual tags are tenant-qualified
-     * when scoped; the handler owns raw SQL tenant predicates. Integrations
-     * expose only the mutation terminal.
+     * when scoped; trackGlobalRead()/trackGlobalWrite() record deliberately
+     * global dependencies. The handler owns raw SQL tenant predicates.
+     * Integrations expose only the mutation terminal.
      */
     integration: createProcedure<IntegrationFunctionContext<TAppContext>>('integration-raw'),
     /**

@@ -4,6 +4,7 @@ import { drizzle } from 'drizzle-orm/pglite'
 import {
   foreignKey,
   integer,
+  pgSchema,
   pgTable,
   primaryKey,
   text as pgText,
@@ -236,11 +237,29 @@ describe('adoptSchema', () => {
       },
       (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
     )
+    const array = pgTable(
+      'array_deleted_at_records',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        deletedAt: pgTimestamp('deleted_at').array(),
+      },
+      (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+    )
 
     expect(() =>
       adoptSchema(tenancy, {
         records: {
           table: required,
+          logicalPrimaryKey: 'id',
+          softDeleteProperty: 'deletedAt',
+        },
+      }),
+    ).toThrow('must be a nullable timestamp without a default')
+    expect(() =>
+      adoptSchema(tenancy, {
+        records: {
+          table: array,
           logicalPrimaryKey: 'id',
           softDeleteProperty: 'deletedAt',
         },
@@ -319,6 +338,47 @@ describe('adoptSchema', () => {
         children: { table: children, logicalPrimaryKey: 'id' },
       }),
     ).toThrow('must include tenant column "workspace_id"')
+  })
+
+  test('validates foreign keys through distinct Drizzle objects for one physical parent', () => {
+    const physicalSchema = pgSchema('object_alias_contract')
+    const schemaTenantTable = () =>
+      physicalSchema.table(
+        'parents',
+        {
+          workspaceId: pgText('workspace_id').notNull(),
+          id: pgText('id').notNull(),
+          value: pgText('value').notNull(),
+          rowRevision: integer('row_revision').notNull().default(1),
+        },
+        (row) => [primaryKey({ columns: [row.workspaceId, row.id] })],
+      )
+    const adoptedParents = schemaTenantTable()
+    const referencedParents = schemaTenantTable()
+    const children = physicalSchema.table(
+      'object_aliased_children',
+      {
+        workspaceId: pgText('workspace_id').notNull(),
+        id: pgText('id').notNull(),
+        parentId: pgText('parent_id').notNull(),
+      },
+      (row) => [
+        primaryKey({ columns: [row.workspaceId, row.id] }),
+        foreignKey({ columns: [row.parentId], foreignColumns: [referencedParents.id] }),
+      ],
+    )
+
+    adoptSchema(tenancy, {
+      parents: { table: adoptedParents, logicalPrimaryKey: 'id' },
+    })
+
+    expect(() =>
+      adoptSchema(tenancy, {
+        children: { table: children, logicalPrimaryKey: 'id' },
+      }),
+    ).toThrow(
+      'Tenant foreign key from "object_aliased_children" to "parents" must include tenant column "workspace_id"',
+    )
   })
 
   test('rejects implicit cascading writes into a draftable table', () => {

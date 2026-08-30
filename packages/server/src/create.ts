@@ -222,6 +222,12 @@ function toRawProcedureDb(
     raw: tracked.raw,
     tablesRead: mappedTrackingSet(tracked.tablesRead, qualifyTag),
     tablesWritten: mappedTrackingSet(tracked.tablesWritten, qualifyTag),
+    trackGlobalRead: (tag: string) => {
+      tracked.tablesRead.add(tag)
+    },
+    trackGlobalWrite: (tag: string) => {
+      tracked.tablesWritten.add(tag)
+    },
     from: ((table: Parameters<DrizzleTracker['from']>[0]) =>
       toProcedureSelectBuilder(tracked.from(table))) as RawProcedureDb['from'],
     into: ((table: Parameters<DrizzleTracker['into']>[0]) =>
@@ -348,9 +354,13 @@ export async function buildWyStack(opts: {
     async call(path: string, args: unknown, context: Record<string, unknown> = {}) {
       // Fresh DrizzleTracker per call — no shared mutable state
       const tracked = await system.scopeTracked(system.createTracked(), context)
+      const definition = getFunction(path)
       let result: unknown
       try {
-        result = await system.runHandler(path, args, tracked, context)
+        result =
+          definition.type === 'mutation' && definition.draftReplayable === true
+            ? await tracked.transaction((tx) => system.runHandler(path, args, tx, context))
+            : await system.runHandler(path, args, tracked, context)
       } finally {
         // Fuse: any COMMITTED tracked write dispatched through `call` fans out
         // on the app's source. The finally is load-bearing for Actions: a

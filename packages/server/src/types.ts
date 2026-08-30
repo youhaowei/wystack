@@ -21,9 +21,14 @@ export interface StageOk<TPatch> {
   readonly patch: TPatch
 }
 
+type FrameworkContextPatch = {
+  readonly db?: never
+  readonly can?: never
+}
+
 export type MiddlewareFn<TCtxIn, TPatch> = (opts: {
   ctx: TCtxIn
-  next: <P = {}>(patch?: P) => StageOk<P>
+  next: <P extends object = {}>(patch?: P & FrameworkContextPatch) => StageOk<P>
 }) => StageOk<TPatch> | Promise<StageOk<TPatch>>
 
 /** Boolean permission probe: denials return false; policy errors propagate. */
@@ -94,6 +99,10 @@ export interface RawProcedureDb extends ProcedureDb {
   readonly raw: DrizzleTracker['raw']
   readonly tablesRead: Set<string>
   readonly tablesWritten: Set<string>
+  /** Record a global-table read while dispatch itself is tenant scoped. */
+  trackGlobalRead(tag: string): void
+  /** Record a global-table write while dispatch itself is tenant scoped. */
+  trackGlobalWrite(tag: string): void
   transaction<R>(fn: (tx: RawProcedureDb) => Promise<R>, opts?: TransactionOptions): Promise<R>
 }
 

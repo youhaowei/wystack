@@ -27,7 +27,12 @@ type ReadModelContext = BuilderContext<Definition['readModel']>
 type IntegrationContext = BuilderContext<Definition['integration']>
 type ReadModelDefinition = ReturnType<Definition['readModel']['query']>
 type IntegrationDefinition = ReturnType<Definition['integration']['mutation']>
-type RawCapabilities = 'raw' | 'tablesRead' | 'tablesWritten'
+type RawCapabilities =
+  | 'raw'
+  | 'tablesRead'
+  | 'tablesWritten'
+  | 'trackGlobalRead'
+  | 'trackGlobalWrite'
 type ScopeCapabilities = 'withTenant' | 'withDraft'
 
 type _ReadModelContextIsNotAny = Expect<IsNotAny<ReadModelContext>>

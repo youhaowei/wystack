@@ -55,7 +55,7 @@ export interface ProcedureBuilder<
   TArgSchema extends Record<string, AnyColumnDef> = Record<never, never>,
   TDatabaseAccess extends ProcedureDatabaseAccess = 'native',
 > {
-  use<TPatch>(
+  use<TPatch extends object>(
     middleware: MiddlewareFn<TContext, TPatch>,
   ): ProcedureBuilder<Overwrite<TContext, TPatch>, TArgSchema, TDatabaseAccess>
   authorize(
@@ -78,10 +78,21 @@ export interface ProcedureBuilder<
   action: ActionTerminal<TContext, TArgSchema, TDatabaseAccess>
 }
 
-function stageOk<P>(patch?: P): StageOk<P> {
+function stageOk<P extends object = {}>(patch?: P): StageOk<P> {
   return {
     [stageOkBrand]: true,
     patch: patch ?? ({} as P),
+  }
+}
+
+function assertMiddlewarePatch(patch: unknown): asserts patch is object {
+  if (typeof patch !== 'object' || patch === null) {
+    throw new Error('Middleware next() patch must be an object')
+  }
+  for (const property of ['db', 'can'] as const) {
+    if (Object.hasOwn(patch, property)) {
+      throw new Error(`Middleware cannot override framework context property "${property}"`)
+    }
   }
 }
 
@@ -126,7 +137,8 @@ function terminal<
         if (!isStageOk(result)) {
           throw new Error('Middleware must return the value produced by next()')
         }
-        const nextContext = { ...currentContext, ...(result.patch as object) }
+        assertMiddlewarePatch(result.patch)
+        const nextContext = { ...currentContext, ...result.patch }
         // Middleware patches can change permission-relevant context. Rebind
         // the probe to the exact object the next stage and handler receive.
         // oxlint-disable-next-line typescript/no-explicit-any -- app permissions carry app-specific contexts
@@ -173,7 +185,7 @@ export function createProcedure<TContext>(
     currentDatabaseAccess: TCurrentDatabaseAccess,
   ): ProcedureBuilder<TCurrentContext, TArgSchema, TCurrentDatabaseAccess> {
     return {
-      use<TPatch>(stage: MiddlewareFn<TCurrentContext, TPatch>) {
+      use<TPatch extends object>(stage: MiddlewareFn<TCurrentContext, TPatch>) {
         return createBuilder<
           Overwrite<TCurrentContext, TPatch>,
           TArgSchema,

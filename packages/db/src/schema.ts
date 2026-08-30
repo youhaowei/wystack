@@ -601,6 +601,12 @@ function normalizedIdentitySqlType(type: string): string {
   return normalized
 }
 
+function adoptedTableIdentity(table: AnyPgTable): string {
+  const tableName = getTableName(table)
+  const schemaName = getTableConfig(table).schema
+  return schemaName ? `${schemaName}.${tableName}` : tableName
+}
+
 function adoptedColumn(
   table: AnyPgTable,
   property: string,
@@ -746,10 +752,12 @@ function assertAdoptedSoftDelete(
     )
   }
   const deletedAt = adoptedColumn(table, softDeleteProperty)
+  const deletedAtType = normalizedIdentitySqlType(deletedAt.getSQLType())
   if (
     deletedAt.notNull ||
     deletedAt.hasDefault === true ||
-    !normalizedIdentitySqlType(deletedAt.getSQLType()).startsWith('timestamp')
+    !deletedAtType.startsWith('timestamp') ||
+    deletedAtType.endsWith('[]')
   ) {
     throw new Error(
       `Adopted table "${tableName}" soft-delete property "${softDeleteProperty}" must be a nullable timestamp without a default`,
@@ -780,18 +788,23 @@ function assertAdoptedSoftDelete(
   }
 }
 
-function assertAdoptedForeignKeys(
-  entries: Array<{
-    table: AnyPgTable
-    capabilities: TableCapabilities
-  }>,
-): void {
-  const adopted = new Map(entries.map((entry) => [entry.table, entry]))
+function assertAdoptedForeignKeys(entries: AdoptedEntry[]): void {
+  const adopted = new Map<string, AdoptedEntry>()
+  for (const entry of entries) {
+    const identity = adoptedTableIdentity(entry.table)
+    const previous = adopted.get(identity)
+    if (previous && !sameAdoptedRegistration(previous, entry)) {
+      throw new Error(
+        `Adopted table "${identity}" is described by multiple Drizzle table objects with different adoption contracts`,
+      )
+    }
+    adopted.set(identity, entry)
+  }
   for (const child of entries) {
     const childTenant = child.capabilities.tenancy!
     for (const foreignKey of getTableConfig(child.table).foreignKeys) {
       const reference = foreignKey.reference()
-      const parent = adopted.get(reference.foreignTable as AnyPgTable)
+      const parent = adopted.get(adoptedTableIdentity(reference.foreignTable as AnyPgTable))
       if (!parent) continue
       const parentTenant = parent.capabilities.tenancy!
       const tenantIndex = reference.columns.findIndex(
@@ -879,10 +892,7 @@ export function adoptSchema<
     }
   }
   const completeAdoptedGraph = new Map(
-    [...adoptedRegistrations].map(([table, registration]) => [
-      table,
-      { table, capabilities: registration.capabilities },
-    ]),
+    [...adoptedRegistrations].map(([table, registration]) => [table, { table, ...registration }]),
   )
   for (const entry of entries) completeAdoptedGraph.set(entry.table, entry)
   assertAdoptedForeignKeys([...completeAdoptedGraph.values()])

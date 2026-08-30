@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
-import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
+import { table, defineSchema, text, int, boolean, eq, multiTenant, syncSchema } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import {
   assertPermissionIds,
@@ -73,6 +73,8 @@ async function inspectRawDbSurface(db: RawProcedureDb, readTag: string) {
     withDraft: 'withDraft' in tx,
     tablesRead: 'tablesRead' in tx,
     tablesWritten: 'tablesWritten' in tx,
+    trackGlobalRead: 'trackGlobalRead' in tx,
+    trackGlobalWrite: 'trackGlobalWrite' in tx,
   }))
   const dbSurface = db as unknown as Record<string, unknown>
   return {
@@ -82,6 +84,8 @@ async function inspectRawDbSurface(db: RawProcedureDb, readTag: string) {
     tablesRead: 'tablesRead' in dbSurface,
     tablesWritten: 'tablesWritten' in dbSurface,
     transaction: typeof dbSurface['transaction'] === 'function',
+    trackGlobalRead: typeof dbSurface['trackGlobalRead'] === 'function',
+    trackGlobalWrite: typeof dbSurface['trackGlobalWrite'] === 'function',
     nested,
   }
 }
@@ -93,12 +97,16 @@ const expectedRawDbSurface = {
   tablesRead: true,
   tablesWritten: true,
   transaction: true,
+  trackGlobalRead: true,
+  trackGlobalWrite: true,
   nested: {
     raw: true,
     withTenant: false,
     withDraft: false,
     tablesRead: true,
     tablesWritten: true,
+    trackGlobalRead: true,
+    trackGlobalWrite: true,
   },
 }
 
@@ -368,6 +376,40 @@ describe('defineApp().build()', () => {
     expect([...betaRead.tablesRead]).toEqual(['tenant:beta:checklists'])
     expect([...alphaWrite.tablesWritten]).toEqual(['tenant:alpha:checklists'])
     expect([...betaRead.tablesRead].some((tag) => alphaWrite.tablesWritten.has(tag))).toBe(false)
+  })
+
+  test('raw handlers can track a global table from a tenant-scoped dispatch', async () => {
+    const tenantWy = defineApp<{ orgId: string }>({ permissions: {} })
+    const tenancy = multiTenant({
+      key: { property: 'orgId', column: 'org_id', type: text },
+    })
+    const mixedSchema = defineSchema({
+      catalog: table({ id: int.primaryKey(), value: text }),
+    })
+    const pg = createTestDatabase()
+    const db = drizzle(pg)
+    await syncSchema(db, mixedSchema)
+    const tenantApp = await tenantWy.build({
+      db,
+      functions: {
+        readCatalog: tenantWy.readModel.input({}).query(async (ctx) => {
+          ctx.db.trackGlobalRead('catalog')
+          return ctx.db.raw.execute('SELECT id FROM catalog')
+        }),
+        writeCatalog: tenantWy.procedure.input({ id: int }).command(async (ctx, args) => {
+          await ctx.db.into(mixedSchema.catalog).insert({ id: args.id, value: 'global' })
+        }),
+      },
+      tenancy,
+      resolveTenant: (context) => context.orgId,
+    })
+
+    const read = await tenantApp.call('readCatalog', {}, { orgId: 'alpha' })
+    const write = await tenantApp.call('writeCatalog', { id: 1 }, { orgId: 'alpha' })
+
+    expect(read.tablesRead).toEqual(new Set(['catalog']))
+    expect(write.tablesWritten).toEqual(new Set(['catalog']))
+    expect([...read.tablesRead].some((tag) => write.tablesWritten.has(tag))).toBe(true)
   })
 
   test('call() executes functions and tracks reads and writes', async () => {

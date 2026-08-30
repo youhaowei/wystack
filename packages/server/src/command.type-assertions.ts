@@ -17,6 +17,12 @@ type _MutationHandlerRetainsTransactions = Expect<
   Equal<Extract<keyof MutationHandlerContext['db'], 'transaction'>, 'transaction'>
 >
 
+const commandApp = defineApp<Record<string, unknown>>({ permissions: {} })
+commandApp.procedure.use(({ next }) => {
+  // @ts-expect-error — middleware cannot replace the framework-owned database facade
+  return next({ db: {} })
+})
+
 export type __CommandProcedureContract = [
   _CommandHandlerOmitsTransactions,
   _MutationHandlerRetainsTransactions,
