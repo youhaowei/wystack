@@ -27,17 +27,20 @@ test('createTestDb exposes an open PGlite client', async () => {
   expect(client.closed).toBe(false)
 })
 
+// Each test below spawns a full child `bun test` process, so its wall time tracks machine load
+// rather than the behavior under test. The generous timeout keeps scheduling from deciding the result.
+
 // The shape-based $client registration must keep working across PGlite and Drizzle upgrades.
 test('double registration still closes the createTestDb client at one clean drain', () => {
   runFixtures(`${import.meta.dir}/testing-first.fixture.ts`)
-})
+}, 60_000)
 
 test('every file registers its own drain even after another file loaded the harness', () => {
   runFixtures(
     `${import.meta.dir}/testing-first.fixture.ts`,
     `${import.meta.dir}/testing-second.fixture.ts`,
   )
-})
+}, 60_000)
 
 test('the runtime guard fails at the constructing test file when the bound is exceeded', () => {
   const sentinelPath = join(tmpdir(), `wystack-pglite-guard-${randomUUID()}`)
@@ -71,4 +74,4 @@ test('the runtime guard fails at the constructing test file when the bound is ex
   } finally {
     if (existsSync(sentinelPath)) unlinkSync(sentinelPath)
   }
-})
+}, 60_000)
