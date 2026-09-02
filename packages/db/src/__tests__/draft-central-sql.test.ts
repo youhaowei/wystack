@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { beforeEach, describe, expect, test } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
   integer,
@@ -20,6 +21,8 @@ import { int, text as dslText } from '../dsl'
 import { multiTenant } from '../table'
 import { syncSchema } from '../sync'
 import { draftChangesTableDdl } from './draft-storage.fixture'
+
+useTestPglite()
 
 const items = pgTable('draft_items', {
   id: integer('id').primaryKey(),
@@ -83,7 +86,7 @@ let db: ReturnType<typeof drizzle>
 let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
-  pg = new PGlite()
+  pg = createTestPg()
   db = drizzle(pg)
   const setup = [
     `CREATE TABLE draft_items (
@@ -123,10 +126,6 @@ beforeEach(async () => {
   for (const statement of setup) await db.execute(sql.raw(statement))
   await syncSchema(db, tenantSchema)
   tracked = createDrizzleTracker(db)
-})
-
-afterEach(async () => {
-  await pg.close()
 })
 
 describe('durable central draft overlay', () => {

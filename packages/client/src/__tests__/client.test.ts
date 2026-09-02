@@ -16,11 +16,14 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { Hono } from 'hono'
 import { upgradeWebSocket, websocket } from 'hono/bun'
-import { PGlite } from '@electric-sql/pglite'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { createRoutes, defineApp } from '@wystack/server'
 import { createClient, toWebClient, type WyStackClient } from '../client'
 import type { QueryRef, MutationRef, ActionRef, RefReturn } from '../refs'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -42,7 +45,7 @@ describe('createClient — non-2xx error body handling', () => {
   let pg: PGlite
 
   beforeEach(async () => {
-    pg = new PGlite()
+    pg = createTestPg()
     const db = drizzle(pg)
     await db.execute(`CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, name TEXT NOT NULL)`)
 
@@ -70,7 +73,6 @@ describe('createClient — non-2xx error body handling', () => {
 
   afterEach(async () => {
     server.stop(true)
-    await pg.close()
   })
 
   test('query(): server-thrown message survives the RPC boundary', async () => {

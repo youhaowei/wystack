@@ -98,4 +98,29 @@ describe('@wystack/lint', () => {
       1, 4, 5, 11, 16, 21, 23, 24, 28, 31, 33, 35, 37, 42,
     ])
   })
+
+  test('rejects directly constructed imported PGlite instances', () => {
+    const root = fixture('no-unmanaged-pglite')
+    const report = lint(
+      'fixture.oxlintrc.json',
+      root,
+      resolve(root, 'composed.fixture.ts'),
+      resolve(root, 'database.ts'),
+      resolve(root, 'input.ts'),
+      resolve(root, 'local-db.ts'),
+      resolve(root, 'local.ts'),
+      resolve(root, 'managed.ts'),
+      resolve(root, 'shared.fixture.ts'),
+      resolve(root, 'unregistered.ts'),
+    )
+
+    expect(ruleLocations(report, 'no-unmanaged-pglite')).toEqual([
+      'database.ts:3',
+      'database.ts:6',
+      'input.ts:3',
+      'input.ts:7',
+      'shared.fixture.ts:3',
+      'unregistered.ts:2',
+    ])
+  })
 })

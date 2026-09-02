@@ -1,5 +1,5 @@
 import { afterEach, beforeEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgTable, text } from 'drizzle-orm/pg-core'
 import { createDrizzleTracker } from '../drizzle-tracker'
@@ -10,6 +10,10 @@ import { syncSchema } from '../sync'
 import { multiTenant } from '../table'
 import type { DrizzleDb } from '../tracker-core'
 import { draftChangesTableDdl } from './draft-storage.fixture'
+
+export function useBoundedDraftHarness(): void {
+  useTestPglite()
+}
 
 const DRAFT_ID = 'bounded-draft'
 const SOURCE_ROW_COUNT = 120
@@ -140,7 +144,7 @@ export async function createBoundedDraftHarness(
 }
 
 async function createHarness() {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await pg.exec(boundedDraftSetupSql)
   const harness = await createBoundedDraftHarness(db, async () => {
@@ -152,7 +156,7 @@ async function createHarness() {
     )
     return changes.rows[0]?.count ?? 0
   })
-  return { ...harness, close: () => pg.close() }
+  return harness
 }
 
 type Harness = Awaited<ReturnType<typeof createHarness>>
@@ -176,8 +180,7 @@ export function boundedDraftScenario() {
     harness = await createHarness()
   })
 
-  afterEach(async () => {
-    await harness?.close()
+  afterEach(() => {
     harness = undefined
   })
 

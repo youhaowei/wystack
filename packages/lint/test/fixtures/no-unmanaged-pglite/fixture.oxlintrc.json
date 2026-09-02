@@ -1,0 +1,5 @@
+{
+  "plugins": ["typescript"],
+  "jsPlugins": [{ "name": "wystack", "specifier": "../../../src/index.mjs" }],
+  "rules": { "wystack/no-unmanaged-pglite": "error" }
+}

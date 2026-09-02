@@ -2,7 +2,13 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { eq, lt, ne } from '../operators'
-import { boundedDraftSetupSql, createBoundedDraftHarness } from './draft-bounded-sql.fixture'
+import {
+  boundedDraftSetupSql,
+  createBoundedDraftHarness,
+  useBoundedDraftHarness,
+} from './draft-bounded-sql.fixture'
+
+useBoundedDraftHarness()
 
 const postgresUrl = process.env['WYSTACK_TEST_POSTGRES_URL']
 const describeWithPostgres = postgresUrl ? describe : describe.skip

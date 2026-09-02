@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
   createDrizzleTracker,
@@ -13,6 +14,8 @@ import {
 } from '../index'
 import { uuid } from '../dsl'
 import { enumerateDraftRowChanges } from '../drizzle-tracker'
+
+useTestPglite()
 
 const tenancy = multiTenant({
   key: {
@@ -43,7 +46,7 @@ let tracked: ReturnType<typeof createDrizzleTracker>
 let client: PGlite | undefined
 
 beforeEach(async () => {
-  client = new PGlite()
+  client = createTestPg()
   await client.waitReady
   const db = drizzle(client)
   await syncSchema(db, schema)
@@ -53,7 +56,6 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  await client?.close()
   client = undefined
 })
 

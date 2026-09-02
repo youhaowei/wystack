@@ -14,6 +14,7 @@ export default defineConfig({
       'wystack/no-chained-type-assertions': 'error',
       'wystack/no-known-value-widening': ['error', { targets: ['primitive', 'record'] }],
       'wystack/no-reflect-get': 'error',
+      'wystack/no-unmanaged-pglite': 'error',
       'wystack/no-placeholder-symbol-names': ['error', { names: ['shape'] }],
     },
     overrides: [
@@ -50,6 +51,17 @@ ordinary local bindings remain excluded. `no-placeholder-symbol-names` requires
 an exact `names` denylist for declarations and non-computed class or type
 members; it never rejects a domain name merely because it contains a
 discouraged word.
+
+`no-unmanaged-pglite` rejects direct construction of `PGlite` imported from
+`@electric-sql/pglite` and calls to `createDb` imported from `@wystack/db`.
+Apply it to test and fixture globs where instances must use `createTestPg` or
+`createTestDb` from `@wystack/db/testing` for lifecycle management. Unrelated
+local classes and functions with the same names are not affected. Files that
+import either test factory must also call `useTestPglite()` at module scope;
+importing the helper alone does not register Bun lifecycle hooks for that file.
+Shared fixture modules must never call it at module scope because the hook would
+attach only to the first importer. They should expose a composed `use...()`
+function for each importing test file to call instead.
 
 See [the rule roadmap](./ROADMAP.md) for the deliberately deferred rules that
 need richer analysis than an AST-only plugin can provide safely.

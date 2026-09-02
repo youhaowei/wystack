@@ -1,9 +1,12 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
+import { createTestDb, useTestPglite } from '@wystack/db/testing'
 import { defineApp } from '@wystack/server'
 import { serve } from '@wystack/server/bun'
 import { createClient } from '../client'
 import { createWsManager } from '../ws'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({
@@ -15,28 +18,13 @@ const schema = defineSchema({
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
-// Track every PGlite handle opened in this file so afterEach can close them
-// all. PGlite WASM instances that are never closed accumulate memory and WASM
-// worker threads across tests, which slows down later tests (especially those
-// that sleep 2500ms inside a 5s timeout) and can trigger flaky WASM crashes.
-const pgliteHandles: Array<{ close(): Promise<void> }> = []
-
-/**
- * Open a fresh in-memory PGlite, register it for cleanup, and return the
- * Drizzle db handle.  Call this instead of `createDb({ dev: 'pglite://' })`
- * inside tests so the handle is always paired with a close() in afterEach.
- */
+// The shared test harness owns every PGlite handle opened in this file.
 async function openDrizzleTracker() {
-  const db = await createDb({ dev: 'pglite://' })
-  // drizzle-orm/pglite exposes the PGlite client via `$client`.
-  pgliteHandles.push(db.$client as { close(): Promise<void> })
-  return db
+  return createTestDb({ dev: 'pglite://' })
 }
 
 // Per-test app factory for auth scenarios — each test creates its own
 // PGlite + wy.build so resolveContext can vary freely.
-// Returns both the WyStack app and the db handle so callers can close the
-// underlying PGlite instance (via the pgliteHandles registry above).
 async function makeAuthApp() {
   const db = await openDrizzleTracker()
   await db.execute(
@@ -226,13 +214,8 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  // Stop the server first, then drain every PGlite handle that was opened
-  // during this test (both the beforeEach handle and any makeAuthApp() handles).
-  // PGlite.close() is async — not awaiting it leaves WASM workers running and
-  // accumulates memory pressure that flakes later tests.
+  // Stop the server first; the harness drains PGlite before the next test.
   server.stop(true)
-  const toClose = pgliteHandles.splice(0)
-  await Promise.allSettled(toClose.map((h) => h.close()))
 })
 
 describe('WsManager', () => {

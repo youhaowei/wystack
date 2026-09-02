@@ -1,10 +1,12 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { text, int } from '@wystack/db'
 import { defineApp } from '../define-app'
 import { createCaller } from '../caller'
 import type { CallerFromFunctions } from '../caller'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -19,7 +21,7 @@ type Functions = typeof functions
 let app: Awaited<ReturnType<typeof wy.build>>
 
 beforeEach(async () => {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   app = await wy.build({ db, functions })
 })
@@ -40,7 +42,7 @@ describe('createCaller', () => {
         return principal?.userId ?? null
       }),
     }
-    const pg = new PGlite()
+    const pg = createTestPg()
     const db = drizzle(pg)
     const ctxApp = await wy.build({ db, functions: withCtx })
     const caller = createCaller<typeof withCtx>(ctxApp, {
@@ -72,7 +74,7 @@ describe('createCaller', () => {
     const reserved = {
       ['__proto__']: wy.procedure.input({}).query(async () => 'reserved-name-ok'),
     }
-    const pg = new PGlite()
+    const pg = createTestPg()
     const db = drizzle(pg)
     const protoApp = await wy.build({ db, functions: reserved })
     const caller = createCaller<typeof reserved>(protoApp, {})

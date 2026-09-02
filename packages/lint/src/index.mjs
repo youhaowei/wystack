@@ -614,6 +614,121 @@ const noPlaceholderSymbolNames = {
   },
 }
 
+const noUnmanagedPglite = {
+  meta: {
+    type: 'problem',
+    docs: {
+      description:
+        'Require test-created PGlite instances to use the shared lifecycle-managed factory.',
+    },
+    messages: {
+      useTestFactory:
+        'Use createTestPg from @wystack/db/testing so the PGlite instance is disposed after the test file finishes.',
+      useTestDb:
+        'Use createTestDb from @wystack/db/testing so an underlying PGlite instance is disposed after the test file finishes.',
+      registerLifecycle:
+        'Call useTestPglite() at module scope. The harness does not drain a file that has not registered its lifecycle hooks.',
+      noSharedLifecycleRegistration:
+        'Do not call useTestPglite() at module scope in a shared module. Expose a use...() function that each importing test file calls instead; a shared module registers only for its first importer.',
+    },
+  },
+  create(context) {
+    const pgliteImports = new Set()
+    const createDbImports = new Set()
+    const testFactoryImports = new Set()
+    const lifecycleImports = new Set()
+    const testFactoryImportNodes = []
+    const moduleLifecycleRegistrations = []
+    let hasLifecycleRegistration = false
+    let isTestFile = false
+
+    return {
+      ImportDeclaration(node) {
+        for (const specifier of node.specifiers ?? []) {
+          if (
+            node.source?.value === 'bun:test' &&
+            specifier.type === 'ImportSpecifier' &&
+            (specifier.imported?.name === 'test' ||
+              specifier.imported?.name === 'it' ||
+              specifier.imported?.name === 'describe')
+          ) {
+            isTestFile = true
+          }
+
+          if (
+            node.source?.value === '@electric-sql/pglite' &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'PGlite' &&
+            isIdentifier(specifier.local)
+          ) {
+            pgliteImports.add(specifier.local)
+          }
+
+          if (
+            node.source?.value === '@wystack/db' &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'createDb' &&
+            isIdentifier(specifier.local)
+          ) {
+            createDbImports.add(specifier.local)
+          }
+
+          if (
+            node.source?.value === '@wystack/db/testing' &&
+            specifier.type === 'ImportSpecifier' &&
+            (specifier.imported?.name === 'createTestPg' ||
+              specifier.imported?.name === 'createTestDb') &&
+            isIdentifier(specifier.local)
+          ) {
+            testFactoryImports.add(specifier.local)
+            testFactoryImportNodes.push(specifier.local)
+          }
+
+          if (
+            node.source?.value === '@wystack/db/testing' &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'useTestPglite' &&
+            isIdentifier(specifier.local)
+          ) {
+            lifecycleImports.add(specifier.local)
+          }
+        }
+      },
+      NewExpression(node) {
+        if (isIdentifier(node.callee) && isImportedBinding(context, node.callee, pgliteImports)) {
+          context.report({ node, messageId: 'useTestFactory' })
+        }
+      },
+      CallExpression(node) {
+        if (
+          node.parent?.type === 'ExpressionStatement' &&
+          node.parent.parent?.type === 'Program' &&
+          isIdentifier(node.callee) &&
+          isImportedBinding(context, node.callee, lifecycleImports)
+        ) {
+          hasLifecycleRegistration = true
+          moduleLifecycleRegistrations.push(node)
+        }
+
+        if (isIdentifier(node.callee) && isImportedBinding(context, node.callee, createDbImports)) {
+          context.report({ node, messageId: 'useTestDb' })
+        }
+      },
+      'Program:exit'() {
+        if (isTestFile && testFactoryImports.size > 0 && !hasLifecycleRegistration) {
+          context.report({ node: testFactoryImportNodes[0], messageId: 'registerLifecycle' })
+        }
+
+        if (!isTestFile) {
+          for (const node of moduleLifecycleRegistrations) {
+            context.report({ node, messageId: 'noSharedLifecycleRegistration' })
+          }
+        }
+      },
+    }
+  },
+}
+
 export default {
   meta: {
     name: 'wystack',
@@ -625,5 +740,6 @@ export default {
     'no-reflect-get': noReflectGet,
     'no-module-mocks-in-domain-tests': noModuleMocksInDomainTests,
     'no-placeholder-symbol-names': noPlaceholderSymbolNames,
+    'no-unmanaged-pglite': noUnmanagedPglite,
   },
 }

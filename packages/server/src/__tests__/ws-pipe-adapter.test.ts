@@ -14,9 +14,11 @@
  */
 import { describe, test, expect } from 'bun:test'
 import type { UpgradeWebSocket, WSContext, WSEvents } from 'hono/ws'
-import { createDb } from '@wystack/db'
+import { createTestDb, useTestPglite } from '@wystack/db/testing'
 import { createRoutes, type RouteOptions } from '../routes'
 import { defineApp } from '../define-app'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -35,7 +37,7 @@ function flush(): Promise<void> {
 }
 
 async function makeApp() {
-  const db = await createDb({ dev: 'pglite://' })
+  const db = await createTestDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )

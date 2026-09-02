@@ -15,6 +15,11 @@
       "types": "./dist/pg.d.ts",
       "bun": "./src/pg.ts",
       "import": "./dist/pg.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "bun": "./src/testing.ts",
+      "import": "./dist/testing.js"
     }
   },
   "scripts": {

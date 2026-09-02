@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { describe, expect, test } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import {
   customType,
@@ -15,25 +16,17 @@ import {
 import { renderCreateTableIfNotExists, syncSchema } from '../sync'
 import { defineSchema, multiTenant, text as wyText, uuid as wyUuid } from '../index'
 
+useTestPglite()
+
 const bytea = customType<{ data: Uint8Array; default: false }>({
   dataType() {
     return 'bytea'
   },
 })
 
-const openDatabases = new Set<PGlite>()
-
 function createTestDatabase(): PGlite {
-  const client = new PGlite()
-  openDatabases.add(client)
-  return client
+  return createTestPg()
 }
-
-afterEach(async () => {
-  const databases = [...openDatabases]
-  openDatabases.clear()
-  await Promise.all(databases.map((client) => client.close()))
-})
 
 describe('renderCreateTableIfNotExists', () => {
   test('emits columns with types, NOT NULL, PK, and default expressions', () => {

@@ -16,11 +16,13 @@ import { createServer, type IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type { AddressInfo } from 'node:net'
 import { WebSocket } from 'ws'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '../index'
 import { mountNodeRoutes } from '../serve-node'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({ id: int.primaryKey(), title: text, done: boolean }),
@@ -35,7 +37,7 @@ const functions = {
 }
 
 async function makeApp() {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
