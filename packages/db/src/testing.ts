@@ -34,6 +34,8 @@ const drain = async () => {
  *
  * Never call this at module scope in a shared helper. Expose a composed `use...()`
  * function that each importing test file calls from its own module body instead.
+ * This design assumes serial test execution; concurrent tests require per-test
+ * ownership rather than this shared instance registry.
  */
 export function useTestPglite(): void {
   // Drain before the next test so a file's own afterEach hooks can still use its database.

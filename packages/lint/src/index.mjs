@@ -636,15 +636,27 @@ const noUnmanagedPglite = {
     const pgliteImports = new Set()
     const pgliteNamespaceImports = new Set()
     const createDbImports = new Set()
+    const dbNamespaceImports = new Set()
     const testFactoryImports = new Set()
+    const testingNamespaceImports = new Set()
     const lifecycleImports = new Set()
     const testFactoryImportNodes = []
+    const namespaceTestFactoryCalls = []
     const moduleLifecycleRegistrations = []
     let hasLifecycleRegistration = false
     let isTestFile = false
     const isPgliteSource = (source) =>
       source === '@electric-sql/pglite' || source?.startsWith('@electric-sql/pglite/')
     const isRelativeSource = (source) => source?.startsWith('./') || source?.startsWith('../')
+    const pgliteMembers = new Set(['PGlite'])
+    const createDbMembers = new Set(['createDb'])
+    const testFactoryMembers = new Set(['createTestPg', 'createTestDb'])
+    const lifecycleMembers = new Set(['useTestPglite'])
+    const isImportedNamespaceMember = (callee, imports, names) =>
+      callee?.type === 'MemberExpression' &&
+      isIdentifier(callee.object) &&
+      names.has(callee.computed ? callee.property?.value : callee.property?.name) &&
+      isImportedBinding(context, callee.object, imports)
 
     return {
       ImportDeclaration(node) {
@@ -688,6 +700,14 @@ const noUnmanagedPglite = {
           }
 
           if (
+            (source === '@wystack/db' || isRelativeSource(source)) &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            dbNamespaceImports.add(specifier.local)
+          }
+
+          if (
             node.source?.value === '@wystack/db/testing' &&
             specifier.type === 'ImportSpecifier' &&
             (specifier.imported?.name === 'createTestPg' ||
@@ -696,6 +716,14 @@ const noUnmanagedPglite = {
           ) {
             testFactoryImports.add(specifier.local)
             testFactoryImportNodes.push(specifier.local)
+          }
+
+          if (
+            source === '@wystack/db/testing' &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            testingNamespaceImports.add(specifier.local)
           }
 
           if (
@@ -715,11 +743,11 @@ const noUnmanagedPglite = {
       },
       NewExpression(node) {
         const callee = node.callee
-        const namespaceConstructor =
-          callee?.type === 'MemberExpression' &&
-          isIdentifier(callee.object) &&
-          (callee.computed ? callee.property?.value : callee.property?.name) === 'PGlite' &&
-          isImportedBinding(context, callee.object, pgliteNamespaceImports)
+        const namespaceConstructor = isImportedNamespaceMember(
+          callee,
+          pgliteNamespaceImports,
+          pgliteMembers,
+        )
 
         if (
           (isIdentifier(callee) && isImportedBinding(context, callee, pgliteImports)) ||
@@ -729,23 +757,46 @@ const noUnmanagedPglite = {
         }
       },
       CallExpression(node) {
+        const namespaceLifecycleCall = isImportedNamespaceMember(
+          node.callee,
+          testingNamespaceImports,
+          lifecycleMembers,
+        )
+        const lifecycleCall =
+          (isIdentifier(node.callee) &&
+            isImportedBinding(context, node.callee, lifecycleImports)) ||
+          namespaceLifecycleCall
+
         if (
           node.parent?.type === 'ExpressionStatement' &&
           node.parent.parent?.type === 'Program' &&
-          isIdentifier(node.callee) &&
-          isImportedBinding(context, node.callee, lifecycleImports)
+          lifecycleCall
         ) {
           hasLifecycleRegistration = true
           moduleLifecycleRegistrations.push(node)
         }
 
-        if (isIdentifier(node.callee) && isImportedBinding(context, node.callee, createDbImports)) {
+        if (isImportedNamespaceMember(node.callee, testingNamespaceImports, testFactoryMembers)) {
+          namespaceTestFactoryCalls.push(node)
+        }
+
+        if (
+          (isIdentifier(node.callee) && isImportedBinding(context, node.callee, createDbImports)) ||
+          isImportedNamespaceMember(node.callee, dbNamespaceImports, createDbMembers)
+        ) {
           context.report({ node, messageId: 'useTestDb' })
         }
       },
       'Program:exit'() {
-        if (isTestFile && testFactoryImports.size > 0 && !hasLifecycleRegistration) {
-          context.report({ node: testFactoryImportNodes[0], messageId: 'registerLifecycle' })
+        if (
+          isTestFile &&
+          (testFactoryImports.size > 0 || namespaceTestFactoryCalls.length > 0) &&
+          !hasLifecycleRegistration
+        ) {
+          context.report({
+            node: testFactoryImportNodes[0] ?? namespaceTestFactoryCalls[0],
+            messageId: 'registerLifecycle',
+          })
         }
 
         if (!isTestFile) {
