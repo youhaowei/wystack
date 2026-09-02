@@ -7,11 +7,13 @@
 import { describe, test, expect, afterAll } from 'bun:test'
 import { Server } from 'node:http'
 import { WebSocket } from 'ws'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '../index'
 import { serve } from '../serve-node'
+
+useTestPglite()
 
 // `@hono/node-server`'s serve() replaces `globalThis.Response` with its own
 // optimised subclass the first time it is called — a process-wide side effect,
@@ -39,7 +41,7 @@ const functions = {
 }
 
 async function makeApp() {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,

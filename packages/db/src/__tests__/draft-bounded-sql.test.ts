@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { eq, gt, gte, lt, lte, ne, type FilterDescriptor } from '../operators'
-import { boundedDraftPlan, boundedDraftScenario } from './draft-bounded-sql.fixture'
+import {
+  boundedDraftPlan,
+  boundedDraftScenario,
+  useBoundedDraftHarness,
+} from './draft-bounded-sql.fixture'
+
+useBoundedDraftHarness()
 
 const plan = boundedDraftPlan()
 

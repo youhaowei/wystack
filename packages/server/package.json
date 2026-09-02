@@ -36,7 +36,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src"
+    "test": "bun test --preload ../../scripts/pglite-instance-guard.ts src"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.12",

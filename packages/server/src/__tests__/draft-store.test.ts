@@ -1,21 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { describe, expect, test } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { ensureDraftStorage } from '../draft-store'
 
-const openDatabases = new Set<PGlite>()
+useTestPglite()
 
 function createTestDatabase(): PGlite {
-  const pg = new PGlite()
-  openDatabases.add(pg)
-  return pg
+  return createTestPg()
 }
-
-afterEach(async () => {
-  const databases = [...openDatabases]
-  openDatabases.clear()
-  await Promise.all(databases.map((pg) => pg.close()))
-})
 
 describe('draft storage migrations', () => {
   test('installs durable lifecycle tables and the whole-draft lookup index idempotently', async () => {

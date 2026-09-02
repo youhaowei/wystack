@@ -1,9 +1,12 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { describe, test, expect, beforeEach } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean, eq, multiTenant } from '@wystack/db'
 import { definePermissions } from '@wystack/permissions'
 import { assertPermissionIds, defineApp, PermissionDeniedError } from '../index'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({
@@ -50,19 +53,9 @@ const throwingPermission = {
 
 const wy = defineApp<AppContext>({ permissions })
 let app: Awaited<ReturnType<typeof wy.build>>
-const openDatabases = new Set<PGlite>()
-
 function createTestDatabase(): PGlite {
-  const pg = new PGlite()
-  openDatabases.add(pg)
-  return pg
+  return createTestPg()
 }
-
-afterEach(async () => {
-  const databases = [...openDatabases]
-  openDatabases.clear()
-  await Promise.all(databases.map((pg) => pg.close()))
-})
 
 beforeEach(async () => {
   const pg = createTestDatabase()

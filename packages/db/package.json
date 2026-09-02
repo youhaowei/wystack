@@ -15,13 +15,18 @@
       "types": "./dist/pg.d.ts",
       "bun": "./src/pg.ts",
       "import": "./dist/pg.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "bun": "./src/testing.ts",
+      "import": "./dist/testing.js"
     }
   },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src"
+    "test": "bun test --preload ../../scripts/pglite-instance-guard.ts src"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.1"

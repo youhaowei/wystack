@@ -1,7 +1,14 @@
 {
   "plugins": ["typescript"],
+  "jsPlugins": [{ "name": "wystack", "specifier": "./packages/lint/src/index.mjs" }],
   "ignorePatterns": ["packages/lint/test/fixtures/**"],
   "rules": {
     "typescript/no-explicit-any": "error"
-  }
+  },
+  "overrides": [
+    {
+      "files": ["**/__tests__/**/*.ts", "**/*.fixture.ts"],
+      "rules": { "wystack/no-unmanaged-pglite": "error" }
+    }
+  ]
 }

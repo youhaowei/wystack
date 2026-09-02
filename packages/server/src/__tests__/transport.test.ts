@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
+import { createTestDb, useTestPglite } from '@wystack/db/testing'
 import { definePermissions } from '@wystack/permissions'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
 import { buildAuthRequest } from '../routes'
@@ -7,6 +8,8 @@ import { serve } from '../serve-bun'
 import { requireAuth } from '../functions'
 import { defineApp } from '../define-app'
 import type { FunctionDef } from '../types'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({
@@ -35,12 +38,8 @@ const permissions = definePermissions<{ principal?: unknown }>()({
   },
 })
 const wy = defineApp<Record<string, unknown>>({ permissions })
-const openDatabases = new Set<{ close(): Promise<void> }>()
-
 async function createTestDatabase() {
-  const db = await createDb({ dev: 'pglite://' })
-  openDatabases.add(db.$client)
-  return db
+  return createTestDb({ dev: 'pglite://' })
 }
 
 // Per-test app factory for auth scenarios: each test creates its own
@@ -113,9 +112,6 @@ beforeEach(async () => {
 
 afterEach(async () => {
   server.stop(true)
-  const databases = [...openDatabases]
-  openDatabases.clear()
-  await Promise.all(databases.map((client) => client.close()))
 })
 
 describe('buildAuthRequest (unit)', () => {

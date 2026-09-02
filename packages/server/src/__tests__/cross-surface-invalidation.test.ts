@@ -17,7 +17,7 @@
 // the signal is the app's fused source. If the fuse regresses, these go red.
 
 import { describe, test, expect } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { defineApp } from '../index'
@@ -25,6 +25,8 @@ import { createCaller } from '../caller'
 import { createInvalidationRouter } from '../engine/invalidation-router'
 import { createInMemorySubscriptionStore } from '../engine/subscription-store'
 import type { SubscriptionEntry } from '../engine/subscription-store'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({ id: int.primaryKey(), title: text, done: boolean }),
@@ -41,7 +43,7 @@ const functions = {
 type Functions = typeof functions
 
 async function makeApp() {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,

@@ -1,9 +1,11 @@
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { applyCommands } from '../apply-commands'
 import { defineApp } from '../define-app'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -22,7 +24,7 @@ const schema = defineSchema({
 let app: Awaited<ReturnType<typeof wy.build>>
 
 beforeEach(async () => {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   // `id` is a plain INT (client-minted), not SERIAL — the client-generated-id
   // invariant requires the batch to choose ids, and a later command to reference

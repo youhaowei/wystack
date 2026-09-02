@@ -14,8 +14,9 @@
  *   5. the resolve(log) hook binds late-bound operands immediately before commit.
  *   6. discard drops the overlay with no canonical effect.
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { describe, test, expect, beforeEach } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { integer, pgSchema, pgTable, text as pgText, varchar } from 'drizzle-orm/pg-core'
 import {
@@ -46,6 +47,8 @@ import {
 import { defineApp } from '../define-app'
 import { applyReviewedChanges } from '../draft-review-state'
 import { refreshStoredDraftIntegrity } from '../draft-store'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 const tenantAwareDescriptor = multiTenant()
@@ -122,12 +125,8 @@ function createDraftLifecycle(
   })
 }
 
-afterEach(async () => {
-  await pg.close()
-})
-
 beforeEach(async () => {
-  pg = new PGlite()
+  pg = createTestPg()
   db = drizzle(pg)
   await db.execute(
     `CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,

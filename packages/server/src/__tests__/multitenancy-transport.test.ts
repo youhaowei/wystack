@@ -1,9 +1,11 @@
 import { expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, multiTenant, syncSchema, text, uuid } from '@wystack/db'
 import { defineApp } from '../define-app'
 import { serve } from '../serve-bun'
+
+useTestPglite()
 
 const tenancy = multiTenant({
   key: { property: 'workspaceId', column: 'workspace_id', type: text },
@@ -14,7 +16,7 @@ const schema = defineSchema({
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 test('HTTP and WebSocket requests resolve tenant scope before procedure access', async () => {
-  const client = new PGlite()
+  const client = createTestPg()
   await client.waitReady
   const db = drizzle(client)
   await syncSchema(db, schema)
@@ -101,6 +103,5 @@ test('HTTP and WebSocket requests resolve tenant scope before procedure access',
     expect(observedReads).toEqual([['alpha only'], ['beta only']])
   } finally {
     server.stop(true)
-    await client.close()
   }
 })

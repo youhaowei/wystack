@@ -1,5 +1,6 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { describe, test, expect, beforeEach } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, registerTableCapabilities } from '../schema'
@@ -12,6 +13,8 @@ import { draftChangesTableDdl } from './draft-storage.fixture'
 import { ensureRowRevisionStorage } from '../row-revisions'
 import { compareRowRevisionRows } from '../row-revisions'
 import { noTenantScope } from '../tracker-core'
+
+useTestPglite()
 
 const schema = defineSchema({
   todos: table({
@@ -56,7 +59,7 @@ let db: ReturnType<typeof drizzle>
 let tracked: ReturnType<typeof createDrizzleTracker>
 
 beforeEach(async () => {
-  pg = new PGlite()
+  pg = createTestPg()
   db = drizzle(pg)
 
   await db.execute(`
@@ -102,10 +105,6 @@ beforeEach(async () => {
   await db.execute('DELETE FROM deferred_tags')
 
   tracked = createDrizzleTracker(db)
-})
-
-afterEach(async () => {
-  await pg.close()
 })
 
 describe('DrizzleTracker', () => {

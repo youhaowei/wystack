@@ -25,9 +25,10 @@
 //   9. identity-provider outage → transient close, NOT auth-failed. A key server
 //      that is down is not a bad credential, and 4001 tells clients not to retry.
 
-import { afterEach, describe, test, expect } from 'bun:test'
+import { describe, test, expect } from 'bun:test'
 import { IdentityProviderUnavailableError } from '@wystack/identity'
-import { table, createDb, defineSchema, text, int, boolean } from '@wystack/db'
+import { table, defineSchema, text, int, boolean } from '@wystack/db'
+import { createTestDb, useTestPglite } from '@wystack/db/testing'
 import {
   createLoopbackPair,
   REACTIVITY_NOT_ENABLED,
@@ -44,6 +45,8 @@ import {
 } from '../engine'
 import { defineApp } from '../define-app'
 
+useTestPglite()
+
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
 const schema = defineSchema({
@@ -56,13 +59,6 @@ const deniedPermission = {
   check: () => false,
 }
 
-const openDatabases = new Set<{ close(): Promise<void> }>()
-
-afterEach(async () => {
-  await Promise.all([...openDatabases].map((client) => client.close()))
-  openDatabases.clear()
-})
-
 function protectListTodos(app: Awaited<ReturnType<typeof makeApp>>): void {
   app.functions.set(
     'listTodos',
@@ -74,8 +70,7 @@ function protectListTodos(app: Awaited<ReturnType<typeof makeApp>>): void {
 }
 
 async function makeApp() {
-  const db = await createDb({ dev: 'pglite://' })
-  openDatabases.add(db.$client)
+  const db = await createTestDb({ dev: 'pglite://' })
   await db.execute(
     `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
   )

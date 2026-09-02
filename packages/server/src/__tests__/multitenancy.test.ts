@@ -1,10 +1,13 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { beforeEach, describe, expect, test } from 'bun:test'
+import type { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { defineSchema, int, multiTenant, syncSchema, table, text, uuid } from '@wystack/db'
 import { applyCommands } from '../apply-commands'
 import { createDraftLifecycle } from '../draft-lifecycle'
 import { defineApp } from '../define-app'
+
+useTestPglite()
 
 const tenancy = multiTenant({
   key: { property: 'workspaceId', column: 'workspace_id', type: text },
@@ -26,7 +29,7 @@ let client: PGlite
 let db: ReturnType<typeof drizzle>
 
 beforeEach(async () => {
-  client = new PGlite()
+  client = createTestPg()
   await client.waitReady
   db = drizzle(client)
   await syncSchema(db, schema)
@@ -56,10 +59,6 @@ beforeEach(async () => {
         .mutation(async (ctx, args) => ctx.db.into(schema.catalog).insert(args)),
     },
   })
-})
-
-afterEach(async () => {
-  await client.close()
 })
 
 const alpha = { requestedTenantId: 'alpha', allowedTenantIds: ['alpha'] }

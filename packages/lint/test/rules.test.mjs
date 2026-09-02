@@ -98,4 +98,64 @@ describe('@wystack/lint', () => {
       1, 4, 5, 11, 16, 21, 23, 24, 28, 31, 33, 35, 37, 42,
     ])
   })
+
+  test('rejects directly constructed imported PGlite instances', () => {
+    const root = fixture('no-unmanaged-pglite')
+    const report = lint(
+      'fixture.oxlintrc.json',
+      root,
+      resolve(root, 'bound-namespace-members.ts'),
+      resolve(root, 'bound-relative-database.ts'),
+      resolve(root, 'bound-testing-managed.ts'),
+      resolve(root, 'bound-testing-shared.fixture.ts'),
+      resolve(root, 'bound-testing-unregistered.ts'),
+      resolve(root, 'composed.fixture.ts'),
+      resolve(root, 'database.ts'),
+      resolve(root, 'dynamic.ts'),
+      resolve(root, 'input.ts'),
+      resolve(root, 'local-db.ts'),
+      resolve(root, 'local.ts'),
+      resolve(root, 'managed.ts'),
+      resolve(root, 'namespace-database.ts'),
+      resolve(root, 'namespace-relative-database.ts'),
+      resolve(root, 'namespace-shared.fixture.ts'),
+      resolve(root, 'namespace-test-db-unregistered.ts'),
+      resolve(root, 'namespace-test-pg-unregistered.ts'),
+      resolve(root, 'namespace-testing-managed.ts'),
+      resolve(root, 'namespace.ts'),
+      resolve(root, 'relative-database.ts'),
+      resolve(root, 'shared.fixture.ts'),
+      resolve(root, 'subpath.ts'),
+      resolve(root, 'unregistered.ts'),
+    )
+
+    expect(ruleLocations(report, 'no-unmanaged-pglite')).toEqual([
+      'bound-namespace-members.ts:10',
+      'bound-namespace-members.ts:11',
+      'bound-namespace-members.ts:12',
+      'bound-namespace-members.ts:9',
+      'bound-relative-database.ts:6',
+      'bound-relative-database.ts:7',
+      'bound-testing-shared.fixture.ts:5',
+      'bound-testing-unregistered.ts:4',
+      'database.ts:3',
+      'database.ts:6',
+      'dynamic.ts:2',
+      'dynamic.ts:3',
+      'input.ts:3',
+      'input.ts:6',
+      'namespace-database.ts:3',
+      'namespace-relative-database.ts:3',
+      'namespace-shared.fixture.ts:3',
+      'namespace-test-db-unregistered.ts:5',
+      'namespace-test-pg-unregistered.ts:5',
+      'namespace.ts:4',
+      'namespace.ts:5',
+      'relative-database.ts:3',
+      'relative-database.ts:6',
+      'shared.fixture.ts:3',
+      'subpath.ts:3',
+      'unregistered.ts:2',
+    ])
+  })
 })

@@ -614,6 +614,263 @@ const noPlaceholderSymbolNames = {
   },
 }
 
+const noUnmanagedPglite = {
+  meta: {
+    type: 'problem',
+    docs: {
+      description:
+        'Provide fast feedback for common unmanaged PGlite construction idioms; the test preload enforces the runtime live-instance bound.',
+    },
+    messages: {
+      useTestFactory:
+        'Use createTestPg from @wystack/db/testing so the PGlite instance is disposed after the test file finishes.',
+      useTestDb:
+        'Use createTestDb from @wystack/db/testing so an underlying PGlite instance is disposed after the test file finishes.',
+      registerLifecycle:
+        'Call useTestPglite() at module scope. The harness does not drain a file that has not registered its lifecycle hooks.',
+      noSharedLifecycleRegistration:
+        'Do not call useTestPglite() at module scope in a shared module. Expose a use...() function that each importing test file calls instead; a shared module registers only for its first importer.',
+    },
+  },
+  create(context) {
+    const pgliteImports = new Set()
+    const pgliteNamespaceImports = new Set()
+    const createDbImports = new Set()
+    const dbNamespaceImports = new Set()
+    const testFactoryImports = new Set()
+    const testingNamespaceImports = new Set()
+    const lifecycleImports = new Set()
+    const testFactoryImportNodes = []
+    const namespaceTestFactoryCalls = []
+    const moduleLifecycleRegistrations = []
+    let hasLifecycleRegistration = false
+    let isTestFile = false
+    const isPgliteSource = (source) =>
+      source === '@electric-sql/pglite' || source?.startsWith('@electric-sql/pglite/')
+    const isRelativeSource = (source) => source?.startsWith('./') || source?.startsWith('../')
+    const pgliteMembers = new Set(['PGlite'])
+    const createDbMembers = new Set(['createDb'])
+    const testFactoryMembers = new Set(['createTestPg', 'createTestDb'])
+    const lifecycleMembers = new Set(['useTestPglite'])
+    const testingMembers = new Set([...testFactoryMembers, ...lifecycleMembers])
+    const isImportedNamespaceMember = (callee, imports, names) =>
+      callee?.type === 'MemberExpression' &&
+      isIdentifier(callee.object) &&
+      names.has(callee.computed ? callee.property?.value : callee.property?.name) &&
+      isImportedBinding(context, callee.object, imports)
+    const trackNamespaceBinding = (binding, member, namespaceImports) => {
+      if (!isIdentifier(binding)) {
+        return
+      }
+
+      if (namespaceImports === pgliteNamespaceImports && pgliteMembers.has(member)) {
+        pgliteImports.add(binding)
+      }
+
+      if (namespaceImports === dbNamespaceImports && createDbMembers.has(member)) {
+        createDbImports.add(binding)
+      }
+
+      if (namespaceImports === testingNamespaceImports && testFactoryMembers.has(member)) {
+        testFactoryImports.add(binding)
+        testFactoryImportNodes.push(binding)
+      }
+
+      if (namespaceImports === testingNamespaceImports && lifecycleMembers.has(member)) {
+        lifecycleImports.add(binding)
+      }
+    }
+
+    return {
+      ImportDeclaration(node) {
+        const source = node.source?.value
+
+        for (const specifier of node.specifiers ?? []) {
+          if (
+            node.source?.value === 'bun:test' &&
+            specifier.type === 'ImportSpecifier' &&
+            (specifier.imported?.name === 'test' ||
+              specifier.imported?.name === 'it' ||
+              specifier.imported?.name === 'describe')
+          ) {
+            isTestFile = true
+          }
+
+          if (
+            isPgliteSource(source) &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'PGlite' &&
+            isIdentifier(specifier.local)
+          ) {
+            pgliteImports.add(specifier.local)
+          }
+
+          if (
+            isPgliteSource(source) &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            pgliteNamespaceImports.add(specifier.local)
+          }
+
+          if (
+            (source === '@wystack/db' || isRelativeSource(source)) &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'createDb' &&
+            isIdentifier(specifier.local)
+          ) {
+            createDbImports.add(specifier.local)
+          }
+
+          if (
+            (source === '@wystack/db' || isRelativeSource(source)) &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            dbNamespaceImports.add(specifier.local)
+          }
+
+          if (
+            node.source?.value === '@wystack/db/testing' &&
+            specifier.type === 'ImportSpecifier' &&
+            (specifier.imported?.name === 'createTestPg' ||
+              specifier.imported?.name === 'createTestDb') &&
+            isIdentifier(specifier.local)
+          ) {
+            testFactoryImports.add(specifier.local)
+            testFactoryImportNodes.push(specifier.local)
+          }
+
+          if (
+            source === '@wystack/db/testing' &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            testingNamespaceImports.add(specifier.local)
+          }
+
+          if (
+            node.source?.value === '@wystack/db/testing' &&
+            specifier.type === 'ImportSpecifier' &&
+            specifier.imported?.name === 'useTestPglite' &&
+            isIdentifier(specifier.local)
+          ) {
+            lifecycleImports.add(specifier.local)
+          }
+        }
+      },
+      VariableDeclarator(node) {
+        const namespaces = [
+          [pgliteNamespaceImports, pgliteMembers],
+          [dbNamespaceImports, createDbMembers],
+          [testingNamespaceImports, testingMembers],
+        ]
+
+        if (isIdentifier(node.id)) {
+          for (const [namespaceImports, members] of namespaces) {
+            if (isImportedNamespaceMember(node.init, namespaceImports, members)) {
+              const member = node.init.computed
+                ? node.init.property?.value
+                : node.init.property?.name
+              trackNamespaceBinding(node.id, member, namespaceImports)
+            }
+          }
+        }
+
+        if (node.id?.type === 'ObjectPattern' && isIdentifier(node.init)) {
+          const namespace = namespaces.find(([imports]) =>
+            isImportedBinding(context, node.init, imports),
+          )
+
+          if (!namespace) {
+            return
+          }
+
+          const [namespaceImports] = namespace
+          for (const property of node.id.properties ?? []) {
+            if (
+              property.type === 'Property' &&
+              property.computed === false &&
+              isIdentifier(property.key)
+            ) {
+              trackNamespaceBinding(property.value, property.key.name, namespaceImports)
+            }
+          }
+        }
+      },
+      ImportExpression(node) {
+        if (isPgliteSource(node.source?.value)) {
+          context.report({ node, messageId: 'useTestFactory' })
+        }
+      },
+      NewExpression(node) {
+        const callee = node.callee
+        const namespaceConstructor = isImportedNamespaceMember(
+          callee,
+          pgliteNamespaceImports,
+          pgliteMembers,
+        )
+
+        if (
+          (isIdentifier(callee) && isImportedBinding(context, callee, pgliteImports)) ||
+          namespaceConstructor
+        ) {
+          context.report({ node, messageId: 'useTestFactory' })
+        }
+      },
+      CallExpression(node) {
+        const namespaceLifecycleCall = isImportedNamespaceMember(
+          node.callee,
+          testingNamespaceImports,
+          lifecycleMembers,
+        )
+        const lifecycleCall =
+          (isIdentifier(node.callee) &&
+            isImportedBinding(context, node.callee, lifecycleImports)) ||
+          namespaceLifecycleCall
+
+        if (
+          node.parent?.type === 'ExpressionStatement' &&
+          node.parent.parent?.type === 'Program' &&
+          lifecycleCall
+        ) {
+          hasLifecycleRegistration = true
+          moduleLifecycleRegistrations.push(node)
+        }
+
+        if (isImportedNamespaceMember(node.callee, testingNamespaceImports, testFactoryMembers)) {
+          namespaceTestFactoryCalls.push(node)
+        }
+
+        if (
+          (isIdentifier(node.callee) && isImportedBinding(context, node.callee, createDbImports)) ||
+          isImportedNamespaceMember(node.callee, dbNamespaceImports, createDbMembers)
+        ) {
+          context.report({ node, messageId: 'useTestDb' })
+        }
+      },
+      'Program:exit'() {
+        if (
+          isTestFile &&
+          (testFactoryImports.size > 0 || namespaceTestFactoryCalls.length > 0) &&
+          !hasLifecycleRegistration
+        ) {
+          context.report({
+            node: testFactoryImportNodes[0] ?? namespaceTestFactoryCalls[0],
+            messageId: 'registerLifecycle',
+          })
+        }
+
+        if (!isTestFile) {
+          for (const node of moduleLifecycleRegistrations) {
+            context.report({ node, messageId: 'noSharedLifecycleRegistration' })
+          }
+        }
+      },
+    }
+  },
+}
+
 export default {
   meta: {
     name: 'wystack',
@@ -625,5 +882,6 @@ export default {
     'no-reflect-get': noReflectGet,
     'no-module-mocks-in-domain-tests': noModuleMocksInDomainTests,
     'no-placeholder-symbol-names': noPlaceholderSymbolNames,
+    'no-unmanaged-pglite': noUnmanagedPglite,
   },
 }

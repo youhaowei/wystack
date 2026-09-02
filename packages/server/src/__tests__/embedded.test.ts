@@ -11,11 +11,13 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { Hono } from 'hono'
 import { upgradeWebSocket, websocket } from 'hono/bun'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean } from '@wystack/db'
 import { createRoutes } from '../routes'
 import { defineApp } from '../define-app'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -31,7 +33,7 @@ let server: ReturnType<typeof Bun.serve>
 let baseUrl: string
 
 beforeEach(async () => {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await db.execute(`
     CREATE TABLE IF NOT EXISTS items (
@@ -158,7 +160,7 @@ describe('Embedded mount: createRoutes into existing Hono app', () => {
   })
 
   test('resolveContext works in embedded mode', async () => {
-    const pg = new PGlite()
+    const pg = createTestPg()
     const db = drizzle(pg)
     await db.execute(
       `CREATE TABLE IF NOT EXISTS items (id SERIAL PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`,

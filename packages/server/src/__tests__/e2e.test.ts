@@ -3,11 +3,13 @@
  * Schema DSL → DrizzleTracker → wy.build → serve → WS subscribe → HTTP mutate → invalidation
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 import { drizzle } from 'drizzle-orm/pglite'
 import { table, defineSchema, text, int, boolean, eq } from '@wystack/db'
 import { serve } from '../serve-bun'
 import { defineApp } from '../define-app'
+
+useTestPglite()
 
 const wy = defineApp<Record<string, unknown>>({ permissions: {} })
 
@@ -23,7 +25,7 @@ let server: ReturnType<typeof serve>
 let baseUrl: string
 
 beforeEach(async () => {
-  const pg = new PGlite()
+  const pg = createTestPg()
   const db = drizzle(pg)
   await db.execute(`
     CREATE TABLE IF NOT EXISTS todos (
@@ -134,7 +136,7 @@ describe('E2E: full reactive lifecycle', () => {
   })
 
   test('context passed through to handlers', async () => {
-    const pg = new PGlite()
+    const pg = createTestPg()
     const db = drizzle(pg)
     await db.execute(
       `CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN NOT NULL)`,
