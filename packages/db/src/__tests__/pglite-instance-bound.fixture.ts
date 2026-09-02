@@ -1,21 +1,10 @@
 import { test } from 'bun:test'
-import { PGlite } from '@electric-sql/pglite'
+import { createTestPg, useTestPglite } from '@wystack/db/testing'
 
-const guardErrors: unknown[] = []
+useTestPglite()
 
-for (let index = 0; index <= 10; index += 1) {
-  try {
-    // oxlint-disable-next-line wystack/no-unmanaged-pglite -- this fixture exercises the runtime guard directly
-    new PGlite()
-  } catch (error) {
-    guardErrors.push(error)
+test('leaking file exceeds the live-instance bound', () => {
+  for (let index = 0; index <= 8; index += 1) {
+    createTestPg()
   }
-}
-
-test('reports only the first live-instance bound breach', () => {
-  if (guardErrors.length !== 1) {
-    throw new Error(`expected one PGlite bound breach, received ${guardErrors.length}`)
-  }
-
-  throw guardErrors[0]
 })
