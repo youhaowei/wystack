@@ -4,14 +4,9 @@ import { createTestDb, useTestPglite } from '@wystack/db/testing'
 
 useTestPglite()
 
-let client: PGlite | undefined
+const db = await createTestDb({ dev: 'pglite://' })
+const client = db.$client as PGlite
 
-test('opens a managed database in the second fixture', async () => {
-  const db = await createTestDb({ dev: 'pglite://' })
-  client = db.$client as PGlite
-  expect(client.closed).toBe(false)
-})
-
-test('drains the second fixture before its next test', () => {
-  expect(client?.closed).toBe(true)
+test('this file drains its module-created client before the test', () => {
+  expect(client.closed).toBe(true)
 })

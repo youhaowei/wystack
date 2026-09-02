@@ -53,7 +53,9 @@ members; it never rejects a domain name merely because it contains a
 discouraged word.
 
 `no-unmanaged-pglite` rejects direct construction of `PGlite` imported from
-`@electric-sql/pglite` and calls to `createDb` imported from `@wystack/db`.
+`@electric-sql/pglite` or one of its subpaths, including namespace and dynamic
+imports. It also rejects calls to imported `createDb`, whether reached through
+`@wystack/db` or a relative import inside the database package.
 Apply it to test and fixture globs where instances must use `createTestPg` or
 `createTestDb` from `@wystack/db/testing` for lifecycle management. Unrelated
 local classes and functions with the same names are not affected. Files that

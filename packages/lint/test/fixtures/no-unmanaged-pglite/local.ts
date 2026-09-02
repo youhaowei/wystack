@@ -1,4 +1,3 @@
 class PGlite {}
 
-export const local = new
-  PGlite()
+export const local = new PGlite()

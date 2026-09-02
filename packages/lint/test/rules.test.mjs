@@ -106,20 +106,31 @@ describe('@wystack/lint', () => {
       root,
       resolve(root, 'composed.fixture.ts'),
       resolve(root, 'database.ts'),
+      resolve(root, 'dynamic.ts'),
       resolve(root, 'input.ts'),
       resolve(root, 'local-db.ts'),
       resolve(root, 'local.ts'),
       resolve(root, 'managed.ts'),
+      resolve(root, 'namespace.ts'),
+      resolve(root, 'relative-database.ts'),
       resolve(root, 'shared.fixture.ts'),
+      resolve(root, 'subpath.ts'),
       resolve(root, 'unregistered.ts'),
     )
 
     expect(ruleLocations(report, 'no-unmanaged-pglite')).toEqual([
       'database.ts:3',
       'database.ts:6',
+      'dynamic.ts:2',
+      'dynamic.ts:3',
       'input.ts:3',
-      'input.ts:7',
+      'input.ts:6',
+      'namespace.ts:4',
+      'namespace.ts:5',
+      'relative-database.ts:3',
+      'relative-database.ts:6',
       'shared.fixture.ts:3',
+      'subpath.ts:3',
       'unregistered.ts:2',
     ])
   })

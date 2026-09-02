@@ -634,6 +634,7 @@ const noUnmanagedPglite = {
   },
   create(context) {
     const pgliteImports = new Set()
+    const pgliteNamespaceImports = new Set()
     const createDbImports = new Set()
     const testFactoryImports = new Set()
     const lifecycleImports = new Set()
@@ -641,9 +642,14 @@ const noUnmanagedPglite = {
     const moduleLifecycleRegistrations = []
     let hasLifecycleRegistration = false
     let isTestFile = false
+    const isPgliteSource = (source) =>
+      source === '@electric-sql/pglite' || source?.startsWith('@electric-sql/pglite/')
+    const isRelativeSource = (source) => source?.startsWith('./') || source?.startsWith('../')
 
     return {
       ImportDeclaration(node) {
+        const source = node.source?.value
+
         for (const specifier of node.specifiers ?? []) {
           if (
             node.source?.value === 'bun:test' &&
@@ -656,7 +662,7 @@ const noUnmanagedPglite = {
           }
 
           if (
-            node.source?.value === '@electric-sql/pglite' &&
+            isPgliteSource(source) &&
             specifier.type === 'ImportSpecifier' &&
             specifier.imported?.name === 'PGlite' &&
             isIdentifier(specifier.local)
@@ -665,7 +671,15 @@ const noUnmanagedPglite = {
           }
 
           if (
-            node.source?.value === '@wystack/db' &&
+            isPgliteSource(source) &&
+            specifier.type === 'ImportNamespaceSpecifier' &&
+            isIdentifier(specifier.local)
+          ) {
+            pgliteNamespaceImports.add(specifier.local)
+          }
+
+          if (
+            (source === '@wystack/db' || isRelativeSource(source)) &&
             specifier.type === 'ImportSpecifier' &&
             specifier.imported?.name === 'createDb' &&
             isIdentifier(specifier.local)
@@ -694,8 +708,23 @@ const noUnmanagedPglite = {
           }
         }
       },
+      ImportExpression(node) {
+        if (isPgliteSource(node.source?.value)) {
+          context.report({ node, messageId: 'useTestFactory' })
+        }
+      },
       NewExpression(node) {
-        if (isIdentifier(node.callee) && isImportedBinding(context, node.callee, pgliteImports)) {
+        const callee = node.callee
+        const namespaceConstructor =
+          callee?.type === 'MemberExpression' &&
+          isIdentifier(callee.object) &&
+          (callee.computed ? callee.property?.value : callee.property?.name) === 'PGlite' &&
+          isImportedBinding(context, callee.object, pgliteNamespaceImports)
+
+        if (
+          (isIdentifier(callee) && isImportedBinding(context, callee, pgliteImports)) ||
+          namespaceConstructor
+        ) {
           context.report({ node, messageId: 'useTestFactory' })
         }
       },

@@ -3,15 +3,11 @@ import type { PGlite } from '@electric-sql/pglite'
 import { createTestDb, useTestPglite } from '@wystack/db/testing'
 
 useTestPglite()
+useTestPglite()
 
-let client: PGlite | undefined
+const db = await createTestDb({ dev: 'pglite://' })
+const client = db.$client as PGlite
 
-test('opens a managed database in the first fixture', async () => {
-  const db = await createTestDb({ dev: 'pglite://' })
-  client = db.$client as PGlite
-  expect(client.closed).toBe(false)
-})
-
-test('drains the first fixture before its next test', () => {
-  expect(client?.closed).toBe(true)
+test('double registration drains a module-created client before the test', () => {
+  expect(client.closed).toBe(true)
 })

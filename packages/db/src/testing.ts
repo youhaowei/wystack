@@ -10,8 +10,20 @@ import type { Db, DbConfig } from './types'
 const live = new Set<PGlite>()
 
 const drain = async () => {
-  for (const pg of live) if (!pg.closed) await pg.close()
+  const pending = [...live]
+  // Clear before awaiting so one disposal failure is reported once and cannot poison later tests.
   live.clear()
+  const results = await Promise.allSettled(
+    pending.map((pg) => (pg.closed ? Promise.resolve() : pg.close())),
+  )
+  const failures = results.filter((result) => result.status === 'rejected')
+
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      'PGlite test instance disposal failed',
+    )
+  }
 }
 
 /**
