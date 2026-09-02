@@ -36,6 +36,8 @@ const drain = async () => {
  * function that each importing test file calls from its own module body instead.
  * This design assumes serial test execution; concurrent tests require per-test
  * ownership rather than this shared instance registry.
+ * The test-command preload only observes construction process-wide; it cannot
+ * replace these hooks, which must register from each test file's own module body.
  */
 export function useTestPglite(): void {
   // Drain before the next test so a file's own afterEach hooks can still use its database.

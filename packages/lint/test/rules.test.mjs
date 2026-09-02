@@ -104,6 +104,11 @@ describe('@wystack/lint', () => {
     const report = lint(
       'fixture.oxlintrc.json',
       root,
+      resolve(root, 'bound-namespace-members.ts'),
+      resolve(root, 'bound-relative-database.ts'),
+      resolve(root, 'bound-testing-managed.ts'),
+      resolve(root, 'bound-testing-shared.fixture.ts'),
+      resolve(root, 'bound-testing-unregistered.ts'),
       resolve(root, 'composed.fixture.ts'),
       resolve(root, 'database.ts'),
       resolve(root, 'dynamic.ts'),
@@ -125,6 +130,14 @@ describe('@wystack/lint', () => {
     )
 
     expect(ruleLocations(report, 'no-unmanaged-pglite')).toEqual([
+      'bound-namespace-members.ts:10',
+      'bound-namespace-members.ts:11',
+      'bound-namespace-members.ts:12',
+      'bound-namespace-members.ts:9',
+      'bound-relative-database.ts:6',
+      'bound-relative-database.ts:7',
+      'bound-testing-shared.fixture.ts:5',
+      'bound-testing-unregistered.ts:4',
       'database.ts:3',
       'database.ts:6',
       'dynamic.ts:2',

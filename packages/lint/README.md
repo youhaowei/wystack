@@ -67,5 +67,12 @@ Shared fixture modules must never call it at module scope because the hook would
 attach only to the first importer. They should expose a composed `use...()`
 function for each importing test file to call instead.
 
+This rule catches the import and call idioms normally used in the repository,
+including direct namespace calls and simple local bindings. It is a guardrail,
+not proof of lifecycle safety: arbitrary aliasing can defeat AST-only analysis.
+The actual runtime guarantee is the always-on live-instance bound in
+`scripts/pglite-instance-guard.ts`, loaded only by the DB, server, and client
+test commands. The lint rule provides earlier feedback for ordinary code shapes.
+
 See [the rule roadmap](./ROADMAP.md) for the deliberately deferred rules that
 need richer analysis than an AST-only plugin can provide safely.

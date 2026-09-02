@@ -619,7 +619,7 @@ const noUnmanagedPglite = {
     type: 'problem',
     docs: {
       description:
-        'Require test-created PGlite instances to use the shared lifecycle-managed factory.',
+        'Provide fast feedback for common unmanaged PGlite construction idioms; the test preload enforces the runtime live-instance bound.',
     },
     messages: {
       useTestFactory:
@@ -652,11 +652,34 @@ const noUnmanagedPglite = {
     const createDbMembers = new Set(['createDb'])
     const testFactoryMembers = new Set(['createTestPg', 'createTestDb'])
     const lifecycleMembers = new Set(['useTestPglite'])
+    const testingMembers = new Set([...testFactoryMembers, ...lifecycleMembers])
     const isImportedNamespaceMember = (callee, imports, names) =>
       callee?.type === 'MemberExpression' &&
       isIdentifier(callee.object) &&
       names.has(callee.computed ? callee.property?.value : callee.property?.name) &&
       isImportedBinding(context, callee.object, imports)
+    const trackNamespaceBinding = (binding, member, namespaceImports) => {
+      if (!isIdentifier(binding)) {
+        return
+      }
+
+      if (namespaceImports === pgliteNamespaceImports && pgliteMembers.has(member)) {
+        pgliteImports.add(binding)
+      }
+
+      if (namespaceImports === dbNamespaceImports && createDbMembers.has(member)) {
+        createDbImports.add(binding)
+      }
+
+      if (namespaceImports === testingNamespaceImports && testFactoryMembers.has(member)) {
+        testFactoryImports.add(binding)
+        testFactoryImportNodes.push(binding)
+      }
+
+      if (namespaceImports === testingNamespaceImports && lifecycleMembers.has(member)) {
+        lifecycleImports.add(binding)
+      }
+    }
 
     return {
       ImportDeclaration(node) {
@@ -733,6 +756,45 @@ const noUnmanagedPglite = {
             isIdentifier(specifier.local)
           ) {
             lifecycleImports.add(specifier.local)
+          }
+        }
+      },
+      VariableDeclarator(node) {
+        const namespaces = [
+          [pgliteNamespaceImports, pgliteMembers],
+          [dbNamespaceImports, createDbMembers],
+          [testingNamespaceImports, testingMembers],
+        ]
+
+        if (isIdentifier(node.id)) {
+          for (const [namespaceImports, members] of namespaces) {
+            if (isImportedNamespaceMember(node.init, namespaceImports, members)) {
+              const member = node.init.computed
+                ? node.init.property?.value
+                : node.init.property?.name
+              trackNamespaceBinding(node.id, member, namespaceImports)
+            }
+          }
+        }
+
+        if (node.id?.type === 'ObjectPattern' && isIdentifier(node.init)) {
+          const namespace = namespaces.find(([imports]) =>
+            isImportedBinding(context, node.init, imports),
+          )
+
+          if (!namespace) {
+            return
+          }
+
+          const [namespaceImports] = namespace
+          for (const property of node.id.properties ?? []) {
+            if (
+              property.type === 'Property' &&
+              property.computed === false &&
+              isIdentifier(property.key)
+            ) {
+              trackNamespaceBinding(property.value, property.key.name, namespaceImports)
+            }
           }
         }
       },
